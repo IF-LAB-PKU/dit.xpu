@@ -58,6 +58,11 @@
 #include "ggml-opencl.h"
 #endif
 
+// htp backend
+#ifdef GGML_USE_HTP
+#include "ggml-htp.h"
+#endif
+
 #ifdef GGML_USE_HEXAGON
 #include "ggml-hexagon.h"
 #endif
@@ -142,6 +147,10 @@ struct ggml_backend_registry {
 
 #ifdef GGML_USE_OPENCL
         register_backend(ggml_backend_opencl_reg());
+#endif
+// register htp backend 
+#ifdef GGML_USE_HTP
+        register_backend(ggml_backend_htp_reg());
 #endif
 #ifdef GGML_USE_ZENDNN
         register_backend(ggml_backend_zendnn_reg());

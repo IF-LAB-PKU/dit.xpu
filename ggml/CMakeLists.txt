@@ -265,6 +265,7 @@ option(GGML_OPENCL_USE_ADRENO_KERNELS       "ggml: use optimized kernels for Adr
 set   (GGML_OPENCL_TARGET_VERSION "300" CACHE STRING
                                             "ggml: OpenCL API version to target")
 
+option(GGML_HTP                             "ggml: use HTP backend"                           OFF)
 option(GGML_HEXAGON                         "ggml: enable Hexagon backend"                    OFF)
 set(GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE 128 CACHE STRING "ggml: quantize group size (32, 64, or 128)")
 
@@ -323,6 +324,7 @@ include(CMakePackageConfigHelpers)
 set(GGML_PUBLIC_HEADERS
     include/ggml.h
     include/ggml-cpu.h
+    include/ggml-htp.h
     include/ggml-alloc.h
     include/ggml-backend.h
     include/ggml-blas.h
