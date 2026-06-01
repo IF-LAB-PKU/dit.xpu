@@ -208,7 +208,15 @@ public:
             LOG_ERROR("backend config failed: %s", error.c_str());
             return false;
         }
-        return ensure_backend_pair(SDBackendModule::DIFFUSION);
+        if (!ensure_backend_pair(SDBackendModule::DIFFUSION)) {
+            return false;
+        }
+        // 在真正进入推理前先按环境变量拉起 HTP，后续算子替换可以直接复用缓存后的 backend。
+        if (!backend_manager.preload_from_env("SD_PRELOAD_BACKENDS", &error)) {
+            LOG_ERROR("backend preload failed: %s", error.c_str());
+            return false;
+        }
+        return true;
     }
 
     std::shared_ptr<RNG> get_rng(rng_type_t rng_type) {

@@ -65,6 +65,9 @@ public:
     bool runtime_backend_is_cpu(SDBackendModule module);
     bool params_backend_is_cpu(SDBackendModule module);
     bool runtime_backend_supports_host_buffer(SDBackendModule module);
+    // 在推理初始化阶段按配置提前拉起后端，当前先用于预加载 HTP。
+    bool preload_spec(const char* preload_spec, std::string* error);
+    bool preload_from_env(const char* env_name, std::string* error);
 
 private:
     bool validate(std::string* error) const;

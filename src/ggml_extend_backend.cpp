@@ -6,6 +6,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 #include "util.h"
@@ -509,6 +510,63 @@ bool SDBackendManager::init(const char* backend_spec,
     }
 
     return validate(error);
+}
+
+// 从环境变量读取预加载列表，避免改动现有 backend/params_backend 参数语义。
+bool SDBackendManager::preload_from_env(const char* env_name, std::string* error) {
+    const char* value = env_name != nullptr ? std::getenv(env_name) : nullptr;
+    return preload_spec(value, error);
+}
+
+// 解析并提前初始化指定后端，当前只接受 htp，用于后续推理接入前先完成 runtime 拉起。
+bool SDBackendManager::preload_spec(const char* preload_spec, std::string* error) {
+    const std::string spec = trim_copy(SAFE_STR(preload_spec));
+    if (spec.empty()) {
+        return true;
+    }
+
+    std::unordered_set<std::string> seen;
+    for (const std::string& raw : split_copy(spec, ',')) {
+        const std::string token = lower_copy(trim_copy(raw));
+        if (token.empty()) {
+            continue;
+        }
+        if (token != "htp") {
+            if (error != nullptr) {
+                *error = "unknown preloaded backend '" + token + "'";
+            }
+            return false;
+        }
+        if (!seen.insert(token).second) {
+            continue;
+        }
+        if (ggml_backend_reg_by_name("HTP") == nullptr) {
+            if (error != nullptr) {
+                *error = "backend 'htp' was not found";
+            }
+            return false;
+        }
+        ggml_backend_t backend = init_cached_backend(token);
+        if (backend == nullptr) {
+            if (error != nullptr && error->empty()) {
+                *error = "failed to initialize preloaded backend '" + token + "'";
+            }
+            return false;
+        }
+        // 某些平台会注册 HTP 但实际 runtime 不可用，这里在初始化阶段提前拦截。
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        const char* description = dev != nullptr ? ggml_backend_dev_description(dev) : nullptr;
+        if (description != nullptr && std::string(description).find("runtime unavailable") != std::string::npos) {
+            if (error != nullptr) {
+                *error = "htp runtime unavailable: ";
+                *error += description;
+            }
+            return false;
+        }
+        LOG_INFO("preloaded backend '%s' for future inference integration", token.c_str());
+    }
+
+    return true;
 }
 
 bool SDBackendManager::validate(std::string* error) const {
