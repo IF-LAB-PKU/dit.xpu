@@ -33,10 +33,17 @@ struct RpcMemMapper {
     void validate(const struct ggml_tensor * dst);
     std::pair<int, ssize_t> get_tensor_mapping(const struct ggml_tensor * tensor) const;
 
-    using UnmapRequest = std::tuple<int, void *, size_t>;
+    struct UnmapRequest {
+        int fd;
+        void * buf_base;
+        size_t buf_size;
+        bool host_unmapped;
+    };
 
     const std::list<UnmapRequest> & get_pending_unmap_reqs() const { return pending_unmap_reqs; }
 
+    // 当 host 侧映射窗口不够时，先同步通知 DSP 释放 HAP_mmap，再执行 host 侧 fastrpc_munmap。
+    void flush_pending_unmaps();
     void unmap_all_pending_buffers();
     void dump_state() const;
 

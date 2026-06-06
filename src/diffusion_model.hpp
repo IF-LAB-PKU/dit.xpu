@@ -60,6 +60,10 @@ struct DiffusionModel {
     virtual void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) = 0;
     virtual size_t get_params_buffer_size()                                      = 0;
     virtual void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter){};
+    // 统一给各个 diffusion runner 透传 HTP backend，避免在 stable-diffusion.cpp 里感知具体模型类型。
+    virtual void set_htp_backend(ggml_backend_t backend)                         {
+        (void)backend;
+    };
     virtual int64_t get_adm_in_channels()                            = 0;
     virtual void set_flash_attention_enabled(bool enabled)           = 0;
     virtual void set_max_graph_vram_bytes(size_t max_vram_bytes)     = 0;
@@ -102,6 +106,11 @@ struct UNetModel : public DiffusionModel {
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
         unet.set_weight_adapter(adapter);
+    }
+
+    void set_htp_backend(ggml_backend_t backend) override {
+        // 把预加载的 HTP backend 透传到具体 runner，图分配和执行阶段都会依赖它做判断。
+        unet.set_htp_backend(backend);
     }
 
     int64_t get_adm_in_channels() override {
@@ -174,6 +183,10 @@ struct MMDiTModel : public DiffusionModel {
         mmdit.set_weight_adapter(adapter);
     }
 
+    void set_htp_backend(ggml_backend_t backend) override {
+        mmdit.set_htp_backend(backend);
+    }
+
     int64_t get_adm_in_channels() override {
         return 768 + 1280;
     }
@@ -241,6 +254,10 @@ struct FluxModel : public DiffusionModel {
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
         flux.set_weight_adapter(adapter);
+    }
+
+    void set_htp_backend(ggml_backend_t backend) override {
+        flux.set_htp_backend(backend);
     }
 
     int64_t get_adm_in_channels() override {
@@ -317,6 +334,10 @@ struct AnimaModel : public DiffusionModel {
         anima.set_weight_adapter(adapter);
     }
 
+    void set_htp_backend(ggml_backend_t backend) override {
+        anima.set_htp_backend(backend);
+    }
+
     int64_t get_adm_in_channels() override {
         return 768;
     }
@@ -384,6 +405,10 @@ struct WanModel : public DiffusionModel {
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
         wan.set_weight_adapter(adapter);
+    }
+
+    void set_htp_backend(ggml_backend_t backend) override {
+        wan.set_htp_backend(backend);
     }
 
     int64_t get_adm_in_channels() override {
@@ -459,6 +484,10 @@ struct QwenImageModel : public DiffusionModel {
         qwen_image.set_weight_adapter(adapter);
     }
 
+    void set_htp_backend(ggml_backend_t backend) override {
+        qwen_image.set_htp_backend(backend);
+    }
+
     int64_t get_adm_in_channels() override {
         return 768;
     }
@@ -526,6 +555,10 @@ struct HiDreamO1Model : public DiffusionModel {
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
         hidream_o1.set_weight_adapter(adapter);
+    }
+
+    void set_htp_backend(ggml_backend_t backend) override {
+        hidream_o1.set_htp_backend(backend);
     }
 
     int64_t get_adm_in_channels() override {
@@ -605,6 +638,10 @@ struct ZImageModel : public DiffusionModel {
         z_image.set_weight_adapter(adapter);
     }
 
+    void set_htp_backend(ggml_backend_t backend) override {
+        z_image.set_htp_backend(backend);
+    }
+
     int64_t get_adm_in_channels() override {
         return 768;
     }
@@ -674,6 +711,10 @@ struct ErnieImageModel : public DiffusionModel {
         ernie_image.set_weight_adapter(adapter);
     }
 
+    void set_htp_backend(ggml_backend_t backend) override {
+        ernie_image.set_htp_backend(backend);
+    }
+
     int64_t get_adm_in_channels() override {
         return 768;
     }
@@ -738,6 +779,10 @@ struct LTXAVModel : public DiffusionModel {
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
         ltxav.set_weight_adapter(adapter);
+    }
+
+    void set_htp_backend(ggml_backend_t backend) override {
+        ltxav.set_htp_backend(backend);
     }
 
     int64_t get_adm_in_channels() override {

@@ -3,6 +3,8 @@ project("stable-diffusion")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+find_package(Threads REQUIRED)
+
 if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
@@ -311,7 +313,11 @@ target_compile_features(${SD_LIB} PUBLIC c_std_11 cxx_std_17)
 
 if (SD_BUILD_TESTS)
     enable_testing()
-    add_subdirectory(tests)
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
+        add_subdirectory(tests)
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ggml/tests/CMakeLists.txt")
+        add_subdirectory(ggml/tests ${CMAKE_BINARY_DIR}/ggml-tests)
+    endif()
 endif()
 
 if (SD_BUILD_EXAMPLES)

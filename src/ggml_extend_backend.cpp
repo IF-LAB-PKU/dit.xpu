@@ -569,6 +569,17 @@ bool SDBackendManager::preload_spec(const char* preload_spec, std::string* error
     return true;
 }
 
+// 这里只查缓存，不触发新的 backend 初始化，方便推理阶段安全复用 preload 出来的 HTP 实例。
+ggml_backend_t SDBackendManager::cached_backend(const char* name) const {
+    const std::string resolved = sd_resolve_backend_name(SAFE_STR(name));
+    const std::string key      = lower_copy(resolved);
+    if (key.empty()) {
+        return nullptr;
+    }
+    auto it = backends_.find(key);
+    return it != backends_.end() ? it->second.get() : nullptr;
+}
+
 bool SDBackendManager::validate(std::string* error) const {
     auto validate_name = [&](const std::string& name) -> bool {
         if (is_default_backend_token(name)) {

@@ -2,7 +2,7 @@
 // 1) 初始化 DSP 会话并加载 libhtp_ops.so；
 // 2) 实现基于 RPCMEM（ION 共享内存）的缓冲区分配/释放；
 // 3) 实现后端设备接口：设备属性、算力查询、图计算调度（逐节点 HTP 分发或混合模式）。
-// 支持的缓冲区类型为 "RPCMEM"，最大 256 MiB，128 字节对齐。
+// 支持的缓冲区类型为 "RPCMEM"，默认按 256 MiB 分块，128 字节对齐；必要时可用环境变量调整切分粒度。
 
 #include "ggml-htp.h"
 
@@ -10,6 +10,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -53,8 +54,45 @@ static void ggml_backend_htp_aligned_free(void * data) {
 #endif
 }
 
+// 把 hybrid 模式做成进程内显式开关，便于 sd.cpp 在单次推理里临时打开 HTP 混合执行。
+static std::atomic<bool> g_htp_hybrid_enabled{false};
+
+void ggml_backend_htp_set_hybrid_enabled(bool enabled) {
+    g_htp_hybrid_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool ggml_backend_htp_get_hybrid_enabled(void) {
+    return g_htp_hybrid_enabled.load(std::memory_order_relaxed);
+}
+
 static bool ggml_backend_htp_use_hybrid_graph_compute() {
-    return std::getenv("GGML_HTP_USE_HYBRID") != nullptr;
+    return ggml_backend_htp_get_hybrid_enabled();
+}
+
+// 部分设备的 fastrpc 可用映射窗口明显小于 3 GiB，这里给一个保守默认值，并允许用环境变量按 MiB 覆盖。
+static size_t ggml_backend_htp_get_max_active_map_size() {
+    const char * env = std::getenv("GGML_HTP_MAX_ACTIVE_MAP_MB");
+    if (env != nullptr && env[0] != '\0') {
+        char * end = nullptr;
+        unsigned long long mb = std::strtoull(env, &end, 10);
+        if (end != env && end != nullptr && *end == '\0' && mb > 0) {
+            return static_cast<size_t>(mb) * 1024ULL * 1024ULL;
+        }
+    }
+    return 2560ULL * 1024ULL * 1024ULL;
+}
+
+// HTP 参数 offload 的 buffer 切分粒度也做成环境变量，便于在真机上验证是“映射窗口不够”还是“切成太多独立 fd”导致的 fastrpc_mmap 失败。
+static size_t ggml_backend_htp_get_buffer_max_size() {
+    const char * env = std::getenv("GGML_HTP_MAX_BUFFER_MB");
+    if (env != nullptr && env[0] != '\0') {
+        char * end = nullptr;
+        unsigned long long mb = std::strtoull(env, &end, 10);
+        if (end != env && end != nullptr && *end == '\0' && mb > 0) {
+            return static_cast<size_t>(mb) * 1024ULL * 1024ULL;
+        }
+    }
+    return 256ULL * 1024ULL * 1024ULL;
 }
 
 static bool ggml_backend_htp_ensure_work_data(ggml_backend_htp_context * ctx, size_t work_size) {
@@ -77,7 +115,7 @@ static bool ggml_backend_htp_ensure_work_data(ggml_backend_htp_context * ctx, si
     return true;
 }
 
-ggml_backend_htp_context::ggml_backend_htp_context() : mapper(3 * 1024UL * 1024 * 1024, true) {
+ggml_backend_htp_context::ggml_backend_htp_context() : mapper(ggml_backend_htp_get_max_active_map_size(), true) {
     if (!dsprpc_is_available()) {
         const char * err = dsprpc_last_error();
         runtime_error    = err ? err : "libcdsprpc.so is unavailable";
@@ -303,7 +341,7 @@ static size_t ggml_backend_htp_buffer_type_get_alignment(ggml_backend_buffer_typ
 
 static size_t ggml_backend_htp_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
-    return 256 * size_t(1024 * 1024);
+    return ggml_backend_htp_get_buffer_max_size();
 }
 
 static bool ggml_backend_htp_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
@@ -359,12 +397,24 @@ static void ggml_backend_htp_free(ggml_backend_t backend) {
     ggml_backend_htp_context::release_instance();
 }
 
+// 调度阶段优先取真正持有共享内存的 backing buffer，避免 view 张量因为 buffer 还没回填而被误判成非 RPCMEM。
+static ggml_backend_buffer_t ggml_backend_htp_get_backing_buffer(const ggml_tensor * tensor) {
+    while (tensor != nullptr) {
+        if (tensor->buffer != nullptr) {
+            return tensor->buffer;
+        }
+        tensor = tensor->view_src;
+    }
+    return nullptr;
+}
+
 static bool ggml_backend_htp_node_has_rpcmem_buffers(const ggml_tensor * node) {
-    if (node == nullptr || node->buffer == nullptr || !ggml_is_contiguous(node)) {
+    ggml_backend_buffer_t node_buffer = ggml_backend_htp_get_backing_buffer(node);
+    if (node == nullptr || node_buffer == nullptr || !ggml_is_contiguous(node)) {
         return false;
     }
 
-    if (!ggml_backend_buft_is_rpcmem(ggml_backend_buffer_get_type(node->buffer))) {
+    if (!ggml_backend_buft_is_rpcmem(ggml_backend_buffer_get_type(node_buffer))) {
         return false;
     }
 
@@ -374,11 +424,12 @@ static bool ggml_backend_htp_node_has_rpcmem_buffers(const ggml_tensor * node) {
             continue;
         }
 
-        if (src->buffer == nullptr || !ggml_is_contiguous(src)) {
+        ggml_backend_buffer_t src_buffer = ggml_backend_htp_get_backing_buffer(src);
+        if (src_buffer == nullptr || !ggml_is_contiguous(src)) {
             return false;
         }
 
-        if (!ggml_backend_buft_is_rpcmem(ggml_backend_buffer_get_type(src->buffer))) {
+        if (!ggml_backend_buft_is_rpcmem(ggml_backend_buffer_get_type(src_buffer))) {
             return false;
         }
     }

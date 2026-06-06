@@ -1711,6 +1711,23 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+// HTP DSP 侧返回非 0 时不能继续用可能已经被污染的 dst 往下推图，必须把错误传播到 hybrid graph compute 的最终返回值。
+static void ggml_htp_mark_op_failed(
+        struct ggml_compute_params * params,
+        struct ggml_tensor * tensor,
+        int err) {
+    if (params->ith == 0) {
+        fprintf(stderr,
+                "ggml-htp: hybrid op failed err=0x%x op=%s name=%s\n",
+                err,
+                tensor != NULL ? ggml_op_name(tensor->op) : "(null)",
+                tensor != NULL && tensor->name[0] != '\0' ? tensor->name : "<unnamed>");
+    }
+    if (params->threadpool != NULL) {
+        params->threadpool->ec = GGML_STATUS_FAILED;
+    }
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -1822,8 +1839,12 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_RMS_NORM:
             {
-                if (htp_ops_support_op(tensor)) {
-                    htp_ops_compute_op(params, tensor);
+                // 运行时只有 shape/type 支持且 src/dst 已经实际落到 RPCMEM 的节点才走 HTP，其余节点必须安全回退到 CPU。
+                if (htp_ops_support_op_runtime(tensor)) {
+                    const int err = htp_ops_compute_op(params, tensor);
+                    if (err != 0) {
+                        ggml_htp_mark_op_failed(params, tensor, err);
+                    }
                 } else {
                     ggml_compute_forward_rms_norm(params, tensor);
                 }
@@ -1842,8 +1863,12 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT:
             {
-                if (htp_ops_support_op(tensor)) {
-                    htp_ops_compute_op(params, tensor);
+                // 避免未被本轮 HTP placement 选中的 MUL_MAT 误进 HTP 路径，导致映射数量与实际 buffer 放置不一致。
+                if (htp_ops_support_op_runtime(tensor)) {
+                    const int err = htp_ops_compute_op(params, tensor);
+                    if (err != 0) {
+                        ggml_htp_mark_op_failed(params, tensor, err);
+                    }
                 } else {
                     ggml_compute_forward_mul_mat(params, tensor);
                 }
@@ -2006,8 +2031,12 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                if (htp_ops_support_op(tensor)) {
-                    htp_ops_compute_op(params, tensor);
+                // FLASH_ATTN_EXT 也必须按运行时 RPCMEM 放置结果判断，避免只因 shape 支持就误分发到 HTP。
+                if (htp_ops_support_op_runtime(tensor)) {
+                    const int err = htp_ops_compute_op(params, tensor);
+                    if (err != 0) {
+                        ggml_htp_mark_op_failed(params, tensor, err);
+                    }
                 } else {
                     ggml_compute_forward_flash_attn_ext(params, tensor);
                 }
@@ -3064,7 +3093,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
-    for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
+    // 如果某个 HTP op 已经失败，当前节点同步完成后立刻停止后续节点，避免错误 dst 继续污染整张图。
+    for (int node_n = 0; node_n < cgraph->n_nodes &&
+            atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n &&
+            tp->ec == GGML_STATUS_SUCCESS; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
         if (ggml_op_is_empty(node->op)) {

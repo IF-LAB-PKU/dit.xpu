@@ -68,6 +68,8 @@ public:
     // 在推理初始化阶段按配置提前拉起后端，当前先用于预加载 HTP。
     bool preload_spec(const char* preload_spec, std::string* error);
     bool preload_from_env(const char* env_name, std::string* error);
+    // 读取已经缓存并初始化过的 backend，避免推理接线阶段重复创建 HTP 实例。
+    ggml_backend_t cached_backend(const char* name) const;
 
 private:
     bool validate(std::string* error) const;
