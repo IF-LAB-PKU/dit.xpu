@@ -15,6 +15,7 @@ extern "C" {
 #endif
 
 bool htp_ops_support_op(const struct ggml_tensor * dst);
+bool htp_ops_support_op_runtime(const struct ggml_tensor * dst);
 int  htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor * dst);
 
 #ifdef __cplusplus

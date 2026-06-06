@@ -1,6 +1,6 @@
 // HTP 算子注册表。定义所有支持算子的枚举索引（HtpOpsIndex），
 // 以及每种算子对应的参数结构体（算子类型 + 张量维度 + 各张量的 RpcmemBufAddr）。
-// 目前支持 RMS_NORM_F32、四种变体的 MAT_MUL 以及 FLASH_ATTN。
+// 目前支持 RMS_NORM_F32、row-major F16 MAT_MUL、三种量化 MAT_MUL 以及 FLASH_ATTN。
 
 #pragma once
 
@@ -9,7 +9,6 @@
 enum HtpOpsIndex {
     HTP_OPS_RMS_NORM_F32,
     HTP_OPS_MAT_MUL_ROW_MAJOR_W16A32,
-    HTP_OPS_MAT_MUL_PERMUTED_W16A32,
     HTP_OPS_MAT_MUL_PERMUTED_W4D16A32,
     HTP_OPS_MAT_MUL_PERMUTED_W8D16A32,
     HTP_OPS_MAT_MUL_PERMUTED_W4D16A32_IQ4_NL,

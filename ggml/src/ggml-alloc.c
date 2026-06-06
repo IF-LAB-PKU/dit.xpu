@@ -653,6 +653,12 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                 }
 
                 struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
+                // 多 buffer 图里不能让目标节点跨 buffer 复用父节点地址，否则会把本该落到 HTP/RPCMEM 的结果错误留在 CPU buffer。
+                if (p_hn->buffer_id != buffer_id) {
+                    AT_PRINTF("not reusing parent %s for %s as buffer ids differ (%d != %d)\n",
+                        parent->name, node->name, p_hn->buffer_id, buffer_id);
+                    continue;
+                }
                 if (p_hn->n_children == 1 && p_hn->n_views == 0) {
                     if (ggml_impl_is_view(parent)) {
                         struct ggml_tensor * view_src = parent->view_src;

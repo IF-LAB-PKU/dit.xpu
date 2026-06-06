@@ -1,6 +1,9 @@
 #include "ggml_extend.hpp"
 #include "ggml_graph_cut.h"
 
+#include <cstdlib>
+#include <cstring>
+
 #include "model.h"
 #include "rng.hpp"
 #include "rng_mt19937.hpp"
@@ -963,6 +966,19 @@ public:
         }
         if (cond_stage_model) {
             cond_stage_model->alloc_params_buffer();
+        }
+        if (sd_env_flag_enabled("SD_HTP_OPS")) {
+            ggml_backend_t htp_backend = backend_manager.cached_backend("htp");
+            if (htp_backend != nullptr && backend_manager.runtime_backend_is_cpu(SDBackendModule::DIFFUSION)) {
+                // 当前只在 diffusion 运行时 backend 为 CPU 时打开 HTP 混合接线，避免误覆盖 GPU 路径。
+                if (diffusion_model) {
+                    diffusion_model->set_htp_backend(htp_backend);
+                }
+                if (high_noise_diffusion_model) {
+                    high_noise_diffusion_model->set_htp_backend(htp_backend);
+                }
+                LOG_INFO("enabled HTP op routing for diffusion runners");
+            }
         }
         if (diffusion_model) {
             diffusion_model->alloc_params_buffer();

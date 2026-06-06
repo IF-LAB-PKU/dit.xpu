@@ -92,7 +92,7 @@ static void test_shape(int64_t k, int64_t n, int64_t m) {
     ggml_tensor * d = ggml_mul_mat(support_ctx, w, a);
     GGML_ASSERT(d != nullptr);
 
-    // RED phase target: this is expected to fail until sd.cpp wires non-tiled F16 matmul to a custom HTP op.
+    // Row-major F16 matmul must be reported as supported for direct HTP dispatch.
     GGML_ASSERT(ggml_backend_dev_supports_op(dev, d));
     ggml_free(support_ctx);
 
@@ -144,6 +144,8 @@ int main() {
 
     test_shape(63, 65, 7);
     test_shape(127, 95, 13);
+    // 回归 case，普通 row-major F16 权重即便 k/n 恰好是 32 的倍数，也不应该被误判成 permuted 权重路径。
+    test_shape(64, 96, 5);
 
     std::printf("\n=== HTP MATMUL_F16 test PASSED ===\n");
     return 0;

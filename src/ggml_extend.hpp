@@ -5,6 +5,7 @@
 #include <inttypes.h>
 #include <stdarg.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -21,10 +22,12 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-htp.h"
 #include "ggml.h"
 #include "ggml_extend_backend.h"
 #include "ggml_graph_cut.h"
@@ -45,6 +48,15 @@
 #ifndef SD_UNUSED
 #define SD_UNUSED(x) (void)(x)
 #endif
+
+// sd.cpp 私有 tensor flag，用来复刻 llama.cpp-npu 的 weight-op 映射；只标记未来会作为 MUL_MAT src0 的参数权重。
+static constexpr int32_t SD_GGML_TENSOR_FLAG_HTP_MUL_MAT_WEIGHT = 1 << 24;
+
+// 统一解析布尔环境变量，避免把 "0" 这种显式关闭值误判成开启。
+__STATIC_INLINE__ bool sd_env_flag_enabled(const char* name) {
+    const char* value = name != nullptr ? std::getenv(name) : nullptr;
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
 
 __STATIC_INLINE__ int align_up_offset(int n, int multiple) {
     return (multiple - n % multiple) % multiple;
@@ -1709,12 +1721,21 @@ protected:
 
     ggml_backend_t params_backend  = nullptr;
     ggml_backend_t runtime_backend = nullptr;
+    // 只有 diffusion 推理明确注入 HTP backend 后，runner 才会启用 RPCMEM 放置和 hybrid compute 判定。
+    ggml_backend_t htp_backend     = nullptr;
 
     ggml_context* params_ctx                    = nullptr;
     ggml_backend_buffer_t params_buffer         = nullptr;
     ggml_context* offload_ctx                   = nullptr;
     ggml_backend_buffer_t runtime_params_buffer = nullptr;
     bool params_on_runtime_backend              = false;
+    // 普通 runtime offload 现在改为显式记录“哪些参数被临时换到 runtime backend”，这样就能跳过常驻 RPCMEM 的 HTP 权重。
+    std::vector<std::pair<ggml_tensor*, ggml_tensor*>> runtime_offload_pairs_;
+    // 参照 llama.cpp-npu，eligible diffusion 权重在参数分配阶段直接放进 RPCMEM，而不是图执行前再复制一份常驻权重池。
+    ggml_context* htp_param_placement_ctx_            = nullptr;
+    ggml_backend_buffer_t htp_param_placement_buffer_ = nullptr;
+    std::vector<std::pair<ggml_tensor*, ggml_tensor*>> htp_param_placement_pairs_;
+    std::unordered_set<ggml_tensor*> htp_placed_param_tensors_;
 
     ggml_context* cache_ctx            = nullptr;
     ggml_backend_buffer_t cache_buffer = nullptr;
@@ -1747,6 +1768,9 @@ protected:
 
     sd::ggml_graph_cut::PlanCache graph_cut_plan_cache_;
     std::unordered_set<const ggml_tensor*> params_tensor_set_;
+    // 记录每个 node/leaf 应该落在哪个 buffer，0=默认 runtime buffer，1=HTP RPCMEM buffer。
+    std::vector<int> compute_node_buffer_ids_;
+    std::vector<int> compute_leaf_buffer_ids_;
 
     template <typename T>
     static sd::Tensor<T> take_or_empty(std::optional<sd::Tensor<T>> tensor) {
@@ -1799,6 +1823,13 @@ protected:
             ggml_free(offload_ctx);
             offload_ctx = nullptr;
         }
+        runtime_offload_pairs_.clear();
+        if (htp_param_placement_ctx_ != nullptr) {
+            ggml_free(htp_param_placement_ctx_);
+            htp_param_placement_ctx_ = nullptr;
+        }
+        htp_param_placement_pairs_.clear();
+        htp_placed_param_tensors_.clear();
         if (partial_offload_ctx != nullptr) {
             ggml_free(partial_offload_ctx);
             partial_offload_ctx = nullptr;
@@ -1913,9 +1944,31 @@ protected:
         if (compute_allocr != nullptr) {
             return true;
         }
-        compute_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(runtime_backend));
+        ggml_backend_buffer_type_t runtime_buft = ggml_backend_get_default_buffer_type(runtime_backend);
+        ggml_backend_buffer_type_t htp_buft     = htp_backend != nullptr ? ggml_backend_get_default_buffer_type(htp_backend) : nullptr;
+        compute_node_buffer_ids_.clear();
+        compute_leaf_buffer_ids_.clear();
 
-        if (!ggml_gallocr_reserve(compute_allocr, gf)) {
+        if (htp_op_routing_enabled() && htp_buft != nullptr) {
+            // 为 CPU 与 HTP RPCMEM 同时创建 allocator，后续按节点/叶子打到不同 buffer。
+            ggml_backend_buffer_type_t bufts[] = {runtime_buft, htp_buft};
+            compute_allocr                    = ggml_gallocr_new_n(bufts, 2);
+            plan_compute_buffer_ids(gf, &compute_node_buffer_ids_, &compute_leaf_buffer_ids_);
+        } else {
+            compute_allocr = ggml_gallocr_new(runtime_buft);
+        }
+
+        bool reserve_ok = false;
+        if (!compute_node_buffer_ids_.empty() || !compute_leaf_buffer_ids_.empty()) {
+            reserve_ok = ggml_gallocr_reserve_n(compute_allocr,
+                                                gf,
+                                                compute_node_buffer_ids_.data(),
+                                                compute_leaf_buffer_ids_.data());
+        } else {
+            reserve_ok = ggml_gallocr_reserve(compute_allocr, gf);
+        }
+
+        if (!reserve_ok) {
             // failed to allocate the compute buffer
             LOG_ERROR("%s: failed to allocate the compute buffer\n", get_desc().c_str());
             free_compute_buffer();
@@ -1928,7 +1981,243 @@ protected:
                   get_desc().c_str(),
                   compute_buffer_size / 1024.0 / 1024.0,
                   ggml_backend_is_cpu(runtime_backend) ? "RAM" : "VRAM");
+        if (compute_node_buffer_ids_.size() > 0) {
+            const size_t rpcmem_buffer_size = ggml_gallocr_get_buffer_size(compute_allocr, 1);
+            LOG_DEBUG("%s htp rpcmem buffer size: %.2f MB",
+                      get_desc().c_str(),
+                      rpcmem_buffer_size / 1024.0 / 1024.0);
+        }
         return true;
+    }
+
+    // 当前只允许 CPU runtime 走 HTP hybrid，因为未支持算子需要直接回退到 CPU。
+    bool htp_op_routing_enabled() const {
+        return htp_backend != nullptr && ggml_backend_is_cpu(runtime_backend);
+    }
+
+    // 统一收敛 diffusion 里 row-major F16 matmul 的资格判断，后续无论是图规划还是参数预放置都复用同一套条件。
+    bool is_htp_row_major_f16_mul_mat(ggml_tensor* node) const {
+        if (!htp_op_routing_enabled() || node == nullptr || node->op != GGML_OP_MUL_MAT) {
+            return false;
+        }
+        if (!ggml_backend_supports_op(htp_backend, node)) {
+            return false;
+        }
+
+        ggml_tensor* weight     = node->src[0];
+        ggml_tensor* activation = node->src[1];
+        if (weight == nullptr || activation == nullptr) {
+            return false;
+        }
+
+        // 当前 HTP row-major F16 kernel 只按二维 [m,k] activation 和 [m,n] dst 连续布局处理，带 batch 维的 MUL_MAT 先留在 CPU。
+        const bool row_major_2d_layout_ok = ggml_nrows(node) == node->ne[1] &&
+                                            ggml_nrows(activation) == activation->ne[1];
+
+        return node->type == GGML_TYPE_F32 &&
+               weight->type == GGML_TYPE_F16 &&
+               activation->type == GGML_TYPE_F32 &&
+               row_major_2d_layout_ok;
+    }
+
+    // 当前阶段只把 diffusion 里的 row-major F16 matmul 纳入 HTP 自动路由，RMS_NORM 先不走这条接线。
+    bool is_htp_target_op(ggml_tensor* node) const {
+        if (!htp_op_routing_enabled() || node == nullptr) {
+            return false;
+        }
+        ggml_tensor* weight = node->src[0];
+        // llama.cpp-npu 式参数放置要求目标 weight 自身已经在 RPCMEM，避免图执行前再创建额外复制池。
+        return is_htp_row_major_f16_mul_mat(node) && htp_param_is_placed(weight);
+    }
+
+    bool htp_param_is_placed(ggml_tensor* tensor) const {
+        ggml_tensor* root = get_htp_tensor_backing_root(tensor);
+        if (root == nullptr || root->buffer == nullptr) {
+            return false;
+        }
+        // view 权重本身不持有 buffer，但只要 backing root 已经按 llama.cpp-npu 形式直接放进 RPCMEM，就可以用 view offset 分发给 HTP。
+        return htp_placed_param_tensors_.find(root) != htp_placed_param_tensors_.end() &&
+               ggml_backend_buft_is_rpcmem(ggml_backend_buffer_get_type(root->buffer));
+    }
+
+    bool should_place_param_in_htp_rpcmem(ggml_tensor* tensor) const {
+        if (!htp_op_routing_enabled() || !sd_env_flag_enabled("SD_HTP_COMPUTE") || tensor == nullptr) {
+            return false;
+        }
+        // 参照 llama.cpp-npu，只有模型结构已经声明会作为 MUL_MAT weight 使用的参数才按 HTP buft 分配，避免把 embedding/表参数等 2D F16 误放进 RPCMEM。
+        return tensor->view_src == nullptr &&
+               (tensor->flags & SD_GGML_TENSOR_FLAG_HTP_MUL_MAT_WEIGHT) != 0 &&
+               tensor->type == GGML_TYPE_F16 &&
+               ggml_n_dims(tensor) == 2 &&
+               ggml_is_contiguous(tensor);
+    }
+
+    std::vector<ggml_tensor*> collect_htp_placeable_params() const {
+        std::vector<ggml_tensor*> tensors;
+        if (params_ctx == nullptr) {
+            return tensors;
+        }
+        for (ggml_tensor* tensor = ggml_get_first_tensor(params_ctx); tensor != nullptr; tensor = ggml_get_next_tensor(params_ctx, tensor)) {
+            if (should_place_param_in_htp_rpcmem(tensor)) {
+                tensors.push_back(tensor);
+            }
+        }
+        return tensors;
+    }
+
+    void bind_tensor_allocation(ggml_tensor* dst, ggml_tensor* src) {
+        GGML_ASSERT(dst != nullptr);
+        GGML_ASSERT(src != nullptr);
+        dst->buffer = src->buffer;
+        dst->data   = src->data;
+        dst->extra  = src->extra;
+    }
+
+    bool allocate_htp_placed_params() {
+        if (!htp_op_routing_enabled() || htp_backend == nullptr || htp_param_placement_buffer_ != nullptr) {
+            return true;
+        }
+
+        std::vector<ggml_tensor*> tensors = collect_htp_placeable_params();
+        if (tensors.empty()) {
+            return true;
+        }
+
+        ggml_init_params params;
+        params.mem_size   = std::max<size_t>(1, tensors.size()) * ggml_tensor_overhead();
+        params.mem_buffer = nullptr;
+        params.no_alloc   = true;
+
+        htp_param_placement_ctx_ = ggml_init(params);
+        GGML_ASSERT(htp_param_placement_ctx_ != nullptr);
+
+        htp_param_placement_pairs_.clear();
+        htp_param_placement_pairs_.reserve(tensors.size());
+        htp_placed_param_tensors_.clear();
+        htp_placed_param_tensors_.reserve(tensors.size());
+
+        for (ggml_tensor* tensor : tensors) {
+            ggml_tensor* placed = ggml_dup_tensor(htp_param_placement_ctx_, tensor);
+            ggml_set_name(placed, tensor->name);
+            htp_param_placement_pairs_.push_back({tensor, placed});
+        }
+
+        ggml_backend_buffer_type_t htp_buft = ggml_backend_get_default_buffer_type(htp_backend);
+        htp_param_placement_buffer_ = ggml_backend_alloc_ctx_tensors_from_buft(htp_param_placement_ctx_, htp_buft);
+        if (htp_param_placement_buffer_ == nullptr) {
+            LOG_ERROR("%s alloc HTP placed params buffer failed, num_tensors = %zu",
+                      get_desc().c_str(),
+                      htp_param_placement_pairs_.size());
+            htp_param_placement_pairs_.clear();
+            htp_placed_param_tensors_.clear();
+            ggml_free(htp_param_placement_ctx_);
+            htp_param_placement_ctx_ = nullptr;
+            return false;
+        }
+        ggml_backend_buffer_set_usage(htp_param_placement_buffer_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        for (auto& pair : htp_param_placement_pairs_) {
+            bind_tensor_allocation(pair.first, pair.second);
+            htp_placed_param_tensors_.insert(pair.first);
+        }
+
+        LOG_INFO("%s placed HTP params directly in RPCMEM (%6.2f MB, %zu tensors)",
+                 get_desc().c_str(),
+                 ggml_backend_buffer_get_size(htp_param_placement_buffer_) / (1024.f * 1024.f),
+                 htp_param_placement_pairs_.size());
+        return true;
+    }
+
+    void free_htp_param_placement() {
+        for (auto& pair : htp_param_placement_pairs_) {
+            ggml_tensor* tensor = pair.first;
+            if (tensor != nullptr) {
+                tensor->buffer = nullptr;
+                tensor->data   = nullptr;
+                tensor->extra  = nullptr;
+            }
+        }
+        htp_param_placement_pairs_.clear();
+        htp_placed_param_tensors_.clear();
+
+        if (htp_param_placement_buffer_ != nullptr) {
+            ggml_backend_buffer_free(htp_param_placement_buffer_);
+            htp_param_placement_buffer_ = nullptr;
+        }
+        if (htp_param_placement_ctx_ != nullptr) {
+            ggml_free(htp_param_placement_ctx_);
+            htp_param_placement_ctx_ = nullptr;
+        }
+    }
+
+    // 参数张量做局部 offload 时必须落到根张量，partial offload 当前不接受 view 张量本身。
+    static ggml_tensor* get_htp_tensor_backing_root(ggml_tensor* tensor) {
+        while (tensor != nullptr && tensor->view_src != nullptr) {
+            tensor = tensor->view_src;
+        }
+        return tensor;
+    }
+
+    // 只有直接参与 HTP matmul 的 node/weight/activation 需要进入 RPCMEM，不能把 view 的 backing root 整块规划进去。
+    bool tensor_directly_used_by_htp_target_op(ggml_tensor* tensor, const std::vector<ggml_tensor*>& target_nodes) const {
+        if (!htp_op_routing_enabled() || tensor == nullptr) {
+            return false;
+        }
+        for (ggml_tensor* node : target_nodes) {
+            if (tensor == node) {
+                return true;
+            }
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                if (tensor == node->src[j]) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // 全量收集符合条件且权重已直接放置到 RPCMEM 的 diffusion F16 matmul。
+    std::vector<ggml_tensor*> collect_planned_htp_target_ops(ggml_cgraph* gf) const {
+        std::vector<ggml_tensor*> selected_nodes;
+        if (!htp_op_routing_enabled() || gf == nullptr) {
+            return selected_nodes;
+        }
+
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor* node = ggml_graph_node(gf, i);
+            if (!is_htp_target_op(node)) {
+                continue;
+            }
+            selected_nodes.push_back(node);
+        }
+
+        return selected_nodes;
+    }
+
+    void plan_compute_buffer_ids(ggml_cgraph* gf,
+                                 std::vector<int>* node_buffer_ids,
+                                 std::vector<int>* leaf_buffer_ids) const {
+        GGML_ASSERT(gf != nullptr);
+        GGML_ASSERT(node_buffer_ids != nullptr);
+        GGML_ASSERT(leaf_buffer_ids != nullptr);
+
+        node_buffer_ids->assign(ggml_graph_n_nodes(gf), 0);
+        leaf_buffer_ids->assign(sd::ggml_graph_cut::leaf_count(gf), 0);
+        std::vector<ggml_tensor*> target_nodes = collect_planned_htp_target_ops(gf);
+
+        // 只把 RMS_NORM / MUL_MAT 及其直接输入输出放到 RPCMEM，其他张量维持原 runtime buffer。
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor* node = ggml_graph_node(gf, i);
+            if (tensor_directly_used_by_htp_target_op(node, target_nodes)) {
+                (*node_buffer_ids)[i] = 1;
+            }
+        }
+        for (int i = 0; i < sd::ggml_graph_cut::leaf_count(gf); ++i) {
+            ggml_tensor* leaf = sd::ggml_graph_cut::leaf_tensor(gf, i);
+            if (tensor_directly_used_by_htp_target_op(leaf, target_nodes)) {
+                (*leaf_buffer_ids)[i] = 1;
+            }
+        }
     }
 
     void free_cache_buffer() {
@@ -2126,15 +2415,21 @@ protected:
         }
         GGML_ASSERT(runtime_params_buffer == nullptr);
         int64_t t0         = ggml_time_ms();
-        size_t num_tensors = ggml_tensor_num(offload_ctx);
-        if (num_tensors == 0) {
+        if (runtime_offload_pairs_.empty()) {
             for (ggml_tensor* t = ggml_get_first_tensor(params_ctx); t != nullptr; t = ggml_get_next_tensor(params_ctx, t)) {
                 GGML_ASSERT(t->view_src == nullptr);
-                ggml_dup_tensor(offload_ctx, t);
+                if (htp_placed_param_tensors_.find(t) != htp_placed_param_tensors_.end()) {
+                    continue;
+                }
+                ggml_tensor* offload_t = ggml_dup_tensor(offload_ctx, t);
+                ggml_set_name(offload_t, t->name);
+                runtime_offload_pairs_.push_back({t, offload_t});
             }
         }
-        num_tensors = ggml_tensor_num(offload_ctx);
-        GGML_ASSERT(num_tensors == ggml_tensor_num(params_ctx));
+        size_t num_tensors = runtime_offload_pairs_.size();
+        if (num_tensors == 0) {
+            return true;
+        }
 
         runtime_params_buffer = ggml_backend_alloc_ctx_tensors(offload_ctx, runtime_backend);
 
@@ -2146,17 +2441,13 @@ protected:
         }
         ggml_backend_buffer_set_usage(runtime_params_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-        ggml_tensor* t         = ggml_get_first_tensor(params_ctx);
-        ggml_tensor* offload_t = ggml_get_first_tensor(offload_ctx);
-
-        while (t != nullptr && offload_t != nullptr) {
+        for (auto& pair : runtime_offload_pairs_) {
+            ggml_tensor* t         = pair.first;
+            ggml_tensor* offload_t = pair.second;
             ggml_backend_tensor_copy(t, offload_t);
             std::swap(t->buffer, offload_t->buffer);
             std::swap(t->data, offload_t->data);
             std::swap(t->extra, offload_t->extra);
-
-            t         = ggml_get_next_tensor(params_ctx, t);
-            offload_t = ggml_get_next_tensor(offload_ctx, offload_t);
         }
 
         int64_t t1 = ggml_time_ms();
@@ -2256,19 +2547,15 @@ protected:
         if (!params_on_runtime_backend) {
             return;
         }
-        ggml_tensor* t         = ggml_get_first_tensor(params_ctx);
-        ggml_tensor* offload_t = ggml_get_first_tensor(offload_ctx);
-
-        while (t != nullptr && offload_t != nullptr) {
+        for (auto& pair : runtime_offload_pairs_) {
+            ggml_tensor* t         = pair.first;
+            ggml_tensor* offload_t = pair.second;
             t->buffer         = offload_t->buffer;
             t->data           = offload_t->data;
             t->extra          = offload_t->extra;
             offload_t->buffer = nullptr;
             offload_t->data   = nullptr;
             offload_t->extra  = nullptr;
-
-            t         = ggml_get_next_tensor(params_ctx, t);
-            offload_t = ggml_get_next_tensor(offload_ctx, offload_t);
         }
 
         if (runtime_params_buffer != nullptr) {
@@ -2426,6 +2713,8 @@ protected:
                                                bool no_return                                          = false,
                                                const std::unordered_set<std::string>* cache_keep_names = nullptr) {
         int64_t t_execute_begin              = ggml_time_ms();
+        const bool use_htp_compute           = htp_op_routing_enabled() &&
+                                              sd_env_flag_enabled("SD_HTP_COMPUTE");
         const bool use_partial_param_offload = !runtime_param_tensors.empty();
         int64_t t_offload_begin              = ggml_time_ms();
         if (use_partial_param_offload) {
@@ -2450,7 +2739,18 @@ protected:
             return std::nullopt;
         }
 
-        if (!ggml_gallocr_alloc_graph(compute_allocr, gf)) {
+        bool alloc_ok = false;
+        if (!compute_node_buffer_ids_.empty() || !compute_leaf_buffer_ids_.empty()) {
+            alloc_ok = ggml_gallocr_reserve_n(compute_allocr,
+                                              gf,
+                                              compute_node_buffer_ids_.data(),
+                                              compute_leaf_buffer_ids_.data()) &&
+                       ggml_gallocr_alloc_graph(compute_allocr, gf);
+        } else {
+            alloc_ok = ggml_gallocr_alloc_graph(compute_allocr, gf);
+        }
+
+        if (!alloc_ok) {
             LOG_ERROR("%s alloc compute graph failed", get_desc().c_str());
             if (free_compute_buffer_immediately) {
                 free_compute_buffer();
@@ -2469,7 +2769,14 @@ protected:
         }
 
         int64_t t_compute_begin = ggml_time_ms();
-        ggml_status status      = ggml_backend_graph_compute(runtime_backend, gf);
+        if (use_htp_compute) {
+            // 只有显式打开 SD_HTP_COMPUTE 时才让整张图走 HTP hybrid，未支持算子仍回退到 CPU。
+            ggml_backend_htp_set_hybrid_enabled(true);
+        }
+        ggml_status status      = ggml_backend_graph_compute(use_htp_compute ? htp_backend : runtime_backend, gf);
+        if (use_htp_compute) {
+            ggml_backend_htp_set_hybrid_enabled(false);
+        }
         int64_t t_compute_end   = ggml_time_ms();
         if (status != GGML_STATUS_SUCCESS) {
             LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
@@ -2641,8 +2948,8 @@ public:
     }
 
     virtual ~GGMLRunner() {
-        free_params_buffer();
         free_compute_buffer();
+        free_params_buffer();
         free_params_ctx();
         free_compute_ctx();
         free_cache_ctx_and_buffer();
@@ -2677,6 +2984,10 @@ public:
         if (num_tensors > 0) {
             // ggml_backend_alloc_ctx_tensors fails when all tensors are already allocated
             // (typical for memory-mapped weights). See ggml-alloc.c n_buffers==0 branch.
+            // 先按 HTP buffer type 放置可执行的 F16 二维权重，后续普通 params 分配会自动跳过这些已分配 tensor。
+            if (!allocate_htp_placed_params()) {
+                return false;
+            }
             bool all_have_data = true;
             for (ggml_tensor* t = ggml_get_first_tensor(params_ctx); t != nullptr; t = ggml_get_next_tensor(params_ctx, t)) {
                 if (t->data == nullptr) {
@@ -2713,6 +3024,7 @@ public:
     }
 
     void free_params_buffer() {
+        free_htp_param_placement();
         if (params_buffer != nullptr) {
             ggml_backend_buffer_free(params_buffer);
             params_buffer = nullptr;
@@ -2720,10 +3032,14 @@ public:
     }
 
     size_t get_params_buffer_size() {
+        size_t size = 0;
         if (params_buffer != nullptr) {
-            return ggml_backend_buffer_get_size(params_buffer);
+            size += ggml_backend_buffer_get_size(params_buffer);
         }
-        return 0;
+        if (htp_param_placement_buffer_ != nullptr) {
+            size += ggml_backend_buffer_get_size(htp_param_placement_buffer_);
+        }
+        return size;
     }
 
     void free_cache_ctx_and_buffer() {
@@ -2736,6 +3052,8 @@ public:
             ggml_gallocr_free(compute_allocr);
             compute_allocr = nullptr;
         }
+        compute_node_buffer_ids_.clear();
+        compute_leaf_buffer_ids_.clear();
         restore_partial_params();
         restore_all_params();
     }
@@ -2851,6 +3169,11 @@ public:
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {
         weight_adapter = adapter;
+    }
+
+    // 由上层在模型初始化完成后注入 HTP backend，避免默认路径无意打开 HTP 逻辑。
+    void set_htp_backend(ggml_backend_t backend) {
+        htp_backend = backend;
     }
 
     void set_max_graph_vram_bytes(size_t max_vram_bytes) {
@@ -2988,6 +3311,8 @@ protected:
             wtype = GGML_TYPE_F32;
         }
         params["weight"] = ggml_new_tensor_2d(ctx, wtype, in_features, out_features);
+        // Linear weight 的唯一前向用途是 MUL_MAT，参数分配阶段可据此选择 HTP RPCMEM buffer type。
+        params["weight"]->flags |= SD_GGML_TENSOR_FLAG_HTP_MUL_MAT_WEIGHT;
         if (bias) {
             enum ggml_type wtype = GGML_TYPE_F32;
             params["bias"]       = ggml_new_tensor_1d(ctx, wtype, out_features);
