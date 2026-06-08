@@ -3,6 +3,8 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <vector>
 
 #include "model.h"
 #include "rng.hpp"
@@ -88,6 +90,113 @@ const char* sampling_methods_str[] = {
     "Euler A CFG++",
     "Euler GE",
 };
+
+static bool sd_debug_tensor_filter_matches(const char* name, const char* filters) {
+    if (filters == nullptr || filters[0] == '\0') {
+        return true;
+    }
+    const char* filter_begin = filters;
+    while (*filter_begin != '\0') {
+        const char* filter_end = std::strchr(filter_begin, ',');
+        const size_t filter_len = filter_end != nullptr ? static_cast<size_t>(filter_end - filter_begin) : std::strlen(filter_begin);
+        if (filter_len > 0) {
+            std::string filter(filter_begin, filter_len);
+            if (std::strstr(name, filter.c_str()) != nullptr) {
+                return true;
+            }
+        }
+        if (filter_end == nullptr) {
+            break;
+        }
+        filter_begin = filter_end + 1;
+    }
+    return false;
+}
+
+static uint64_t sd_debug_hash_tensor_bytes(ggml_tensor* tensor) {
+    static constexpr uint64_t FNV1A64_OFFSET = UINT64_C(14695981039346656037);
+    uint64_t hash = FNV1A64_OFFSET;
+    const size_t nbytes = ggml_nbytes(tensor);
+    std::vector<uint8_t> buffer(std::min<size_t>(nbytes, 1024 * 1024));
+    for (size_t offset = 0; offset < nbytes;) {
+        const size_t chunk = std::min(buffer.size(), nbytes - offset);
+        ggml_backend_tensor_get(tensor, buffer.data(), offset, chunk);
+        hash = sd_fnv1a64_update(hash, buffer.data(), chunk);
+        offset += chunk;
+    }
+    return hash;
+}
+
+static bool sd_debug_is_htp_packable_param_tensor(ggml_tensor* tensor) {
+    return tensor != nullptr &&
+           (tensor->flags & SD_GGML_TENSOR_FLAG_HTP_MUL_MAT_WEIGHT) != 0 &&
+           tensor->type == GGML_TYPE_F16 &&
+           ggml_n_dims(tensor) == 2 &&
+           ggml_is_contiguous(tensor) &&
+           tensor->ne[0] % 32 == 0 &&
+           tensor->ne[1] % 32 == 0;
+}
+
+static void sd_debug_log_loaded_tensor_hashes(const std::map<std::string, ggml_tensor*>& tensors) {
+    if (!sd_env_flag_enabled("SD_DEBUG_PARAM_HASH")) {
+        return;
+    }
+
+    const char* filters = sd_env_value("SD_DEBUG_PARAM_HASH_FILTER");
+    const char* limit_value = sd_env_value("SD_DEBUG_PARAM_HASH_LOG_LIMIT");
+    const bool skip_htp_packable = sd_env_flag_enabled("SD_DEBUG_PARAM_HASH_SKIP_HTP_PACKABLE");
+    int log_limit = limit_value != nullptr ? std::atoi(limit_value) : 32;
+    if (log_limit < 0) {
+        log_limit = 0;
+    }
+
+    static constexpr uint64_t FNV1A64_OFFSET = UINT64_C(14695981039346656037);
+    uint64_t aggregate = FNV1A64_OFFSET;
+    size_t hashed_count = 0;
+    size_t hashed_bytes = 0;
+    int logged = 0;
+
+    for (const auto& item : tensors) {
+        ggml_tensor* tensor = item.second;
+        if (tensor == nullptr || !sd_debug_tensor_filter_matches(item.first.c_str(), filters)) {
+            continue;
+        }
+        if (skip_htp_packable && sd_debug_is_htp_packable_param_tensor(tensor)) {
+            continue;
+        }
+
+        const uint64_t tensor_hash = sd_debug_hash_tensor_bytes(tensor);
+        const size_t nbytes = ggml_nbytes(tensor);
+        aggregate = sd_fnv1a64_update(aggregate, &tensor_hash, sizeof(tensor_hash));
+        aggregate = sd_fnv1a64_update(aggregate, &nbytes, sizeof(nbytes));
+        aggregate = sd_fnv1a64_update(aggregate, item.first.data(), item.first.size());
+        hashed_count += 1;
+        hashed_bytes += nbytes;
+
+        if (logged < log_limit) {
+            LOG_INFO("loaded tensor hash[%zu] name='%s' type=%s flags=%d ne=[%lld,%lld,%lld,%lld] bytes=%zu hash=%016" PRIx64,
+                     hashed_count - 1,
+                     item.first.c_str(),
+                     ggml_type_name(tensor->type),
+                     tensor->flags,
+                     (long long)tensor->ne[0],
+                     (long long)tensor->ne[1],
+                     (long long)tensor->ne[2],
+                     (long long)tensor->ne[3],
+                     nbytes,
+                     tensor_hash);
+            logged += 1;
+        }
+    }
+
+    LOG_INFO("loaded tensor hash aggregate tensors=%zu bytes=%zu hash=%016" PRIx64 "%s%s%s",
+             hashed_count,
+             hashed_bytes,
+             aggregate,
+             filters != nullptr ? " filter=" : "",
+             filters != nullptr ? filters : "",
+             skip_htp_packable ? " skip_htp_packable=1" : "");
+}
 
 /*================================================== Helper Functions ================================================*/
 
@@ -1013,6 +1122,7 @@ public:
             ggml_free(ctx);
             return false;
         }
+        sd_debug_log_loaded_tensor_hashes(tensors);
 
         LOG_DEBUG("finished loaded file");
 

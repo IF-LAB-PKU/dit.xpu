@@ -9,6 +9,7 @@
 #include "htp-ops.h"
 
 #include <cerrno>
+#include <cinttypes>
 #include <cstdlib>
 #include <cstdio>
 #include <dlfcn.h>
@@ -16,6 +17,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <tuple>
 #include <vector>
 
 #include "ggml-backend-impl.h"
@@ -150,12 +152,58 @@ bool htp_trace_ops_enabled() {
     return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
 }
 
+bool htp_debug_hash_enabled() {
+    const char * env = std::getenv("GGML_HTP_DEBUG_HASH");
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+int htp_debug_hash_limit() {
+    const char * env = std::getenv("GGML_HTP_DEBUG_HASH_LIMIT");
+    if (env == nullptr || env[0] == '\0') {
+        return 16;
+    }
+    char * end = nullptr;
+    long value = std::strtol(env, &end, 10);
+    if (end == env || *end != '\0' || value < 0) {
+        return 16;
+    }
+    return static_cast<int>(value);
+}
+
+bool htp_debug_hash_filter_matches(const ggml_tensor * weight) {
+    const char * filter = std::getenv("GGML_HTP_DEBUG_HASH_FILTER");
+    if (filter == nullptr || filter[0] == '\0') {
+        return true;
+    }
+    const char * name = weight != nullptr && weight->name[0] != '\0' ? weight->name : "";
+    return std::strstr(name, filter) != nullptr;
+}
+
+uint64_t htp_fnv1a64_update(uint64_t hash, const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+uint64_t htp_hash_tensor_bytes(const ggml_tensor * tensor) {
+    static constexpr uint64_t FNV1A64_OFFSET = UINT64_C(14695981039346656037);
+    if (tensor == nullptr || tensor->data == nullptr) {
+        return 0;
+    }
+    return htp_fnv1a64_update(FNV1A64_OFFSET, tensor->data, ggml_nbytes(tensor));
+}
+
+std::atomic<int> htp_debug_hash_counter{0};
+
 const char * htp_op_index_name(int op_index) {
     switch (op_index) {
         case HTP_OPS_RMS_NORM_F32:
             return "HTP_OPS_RMS_NORM_F32";
-        case HTP_OPS_MAT_MUL_ROW_MAJOR_W16A32:
-            return "HTP_OPS_MAT_MUL_ROW_MAJOR_W16A32";
+        case HTP_OPS_MAT_MUL_PERMUTED_W16A32:
+            return "HTP_OPS_MAT_MUL_PERMUTED_W16A32";
         case HTP_OPS_MAT_MUL_PERMUTED_W4D16A32:
             return "HTP_OPS_MAT_MUL_PERMUTED_W4D16A32";
         case HTP_OPS_MAT_MUL_PERMUTED_W8D16A32:
@@ -230,14 +278,14 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                 size_t k = weight->ne[0];
                 size_t n = weight->ne[1];
 
-                // 当前 row-major matmul DSP kernel 只按二维 [m,k] activation 和 [m,n] dst 线性写入，带 batch 维的 ggml MUL_MAT 先不分发到 HTP。
+                // 当前 permuted matmul DSP kernel 只按二维 [m,k] activation 和 [m,n] dst 线性写入，带 batch 维的 ggml MUL_MAT 先不分发到 HTP。
                 bool row_major_2d_layout_ok = ggml_nrows(dst) == dst->ne[1] &&
                                               ggml_nrows(activation) == activation->ne[1];
                 bool tiled_shape_ok = k % 32 == 0 && n % 32 == 0 && row_major_2d_layout_ok;
 
                 if (dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F16 && activation->type == GGML_TYPE_F32) {
-                    return row_major_2d_layout_ok &&
-                           dlsym(ops_dl_handle, "htp_ops_rpc_mat_mul_row_major_w16a32") != nullptr;
+                    return tiled_shape_ok &&
+                           dlsym(ops_dl_handle, "htp_ops_rpc_mat_mul_permuted_w16a32") != nullptr;
                 }
                 if (dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_Q4_0 && activation->type == GGML_TYPE_F32) {
                     return tiled_shape_ok;
@@ -278,6 +326,19 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
         return false;
     }
 
+    if (dst->op == GGML_OP_MUL_MAT) {
+        const ggml_tensor * weight     = dst->src[0];
+        const ggml_tensor * activation = dst->src[1];
+        if (weight != nullptr && activation != nullptr &&
+            dst->type == GGML_TYPE_F32 &&
+            weight->type == GGML_TYPE_F16 &&
+            activation->type == GGML_TYPE_F32) {
+            ggml_tensor * packed_weight = ggml_backend_htp_get_packed_f16_weight(weight);
+            return tensor_ready_for_htp_dispatch(activation) &&
+                   tensor_ready_for_htp_dispatch(packed_weight);
+        }
+    }
+
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         const ggml_tensor * src = dst->src[i];
         if (src == nullptr) {
@@ -296,8 +357,6 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
         return 0;
     }
 
-    prepare_tensor_rpcmem_mapping(dst);
-
     auto * ctx           = ggml_backend_htp_context::instance();
     void * ops_dl_handle = ctx->ops_dl_handle;
     GGML_ASSERT(ops_dl_handle != nullptr);
@@ -307,10 +366,16 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     int dispatch_m = 0;
     int dispatch_k = 0;
     int dispatch_n = 0;
+    const ggml_tensor * debug_weight = nullptr;
+    const ggml_tensor * debug_activation = nullptr;
+    const ggml_tensor * debug_packed_weight = nullptr;
+    bool debug_f16_matmul = false;
 
     switch (dst->op) {
         case GGML_OP_RMS_NORM:
             {
+                prepare_tensor_rpcmem_mapping(dst);
+
                 auto mappings = get_all_rpcmem_mappings(dst);
                 GGML_ASSERT(mappings.size() == 2);
 
@@ -337,16 +402,50 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
             {
                 auto * weight     = dst->src[0];
                 auto * activation = dst->src[1];
+                ggml_tensor * packed_weight = nullptr;
 
-                auto mappings = get_all_rpcmem_mappings(dst);
-                if (mappings.size() != 3) {
-                    dump_missing_mapping_diagnostics(dst, mappings);
+                const bool is_f16 = dst->type == GGML_TYPE_F32 &&
+                                    weight != nullptr && weight->type == GGML_TYPE_F16 &&
+                                    activation != nullptr && activation->type == GGML_TYPE_F32;
+
+                if (is_f16) {
+                    // F16 路径的 DSP kernel 只接受 permuted W16A32 权重。src[0] 可能是普通 ggml weight，
+                    // 因此必须从注册表取出“已确认 packed”的 tensor；离线 packed GGUF 下这里会返回 weight 本体。
+                    packed_weight = ggml_backend_htp_get_packed_f16_weight(weight);
+                    if (packed_weight == nullptr) {
+                        std::fprintf(stderr,
+                                     "[ggml-htp-trace] missing packed F16 weight for tensor=%s\n",
+                                     weight != nullptr && weight->name[0] != '\0' ? weight->name : "<unnamed>");
+                        return -EINVAL;
+                    }
+                    prepare_tensor_rpcmem_mapping_with_extra(dst, packed_weight);
+                } else {
+                    prepare_tensor_rpcmem_mapping(dst);
                 }
-                GGML_ASSERT(mappings.size() == 3);
 
-                auto [output_fd, output_offset]         = mappings[0];
-                auto [weight_fd, weight_offset]         = mappings[1];
-                auto [activation_fd, activation_offset] = mappings[2];
+                int output_fd = -1;
+                ssize_t output_offset = 0;
+                int weight_fd = -1;
+                ssize_t weight_offset = 0;
+                int activation_fd = -1;
+                ssize_t activation_offset = 0;
+
+                if (is_f16) {
+                    auto & mapper = ctx->mapper;
+                    std::tie(output_fd, output_offset)         = mapper.get_tensor_mapping(dst);
+                    std::tie(weight_fd, weight_offset)         = mapper.get_tensor_mapping(packed_weight);
+                    std::tie(activation_fd, activation_offset) = mapper.get_tensor_mapping(activation);
+                } else {
+                    auto mappings = get_all_rpcmem_mappings(dst);
+                    if (mappings.size() != 3) {
+                        dump_missing_mapping_diagnostics(dst, mappings);
+                    }
+                    GGML_ASSERT(mappings.size() == 3);
+
+                    std::tie(output_fd, output_offset)         = mappings[0];
+                    std::tie(weight_fd, weight_offset)         = mappings[1];
+                    std::tie(activation_fd, activation_offset) = mappings[2];
+                }
 
                 MatMulParams op_params{
                     .output     = { output_fd,     (int32_t) output_offset     },
@@ -364,8 +463,11 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 dispatch_n = op_params.n;
 
                 if (dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F16 && activation->type == GGML_TYPE_F32) {
-                    // sd.cpp 当前接入的 F16 权重仍是普通 row-major 存储，不能仅因为 k/n 是 32 的倍数就误走 permuted 权重内核，否则结果会直接失真成噪声图。
-                    op_index = HTP_OPS_MAT_MUL_ROW_MAJOR_W16A32;
+                    op_index = HTP_OPS_MAT_MUL_PERMUTED_W16A32;
+                    debug_f16_matmul = true;
+                    debug_weight = weight;
+                    debug_activation = activation;
+                    debug_packed_weight = packed_weight;
                 } else if (dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_Q4_0 && activation->type == GGML_TYPE_F32) {
                     op_index = HTP_OPS_MAT_MUL_PERMUTED_W4D16A32;
                 } else if (dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_Q8_0 && activation->type == GGML_TYPE_F32) {
@@ -380,6 +482,8 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
 
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                prepare_tensor_rpcmem_mapping(dst);
+
                 auto * q = dst->src[0];
                 auto * k = dst->src[1];
 
@@ -496,6 +600,17 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     if (htp_trace_ops_enabled()) {
         dump_htp_dispatch_state("dispatch-begin", dst, op_index, dispatch_m, dispatch_k, dispatch_n, 0);
     }
+
+    int debug_hash_index = -1;
+    uint64_t debug_activation_hash = 0;
+    if (debug_f16_matmul && htp_debug_hash_enabled() && htp_debug_hash_filter_matches(debug_weight)) {
+        const int next_index = htp_debug_hash_counter.fetch_add(1);
+        if (next_index < htp_debug_hash_limit()) {
+            debug_hash_index = next_index;
+            debug_activation_hash = htp_hash_tensor_bytes(debug_activation);
+        }
+    }
+
     std::atomic_store_explicit(v0_ptr, uint8_t{ 1 }, std::memory_order_release);
 
     const int timeout_ms = htp_dispatch_timeout_ms();
@@ -520,6 +635,24 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
 
     std::atomic_thread_fence(std::memory_order_acquire);
     const int ret = message_header_get_request_ptr(msg_hdr, 0)->state;
+    if (debug_hash_index >= 0) {
+        const uint64_t output_hash = htp_hash_tensor_bytes(dst);
+        std::fprintf(stderr,
+                     "[ggml-htp-hash] idx=%d ret=%d weight=%s packed=%s self_packed=%d mkn=[%d,%d,%d] "
+                     "act_bytes=%zu act_hash=%016" PRIx64 " out_bytes=%zu out_hash=%016" PRIx64 "\n",
+                     debug_hash_index,
+                     ret,
+                     debug_weight != nullptr && debug_weight->name[0] != '\0' ? debug_weight->name : "<unnamed>",
+                     debug_packed_weight != nullptr && debug_packed_weight->name[0] != '\0' ? debug_packed_weight->name : "<unnamed>",
+                     debug_weight == debug_packed_weight ? 1 : 0,
+                     dispatch_m,
+                     dispatch_k,
+                     dispatch_n,
+                     debug_activation != nullptr ? ggml_nbytes(debug_activation) : 0,
+                     debug_activation_hash,
+                     dst != nullptr ? ggml_nbytes(dst) : 0,
+                     output_hash);
+    }
     if (ret != 0 || htp_trace_ops_enabled()) {
         dump_htp_dispatch_state(ret == 0 ? "dispatch-end" : "dispatch-error",
                                 dst,

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "model.h"
+#include "htp_tensor_flags.h"
 #include "model_io/gguf_io.h"
 #include "model_io/safetensors_io.h"
 #include "model_io/torch_legacy_io.h"
@@ -1194,6 +1195,11 @@ bool ModelLoader::load_tensors(std::map<std::string, ggml_tensor*>& tensors,
         }
 
         *dst_tensor = real;
+        if (tensor_storage.layout == TensorDataLayout::HTP_PERMUTED_W16A32) {
+            // GGUF 元数据已声明该权重是离线 packed 布局；打上 HTP-only flag 后，
+            // runner 会把它放进 RPCMEM 并禁止 CPU fallback 按 row-major 解释这块数据。
+            real->flags |= SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32;
+        }
 
         return true;
     };

@@ -378,6 +378,53 @@ bool ggml_backend_buft_is_rpcmem(ggml_backend_buffer_type_t buft) {
     return buft != nullptr && buft->iface.get_name == ggml_backend_htp_buffer_type_get_name;
 }
 
+void ggml_backend_htp_pack_f16_weight(ggml_fp16_t * dst, const ggml_fp16_t * src, int64_t k, int64_t n) {
+    GGML_ASSERT(dst != nullptr);
+    GGML_ASSERT(src != nullptr);
+    GGML_ASSERT(k % 32 == 0);
+    GGML_ASSERT(n % 32 == 0);
+
+    // 离线 HTP packed GGUF 复用这个布局转换：把 ggml Linear 的 row-major [n, k]
+    // 权重重排成 DSP HMX matmul 直接读取的 32x32 tile 顺序。
+    // src is ggml Linear weight laid out as row-major [n, k].
+    // dst is HMX 32x32 tile order for logical W[k, n].
+    for (int64_t i = 0; i < k; ++i) {
+        for (int64_t j = 0; j < n; ++j) {
+            const int64_t i0 = i / 32;
+            const int64_t i1 = i % 32;
+            const int64_t j0 = j / 32;
+            const int64_t j1 = j % 32;
+
+            const int64_t tile_idx = j0 * (k / 32) + i0;
+            ggml_fp16_t * tile = dst + tile_idx * 32 * 32;
+            tile[(i1 & ~int64_t{1}) * 32 + j1 * 2 + (i1 & int64_t{1})] = src[j * k + i];
+        }
+    }
+}
+
+void ggml_backend_htp_register_packed_f16_weight(const ggml_tensor * original, ggml_tensor * packed) {
+    if (original == nullptr || packed == nullptr) {
+        return;
+    }
+    ggml_backend_htp_context::instance()->packed_f16_weights[original] = packed;
+}
+
+void ggml_backend_htp_unregister_packed_f16_weight(const ggml_tensor * original) {
+    if (original == nullptr) {
+        return;
+    }
+    ggml_backend_htp_context::instance()->packed_f16_weights.erase(original);
+}
+
+ggml_tensor * ggml_backend_htp_get_packed_f16_weight(const ggml_tensor * original) {
+    if (original == nullptr) {
+        return nullptr;
+    }
+    auto & packed = ggml_backend_htp_context::instance()->packed_f16_weights;
+    auto it = packed.find(original);
+    return it != packed.end() ? it->second : nullptr;
+}
+
 bool ggml_backend_htp_runtime_available(void) {
     return ggml_backend_htp_context::instance()->runtime_available;
 }
@@ -537,6 +584,17 @@ ggml_backend_t ggml_backend_htp_init(void) {
 
 bool ggml_backend_is_htp(ggml_backend_t backend) {
     return backend != nullptr && ggml_guid_matches(backend->guid, ggml_backend_htp_guid());
+}
+
+void ggml_backend_htp_set_n_threads(ggml_backend_t backend, int n_threads) {
+    if (!ggml_backend_is_htp(backend)) {
+        return;
+    }
+
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    if (ctx != nullptr) {
+        ctx->n_threads = n_threads > 0 ? n_threads : 1;
+    }
 }
 
 static const char * ggml_backend_htp_device_get_name(ggml_backend_dev_t dev) {

@@ -104,7 +104,7 @@ void send_rpcmem_puts_to_dsp(const std::list<RpcMemMapper::UnmapRequest> & pendi
 
 } // namespace
 
-void RpcMemMapper::validate(const ggml_tensor * dst) {
+void RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) {
     std::vector<ggml_backend_buffer *> buffers;
     std::unordered_set<ggml_backend_buffer *> seen_buffers;
 
@@ -122,6 +122,7 @@ void RpcMemMapper::validate(const ggml_tensor * dst) {
         }
     }
     add_buffer(get_backing_buffer(dst));
+    add_buffer(get_backing_buffer(extra));
 
     // 记录当前算子真正需要保留的 buffer，mmap 失败后的紧急驱逐不能把这些 src/dst 本身提前释放掉。
     std::unordered_set<void *> required_buf_bases;
@@ -319,6 +320,11 @@ extern "C" {
 
 int prepare_tensor_rpcmem_mapping(const struct ggml_tensor * dst) {
     ggml_backend_htp_context::instance()->mapper.validate(dst);
+    return 0;
+}
+
+int prepare_tensor_rpcmem_mapping_with_extra(const struct ggml_tensor * dst, const struct ggml_tensor * extra) {
+    ggml_backend_htp_context::instance()->mapper.validate(dst, extra);
     return 0;
 }
 
