@@ -41,6 +41,7 @@ struct SDCliParams {
     bool verbose          = false;
     bool canny_preprocess = false;
     bool convert_name     = false;
+    bool htp_pack_dit     = false;
 
     preview_t preview_method = PREVIEW_NONE;
     int preview_interval     = 1;
@@ -97,6 +98,10 @@ struct SDCliParams {
              "--convert-name",
              "convert tensor name (for convert mode)",
              true, &convert_name},
+            {"",
+             "--htp-pack-dit",
+             "convert standalone DIT weights to HTP packed W16A32 GGUF layout; HTP-only matmul fallback is forbidden",
+             true, &htp_pack_dit},
             {"-v",
              "--verbose",
              "print extra info",
@@ -242,6 +247,7 @@ struct SDCliParams {
             << "  color: " << (color ? "true" : "false") << ",\n"
             << "  canny_preprocess: " << (canny_preprocess ? "true" : "false") << ",\n"
             << "  convert_name: " << (convert_name ? "true" : "false") << ",\n"
+            << "  htp_pack_dit: " << (htp_pack_dit ? "true" : "false") << ",\n"
             << "  preview_method: " << previews_str[preview_method] << ",\n"
             << "  preview_interval: " << preview_interval << ",\n"
             << "  preview_path: \"" << preview_path << "\",\n"
@@ -606,7 +612,8 @@ int main(int argc, const char* argv[]) {
                                cli_params.output_path.c_str(),
                                ctx_params.wtype,
                                ctx_params.tensor_type_rules.c_str(),
-                               cli_params.convert_name);
+                               cli_params.convert_name,
+                               cli_params.htp_pack_dit);
         if (!success) {
             LOG_ERROR("convert '%s'/'%s' to '%s' failed",
                       ctx_params.model_path.c_str(),

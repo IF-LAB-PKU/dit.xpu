@@ -2507,6 +2507,81 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     return n_tasks;
 }
 
+static bool ggml_htp_debug_node_hash_enabled(void) {
+    const char * env = getenv("GGML_HTP_DEBUG_NODE_HASH");
+    return env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
+}
+
+static int ggml_htp_debug_node_hash_limit(void) {
+    const char * env = getenv("GGML_HTP_DEBUG_NODE_HASH_LIMIT");
+    if (env == NULL || env[0] == '\0') {
+        return 512;
+    }
+    char * end = NULL;
+    long value = strtol(env, &end, 10);
+    if (end == env || *end != '\0' || value < 0) {
+        return 512;
+    }
+    return (int) value;
+}
+
+static uint64_t ggml_htp_fnv1a64_update(uint64_t hash, const void * data, size_t size) {
+    const uint8_t * bytes = (const uint8_t *) data;
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t ggml_htp_hash_tensor_bytes(const struct ggml_tensor * tensor) {
+    const uint64_t offset = UINT64_C(14695981039346656037);
+    if (tensor == NULL || tensor->data == NULL) {
+        return 0;
+    }
+    return ggml_htp_fnv1a64_update(offset, tensor->data, ggml_nbytes(tensor));
+}
+
+static int ggml_htp_debug_node_hash_counter = 0;
+
+static void ggml_htp_debug_log_node_hash(const struct ggml_tensor * node) {
+    if (!ggml_htp_debug_node_hash_enabled()) {
+        return;
+    }
+    const int idx = ggml_htp_debug_node_hash_counter++;
+    if (idx >= ggml_htp_debug_node_hash_limit()) {
+        return;
+    }
+    fprintf(stderr,
+            "[ggml-htp-node-hash] idx=%d op=%s name=%s type=%s bytes=%zu hash=%016" PRIx64 " shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "src0=%s/%s/flags=%d shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "src1=%s/%s/flags=%d shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+            idx,
+            ggml_op_name(node->op),
+            node->name[0] != '\0' ? node->name : "<unnamed>",
+            ggml_type_name(node->type),
+            ggml_nbytes(node),
+            ggml_htp_hash_tensor_bytes(node),
+            node->ne[0],
+            node->ne[1],
+            node->ne[2],
+            node->ne[3],
+            node->src[0] != NULL && node->src[0]->name[0] != '\0' ? node->src[0]->name : "<none>",
+            node->src[0] != NULL ? ggml_type_name(node->src[0]->type) : "<none>",
+            node->src[0] != NULL ? node->src[0]->flags : 0,
+            node->src[0] != NULL ? node->src[0]->ne[0] : 0,
+            node->src[0] != NULL ? node->src[0]->ne[1] : 0,
+            node->src[0] != NULL ? node->src[0]->ne[2] : 0,
+            node->src[0] != NULL ? node->src[0]->ne[3] : 0,
+            node->src[1] != NULL && node->src[1]->name[0] != '\0' ? node->src[1]->name : "<none>",
+            node->src[1] != NULL ? ggml_type_name(node->src[1]->type) : "<none>",
+            node->src[1] != NULL ? node->src[1]->flags : 0,
+            node->src[1] != NULL ? node->src[1]->ne[0] : 0,
+            node->src[1] != NULL ? node->src[1]->ne[1] : 0,
+            node->src[1] != NULL ? node->src[1]->ne[2] : 0,
+            node->src[1] != NULL ? node->src[1]->ne[3] : 0);
+}
+
 static thread_ret_t ggml_graph_compute_secondary_thread(void* data);
 
 #if defined(_WIN32)
@@ -3123,7 +3198,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
-        if (node_n + 1 < cgraph->n_nodes) {
+        if (ggml_htp_debug_node_hash_enabled()) {
+            ggml_barrier(state->threadpool);
+            if (state->ith == 0) {
+                ggml_htp_debug_log_node_hash(node);
+            }
+            ggml_barrier(state->threadpool);
+        } else if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
     }

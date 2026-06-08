@@ -1,4 +1,4 @@
-// 验证 diffusion HTP 路由资格判定：只有 weight=F16, act=F32, dst=F32 的 MUL_MAT 会被视为 HTP row-major F16 目标算子。
+// 验证 diffusion HTP 路由资格判定：只有离线 packed 的 weight=F16, act=F32, dst=F32 的 MUL_MAT 会被视为 HTP F16 目标算子。
 
 #include "../../src/ggml_extend.hpp"
 
@@ -29,7 +29,7 @@ struct RoutingProbeRunner : GGMLRunner {
     }
 
     bool eligible_f16_mul_mat(ggml_tensor * node) const {
-        return is_htp_row_major_f16_mul_mat(node);
+        return is_htp_supported_f16_mul_mat(node);
     }
 
     bool htp_target(ggml_tensor * node) const {
@@ -38,6 +38,10 @@ struct RoutingProbeRunner : GGMLRunner {
 
     std::vector<ggml_tensor *> planned_targets(ggml_cgraph * gf) const {
         return collect_planned_htp_target_ops(gf);
+    }
+
+    bool valid_packed_only_consumers(ggml_cgraph * gf) {
+        return validate_htp_packed_only_consumers(gf);
     }
 };
 
@@ -165,12 +169,32 @@ struct PlacementProbeRunner : GGMLRunner {
         return htp_placed_param_tensors_.size();
     }
 
+    size_t packed_htp_weight_count() const {
+        return htp_packed_self_registered_weights_.size();
+    }
+
     bool direct_htp_contains(ggml_tensor * tensor) const {
         return htp_param_is_placed(tensor);
     }
 
+    void mark_packed_only(ggml_tensor * tensor) {
+        tensor->flags |= SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32;
+    }
+
+    bool packed_htp_contains(ggml_tensor * tensor) const {
+        return ggml_backend_htp_get_packed_f16_weight(tensor) != nullptr;
+    }
+
+    bool prepare_packed_htp_weights() {
+        return prepare_htp_packed_f16_weights();
+    }
+
     bool has_partial_runtime_params_buffer() const {
         return partial_runtime_params_buffer != nullptr;
+    }
+
+    int planned_htp_compute_node_count() const {
+        return std::accumulate(compute_node_buffer_ids_.begin(), compute_node_buffer_ids_.end(), 0);
     }
 
     std::optional<sd::Tensor<float>> run_fake_htp_compute() {
@@ -215,7 +239,7 @@ struct PlacementProbeRunner : GGMLRunner {
         std::string old_value = old != nullptr ? old : "";
         const bool had_old = old != nullptr;
         setenv("SD_HTP_COMPUTE", "1", 1);
-        auto result = GGMLRunner::compute<float>(get_graph, 1, true);
+        auto result = GGMLRunner::compute<float>(get_graph, 1, false);
         if (had_old) {
             setenv("SD_HTP_COMPUTE", old_value.c_str(), 1);
         } else {
@@ -363,6 +387,10 @@ int main() {
     GGML_ASSERT(find_node_index(gf, mm3) >= 0);
     GGML_ASSERT(find_node_index(gf, mm4) >= 0);
 
+    w0->flags |= SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32;
+    GGML_ASSERT(!runner.valid_packed_only_consumers(gf));
+    w0->flags &= ~SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32;
+
     ggml_backend_t htp = ggml_backend_init_by_name("HTP", nullptr);
     GGML_ASSERT(htp != nullptr);
     if (ggml_backend_htp_runtime_available()) {
@@ -383,25 +411,70 @@ int main() {
         fill_tensor_f16(placement_runner.eligible_w2, 0.75f);
 
         GGML_ASSERT(placement_runner.get_default_params_buffer() != nullptr);
-        // 新的目标是参数分配阶段直接把可执行的 F16 权重放进 RPCMEM，不再等图执行前复制。
-        GGML_ASSERT(placement_runner.get_direct_htp_params_buffer() != nullptr);
-        GGML_ASSERT(tensor_is_rpcmem(placement_runner.eligible_w0));
+        // 普通 row-major 权重不能再在线重排，也不能直接放到 HTP RPCMEM。
+        GGML_ASSERT(placement_runner.get_direct_htp_params_buffer() == nullptr);
+        GGML_ASSERT(!tensor_is_rpcmem(placement_runner.eligible_w0));
         GGML_ASSERT(!tensor_is_rpcmem(placement_runner.ineligible_w1));
-        GGML_ASSERT(tensor_is_rpcmem(placement_runner.eligible_w2));
+        GGML_ASSERT(!tensor_is_rpcmem(placement_runner.eligible_w2));
         // 普通 2D F16 参数如果没有被模型结构标记为 MUL_MAT weight，不能被盲目放到 RPCMEM。
         GGML_ASSERT(!tensor_is_rpcmem(placement_runner.unmarked_w3));
-        GGML_ASSERT(placement_runner.direct_htp_param_count() == 3);
+        GGML_ASSERT(placement_runner.direct_htp_param_count() == 0);
+
+        setenv("SD_HTP_COMPUTE", "1", 1);
+        GGML_ASSERT(placement_runner.prepare_packed_htp_weights());
+        if (had_old) {
+            setenv("SD_HTP_COMPUTE", old_value.c_str(), 1);
+        } else {
+            unsetenv("SD_HTP_COMPUTE");
+        }
+        GGML_ASSERT(placement_runner.packed_htp_weight_count() == 0);
+        GGML_ASSERT(!placement_runner.packed_htp_contains(placement_runner.eligible_w0));
+        GGML_ASSERT(!placement_runner.packed_htp_contains(placement_runner.eligible_w2));
+        GGML_ASSERT(!placement_runner.packed_htp_contains(placement_runner.ineligible_w1));
+        GGML_ASSERT(!placement_runner.packed_htp_contains(placement_runner.unmarked_w3));
 
         ggml_cgraph * placement_gf = placement_runner.build_graph();
         GGML_ASSERT(placement_gf != nullptr);
         std::vector<ggml_tensor *> placement_targets = placement_runner.planned_targets(placement_gf);
-        GGML_ASSERT(placement_targets.size() == 2);
+        GGML_ASSERT(placement_targets.empty());
 
-        GGML_ASSERT(placement_runner.get_direct_htp_params_buffer() != nullptr);
-        GGML_ASSERT(tensor_is_rpcmem(placement_runner.eligible_w0));
+        GGML_ASSERT(placement_runner.get_direct_htp_params_buffer() == nullptr);
+        GGML_ASSERT(!tensor_is_rpcmem(placement_runner.eligible_w0));
         GGML_ASSERT(!tensor_is_rpcmem(placement_runner.ineligible_w1));
-        GGML_ASSERT(tensor_is_rpcmem(placement_runner.eligible_w2));
+        GGML_ASSERT(!tensor_is_rpcmem(placement_runner.eligible_w2));
         GGML_ASSERT(!tensor_is_rpcmem(placement_runner.unmarked_w3));
+
+        setenv("SD_HTP_COMPUTE", "1", 1);
+        PlacementProbeRunner packed_placement_runner(cpu, cpu, htp);
+        packed_placement_runner.mark_packed_only(packed_placement_runner.eligible_w0);
+        GGML_ASSERT(packed_placement_runner.alloc_params_buffer());
+        if (had_old) {
+            setenv("SD_HTP_COMPUTE", old_value.c_str(), 1);
+        } else {
+            unsetenv("SD_HTP_COMPUTE");
+        }
+
+        GGML_ASSERT(packed_placement_runner.get_direct_htp_params_buffer() != nullptr);
+        GGML_ASSERT(packed_placement_runner.direct_htp_param_count() == 1);
+        GGML_ASSERT(packed_placement_runner.direct_htp_contains(packed_placement_runner.eligible_w0));
+        GGML_ASSERT(tensor_is_rpcmem(packed_placement_runner.eligible_w0));
+        GGML_ASSERT(!tensor_is_rpcmem(packed_placement_runner.eligible_w2));
+
+        fill_tensor_f16(packed_placement_runner.eligible_w0, 0.33f);
+        fill_tensor_f32(packed_placement_runner.ineligible_w1, 0.44f);
+        fill_tensor_f16(packed_placement_runner.eligible_w2, 0.66f);
+        ggml_cgraph * packed_placement_gf = packed_placement_runner.build_graph();
+        GGML_ASSERT(packed_placement_gf != nullptr);
+
+        setenv("SD_HTP_COMPUTE", "1", 1);
+        GGML_ASSERT(packed_placement_runner.prepare_packed_htp_weights());
+        if (had_old) {
+            setenv("SD_HTP_COMPUTE", old_value.c_str(), 1);
+        } else {
+            unsetenv("SD_HTP_COMPUTE");
+        }
+        GGML_ASSERT(packed_placement_runner.packed_htp_weight_count() == 1);
+        GGML_ASSERT(ggml_backend_htp_get_packed_f16_weight(packed_placement_runner.eligible_w0) == packed_placement_runner.eligible_w0);
     } else {
         std::printf("[SKIP] htp persistent placement probe: runtime unavailable (%s)\n",
                     ggml_backend_htp_runtime_error() != nullptr ? ggml_backend_htp_runtime_error() : "unknown");
@@ -427,11 +500,21 @@ int main() {
 
         auto out = fake_htp_runner.run_fake_htp_compute();
         GGML_ASSERT(out.has_value());
+        GGML_ASSERT(fake_htp_runner.packed_htp_weight_count() == 0);
+        GGML_ASSERT(fake_htp_runner.planned_htp_compute_node_count() == 0);
         GGML_ASSERT(fake_htp_runner.direct_htp_param_count() == 0);
         // HTP 参数直接放置后，不应该再额外创建 partial runtime params buffer。
         GGML_ASSERT(!fake_htp_runner.has_partial_runtime_params_buffer());
         // CPU 伪装 HTP 不会产生 RPCMEM placement，因此全部参数仍走普通 runtime offload。
         GGML_ASSERT(fake_htp_runner.runtime_offload_pair_count() == 5);
+
+        PlacementProbeRunner packed_runner(cpu, cpu_params, cpu);
+        GGML_ASSERT(packed_runner.alloc_params_buffer());
+        packed_runner.mark_packed_only(packed_runner.eligible_w0);
+        auto packed_out = packed_runner.run_fake_htp_compute();
+        GGML_ASSERT(packed_out.has_value());
+        GGML_ASSERT(packed_runner.packed_htp_weight_count() == 1);
+        GGML_ASSERT(ggml_backend_htp_get_packed_f16_weight(packed_runner.eligible_w0) == packed_runner.eligible_w0);
     }
 
     if (ggml_backend_htp_runtime_available()) {
@@ -454,19 +537,19 @@ int main() {
         fill_tensor_f16(view_runner.view_root, 0.95f);
 
         std::vector<ggml_tensor *> persistent_weights = view_runner.directly_placed_htp_weights(view_gf);
-        // llama.cpp-npu 式直接参数放置会把参数 root 放进 RPCMEM，view 权重通过 backing root 的 offset 进入 HTP。
-        GGML_ASSERT(contains_tensor(persistent_weights, view_runner.view_root));
+        // packed F16 路径不再把原始 root 直接放进 RPCMEM；view 权重先保持 CPU fallback，避免 root packed layout 被误用于 view。
+        GGML_ASSERT(!contains_tensor(persistent_weights, view_runner.view_root));
         std::vector<ggml_tensor *> view_targets = view_runner.planned_targets(view_gf);
-        GGML_ASSERT(view_targets.size() == 1);
+        GGML_ASSERT(view_targets.empty());
 
         int node_id_sum = 0;
         int leaf_id_sum = 0;
         view_runner.planned_buffer_id_sums(view_gf, &node_id_sum, &leaf_id_sum);
-        GGML_ASSERT(node_id_sum == 2);
-        GGML_ASSERT(leaf_id_sum == 1);
+        GGML_ASSERT(node_id_sum == 0);
+        GGML_ASSERT(leaf_id_sum == 0);
 
-        GGML_ASSERT(view_runner.direct_htp_param_count() == 3);
-        GGML_ASSERT(view_runner.direct_htp_contains(view_runner.view_root));
+        GGML_ASSERT(view_runner.direct_htp_param_count() == 0);
+        GGML_ASSERT(!view_runner.direct_htp_contains(view_runner.view_root));
     }
 
     std::printf("test-backend-htp-diffusion-f16-routing passed\n");

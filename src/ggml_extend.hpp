@@ -32,6 +32,7 @@
 #include "ggml_extend_backend.h"
 #include "ggml_graph_cut.h"
 
+#include "htp_tensor_flags.h"
 #include "model.h"
 #include "tensor.hpp"
 
@@ -49,13 +50,67 @@
 #define SD_UNUSED(x) (void)(x)
 #endif
 
-// sd.cpp 私有 tensor flag，用来复刻 llama.cpp-npu 的 weight-op 映射；只标记未来会作为 MUL_MAT src0 的参数权重。
-static constexpr int32_t SD_GGML_TENSOR_FLAG_HTP_MUL_MAT_WEIGHT = 1 << 24;
-
 // 统一解析布尔环境变量，避免把 "0" 这种显式关闭值误判成开启。
 __STATIC_INLINE__ bool sd_env_flag_enabled(const char* name) {
     const char* value = name != nullptr ? std::getenv(name) : nullptr;
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+__STATIC_INLINE__ const char* sd_env_value(const char* name) {
+    const char* value = name != nullptr ? std::getenv(name) : nullptr;
+    return value != nullptr && value[0] != '\0' ? value : nullptr;
+}
+
+__STATIC_INLINE__ uint64_t sd_fnv1a64_update(uint64_t hash, const void* data, size_t size) {
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+__STATIC_INLINE__ ggml_tensor* sd_backend_htp_get_packed_f16_weight(const ggml_tensor* original) {
+#ifdef GGML_USE_HTP
+    return ggml_backend_htp_get_packed_f16_weight(original);
+#else
+    SD_UNUSED(original);
+    return nullptr;
+#endif
+}
+
+__STATIC_INLINE__ void sd_backend_htp_register_packed_f16_weight(const ggml_tensor* original, ggml_tensor* packed) {
+#ifdef GGML_USE_HTP
+    ggml_backend_htp_register_packed_f16_weight(original, packed);
+#else
+    SD_UNUSED(original);
+    SD_UNUSED(packed);
+#endif
+}
+
+__STATIC_INLINE__ void sd_backend_htp_unregister_packed_f16_weight(const ggml_tensor* original) {
+#ifdef GGML_USE_HTP
+    ggml_backend_htp_unregister_packed_f16_weight(original);
+#else
+    SD_UNUSED(original);
+#endif
+}
+
+__STATIC_INLINE__ void sd_backend_htp_set_n_threads(ggml_backend_t backend, int n_threads) {
+#ifdef GGML_USE_HTP
+    ggml_backend_htp_set_n_threads(backend, n_threads);
+#else
+    SD_UNUSED(backend);
+    SD_UNUSED(n_threads);
+#endif
+}
+
+__STATIC_INLINE__ void sd_backend_htp_set_hybrid_enabled(bool enabled) {
+#ifdef GGML_USE_HTP
+    ggml_backend_htp_set_hybrid_enabled(enabled);
+#else
+    SD_UNUSED(enabled);
+#endif
 }
 
 __STATIC_INLINE__ int align_up_offset(int n, int multiple) {
@@ -1736,6 +1791,7 @@ protected:
     ggml_backend_buffer_t htp_param_placement_buffer_ = nullptr;
     std::vector<std::pair<ggml_tensor*, ggml_tensor*>> htp_param_placement_pairs_;
     std::unordered_set<ggml_tensor*> htp_placed_param_tensors_;
+    std::vector<ggml_tensor*> htp_packed_self_registered_weights_;
 
     ggml_context* cache_ctx            = nullptr;
     ggml_backend_buffer_t cache_buffer = nullptr;
@@ -1995,8 +2051,8 @@ protected:
         return htp_backend != nullptr && ggml_backend_is_cpu(runtime_backend);
     }
 
-    // 统一收敛 diffusion 里 row-major F16 matmul 的资格判断，后续无论是图规划还是参数预放置都复用同一套条件。
-    bool is_htp_row_major_f16_mul_mat(ggml_tensor* node) const {
+    // 统一收敛 diffusion 里 HTP F16 matmul 的基础 type/shape 判断；weight layout 资格由离线 packed flag 单独决定。
+    bool is_htp_supported_f16_mul_mat(ggml_tensor* node) const {
         if (!htp_op_routing_enabled() || node == nullptr || node->op != GGML_OP_MUL_MAT) {
             return false;
         }
@@ -2010,24 +2066,31 @@ protected:
             return false;
         }
 
-        // 当前 HTP row-major F16 kernel 只按二维 [m,k] activation 和 [m,n] dst 连续布局处理，带 batch 维的 MUL_MAT 先留在 CPU。
+        // 当前 HTP permuted F16 kernel 只按二维 [m,k] activation 和 [m,n] dst 连续布局处理，带 batch 维或 view-stride 的 MUL_MAT 先留在 CPU。
         const bool row_major_2d_layout_ok = ggml_nrows(node) == node->ne[1] &&
                                             ggml_nrows(activation) == activation->ne[1];
 
         return node->type == GGML_TYPE_F32 &&
                weight->type == GGML_TYPE_F16 &&
                activation->type == GGML_TYPE_F32 &&
-               row_major_2d_layout_ok;
+               row_major_2d_layout_ok &&
+               ggml_is_contiguous(weight) &&
+               ggml_is_contiguous(activation) &&
+               ggml_is_contiguous(node);
     }
 
-    // 当前阶段只把 diffusion 里的 row-major F16 matmul 纳入 HTP 自动路由，RMS_NORM 先不走这条接线。
+    bool htp_packed_f16_weight_is_prepared(ggml_tensor* tensor) const {
+        return sd_backend_htp_get_packed_f16_weight(tensor) != nullptr;
+    }
+
+    // 当前阶段只把 diffusion 里的 F16 matmul 纳入 HTP 自动路由，RMS_NORM 先不走这条接线。
     bool is_htp_target_op(ggml_tensor* node) const {
         if (!htp_op_routing_enabled() || node == nullptr) {
             return false;
         }
         ggml_tensor* weight = node->src[0];
-        // llama.cpp-npu 式参数放置要求目标 weight 自身已经在 RPCMEM，避免图执行前再创建额外复制池。
-        return is_htp_row_major_f16_mul_mat(node) && htp_param_is_placed(weight);
+        // F16 permuted matmul 只能在 weight 已经是离线 packed layout 且完成注册时进入 HTP；否则必须走 CPU fallback。
+        return is_htp_supported_f16_mul_mat(node) && htp_packed_f16_weight_is_prepared(weight);
     }
 
     bool htp_param_is_placed(ggml_tensor* tensor) const {
@@ -2041,15 +2104,34 @@ protected:
     }
 
     bool should_place_param_in_htp_rpcmem(ggml_tensor* tensor) const {
-        if (!htp_op_routing_enabled() || !sd_env_flag_enabled("SD_HTP_COMPUTE") || tensor == nullptr) {
+        if (!htp_op_routing_enabled() || !sd_env_flag_enabled("SD_HTP_COMPUTE") || htp_backend == nullptr || tensor == nullptr) {
             return false;
         }
-        // 参照 llama.cpp-npu，只有模型结构已经声明会作为 MUL_MAT weight 使用的参数才按 HTP buft 分配，避免把 embedding/表参数等 2D F16 误放进 RPCMEM。
+        // packed GGUF 里这类权重已经是 HTP kernel 需要的 W16A32 布局，不能留在普通 CPU buffer；
+        // 直接放进 RPCMEM 后，HTP matmul 可以把原 tensor 本体当作 packed weight 使用。
         return tensor->view_src == nullptr &&
-               (tensor->flags & SD_GGML_TENSOR_FLAG_HTP_MUL_MAT_WEIGHT) != 0 &&
+               (tensor->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) != 0 &&
                tensor->type == GGML_TYPE_F16 &&
                ggml_n_dims(tensor) == 2 &&
                ggml_is_contiguous(tensor);
+    }
+
+    bool should_prepare_htp_packed_f16_weight(ggml_tensor* tensor) const {
+        if (!htp_op_routing_enabled() || !sd_env_flag_enabled("SD_HTP_COMPUTE") || tensor == nullptr) {
+            return false;
+        }
+        ggml_tensor* root = get_htp_tensor_backing_root(tensor);
+        // 只接受离线 packed 的直接参数。普通 row-major F16 权重不再在推理前在线重排。
+        return root != nullptr &&
+               root == tensor &&
+               (root->flags & SD_GGML_TENSOR_FLAG_HTP_MUL_MAT_WEIGHT) != 0 &&
+               (root->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) != 0 &&
+               tensor->view_src == nullptr &&
+               tensor->type == GGML_TYPE_F16 &&
+               ggml_n_dims(tensor) == 2 &&
+               ggml_is_contiguous(tensor) &&
+               tensor->ne[0] % 32 == 0 &&
+               tensor->ne[1] % 32 == 0;
     }
 
     std::vector<ggml_tensor*> collect_htp_placeable_params() const {
@@ -2065,6 +2147,124 @@ protected:
         return tensors;
     }
 
+    std::vector<ggml_tensor*> collect_htp_packable_f16_weights() const {
+        std::vector<ggml_tensor*> tensors;
+        if (params_ctx == nullptr) {
+            return tensors;
+        }
+        for (ggml_tensor* tensor = ggml_get_first_tensor(params_ctx); tensor != nullptr; tensor = ggml_get_next_tensor(params_ctx, tensor)) {
+            if (should_prepare_htp_packed_f16_weight(tensor)) {
+                tensors.push_back(tensor);
+            }
+        }
+        return tensors;
+    }
+
+    std::vector<ggml_tensor*> collect_htp_packable_f16_weights(ggml_cgraph* gf) const {
+        if (gf == nullptr) {
+            return collect_htp_packable_f16_weights();
+        }
+
+        // 按当前图收集会被 HTP matmul 使用的离线 packed 权重；普通 row-major 权重即使形状满足，
+        // 也不会在这里被在线重排或注册。
+        std::vector<ggml_tensor*> tensors;
+        std::unordered_set<ggml_tensor*> seen;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor* node = ggml_graph_node(gf, i);
+            if (!is_htp_supported_f16_mul_mat(node)) {
+                continue;
+            }
+            ggml_tensor* weight = node->src[0];
+            if (should_prepare_htp_packed_f16_weight(weight) && seen.insert(weight).second) {
+                tensors.push_back(weight);
+            }
+        }
+        return tensors;
+    }
+
+    uint64_t hash_tensor_bytes_for_debug(ggml_tensor* tensor) const {
+        GGML_ASSERT(tensor != nullptr);
+        static constexpr uint64_t FNV1A64_OFFSET = UINT64_C(14695981039346656037);
+        uint64_t hash = FNV1A64_OFFSET;
+        const size_t nbytes = ggml_nbytes(tensor);
+        std::vector<uint8_t> buffer(std::min<size_t>(nbytes, 1024 * 1024));
+        for (size_t offset = 0; offset < nbytes;) {
+            const size_t chunk = std::min(buffer.size(), nbytes - offset);
+            ggml_backend_tensor_get(tensor, buffer.data(), offset, chunk);
+            hash = sd_fnv1a64_update(hash, buffer.data(), chunk);
+            offset += chunk;
+        }
+        return hash;
+    }
+
+    void log_htp_packed_f16_weight_hashes_for_debug(const std::vector<ggml_tensor*>& tensors) {
+        if (!sd_env_flag_enabled("SD_HTP_DEBUG_PACKED_HASH")) {
+            return;
+        }
+
+        const char* filter = sd_env_value("SD_HTP_DEBUG_PACKED_FILTER");
+        const char* limit_value = sd_env_value("SD_HTP_DEBUG_PACKED_LOG_LIMIT");
+        int log_limit = limit_value != nullptr ? std::atoi(limit_value) : 8;
+        if (log_limit < 0) {
+            log_limit = 0;
+        }
+
+        static constexpr uint64_t FNV1A64_OFFSET = UINT64_C(14695981039346656037);
+        uint64_t aggregate = FNV1A64_OFFSET;
+        size_t hashed_count = 0;
+        size_t hashed_bytes = 0;
+        int logged = 0;
+
+        for (ggml_tensor* original : tensors) {
+            if (original == nullptr) {
+                continue;
+            }
+            const char* name = original->name[0] != '\0' ? original->name : "<unnamed>";
+            if (filter != nullptr && std::strstr(name, filter) == nullptr) {
+                continue;
+            }
+
+            ggml_tensor* packed = sd_backend_htp_get_packed_f16_weight(original);
+            if (packed == nullptr) {
+                LOG_WARN("%s HTP packed hash debug skipped unregistered weight '%s'",
+                         get_desc().c_str(),
+                         name);
+                continue;
+            }
+
+            const uint64_t tensor_hash = hash_tensor_bytes_for_debug(packed);
+            const size_t nbytes = ggml_nbytes(packed);
+            aggregate = sd_fnv1a64_update(aggregate, &tensor_hash, sizeof(tensor_hash));
+            aggregate = sd_fnv1a64_update(aggregate, &nbytes, sizeof(nbytes));
+            aggregate = sd_fnv1a64_update(aggregate, name, std::strlen(name));
+            hashed_count += 1;
+            hashed_bytes += nbytes;
+
+            if (logged < log_limit) {
+                LOG_INFO("%s HTP packed hash[%zu] name='%s' packed='%s' ne=[%lld,%lld,%lld,%lld] bytes=%zu hash=%016" PRIx64,
+                         get_desc().c_str(),
+                         hashed_count - 1,
+                         name,
+                         packed->name[0] != '\0' ? packed->name : "<unnamed>",
+                         (long long)packed->ne[0],
+                         (long long)packed->ne[1],
+                         (long long)packed->ne[2],
+                         (long long)packed->ne[3],
+                         nbytes,
+                         tensor_hash);
+                logged += 1;
+            }
+        }
+
+        LOG_INFO("%s HTP packed hash aggregate tensors=%zu bytes=%zu hash=%016" PRIx64 "%s%s",
+                 get_desc().c_str(),
+                 hashed_count,
+                 hashed_bytes,
+                 aggregate,
+                 filter != nullptr ? " filter=" : "",
+                 filter != nullptr ? filter : "");
+    }
+
     void bind_tensor_allocation(ggml_tensor* dst, ggml_tensor* src) {
         GGML_ASSERT(dst != nullptr);
         GGML_ASSERT(src != nullptr);
@@ -2074,10 +2274,12 @@ protected:
     }
 
     bool allocate_htp_placed_params() {
-        if (!htp_op_routing_enabled() || htp_backend == nullptr || htp_param_placement_buffer_ != nullptr) {
+        if (!htp_op_routing_enabled() || htp_param_placement_buffer_ != nullptr) {
             return true;
         }
 
+        // 参数分配阶段只搬运离线 packed 的权重。这里不创建第二份 packed shadow，
+        // 而是把原 tensor 的 buffer/data 绑定到 RPCMEM 分配出的镜像 tensor 上。
         std::vector<ggml_tensor*> tensors = collect_htp_placeable_params();
         if (tensors.empty()) {
             return true;
@@ -2097,15 +2299,15 @@ protected:
         htp_placed_param_tensors_.reserve(tensors.size());
 
         for (ggml_tensor* tensor : tensors) {
-            ggml_tensor* placed = ggml_dup_tensor(htp_param_placement_ctx_, tensor);
-            ggml_set_name(placed, tensor->name);
-            htp_param_placement_pairs_.push_back({tensor, placed});
+            ggml_tensor* htp_tensor = ggml_dup_tensor(htp_param_placement_ctx_, tensor);
+            ggml_set_name(htp_tensor, tensor->name);
+            htp_param_placement_pairs_.push_back({tensor, htp_tensor});
         }
 
         ggml_backend_buffer_type_t htp_buft = ggml_backend_get_default_buffer_type(htp_backend);
         htp_param_placement_buffer_ = ggml_backend_alloc_ctx_tensors_from_buft(htp_param_placement_ctx_, htp_buft);
         if (htp_param_placement_buffer_ == nullptr) {
-            LOG_ERROR("%s alloc HTP placed params buffer failed, num_tensors = %zu",
+            LOG_ERROR("%s alloc HTP packed-only params buffer failed, num_tensors = %zu",
                       get_desc().c_str(),
                       htp_param_placement_pairs_.size());
             htp_param_placement_pairs_.clear();
@@ -2116,19 +2318,62 @@ protected:
         }
         ggml_backend_buffer_set_usage(htp_param_placement_buffer_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
+        size_t placed_bytes = 0;
         for (auto& pair : htp_param_placement_pairs_) {
-            bind_tensor_allocation(pair.first, pair.second);
-            htp_placed_param_tensors_.insert(pair.first);
+            ggml_tensor* tensor     = pair.first;
+            ggml_tensor* htp_tensor = pair.second;
+            bind_tensor_allocation(tensor, htp_tensor);
+            htp_placed_param_tensors_.insert(tensor);
+            placed_bytes += ggml_nbytes(tensor);
         }
 
-        LOG_INFO("%s placed HTP params directly in RPCMEM (%6.2f MB, %zu tensors)",
+        LOG_INFO("%s placed packed-only HTP F16 params in RPCMEM (%6.2f MB, %zu tensors)",
                  get_desc().c_str(),
-                 ggml_backend_buffer_get_size(htp_param_placement_buffer_) / (1024.f * 1024.f),
-                 htp_param_placement_pairs_.size());
+                 placed_bytes / (1024.f * 1024.f),
+                 htp_placed_param_tensors_.size());
         return true;
     }
 
+    bool prepare_htp_packed_f16_weights(ggml_cgraph* gf = nullptr) {
+        if (!htp_op_routing_enabled() || htp_backend == nullptr) {
+            return true;
+        }
+
+        // 推理前只做“自注册”：original tensor 和 packed tensor 是同一个对象。
+        // 这样运行时没有在线重排、没有额外常驻 packed buffer，也不会保留 row-major 副本。
+        std::vector<ggml_tensor*> tensors = collect_htp_packable_f16_weights(gf);
+        if (tensors.empty()) {
+            return true;
+        }
+
+        size_t self_registered_bytes = 0;
+        for (ggml_tensor* tensor : tensors) {
+            if (!htp_packed_f16_weight_is_prepared(tensor)) {
+                sd_backend_htp_register_packed_f16_weight(tensor, tensor);
+                htp_packed_self_registered_weights_.push_back(tensor);
+                self_registered_bytes += ggml_nbytes(tensor);
+            }
+        }
+
+        if (self_registered_bytes > 0) {
+            LOG_INFO("%s registered offline packed HTP F16 weights (%6.2f MB, %zu tensors)",
+                     get_desc().c_str(),
+                     self_registered_bytes / (1024.f * 1024.f),
+                     htp_packed_self_registered_weights_.size());
+        }
+        log_htp_packed_f16_weight_hashes_for_debug(tensors);
+        return true;
+    }
+
+    void free_htp_packed_weights() {
+        for (ggml_tensor* tensor : htp_packed_self_registered_weights_) {
+            sd_backend_htp_unregister_packed_f16_weight(tensor);
+        }
+        htp_packed_self_registered_weights_.clear();
+    }
+
     void free_htp_param_placement() {
+        free_htp_packed_weights();
         for (auto& pair : htp_param_placement_pairs_) {
             ggml_tensor* tensor = pair.first;
             if (tensor != nullptr) {
@@ -2167,8 +2412,21 @@ protected:
             if (tensor == node) {
                 return true;
             }
+            if (node->op == GGML_OP_MUL_MAT &&
+                node->src[0] != nullptr &&
+                tensor == node->src[0] &&
+                htp_packed_f16_weight_is_prepared(node->src[0])) {
+                continue;
+            }
             for (int j = 0; j < GGML_MAX_SRC; ++j) {
-                if (tensor == node->src[j]) {
+                ggml_tensor* src = node->src[j];
+                if (tensor == src) {
+                    return true;
+                }
+                if (j == 0 && node->op == GGML_OP_MUL_MAT) {
+                    continue;
+                }
+                if (src != nullptr && ggml_is_contiguous(src) && tensor == get_htp_tensor_backing_root(src)) {
                     return true;
                 }
             }
@@ -2192,6 +2450,58 @@ protected:
         }
 
         return selected_nodes;
+    }
+
+    bool validate_htp_packed_only_consumers(ggml_cgraph* gf) {
+        if (gf == nullptr) {
+            return true;
+        }
+
+        // packed-only tensor 的内存布局已经不是 CPU matmul 可解释的 row-major。
+        // 如果图里任何非 HTP matmul 消费它，必须 fail fast，不能静默 CPU fallback。
+        bool valid = true;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor* node = ggml_graph_node(gf, i);
+            if (node == nullptr) {
+                continue;
+            }
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                ggml_tensor* src = node->src[j];
+                ggml_tensor* root = get_htp_tensor_backing_root(src);
+                if (root == nullptr || (root->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) == 0) {
+                    continue;
+                }
+
+                const bool routed_to_htp = j == 0 &&
+                                           node->op == GGML_OP_MUL_MAT &&
+                                           src == node->src[0] &&
+                                           is_htp_target_op(node);
+                if (routed_to_htp) {
+                    continue;
+                }
+
+                LOG_ERROR("%s packed-only HTP tensor '%s' is consumed by unsupported op '%s' node '%s' src[%d]; packed layout cannot fall back to CPU; weight=[%lld,%lld,%lld,%lld] activation=[%lld,%lld,%lld,%lld] dst=[%lld,%lld,%lld,%lld]",
+                          get_desc().c_str(),
+                          root->name,
+                          ggml_op_name(node->op),
+                          node->name,
+                          j,
+                          (long long) root->ne[0],
+                          (long long) root->ne[1],
+                          (long long) root->ne[2],
+                          (long long) root->ne[3],
+                          node->src[1] != nullptr ? (long long) node->src[1]->ne[0] : 0,
+                          node->src[1] != nullptr ? (long long) node->src[1]->ne[1] : 0,
+                          node->src[1] != nullptr ? (long long) node->src[1]->ne[2] : 0,
+                          node->src[1] != nullptr ? (long long) node->src[1]->ne[3] : 0,
+                          (long long) node->ne[0],
+                          (long long) node->ne[1],
+                          (long long) node->ne[2],
+                          (long long) node->ne[3]);
+                valid = false;
+            }
+        }
+        return valid;
     }
 
     void plan_compute_buffer_ids(ggml_cgraph* gf,
@@ -2484,6 +2794,9 @@ protected:
             if (tensor == nullptr) {
                 continue;
             }
+            if (htp_placed_param_tensors_.find(tensor) != htp_placed_param_tensors_.end()) {
+                continue;
+            }
             if (seen_tensors.insert(tensor).second) {
                 unique_tensors.push_back(tensor);
             }
@@ -2730,6 +3043,20 @@ protected:
         }
         int64_t t_offload_end = ggml_time_ms();
 
+        if (use_htp_compute && !prepare_htp_packed_f16_weights(gf)) {
+            LOG_ERROR("%s prepare HTP packed F16 weights failed", get_desc().c_str());
+            if (use_partial_param_offload) {
+                restore_partial_params();
+            }
+            return std::nullopt;
+        }
+        if (use_htp_compute && !validate_htp_packed_only_consumers(gf)) {
+            if (use_partial_param_offload) {
+                restore_partial_params();
+            }
+            return std::nullopt;
+        }
+
         int64_t t_alloc_begin = ggml_time_ms();
         if (!alloc_compute_buffer(gf)) {
             LOG_ERROR("%s alloc compute buffer failed", get_desc().c_str());
@@ -2771,11 +3098,12 @@ protected:
         int64_t t_compute_begin = ggml_time_ms();
         if (use_htp_compute) {
             // 只有显式打开 SD_HTP_COMPUTE 时才让整张图走 HTP hybrid，未支持算子仍回退到 CPU。
-            ggml_backend_htp_set_hybrid_enabled(true);
+            sd_backend_htp_set_n_threads(htp_backend, n_threads);
+            sd_backend_htp_set_hybrid_enabled(true);
         }
         ggml_status status      = ggml_backend_graph_compute(use_htp_compute ? htp_backend : runtime_backend, gf);
         if (use_htp_compute) {
-            ggml_backend_htp_set_hybrid_enabled(false);
+            sd_backend_htp_set_hybrid_enabled(false);
         }
         int64_t t_compute_end   = ggml_time_ms();
         if (status != GGML_STATUS_SUCCESS) {
@@ -3128,6 +3456,18 @@ public:
         }
         GGML_ASSERT(gf != nullptr);
 
+        const bool use_htp_compute = htp_op_routing_enabled() &&
+                                     sd_env_flag_enabled("SD_HTP_COMPUTE");
+        if (use_htp_compute && !prepare_htp_packed_f16_weights(gf)) {
+            LOG_ERROR("%s prepare HTP packed F16 weights failed", get_desc().c_str());
+            free_compute_ctx();
+            return std::nullopt;
+        }
+        if (use_htp_compute && !validate_htp_packed_only_consumers(gf)) {
+            free_compute_ctx();
+            return std::nullopt;
+        }
+
         if (can_attempt_graph_cut_segmented_compute()) {
             GraphCutPlan plan;
             if (!resolve_graph_cut_plan(gf, &plan)) {
@@ -3210,6 +3550,14 @@ protected:
         return wtype;
     }
 
+    TensorDataLayout get_data_layout(const std::string& name, const String2TensorStorage& tensor_storage_map) {
+        auto iter = tensor_storage_map.find(name);
+        if (iter == tensor_storage_map.end()) {
+            return TensorDataLayout::REFERENCE;
+        }
+        return iter->second.layout;
+    }
+
     void init_blocks(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") {
         for (auto& pair : blocks) {
             auto& block = pair.second;
@@ -3263,8 +3611,10 @@ public:
         }
 
         for (auto& pair : params) {
-            ggml_tensor* param           = pair.second;
-            tensors[prefix + pair.first] = pair.second;
+            ggml_tensor* param       = pair.second;
+            std::string tensor_name  = prefix + pair.first;
+            tensors[tensor_name]     = param;
+            ggml_set_name(param, tensor_name.c_str());
         }
     }
 
@@ -3313,6 +3663,9 @@ protected:
         params["weight"] = ggml_new_tensor_2d(ctx, wtype, in_features, out_features);
         // Linear weight 的唯一前向用途是 MUL_MAT，参数分配阶段可据此选择 HTP RPCMEM buffer type。
         params["weight"]->flags |= SD_GGML_TENSOR_FLAG_HTP_MUL_MAT_WEIGHT;
+        if (get_data_layout(prefix + "weight", tensor_storage_map) == TensorDataLayout::HTP_PERMUTED_W16A32) {
+            params["weight"]->flags |= SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32;
+        }
         if (bias) {
             enum ggml_type wtype = GGML_TYPE_F32;
             params["bias"]       = ggml_new_tensor_1d(ctx, wtype, out_features);

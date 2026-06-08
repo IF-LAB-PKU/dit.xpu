@@ -13,10 +13,16 @@
 
 #define SD_MAX_DIMS 5
 
+enum class TensorDataLayout {
+    REFERENCE,
+    HTP_PERMUTED_W16A32,
+};
+
 struct TensorStorage {
     std::string name;
     ggml_type type          = GGML_TYPE_F32;
     ggml_type expected_type = GGML_TYPE_COUNT;
+    TensorDataLayout layout = TensorDataLayout::REFERENCE;
     bool is_f8_e4m3         = false;
     bool is_f8_e5m2         = false;
     bool is_f64             = false;

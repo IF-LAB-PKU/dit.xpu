@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 int prepare_tensor_rpcmem_mapping(const struct ggml_tensor * dst);
+int prepare_tensor_rpcmem_mapping_with_extra(const struct ggml_tensor * dst, const struct ggml_tensor * extra);
 
 #ifdef __cplusplus
 }
@@ -30,7 +31,7 @@ struct RpcMemMapper {
         active_map_size{ 0 },
         defer_unmap{ defer_unmap_ops } {}
 
-    void validate(const struct ggml_tensor * dst);
+    void validate(const struct ggml_tensor * dst, const struct ggml_tensor * extra = nullptr);
     std::pair<int, ssize_t> get_tensor_mapping(const struct ggml_tensor * tensor) const;
 
     struct UnmapRequest {

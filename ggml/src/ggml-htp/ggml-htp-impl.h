@@ -5,6 +5,7 @@
 #pragma once
 
 #include <string>
+#include <unordered_map>
 
 #include "ggml.h"
 #include "rpcmem_mapper.h"
@@ -30,6 +31,7 @@ struct ggml_backend_htp_context {
     bool skip_htp_ops = false;
     bool runtime_available = false;
     std::string runtime_error;
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> packed_f16_weights;
 
     ggml_backend_htp_context();
     ~ggml_backend_htp_context();
