@@ -1080,11 +1080,24 @@ public:
             ggml_backend_t htp_backend = backend_manager.cached_backend("htp");
             if (htp_backend != nullptr && backend_manager.runtime_backend_is_cpu(SDBackendModule::DIFFUSION)) {
                 // 当前只在 diffusion 运行时 backend 为 CPU 时打开 HTP 混合接线，避免误覆盖 GPU 路径。
+                const bool htp_attention_enabled   = sd_env_flag_enabled("SD_HTP_ATTENTION");
+                const bool htp_block_sparse_attn = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_ATTN");
                 if (diffusion_model) {
                     diffusion_model->set_htp_backend(htp_backend);
+                    diffusion_model->set_block_sparse_attention_enabled(htp_attention_enabled && htp_block_sparse_attn);
+                    diffusion_model->set_htp_attention_enabled(htp_attention_enabled);
                 }
                 if (high_noise_diffusion_model) {
                     high_noise_diffusion_model->set_htp_backend(htp_backend);
+                    high_noise_diffusion_model->set_block_sparse_attention_enabled(htp_attention_enabled && htp_block_sparse_attn);
+                    high_noise_diffusion_model->set_htp_attention_enabled(htp_attention_enabled);
+                }
+                if (htp_attention_enabled) {
+                    if (htp_block_sparse_attn) {
+                        LOG_INFO("enabled HTP diffusion attention with block sparse");
+                    } else {
+                        LOG_INFO("enabled HTP diffusion attention");
+                    }
                 }
                 LOG_INFO("enabled HTP op routing for diffusion runners");
             }

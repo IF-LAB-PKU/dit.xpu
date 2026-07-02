@@ -50,6 +50,9 @@
 #include <syscall.h>
 #endif
 
+static uint64_t ggml_htp_hash_tensor_bytes(const struct ggml_tensor * tensor);
+static int64_t ggml_htp_count_nonzero_i32(const struct ggml_tensor * tensor);
+
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
@@ -2032,13 +2035,66 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 // FLASH_ATTN_EXT 也必须按运行时 RPCMEM 放置结果判断，避免只因 shape 支持就误分发到 HTP。
+                const char * trace_env = getenv("SD_HTP_BLOCK_SPARSE_MASK_TRACE");
+                const bool trace_attn = trace_env != NULL && trace_env[0] != '\0' && strcmp(trace_env, "0") != 0 && params->ith == 0;
+                const int64_t trace_begin = trace_attn ? ggml_time_ms() : 0;
                 if (htp_ops_support_op_runtime(tensor)) {
                     const int err = htp_ops_compute_op(params, tensor);
                     if (err != 0) {
                         ggml_htp_mark_op_failed(params, tensor, err);
                     }
+                    if (trace_attn) {
+                        const struct ggml_tensor * q = tensor->src[0];
+                        const struct ggml_tensor * k = tensor->src[1];
+                        const struct ggml_tensor * v = tensor->src[2];
+                        const struct ggml_tensor * mask = tensor->src[3];
+                        const bool is_block_sparse = mask != NULL && mask->type == GGML_TYPE_I32;
+                        const int64_t mask_nnz = is_block_sparse ? ggml_htp_count_nonzero_i32(mask) : -1;
+                        const int64_t mask_total = mask != NULL ? ggml_nelements(mask) : 0;
+                        fprintf(stderr,
+                                "attention_timing route=htp mask_type=%s total=%lldms qo=%lld kv=%lld heads=%lld d=%lld "
+                                "q_hash=%016" PRIx64 " k_hash=%016" PRIx64 " v_hash=%016" PRIx64
+                                " block_sparse=%d mask_nnz=%lld mask_total=%lld\n",
+                                mask != NULL ? ggml_type_name(mask->type) : "none",
+                                (long long) (ggml_time_ms() - trace_begin),
+                                (long long) tensor->src[0]->ne[1],
+                                (long long) tensor->src[1]->ne[1],
+                                (long long) tensor->src[0]->ne[2],
+                                (long long) tensor->src[0]->ne[0],
+                                ggml_htp_hash_tensor_bytes(q),
+                                ggml_htp_hash_tensor_bytes(k),
+                                ggml_htp_hash_tensor_bytes(v),
+                                is_block_sparse ? 1 : 0,
+                                (long long) mask_nnz,
+                                (long long) mask_total);
+                    }
                 } else {
                     ggml_compute_forward_flash_attn_ext(params, tensor);
+                    if (trace_attn) {
+                        const struct ggml_tensor * q = tensor->src[0];
+                        const struct ggml_tensor * k = tensor->src[1];
+                        const struct ggml_tensor * v = tensor->src[2];
+                        const struct ggml_tensor * mask = tensor->src[3];
+                        const bool is_block_sparse = mask != NULL && mask->type == GGML_TYPE_I32;
+                        const int64_t mask_nnz = is_block_sparse ? ggml_htp_count_nonzero_i32(mask) : -1;
+                        const int64_t mask_total = mask != NULL ? ggml_nelements(mask) : 0;
+                        fprintf(stderr,
+                                "attention_timing route=cpu mask_type=%s total=%lldms qo=%lld kv=%lld heads=%lld d=%lld "
+                                "q_hash=%016" PRIx64 " k_hash=%016" PRIx64 " v_hash=%016" PRIx64
+                                " block_sparse=%d mask_nnz=%lld mask_total=%lld\n",
+                                mask != NULL ? ggml_type_name(mask->type) : "none",
+                                (long long) (ggml_time_ms() - trace_begin),
+                                (long long) tensor->src[0]->ne[1],
+                                (long long) tensor->src[1]->ne[1],
+                                (long long) tensor->src[0]->ne[2],
+                                (long long) tensor->src[0]->ne[0],
+                                ggml_htp_hash_tensor_bytes(q),
+                                ggml_htp_hash_tensor_bytes(k),
+                                ggml_htp_hash_tensor_bytes(v),
+                                is_block_sparse ? 1 : 0,
+                                (long long) mask_nnz,
+                                (long long) mask_total);
+                    }
                 }
             } break;
         case GGML_OP_FLASH_ATTN_BACK:
@@ -2117,7 +2173,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             break;
         case GGML_OP_CUSTOM:
             {
-                ggml_compute_forward_custom(params, tensor);
+                if (htp_ops_support_op_runtime(tensor)) {
+                    const int err = htp_ops_compute_op(params, tensor);
+                    if (err != 0) {
+                        ggml_htp_mark_op_failed(params, tensor, err);
+                    }
+                } else {
+                    ggml_compute_forward_custom(params, tensor);
+                }
             }
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
@@ -2540,6 +2603,22 @@ static uint64_t ggml_htp_hash_tensor_bytes(const struct ggml_tensor * tensor) {
         return 0;
     }
     return ggml_htp_fnv1a64_update(offset, tensor->data, ggml_nbytes(tensor));
+}
+
+static int64_t ggml_htp_count_nonzero_i32(const struct ggml_tensor * tensor) {
+    if (tensor == NULL || tensor->data == NULL || tensor->type != GGML_TYPE_I32) {
+        return -1;
+    }
+
+    const int32_t * data = (const int32_t *) tensor->data;
+    const int64_t n = ggml_nelements(tensor);
+    int64_t nnz = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        if (data[i] != 0) {
+            ++nnz;
+        }
+    }
+    return nnz;
 }
 
 static int ggml_htp_debug_node_hash_counter = 0;

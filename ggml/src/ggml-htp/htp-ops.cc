@@ -37,6 +37,13 @@ const ggml_tensor * get_tensor_with_backing_buffer(const ggml_tensor * tensor) {
     return tensor;
 }
 
+const ggml_tensor * get_tensor_backing_root(const ggml_tensor * tensor) {
+    while (tensor != nullptr && tensor->view_src != nullptr) {
+        tensor = tensor->view_src;
+    }
+    return tensor;
+}
+
 // hybrid 调度阶段只有真正已经落到 RPCMEM 且可直接寻址的张量，才允许进入 HTP 分发；否则必须立刻回退到 CPU，避免“支持 shape 但没做 placement”的节点撞到映射断言。
 bool tensor_ready_for_htp_dispatch(const ggml_tensor * tensor) {
     const ggml_tensor * backing = get_tensor_with_backing_buffer(tensor);
@@ -44,6 +51,17 @@ bool tensor_ready_for_htp_dispatch(const ggml_tensor * tensor) {
         return false;
     }
     return ggml_backend_buft_is_rpcmem(backing->buffer->buft);
+}
+
+bool tensor_ready_for_htp_dispatch_view_backed(const ggml_tensor * tensor) {
+    const ggml_tensor * backing = get_tensor_backing_root(tensor);
+    if (tensor == nullptr || backing == nullptr || backing->buffer == nullptr) {
+        return false;
+    }
+    if (!ggml_backend_buft_is_rpcmem(backing->buffer->buft)) {
+        return false;
+    }
+    return tensor->view_src != nullptr ? ggml_is_contiguous(backing) : ggml_is_contiguous(tensor);
 }
 
 // 出现映射数量不足时，把 tensor 本体与 backing root 的 buffer 状态都打出来，便于确认哪一路没有真正落到 RPCMEM。
@@ -152,6 +170,11 @@ bool htp_trace_ops_enabled() {
     return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
 }
 
+bool env_flag_enabled(const char * name) {
+    const char * env = std::getenv(name);
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
 bool htp_debug_hash_enabled() {
     const char * env = std::getenv("GGML_HTP_DEBUG_HASH");
     return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
@@ -198,6 +221,30 @@ uint64_t htp_hash_tensor_bytes(const ggml_tensor * tensor) {
 
 std::atomic<int> htp_debug_hash_counter{0};
 
+bool is_block_sparse_score_custom(const ggml_tensor * dst) {
+    if (dst == nullptr || dst->op != GGML_OP_CUSTOM || std::strcmp(dst->name, "block_sparse_score_topk") != 0) {
+        return false;
+    }
+
+    const ggml_tensor * q_mean = dst->src[0];
+    const ggml_tensor * k_mean = dst->src[1];
+    if (q_mean == nullptr || k_mean == nullptr || dst->src[2] != nullptr) {
+        return false;
+    }
+
+    return dst->type == GGML_TYPE_F16 &&
+           q_mean->type == GGML_TYPE_F16 &&
+           k_mean->type == GGML_TYPE_F16 &&
+           q_mean->ne[0] == k_mean->ne[0] &&
+           q_mean->ne[2] == 1 &&
+           k_mean->ne[2] == 1 &&
+           dst->ne[0] == k_mean->ne[1] &&
+           dst->ne[1] == q_mean->ne[1] &&
+           ggml_is_contiguous(dst) &&
+           ggml_is_contiguous(q_mean) &&
+           ggml_is_contiguous(k_mean);
+}
+
 const char * htp_op_index_name(int op_index) {
     switch (op_index) {
         case HTP_OPS_RMS_NORM_F32:
@@ -212,6 +259,10 @@ const char * htp_op_index_name(int op_index) {
             return "HTP_OPS_MAT_MUL_PERMUTED_W4D16A32_IQ4_NL";
         case HTP_OPS_FLASH_ATTN_QO_F32_KV_F16:
             return "HTP_OPS_FLASH_ATTN_QO_F32_KV_F16";
+        case HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16:
+            return "HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16";
+        case HTP_OPS_BLOCK_SPARSE_SCORE_QO_F32_KM_F16:
+            return "HTP_OPS_BLOCK_SPARSE_SCORE_QO_F32_KM_F16";
         default:
             return "HTP_OPS_UNKNOWN";
     }
@@ -313,9 +364,11 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                 }
 
                 return dst->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
-                       v->type == GGML_TYPE_F16 && mask->type == GGML_TYPE_F16 &&
+                       v->type == GGML_TYPE_F16 && (mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32) &&
                        max_bias == 0 && logit_softcap == 0;
             }
+        case GGML_OP_CUSTOM:
+            return is_block_sparse_score_custom(dst);
         default:
             return false;
     }
@@ -324,6 +377,24 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
 bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
     if (!htp_ops_support_op(dst) || !tensor_ready_for_htp_dispatch(dst)) {
         return false;
+    }
+
+    if (dst->op == GGML_OP_FLASH_ATTN_EXT) {
+        const ggml_tensor * mask = dst->src[3];
+        const bool sparse_block_mask = mask != nullptr && mask->type == GGML_TYPE_I32;
+        const bool dense_f16_mask = mask != nullptr && mask->type == GGML_TYPE_F16;
+        if (sparse_block_mask || dense_f16_mask) {
+            for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                const ggml_tensor * src = dst->src[i];
+                if (src == nullptr) {
+                    continue;
+                }
+                if (!tensor_ready_for_htp_dispatch_view_backed(src)) {
+                    return false;
+                }
+            }
+            return true;
+        }
     }
 
     if (dst->op == GGML_OP_MUL_MAT) {
@@ -496,25 +567,106 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 auto [v_fd, v_offset]       = mappings[3];
                 auto [mask_fd, mask_offset] = mappings[4];
 
-                FlashAttnParams op_params{
-                    .o          = { o_fd,    (int32_t) o_offset    },
-                    .q          = { q_fd,    (int32_t) q_offset    },
-                    .k          = { k_fd,    (int32_t) k_offset    },
-                    .v          = { v_fd,    (int32_t) v_offset    },
-                    .mask       = { mask_fd, (int32_t) mask_offset },
-                    .qo_len     = (int32_t) q->ne[1],
-                    .kv_len     = (int32_t) k->ne[1],
-                    .n_heads    = (int32_t) q->ne[2],
-                    .n_kv_heads = (int32_t) k->ne[2],
-                    .head_dim   = (int32_t) q->ne[0],
-                };
-                *reinterpret_cast<FlashAttnParams *>(param_buf) = op_params;
+                auto * mask = dst->src[3];
+                if (mask->type == GGML_TYPE_I32) {
+                    const int32_t block_q = ggml_get_op_params_i32(dst, 4);
+                    const int32_t block_k = ggml_get_op_params_i32(dst, 5);
+                    GGML_ASSERT(block_q > 0 && block_k > 0);
+                    const bool is_index = std::strcmp(mask->name, "block_sparse_index") == 0;
+                    const int32_t computed_n_q_blocks =
+                        (int32_t) q->ne[2] * (int32_t) ((q->ne[1] + block_q - 1) / block_q);
+                    const int32_t computed_n_k_blocks =
+                        (int32_t) k->ne[2] * (int32_t) ((k->ne[1] + block_k - 1) / block_k);
+                    GGML_ASSERT((int32_t) mask->ne[1] == computed_n_q_blocks);
+                    if (!is_index) {
+                        GGML_ASSERT((int32_t) mask->ne[0] == computed_n_k_blocks);
+                    }
 
-                op_index  = HTP_OPS_FLASH_ATTN_QO_F32_KV_F16;
-                args_size = sizeof(FlashAttnParams);
-                dispatch_m = op_params.qo_len;
-                dispatch_k = op_params.kv_len;
-                dispatch_n = op_params.n_heads;
+                    BlockSparseAttnParams op_params{
+                        .o          = { o_fd,    (int32_t) o_offset    },
+                        .q          = { q_fd,    (int32_t) q_offset    },
+                        .k          = { k_fd,    (int32_t) k_offset    },
+                        .v          = { v_fd,    (int32_t) v_offset    },
+                        .block_mask = { mask_fd, (int32_t) mask_offset },
+                        .qo_len     = (int32_t) q->ne[1],
+                        .kv_len     = (int32_t) k->ne[1],
+                        .n_heads    = (int32_t) q->ne[2],
+                        .n_kv_heads = (int32_t) k->ne[2],
+                        .head_dim   = (int32_t) q->ne[0],
+                        .block_q    = block_q,
+                        .block_k    = block_k,
+                        .n_q_blocks = is_index ? computed_n_q_blocks : (int32_t) mask->ne[1],
+                        .n_k_blocks = computed_n_k_blocks,
+                        .mask_format = is_index ? 1 : 0,
+                        .max_kept_blocks = is_index ? (int32_t) mask->ne[0] : 0,
+                    };
+                    *reinterpret_cast<BlockSparseAttnParams *>(param_buf) = op_params;
+
+                    op_index   = HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16;
+                    args_size  = sizeof(BlockSparseAttnParams);
+                    dispatch_m = op_params.qo_len;
+                    dispatch_k = op_params.kv_len;
+                    dispatch_n = op_params.n_heads;
+                } else {
+                    FlashAttnParams op_params{
+                        .o          = { o_fd,    (int32_t) o_offset    },
+                        .q          = { q_fd,    (int32_t) q_offset    },
+                        .k          = { k_fd,    (int32_t) k_offset    },
+                        .v          = { v_fd,    (int32_t) v_offset    },
+                        .mask       = { mask_fd, (int32_t) mask_offset },
+                        .qo_len     = (int32_t) q->ne[1],
+                        .kv_len     = (int32_t) k->ne[1],
+                        .n_heads    = (int32_t) q->ne[2],
+                        .n_kv_heads = (int32_t) k->ne[2],
+                        .head_dim   = (int32_t) q->ne[0],
+                    };
+                    *reinterpret_cast<FlashAttnParams *>(param_buf) = op_params;
+
+                    op_index   = HTP_OPS_FLASH_ATTN_QO_F32_KV_F16;
+                    args_size  = sizeof(FlashAttnParams);
+                    dispatch_m = op_params.qo_len;
+                    dispatch_k = op_params.kv_len;
+                    dispatch_n = op_params.n_heads;
+                }
+            }
+            break;
+
+        case GGML_OP_CUSTOM:
+            {
+                if (!is_block_sparse_score_custom(dst)) {
+                    break;
+                }
+
+                prepare_tensor_rpcmem_mapping(dst);
+
+                auto * q_mean = dst->src[0];
+                auto * k_mean = dst->src[1];
+
+                auto mappings = get_all_rpcmem_mappings(dst);
+                if (mappings.size() != 3) {
+                    dump_missing_mapping_diagnostics(dst, mappings);
+                }
+                GGML_ASSERT(mappings.size() == 3);
+
+                auto [score_fd, score_offset] = mappings[0];
+                auto [q_fd, q_offset]         = mappings[1];
+                auto [k_fd, k_offset]         = mappings[2];
+
+                BlockSparseScoreParams op_params{
+                    .score      = { score_fd, (int32_t) score_offset },
+                    .q_mean     = { q_fd,     (int32_t) q_offset     },
+                    .k_mean     = { k_fd,     (int32_t) k_offset     },
+                    .head_dim   = (int32_t) q_mean->ne[0],
+                    .n_q_blocks = (int32_t) q_mean->ne[1],
+                    .n_k_blocks = (int32_t) k_mean->ne[1],
+                };
+                *reinterpret_cast<BlockSparseScoreParams *>(param_buf) = op_params;
+
+                op_index   = HTP_OPS_BLOCK_SPARSE_SCORE_QO_F32_KM_F16;
+                args_size  = sizeof(BlockSparseScoreParams);
+                dispatch_m = op_params.n_q_blocks;
+                dispatch_k = op_params.n_k_blocks;
+                dispatch_n = op_params.head_dim;
             }
             break;
 
@@ -652,6 +804,18 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                      debug_activation_hash,
                      dst != nullptr ? ggml_nbytes(dst) : 0,
                      output_hash);
+    }
+    if (op_index == HTP_OPS_BLOCK_SPARSE_SCORE_QO_F32_KM_F16) {
+        const char * trace = std::getenv("SD_HTP_BLOCK_SPARSE_MASK_TRACE");
+        if (trace != nullptr && trace[0] != '\0' && std::strcmp(trace, "0") != 0) {
+            std::fprintf(stderr,
+                         "block_sparse_score_step score=%dms n_q_blocks=%d n_k_blocks=%d head_dim=%d ret=%d\n",
+                         static_cast<int>(ggml_time_ms() - wait_begin_ms),
+                         dispatch_m,
+                         dispatch_k,
+                         dispatch_n,
+                         ret);
+        }
     }
     if (ret != 0 || htp_trace_ops_enabled()) {
         dump_htp_dispatch_state(ret == 0 ? "dispatch-end" : "dispatch-error",
