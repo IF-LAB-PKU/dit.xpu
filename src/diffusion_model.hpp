@@ -64,6 +64,12 @@ struct DiffusionModel {
     virtual void set_htp_backend(ggml_backend_t backend)                         {
         (void)backend;
     };
+    virtual void set_block_sparse_attention_enabled(bool enabled)                {
+        (void)enabled;
+    };
+    virtual void set_htp_attention_enabled(bool enabled) {
+        (void)enabled;
+    };
     virtual int64_t get_adm_in_channels()                            = 0;
     virtual void set_flash_attention_enabled(bool enabled)           = 0;
     virtual void set_max_graph_vram_bytes(size_t max_vram_bytes)     = 0;
@@ -185,6 +191,14 @@ struct MMDiTModel : public DiffusionModel {
 
     void set_htp_backend(ggml_backend_t backend) override {
         mmdit.set_htp_backend(backend);
+    }
+
+    void set_block_sparse_attention_enabled(bool enabled) override {
+        mmdit.set_block_sparse_attention_enabled(enabled);
+    }
+
+    void set_htp_attention_enabled(bool enabled) override {
+        mmdit.set_htp_attention_enabled(enabled);
     }
 
     int64_t get_adm_in_channels() override {
