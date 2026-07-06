@@ -245,6 +245,11 @@ bool is_block_sparse_score_custom(const ggml_tensor * dst) {
            ggml_is_contiguous(k_mean);
 }
 
+bool htp_attention_impl_is_normal() {
+    const char * v = std::getenv("SD_HTP_ATTENTION_IMPL");
+    return v != nullptr && std::strcmp(v, "normal") == 0;
+}
+
 const char * htp_op_index_name(int op_index) {
     switch (op_index) {
         case HTP_OPS_RMS_NORM_F32:
@@ -619,6 +624,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                         .n_heads    = (int32_t) q->ne[2],
                         .n_kv_heads = (int32_t) k->ne[2],
                         .head_dim   = (int32_t) q->ne[0],
+                        .impl       = htp_attention_impl_is_normal() ? 1 : 0,
                     };
                     *reinterpret_cast<FlashAttnParams *>(param_buf) = op_params;
 

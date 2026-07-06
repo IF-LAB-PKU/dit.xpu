@@ -50,6 +50,7 @@ struct FlashAttnParams {
     int32_t n_heads;
     int32_t n_kv_heads;
     int32_t head_dim;
+    int32_t impl;
 } __attribute__((packed));
 
 struct BlockSparseAttnParams {
