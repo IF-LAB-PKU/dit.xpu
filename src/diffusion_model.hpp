@@ -67,6 +67,9 @@ struct DiffusionModel {
     virtual void set_block_sparse_attention_enabled(bool enabled)                {
         (void)enabled;
     };
+    virtual bool is_block_sparse_attention_enabled() const {
+        return false;
+    };
     virtual void set_htp_attention_enabled(bool enabled) {
         (void)enabled;
     };
@@ -195,6 +198,10 @@ struct MMDiTModel : public DiffusionModel {
 
     void set_block_sparse_attention_enabled(bool enabled) override {
         mmdit.set_block_sparse_attention_enabled(enabled);
+    }
+
+    bool is_block_sparse_attention_enabled() const override {
+        return mmdit.is_block_sparse_attention_enabled();
     }
 
     void set_htp_attention_enabled(bool enabled) override {

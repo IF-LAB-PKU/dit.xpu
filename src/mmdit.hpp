@@ -491,7 +491,7 @@ block_mixing(GGMLRunnerContext* ctx,
     }
     std::vector<ggml_tensor*> qkv;
     for (int i = 0; i < 3; i++) {
-        qkv.push_back(ggml_concat(ctx->ggml_ctx, context_qkv[i], x_qkv[i], 1));
+        qkv.push_back(ggml_concat(ctx->ggml_ctx, x_qkv[i], context_qkv[i], 1));
     }
 
     auto attn = ggml_ext_attention_ext(ctx->ggml_ctx,
@@ -505,16 +505,9 @@ block_mixing(GGMLRunnerContext* ctx,
                                        ctx->flash_attn_enabled,
                                        1.0f,
                                        ctx->block_sparse_attn_enabled,
-                                       static_cast<int>(context->ne[1]));  // [N, n_context + n_token, hidden_size]
+                                       static_cast<int>(x->ne[1]),
+                                       static_cast<int>(context->ne[1]));  // [N, n_token + n_context, hidden_size]
 
-    auto context_attn = ggml_view_3d(ctx->ggml_ctx,
-                                     attn,
-                                     attn->ne[0],
-                                     context->ne[1],
-                                     attn->ne[2],
-                                     attn->nb[1],
-                                     attn->nb[2],
-                                     0);  // [N, n_context, hidden_size]
     auto x_attn       = ggml_view_3d(ctx->ggml_ctx,
                                      attn,
                                      attn->ne[0],
@@ -522,7 +515,15 @@ block_mixing(GGMLRunnerContext* ctx,
                                      attn->ne[2],
                                      attn->nb[1],
                                      attn->nb[2],
-                                     context->ne[1] * attn->nb[1]);  // [N, n_token, hidden_size]
+                                     0);  // [N, n_token, hidden_size]
+    auto context_attn = ggml_view_3d(ctx->ggml_ctx,
+                                     attn,
+                                     attn->ne[0],
+                                     context->ne[1],
+                                     attn->ne[2],
+                                     attn->nb[1],
+                                     attn->nb[2],
+                                     x->ne[1] * attn->nb[1]);  // [N, n_context, hidden_size]
 
     if (!context_block->pre_only) {
         context = context_block->post_attention(ctx,

@@ -24,6 +24,14 @@
 
 #include "../../src/ggml_extend.hpp"
 
+#ifndef HTP_ATTN_PRECISION_IMPL
+#define HTP_ATTN_PRECISION_IMPL "flash"
+#endif
+
+#ifndef HTP_ATTN_PRECISION_LABEL
+#define HTP_ATTN_PRECISION_LABEL "flash"
+#endif
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -307,8 +315,10 @@ static bool run_case(ggml_backend_t cpu_backend, ggml_backend_t htp_backend, con
     printf("  CPU reference elapsed: %.3f ms, output elements: %zu\n",
            cpu_result.elapsed_us / 1000.0, cpu_result.output.size());
 
-    printf("  Running HTP dense (SD_HTP_ATTENTION=1)...\n");
+    printf("  Running HTP dense %s (SD_HTP_ATTENTION=1 SD_HTP_ATTENTION_IMPL=%s)...\n",
+           HTP_ATTN_PRECISION_LABEL, HTP_ATTN_PRECISION_IMPL);
     EnvGuard env_attn1("SD_HTP_ATTENTION", "1");
+    EnvGuard env_impl("SD_HTP_ATTENTION_IMPL", HTP_ATTN_PRECISION_IMPL);
     AttnResult htp_result = runner.run(1,
                                        p.qo_len,
                                        p.kv_len,
@@ -330,7 +340,8 @@ static bool run_case(ggml_backend_t cpu_backend, ggml_backend_t htp_backend, con
 
     // Compare
     CmpStats stats = compare(cpu_result.output, htp_result.output);
-    print_stats("CPU reference vs HTP dense attention", stats, cpu_result.output.size());
+    std::string stats_label = std::string("CPU reference vs HTP dense ") + HTP_ATTN_PRECISION_LABEL + " attention";
+    print_stats(stats_label.c_str(), stats, cpu_result.output.size());
 
     if (stats.max_abs_err > 1.0) {
         printf("  WARNING: max_abs_err > 1.0 — significant deviation\n");

@@ -188,6 +188,7 @@ static std::vector<int32_t> run_mask_node_cpu(int n_q_blocks,
                                                                       block_k,
                                                                       2,
                                                                       causal,
+                                                                      0,
                                                                       protected_prefix_len,
                                                                       n_heads,
                                                                       n_kv_heads);
@@ -230,6 +231,7 @@ static std::vector<int32_t> run_index_node_cpu(int n_q_blocks,
                                                                         block_k,
                                                                         2,
                                                                         causal,
+                                                                        0,
                                                                         protected_prefix_len,
                                                                         n_heads,
                                                                         n_kv_heads);
@@ -255,6 +257,120 @@ static std::vector<int32_t> run_index_node_cpu(int n_q_blocks,
     ggml_backend_free(cpu);
     ggml_free(ctx);
     return index;
+}
+
+static std::vector<int32_t> run_index_node_cpu_range(int n_q_blocks,
+                                                     int n_k_blocks,
+                                                     int block_q,
+                                                     int block_k,
+                                                     const std::vector<ggml_fp16_t> & score,
+                                                     bool causal,
+                                                     int protected_start,
+                                                     int protected_len,
+                                                     int n_heads,
+                                                     int n_kv_heads,
+                                                     int * max_kept_out) {
+    ggml_context * ctx = make_ctx(8, score.size() * sizeof(ggml_fp16_t) + 256 * 1024);
+    ggml_tensor * score_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_k_blocks, n_q_blocks);
+    ggml_tensor * index_t = ggml_ext_block_sparse_index_from_score_node(ctx,
+                                                                        score_t,
+                                                                        block_q,
+                                                                        block_k,
+                                                                        2,
+                                                                        causal,
+                                                                        protected_start,
+                                                                        protected_len,
+                                                                        n_heads,
+                                                                        n_kv_heads);
+    GGML_ASSERT(score_t != nullptr && index_t != nullptr);
+
+    ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);
+    GGML_ASSERT(cpu != nullptr);
+    ggml_backend_cpu_set_n_threads(cpu, 4);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(cpu));
+    GGML_ASSERT(buffer != nullptr);
+
+    ggml_backend_tensor_set(score_t, score.data(), 0, score.size() * sizeof(ggml_fp16_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, index_t);
+    GGML_ASSERT(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(cpu);
+
+    if (max_kept_out != nullptr) {
+        *max_kept_out = static_cast<int>(index_t->ne[0]);
+    }
+    std::vector<int32_t> index = read_i32_tensor(index_t);
+    ggml_backend_buffer_free(buffer);
+    ggml_backend_free(cpu);
+    ggml_free(ctx);
+    return index;
+}
+
+static void test_score_to_index_suffix_protection() {
+    constexpr int block_q = 32;
+    constexpr int block_k = 32;
+    constexpr int n_heads = 24;
+    constexpr int n_kv_heads = 24;
+    constexpr int qo_len = 410;
+    constexpr int kv_len = 410;
+    constexpr int image_tokens = 256;
+    constexpr int text_tokens = 154;
+    const int n_q_blocks = ceil_div_int(qo_len, block_q) * n_heads;
+    const int n_k_blocks = ceil_div_int(kv_len, block_k) * n_kv_heads;
+    const std::vector<ggml_fp16_t> score = make_score_data(n_q_blocks, n_k_blocks);
+
+    setenv("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", "0.5", 1);
+
+    int max_kept = 0;
+    const std::vector<int32_t> index = run_index_node_cpu_range(n_q_blocks,
+                                                                n_k_blocks,
+                                                                block_q,
+                                                                block_k,
+                                                                score,
+                                                                false,
+                                                                image_tokens,
+                                                                text_tokens,
+                                                                n_heads,
+                                                                n_kv_heads,
+                                                                &max_kept);
+
+    const int blocks_per_head = ceil_div_int(qo_len, block_q);
+    const int protected_first_block = image_tokens / block_q;
+    const int protected_last_block = ceil_div_int(image_tokens + text_tokens, block_q) - 1;
+    GGML_ASSERT(max_kept == blocks_per_head);
+
+    for (int h = 0; h < n_heads; ++h) {
+        const int q_text_block = h * blocks_per_head + protected_first_block;
+        std::vector<int32_t> kept;
+        for (int i = 0; i < max_kept; ++i) {
+            const int32_t kb = index[size_t(q_text_block) * size_t(max_kept) + size_t(i)];
+            if (kb >= 0) {
+                kept.push_back(kb);
+            }
+        }
+        GGML_ASSERT(kept.size() == size_t(blocks_per_head));
+        GGML_ASSERT(kept.front() == h * blocks_per_head);
+        GGML_ASSERT(kept.back() == h * blocks_per_head + blocks_per_head - 1);
+
+        const int q_image_block = h * blocks_per_head;
+        bool saw_text_k = false;
+        for (int i = 0; i < max_kept; ++i) {
+            const int32_t kb = index[size_t(q_image_block) * size_t(max_kept) + size_t(i)];
+            if (kb < 0) {
+                continue;
+            }
+            const int k_block_in_head = kb - h * blocks_per_head;
+            if (k_block_in_head >= protected_first_block && k_block_in_head <= protected_last_block) {
+                saw_text_k = true;
+            }
+        }
+        GGML_ASSERT(saw_text_k);
+    }
+
+    std::printf("[PASS] score-to-index suffix protection image=%d text=%d max_kept=%d\n",
+                image_tokens,
+                text_tokens,
+                max_kept);
 }
 
 static void test_score_to_index_equivalence(int qo_len,
@@ -387,6 +503,7 @@ static void test_score_to_mask_reference(int n_q_blocks, int n_k_blocks, float k
                                                                             block_k,
                                                                             2,
                                                                             causal,
+                                                                            0,
                                                                             protected_prefix_len,
                                                                             n_heads,
                                                                             n_kv_heads);
@@ -619,6 +736,7 @@ int main() {
     test_score_to_index_equivalence(410, 410, 0.98f, 154);
     test_score_to_index_equivalence(410, 410, 0.95f, 154);
     test_score_to_index_equivalence(410, 410, 0.90f, 154);
+    test_score_to_index_suffix_protection();
     test_flat_mean_score_shape(256, 256, 24, 24, 64);
     test_flat_mean_score_shape(410, 410, 24, 24, 64);
     test_score_shape(96, 128, 24, 24, 64);

@@ -1,6 +1,8 @@
 #include "ggml_extend.hpp"
 #include "ggml_graph_cut.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -2030,6 +2032,32 @@ public:
         }
 
         size_t steps       = sigmas.size() - 1;
+        const float htp_block_sparse_warmup_ratio =
+            std::clamp(sd_env_float_value("SD_HTP_BLOCK_SPARSE_WARMUP_RATIO", 0.0f), 0.0f, 1.0f);
+        const size_t htp_block_sparse_warmup_steps =
+            htp_block_sparse_warmup_ratio > 0.0f
+                ? std::min(steps, static_cast<size_t>(std::ceil(float(steps) * htp_block_sparse_warmup_ratio)))
+                : 0;
+        const float htp_block_sparse_dense_tail_ratio =
+            std::clamp(sd_env_float_value("SD_HTP_BLOCK_SPARSE_DENSE_TAIL_RATIO", 0.0f), 0.0f, 1.0f);
+        const size_t htp_block_sparse_dense_tail_steps =
+            htp_block_sparse_dense_tail_ratio > 0.0f
+                ? std::min(steps, static_cast<size_t>(std::ceil(float(steps) * htp_block_sparse_dense_tail_ratio)))
+                : 0;
+        const bool htp_block_sparse_original = work_diffusion_model != nullptr &&
+                                               work_diffusion_model->is_block_sparse_attention_enabled();
+        if (htp_block_sparse_original && htp_block_sparse_warmup_steps > 0) {
+            LOG_INFO("HTP block sparse warmup enabled: dense_steps=%zu/%zu ratio=%.3f",
+                     htp_block_sparse_warmup_steps,
+                     steps,
+                     htp_block_sparse_warmup_ratio);
+        }
+        if (htp_block_sparse_original && htp_block_sparse_dense_tail_steps > 0) {
+            LOG_INFO("HTP block sparse dense tail enabled: dense_tail_steps=%zu/%zu ratio=%.3f",
+                     htp_block_sparse_dense_tail_steps,
+                     steps,
+                     htp_block_sparse_dense_tail_ratio);
+        }
         bool has_skiplayer = slg_scale != 0.0f && !skip_layers.empty();
         if (has_skiplayer && !sd_version_is_dit(version)) {
             has_skiplayer = false;
@@ -2055,6 +2083,32 @@ public:
         auto denoise = [&](const sd::Tensor<float>& x, float sigma, int step) -> sd::guidance::GuiderOutput {
             if (step == 1 || step == -1) {
                 pretty_progress(0, (int)steps, 0);
+            }
+
+            const size_t denoise_step_index = step > 0 ? static_cast<size_t>(step) : 0;
+            const bool htp_block_sparse_in_dense_tail =
+                htp_block_sparse_original &&
+                htp_block_sparse_dense_tail_steps > 0 &&
+                denoise_step_index > 0 &&
+                denoise_step_index > steps - htp_block_sparse_dense_tail_steps;
+            const bool htp_block_sparse_in_warmup =
+                htp_block_sparse_original &&
+                htp_block_sparse_warmup_steps > 0 &&
+                denoise_step_index > 0 &&
+                denoise_step_index <= htp_block_sparse_warmup_steps;
+            const bool htp_block_sparse_step_enabled =
+                htp_block_sparse_original &&
+                !htp_block_sparse_in_warmup &&
+                !htp_block_sparse_in_dense_tail;
+            if (htp_block_sparse_original &&
+                (htp_block_sparse_warmup_steps > 0 || htp_block_sparse_dense_tail_steps > 0)) {
+                work_diffusion_model->set_block_sparse_attention_enabled(htp_block_sparse_step_enabled);
+                LOG_DEBUG("HTP block sparse step=%zu/%zu warmup_dense=%d tail_dense=%d sparse=%d",
+                          denoise_step_index,
+                          steps,
+                          htp_block_sparse_in_warmup ? 1 : 0,
+                          htp_block_sparse_in_dense_tail ? 1 : 0,
+                          htp_block_sparse_step_enabled ? 1 : 0);
             }
 
             std::vector<float> scaling = denoiser->get_scalings(sigma);
@@ -2244,6 +2298,10 @@ public:
         };
 
         auto x0_opt = sample_k_diffusion(method, denoise, x_t, sigmas, sampler_rng, eta, is_flow_denoiser, extra_sample_args);
+        if (htp_block_sparse_original &&
+            (htp_block_sparse_warmup_steps > 0 || htp_block_sparse_dense_tail_steps > 0)) {
+            work_diffusion_model->set_block_sparse_attention_enabled(htp_block_sparse_original);
+        }
         if (x0_opt.empty()) {
             LOG_ERROR("Diffusion model sampling failed");
             if (control_net) {
