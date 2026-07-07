@@ -205,6 +205,41 @@ static void test_patch_major_mapping_roundtrip() {
     std::printf("[PASS] patch-major mapping roundtrip\n");
 }
 
+static void test_patch_major_shift_mapping_roundtrip() {
+    const std::vector<std::pair<int, int>> shapes = {
+        {16, 16},
+        {20, 20},
+        {16, 32},
+        {13, 17},
+        {3, 5},
+    };
+    const std::vector<std::pair<int, int>> shifts = {
+        {0, 0},
+        {-2, -2},
+        {2, 2},
+        {-7, 5},
+    };
+
+    for (const auto & shape : shapes) {
+        const int h = shape.first;
+        const int w = shape.second;
+        for (const auto & shift : shifts) {
+            std::vector<int> seen(size_t(h) * size_t(w), 0);
+            for (int row = 0; row < h * w; ++row) {
+                const int pm = sd_patch_major_shifted_index_from_row_major(row, h, w, 4, shift.first, shift.second);
+                GGML_ASSERT(pm >= 0 && pm < h * w);
+                GGML_ASSERT(sd_row_major_index_from_patch_major_shifted(pm, h, w, 4, shift.first, shift.second) == row);
+                seen[size_t(pm)]++;
+            }
+            for (int v : seen) {
+                GGML_ASSERT(v == 1);
+            }
+        }
+    }
+
+    std::printf("[PASS] patch-major shifted mapping roundtrip\n");
+}
+
 static void test_patch_major_reorder_tensor_roundtrip() {
     constexpr int c = 3;
     constexpr int h = 20;
@@ -246,6 +281,106 @@ static void test_patch_major_reorder_tensor_roundtrip() {
     std::printf("[PASS] patch-major tensor reorder roundtrip\n");
 }
 
+static void test_patch_major_shifted_reorder_tensor_roundtrip() {
+    constexpr int c = 3;
+    constexpr int h = 13;
+    constexpr int w = 17;
+    constexpr int n = 1;
+    const int l = h * w;
+    std::vector<float> input(size_t(c) * size_t(l) * size_t(n));
+    for (int token = 0; token < l; ++token) {
+        for (int ch = 0; ch < c; ++ch) {
+            input[size_t(token) * size_t(c) + size_t(ch)] = float(token * 10 + ch);
+        }
+    }
+
+    ggml_context * ctx = make_ctx(16, input.size() * sizeof(float) * 3 + 256 * 1024);
+    ggml_tensor * src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c, l, n);
+    ggml_tensor * reordered = sd_patch_major_reorder_node(ctx, src, h, w, 4, false, -2, -2);
+    ggml_tensor * restored = sd_patch_major_reorder_node(ctx, reordered, h, w, 4, true, -2, -2);
+    GGML_ASSERT(src != nullptr && reordered != nullptr && restored != nullptr);
+
+    ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);
+    GGML_ASSERT(cpu != nullptr);
+    ggml_backend_cpu_set_n_threads(cpu, 4);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(cpu));
+    GGML_ASSERT(buffer != nullptr);
+
+    ggml_backend_tensor_set(src, input.data(), 0, input.size() * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, restored);
+    GGML_ASSERT(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(cpu);
+
+    const std::vector<float> actual = read_f32_tensor(restored);
+    GGML_ASSERT(actual == input);
+
+    ggml_backend_buffer_free(buffer);
+    ggml_backend_free(cpu);
+    ggml_free(ctx);
+
+    std::printf("[PASS] patch-major shifted tensor reorder roundtrip\n");
+}
+
+static void test_patch_major_shifted_to_shifted_reorder_tensor_roundtrip() {
+    constexpr int c = 3;
+    constexpr int h = 13;
+    constexpr int w = 17;
+    constexpr int n = 1;
+    const int l = h * w;
+    std::vector<float> input(size_t(c) * size_t(l) * size_t(n));
+    for (int token = 0; token < l; ++token) {
+        for (int ch = 0; ch < c; ++ch) {
+            input[size_t(token) * size_t(c) + size_t(ch)] = float(token * 10 + ch);
+        }
+    }
+
+    ggml_context * ctx = make_ctx(20, input.size() * sizeof(float) * 4 + 256 * 1024);
+    ggml_tensor * src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c, l, n);
+    ggml_tensor * unshifted = sd_patch_major_reorder_node(ctx, src, h, w, 4, false, 0, 0);
+    ggml_tensor * shifted = sd_patch_major_reorder_node(ctx, unshifted, h, w, 4, false, -2, -2, 0, 0, true);
+    ggml_tensor * restored = sd_patch_major_reorder_node(ctx, shifted, h, w, 4, true, -2, -2);
+    GGML_ASSERT(src != nullptr && unshifted != nullptr && shifted != nullptr && restored != nullptr);
+
+    ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);
+    GGML_ASSERT(cpu != nullptr);
+    ggml_backend_cpu_set_n_threads(cpu, 4);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(cpu));
+    GGML_ASSERT(buffer != nullptr);
+
+    ggml_backend_tensor_set(src, input.data(), 0, input.size() * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, restored);
+    GGML_ASSERT(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(cpu);
+
+    const std::vector<float> actual = read_f32_tensor(restored);
+    GGML_ASSERT(actual == input);
+
+    ggml_backend_buffer_free(buffer);
+    ggml_backend_free(cpu);
+    ggml_free(ctx);
+
+    std::printf("[PASS] patch-major shifted-to-shifted tensor reorder roundtrip\n");
+}
+
+static void test_block_sparse_step_shift_policy() {
+    GGML_ASSERT(sd_htp_block_sparse_step_shift(false, 0) == 0);
+    GGML_ASSERT(sd_htp_block_sparse_step_shift(false, 1) == 0);
+    GGML_ASSERT(sd_htp_block_sparse_step_shift(false, 3) == 0);
+    GGML_ASSERT(sd_htp_block_sparse_step_shift(false, 6) == 0);
+    GGML_ASSERT(sd_htp_block_sparse_step_shift(true, 0) == 0);
+    GGML_ASSERT(sd_htp_block_sparse_step_shift(true, 1) == 0);
+    GGML_ASSERT(sd_htp_block_sparse_step_shift(true, 2) == -2);
+    GGML_ASSERT(sd_htp_block_sparse_step_shift(true, 3) == 0);
+    GGML_ASSERT(sd_htp_block_sparse_step_shift(true, 4) == -2);
+    GGML_ASSERT(sd_htp_block_sparse_step_shift(true, 5) == 0);
+    GGML_ASSERT(sd_htp_block_sparse_step_shift(true, 6) == -2);
+    GGML_ASSERT(sd_htp_block_sparse_step_shift(true, -1) == 0);
+
+    std::printf("[PASS] block sparse step shift policy\n");
+}
+
 static void test_patch_score_mask_promotes_to_dsp_index() {
     constexpr int n_q16 = 4;
     constexpr int n_k16 = 5;
@@ -269,7 +404,7 @@ static void test_patch_score_mask_promotes_to_dsp_index() {
                                                       n_kv_heads);
 
     const std::vector<int32_t> expected = {
-        0, 1, -1,
+        0, -1, -1,
         1, 2, -1,
     };
     GGML_ASSERT(index32 == expected);
@@ -320,7 +455,7 @@ static void test_patch_score_node_promotes_to_dsp_index() {
 
     const std::vector<int32_t> index32 = read_i32_tensor(index_t);
     const std::vector<int32_t> expected = {
-        0, 1, -1,
+        0, -1, -1,
         1, 2, -1,
     };
     GGML_ASSERT(index32 == expected);
@@ -887,7 +1022,11 @@ static void test_score_shape(int qo_len, int kv_len, int n_heads, int n_kv_heads
 
 int main() {
     test_patch_major_mapping_roundtrip();
+    test_patch_major_shift_mapping_roundtrip();
     test_patch_major_reorder_tensor_roundtrip();
+    test_patch_major_shifted_reorder_tensor_roundtrip();
+    test_patch_major_shifted_to_shifted_reorder_tensor_roundtrip();
+    test_block_sparse_step_shift_policy();
     test_patch_score_mask_promotes_to_dsp_index();
     test_patch_score_node_promotes_to_dsp_index();
     test_score_to_mask_reference(24, 24, 0.95f, 0);

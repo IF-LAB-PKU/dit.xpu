@@ -42,6 +42,8 @@ struct DiffusionParams {
     float frame_rate                                                   = 24.f;
     const sd::Tensor<float>* video_positions                           = nullptr;
     const std::vector<int>* skip_layers                                = nullptr;
+    int denoise_step                                                   = 0;
+    int block_sparse_step_index                                        = 0;
 };
 
 template <typename T>
@@ -234,7 +236,8 @@ struct MMDiTModel : public DiffusionModel {
                              *diffusion_params.timesteps,
                              tensor_or_empty(diffusion_params.context),
                              tensor_or_empty(diffusion_params.y),
-                             diffusion_params.skip_layers ? *diffusion_params.skip_layers : empty_skip_layers);
+                             diffusion_params.skip_layers ? *diffusion_params.skip_layers : empty_skip_layers,
+                             diffusion_params.block_sparse_step_index);
     }
 };
 

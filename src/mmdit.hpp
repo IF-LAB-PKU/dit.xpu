@@ -790,7 +790,8 @@ public:
                          ggml_tensor* t,
                          ggml_tensor* y               = nullptr,
                          ggml_tensor* context         = nullptr,
-                         std::vector<int> skip_layers = std::vector<int>()) {
+                         std::vector<int> skip_layers = std::vector<int>(),
+                         int block_sparse_step_index  = 0) {
         // Forward pass of DiT.
         // x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         // t: (N,) tensor of diffusion timesteps
@@ -808,12 +809,31 @@ public:
         x                = ggml_add(ctx->ggml_ctx, patch_embed, pos_embed);  // [N, H*W, hidden_size]
         const int64_t token_h = (H + patch_size - 1) / patch_size;
         const int64_t token_w = (W + patch_size - 1) / patch_size;
+        const bool block_sparse_step_shift_enabled = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_STEP_SHIFT");
+        int block_sparse_shift_y = ctx->block_sparse_attn_enabled ?
+            sd_htp_block_sparse_step_shift(block_sparse_step_shift_enabled, block_sparse_step_index) :
+            0;
+        int block_sparse_shift_x = block_sparse_shift_y;
+        if (sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
+            std::fprintf(stderr,
+                         "patch_major_step_shift sparse_step=%d sparse=%d step_shift_enabled=%d initial_shift_y=%d initial_shift_x=%d token_h=%lld token_w=%lld depth=%lld\n",
+                         block_sparse_step_index,
+                         ctx->block_sparse_attn_enabled ? 1 : 0,
+                         block_sparse_step_shift_enabled ? 1 : 0,
+                         block_sparse_shift_y,
+                         block_sparse_shift_x,
+                         static_cast<long long>(token_h),
+                         static_cast<long long>(token_w),
+                         static_cast<long long>(depth));
+        }
         x = sd_patch_major_reorder_node(ctx->ggml_ctx,
                                         x,
                                         static_cast<int>(token_h),
                                         static_cast<int>(token_w),
                                         SD_HTP_BLOCK_SPARSE_PATCH_SIZE,
-                                        false);
+                                        false,
+                                        block_sparse_shift_y,
+                                        block_sparse_shift_x);
 
         auto c = t_embedder->forward(ctx, t);  // [N, hidden_size]
         if (y != nullptr && adm_in_channels != -1) {
@@ -834,13 +854,19 @@ public:
             sd::ggml_graph_cut::mark_graph_cut(context, "mmdit.prelude", "context");
         }
 
-        x = forward_core_with_concat(ctx, x, c, context, skip_layers);  // (N, H*W, patch_size ** 2 * out_channels)
+        x = forward_core_with_concat(ctx,
+                                     x,
+                                     c,
+                                     context,
+                                     skip_layers);  // (N, H*W, patch_size ** 2 * out_channels)
         x = sd_patch_major_reorder_node(ctx->ggml_ctx,
                                         x,
                                         static_cast<int>(token_h),
                                         static_cast<int>(token_w),
                                         SD_HTP_BLOCK_SPARSE_PATCH_SIZE,
-                                        true);
+                                        true,
+                                        block_sparse_shift_y,
+                                        block_sparse_shift_x);
 
         auto final_layer = std::dynamic_pointer_cast<FinalLayer>(blocks["final_layer"]);
         x = final_layer->forward(ctx, x, c);  // (N, T, patch_size ** 2 * out_channels)
@@ -873,7 +899,8 @@ struct MMDiTRunner : public GGMLRunner {
                              const sd::Tensor<float>& timesteps_tensor,
                              const sd::Tensor<float>& context_tensor = {},
                              const sd::Tensor<float>& y_tensor       = {},
-                             std::vector<int> skip_layers            = std::vector<int>()) {
+                             std::vector<int> skip_layers            = std::vector<int>(),
+                             int block_sparse_step_index             = 0) {
         ggml_cgraph* gf = new_graph_custom(MMDIT_GRAPH_SIZE);
 
         ggml_tensor* x         = make_input(x_tensor);
@@ -887,7 +914,8 @@ struct MMDiTRunner : public GGMLRunner {
                                          timesteps,
                                          y,
                                          context,
-                                         skip_layers);
+                                         skip_layers,
+                                         block_sparse_step_index);
 
         ggml_build_forward_expand(gf, out);
 
@@ -899,13 +927,14 @@ struct MMDiTRunner : public GGMLRunner {
                               const sd::Tensor<float>& timesteps,
                               const sd::Tensor<float>& context = {},
                               const sd::Tensor<float>& y       = {},
-                              std::vector<int> skip_layers     = std::vector<int>()) {
+                              std::vector<int> skip_layers     = std::vector<int>(),
+                              int block_sparse_step_index      = 0) {
         // x: [N, in_channels, h, w]
         // timesteps: [N, ]
         // context: [N, max_position, hidden_size]([N, 154, 4096]) or [1, max_position, hidden_size]
         // y: [N, adm_in_channels] or [1, adm_in_channels]
         auto get_graph = [&]() -> ggml_cgraph* {
-            return build_graph(x, timesteps, context, y, skip_layers);
+            return build_graph(x, timesteps, context, y, skip_layers, block_sparse_step_index);
         };
 
         return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
