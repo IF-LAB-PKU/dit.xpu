@@ -446,6 +446,35 @@ static void test_patch_score_mask_2d_halo_keeps_surrounding_blocks() {
     std::printf("[PASS] patch score mask 2d halo keeps surrounding blocks\n");
 }
 
+static void test_patch_score_mask_center_sink_keeps_center_blocks() {
+    constexpr int n_q16 = 16;
+    constexpr int n_k16 = 16;
+    constexpr int n_heads = 1;
+    constexpr int n_kv_heads = 1;
+
+    std::vector<int32_t> mask16(size_t(n_q16) * size_t(n_k16), 1);
+    ggml_ext_block_sparse_force_center_sink_mask(mask16.data(),
+                                                 n_q16,
+                                                 n_k16,
+                                                 16,
+                                                 16,
+                                                 n_heads,
+                                                 n_kv_heads);
+
+    const std::vector<int32_t> expected_kept = {5, 6, 9, 10};
+    for (int qb = 0; qb < n_q16; ++qb) {
+        std::vector<int32_t> actual_kept;
+        for (int kb = 0; kb < n_k16; ++kb) {
+            if (mask16[size_t(qb) * size_t(n_k16) + size_t(kb)] == 0) {
+                actual_kept.push_back(kb);
+            }
+        }
+        GGML_ASSERT(actual_kept == expected_kept);
+    }
+
+    std::printf("[PASS] patch score mask center sink keeps center blocks\n");
+}
+
 static void test_patch_score_node_promotes_to_dsp_index() {
     constexpr int n_q16 = 4;
     constexpr int n_k16 = 5;
@@ -1063,6 +1092,7 @@ int main() {
     test_block_sparse_step_shift_policy();
     test_patch_score_mask_promotes_to_dsp_index();
     test_patch_score_mask_2d_halo_keeps_surrounding_blocks();
+    test_patch_score_mask_center_sink_keeps_center_blocks();
     test_patch_score_node_promotes_to_dsp_index();
     test_score_to_mask_reference(24, 24, 0.95f, 0);
     test_score_to_mask_reference(192, 192, 0.95f, 0);
