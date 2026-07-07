@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <vector>
 
 static ggml_context * make_ctx(size_t tensor_count, size_t extra = 256 * 1024) {
@@ -169,6 +170,166 @@ static std::vector<int32_t> read_i32_tensor(const ggml_tensor * t) {
     std::vector<int32_t> data(size_t(ggml_nelements(t)));
     ggml_backend_tensor_get(t, data.data(), 0, data.size() * sizeof(int32_t));
     return data;
+}
+
+static std::vector<float> read_f32_tensor(const ggml_tensor * t) {
+    std::vector<float> data(size_t(ggml_nelements(t)));
+    ggml_backend_tensor_get(t, data.data(), 0, data.size() * sizeof(float));
+    return data;
+}
+
+static void test_patch_major_mapping_roundtrip() {
+    const std::vector<std::pair<int, int>> shapes = {
+        {16, 16},
+        {20, 20},
+        {16, 32},
+        {13, 17},
+    };
+
+    for (const auto & shape : shapes) {
+        const int h = shape.first;
+        const int w = shape.second;
+        GGML_ASSERT(sd_patch_major_token_count(h, w) == h * w);
+        std::vector<int> seen(size_t(h) * size_t(w), 0);
+        for (int row = 0; row < h * w; ++row) {
+            const int pm = sd_patch_major_index_from_row_major(row, h, w, 4);
+            GGML_ASSERT(pm >= 0 && pm < h * w);
+            GGML_ASSERT(sd_row_major_index_from_patch_major(pm, h, w, 4) == row);
+            seen[size_t(pm)]++;
+        }
+        for (int v : seen) {
+            GGML_ASSERT(v == 1);
+        }
+    }
+
+    std::printf("[PASS] patch-major mapping roundtrip\n");
+}
+
+static void test_patch_major_reorder_tensor_roundtrip() {
+    constexpr int c = 3;
+    constexpr int h = 20;
+    constexpr int w = 20;
+    constexpr int n = 1;
+    const int l = h * w;
+    std::vector<float> input(size_t(c) * size_t(l) * size_t(n));
+    for (int token = 0; token < l; ++token) {
+        for (int ch = 0; ch < c; ++ch) {
+            input[size_t(token) * size_t(c) + size_t(ch)] = float(token * 10 + ch);
+        }
+    }
+
+    ggml_context * ctx = make_ctx(16, input.size() * sizeof(float) * 3 + 256 * 1024);
+    ggml_tensor * src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c, l, n);
+    ggml_tensor * reordered = sd_patch_major_reorder_node(ctx, src, h, w, 4, false);
+    ggml_tensor * restored = sd_patch_major_reorder_node(ctx, reordered, h, w, 4, true);
+    GGML_ASSERT(src != nullptr && reordered != nullptr && restored != nullptr);
+
+    ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);
+    GGML_ASSERT(cpu != nullptr);
+    ggml_backend_cpu_set_n_threads(cpu, 4);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(cpu));
+    GGML_ASSERT(buffer != nullptr);
+
+    ggml_backend_tensor_set(src, input.data(), 0, input.size() * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, restored);
+    GGML_ASSERT(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(cpu);
+
+    const std::vector<float> actual = read_f32_tensor(restored);
+    GGML_ASSERT(actual == input);
+
+    ggml_backend_buffer_free(buffer);
+    ggml_backend_free(cpu);
+    ggml_free(ctx);
+
+    std::printf("[PASS] patch-major tensor reorder roundtrip\n");
+}
+
+static void test_patch_score_mask_promotes_to_dsp_index() {
+    constexpr int n_q16 = 4;
+    constexpr int n_k16 = 5;
+    constexpr int n_heads = 1;
+    constexpr int n_kv_heads = 1;
+    constexpr int max_kept32 = 3;
+
+    std::vector<int32_t> mask16(size_t(n_q16) * size_t(n_k16), 1);
+    mask16[0 * n_k16 + 0] = 0;
+    mask16[1 * n_k16 + 1] = 0;
+    mask16[2 * n_k16 + 2] = 0;
+    mask16[3 * n_k16 + 4] = 0;
+
+    std::vector<int32_t> index32(size_t(2) * size_t(max_kept32), -1);
+    ggml_ext_block_sparse_promote_16_mask_to_32_index(mask16.data(),
+                                                      index32.data(),
+                                                      n_q16,
+                                                      n_k16,
+                                                      max_kept32,
+                                                      n_heads,
+                                                      n_kv_heads);
+
+    const std::vector<int32_t> expected = {
+        0, 1, -1,
+        1, 2, -1,
+    };
+    GGML_ASSERT(index32 == expected);
+
+    std::printf("[PASS] patch score mask promotes to dsp index\n");
+}
+
+static void test_patch_score_node_promotes_to_dsp_index() {
+    constexpr int n_q16 = 4;
+    constexpr int n_k16 = 5;
+    constexpr int n_heads = 1;
+    constexpr int n_kv_heads = 1;
+    constexpr int max_kept32 = 3;
+
+    setenv("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", "0.01", 1);
+
+    std::vector<ggml_fp16_t> score(size_t(n_q16) * size_t(n_k16), ggml_fp32_to_fp16(-10.0f));
+    score[0 * n_k16 + 0] = ggml_fp32_to_fp16(10.0f);
+    score[1 * n_k16 + 1] = ggml_fp32_to_fp16(10.0f);
+    score[2 * n_k16 + 2] = ggml_fp32_to_fp16(10.0f);
+    score[3 * n_k16 + 4] = ggml_fp32_to_fp16(10.0f);
+
+    ggml_context * ctx = make_ctx(8, score.size() * sizeof(ggml_fp16_t) + 256 * 1024);
+    ggml_tensor * score_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_k16, n_q16);
+    ggml_tensor * index_t = ggml_ext_block_sparse_index_32_from_16_score_node(ctx,
+                                                                              score_t,
+                                                                              2,
+                                                                              false,
+                                                                              0,
+                                                                              0,
+                                                                              n_heads,
+                                                                              n_kv_heads);
+    GGML_ASSERT(score_t != nullptr && index_t != nullptr);
+    GGML_ASSERT(index_t->ne[0] == max_kept32);
+    GGML_ASSERT(index_t->ne[1] == 2);
+
+    ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);
+    GGML_ASSERT(cpu != nullptr);
+    ggml_backend_cpu_set_n_threads(cpu, 4);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(cpu));
+    GGML_ASSERT(buffer != nullptr);
+
+    ggml_backend_tensor_set(score_t, score.data(), 0, score.size() * sizeof(ggml_fp16_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, index_t);
+    GGML_ASSERT(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(cpu);
+
+    const std::vector<int32_t> index32 = read_i32_tensor(index_t);
+    const std::vector<int32_t> expected = {
+        0, 1, -1,
+        1, 2, -1,
+    };
+    GGML_ASSERT(index32 == expected);
+
+    ggml_backend_buffer_free(buffer);
+    ggml_backend_free(cpu);
+    ggml_free(ctx);
+
+    std::printf("[PASS] patch score node promotes to dsp index\n");
 }
 
 static std::vector<int32_t> run_mask_node_cpu(int n_q_blocks,
@@ -725,6 +886,10 @@ static void test_score_shape(int qo_len, int kv_len, int n_heads, int n_kv_heads
 }
 
 int main() {
+    test_patch_major_mapping_roundtrip();
+    test_patch_major_reorder_tensor_roundtrip();
+    test_patch_score_mask_promotes_to_dsp_index();
+    test_patch_score_node_promotes_to_dsp_index();
     test_score_to_mask_reference(24, 24, 0.95f, 0);
     test_score_to_mask_reference(192, 192, 0.95f, 0);
     test_score_to_mask_reference(312, 312, 0.95f, 154);
