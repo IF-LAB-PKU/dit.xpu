@@ -93,6 +93,14 @@ __STATIC_INLINE__ int sd_env_ratio_to_keep_count(const char* name, int total, fl
 constexpr int SD_HTP_BLOCK_SPARSE_MASK_BLOCK = 32;
 constexpr int SD_HTP_BLOCK_SPARSE_PATCH_BLOCK = 16;
 constexpr int SD_HTP_BLOCK_SPARSE_PATCH_SIZE = 4;
+constexpr int SD_HTP_BLOCK_SPARSE_STEP_SHIFT_PERIOD = 2;
+
+__STATIC_INLINE__ int sd_htp_block_sparse_step_shift(bool enabled, int sparse_step_index) {
+    if (!enabled || sparse_step_index <= 0) {
+        return 0;
+    }
+    return sparse_step_index % SD_HTP_BLOCK_SPARSE_STEP_SHIFT_PERIOD == 0 ? -2 : 0;
+}
 
 __STATIC_INLINE__ int sd_patch_major_token_count(int token_h, int token_w) {
     return std::max(0, token_h) * std::max(0, token_w);
@@ -155,11 +163,57 @@ __STATIC_INLINE__ int sd_row_major_index_from_patch_major(int patch_major,
     return -1;
 }
 
+__STATIC_INLINE__ int sd_positive_mod(int v, int m) {
+    GGML_ASSERT(m > 0);
+    const int r = v % m;
+    return r < 0 ? r + m : r;
+}
+
+__STATIC_INLINE__ int sd_patch_major_shifted_index_from_row_major(int row_major,
+                                                                  int token_h,
+                                                                  int token_w,
+                                                                  int patch,
+                                                                  int shift_y,
+                                                                  int shift_x) {
+    GGML_ASSERT(row_major >= 0);
+    GGML_ASSERT(token_h > 0 && token_w > 0 && patch > 0);
+    GGML_ASSERT(row_major < token_h * token_w);
+    const int y = row_major / token_w;
+    const int x = row_major % token_w;
+    const int shifted_y = sd_positive_mod(y + shift_y, token_h);
+    const int shifted_x = sd_positive_mod(x + shift_x, token_w);
+    const int shifted_row = shifted_y * token_w + shifted_x;
+    return sd_patch_major_index_from_row_major(shifted_row, token_h, token_w, patch);
+}
+
+__STATIC_INLINE__ int sd_row_major_index_from_patch_major_shifted(int patch_major,
+                                                                  int token_h,
+                                                                  int token_w,
+                                                                  int patch,
+                                                                  int shift_y,
+                                                                  int shift_x) {
+    GGML_ASSERT(patch_major >= 0);
+    GGML_ASSERT(token_h > 0 && token_w > 0 && patch > 0);
+    GGML_ASSERT(patch_major < token_h * token_w);
+    const int shifted_row = sd_row_major_index_from_patch_major(patch_major, token_h, token_w, patch);
+    GGML_ASSERT(shifted_row >= 0);
+    const int shifted_y = shifted_row / token_w;
+    const int shifted_x = shifted_row % token_w;
+    const int y = sd_positive_mod(shifted_y - shift_y, token_h);
+    const int x = sd_positive_mod(shifted_x - shift_x, token_w);
+    return y * token_w + x;
+}
+
 struct sd_patch_major_reorder_params {
     int token_h;
     int token_w;
     int patch;
     int inverse;
+    int shift_y;
+    int shift_x;
+    int src_shift_y;
+    int src_shift_x;
+    int src_patch_major;
 };
 
 __STATIC_INLINE__ void sd_patch_major_reorder_custom(ggml_tensor* dst,
@@ -181,9 +235,35 @@ __STATIC_INLINE__ void sd_patch_major_reorder_custom(ggml_tensor* dst,
 
     for (int64_t n = ith; n < src->ne[2]; n += nth) {
         for (int64_t dst_l = 0; dst_l < src->ne[1]; ++dst_l) {
-            const int src_l = params->inverse != 0 ?
-                sd_patch_major_index_from_row_major(static_cast<int>(dst_l), params->token_h, params->token_w, params->patch) :
-                sd_row_major_index_from_patch_major(static_cast<int>(dst_l), params->token_h, params->token_w, params->patch);
+            int src_l = -1;
+            if (params->inverse != 0) {
+                src_l = sd_patch_major_shifted_index_from_row_major(static_cast<int>(dst_l),
+                                                                    params->token_h,
+                                                                    params->token_w,
+                                                                    params->patch,
+                                                                    params->shift_y,
+                                                                    params->shift_x);
+            } else if (params->src_patch_major != 0) {
+                const int row = sd_row_major_index_from_patch_major_shifted(static_cast<int>(dst_l),
+                                                                            params->token_h,
+                                                                            params->token_w,
+                                                                            params->patch,
+                                                                            params->shift_y,
+                                                                            params->shift_x);
+                src_l = sd_patch_major_shifted_index_from_row_major(row,
+                                                                    params->token_h,
+                                                                    params->token_w,
+                                                                    params->patch,
+                                                                    params->src_shift_y,
+                                                                    params->src_shift_x);
+            } else {
+                src_l = sd_row_major_index_from_patch_major_shifted(static_cast<int>(dst_l),
+                                                                    params->token_h,
+                                                                    params->token_w,
+                                                                    params->patch,
+                                                                    params->shift_y,
+                                                                    params->shift_x);
+            }
             GGML_ASSERT(src_l >= 0);
             const char* src_row = static_cast<const char*>(src->data) + n * src->nb[2] + int64_t(src_l) * src->nb[1];
             char* dst_row = static_cast<char*>(dst->data) + n * dst->nb[2] + dst_l * dst->nb[1];
@@ -197,7 +277,12 @@ __STATIC_INLINE__ ggml_tensor* sd_patch_major_reorder_node(ggml_context* ctx,
                                                            int token_h,
                                                            int token_w,
                                                            int patch,
-                                                           bool inverse) {
+                                                           bool inverse,
+                                                           int shift_y = 0,
+                                                           int shift_x = 0,
+                                                           int src_shift_y = 0,
+                                                           int src_shift_x = 0,
+                                                           bool src_patch_major = false) {
     GGML_ASSERT(ctx != nullptr && x != nullptr);
     GGML_ASSERT(token_h > 0 && token_w > 0 && patch > 0);
     GGML_ASSERT(x->ne[1] == int64_t(token_h) * int64_t(token_w));
@@ -208,6 +293,11 @@ __STATIC_INLINE__ ggml_tensor* sd_patch_major_reorder_node(ggml_context* ctx,
     params->token_w = token_w;
     params->patch = patch;
     params->inverse = inverse ? 1 : 0;
+    params->shift_y = shift_y;
+    params->shift_x = shift_x;
+    params->src_shift_y = src_shift_y;
+    params->src_shift_x = src_shift_x;
+    params->src_patch_major = src_patch_major ? 1 : 0;
     ggml_tensor* result = ggml_custom_4d(ctx,
                                          x->type,
                                          x->ne[0],

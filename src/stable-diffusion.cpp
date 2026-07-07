@@ -2100,15 +2100,20 @@ public:
                 htp_block_sparse_original &&
                 !htp_block_sparse_in_warmup &&
                 !htp_block_sparse_in_dense_tail;
+            const size_t htp_block_sparse_step_index =
+                htp_block_sparse_step_enabled && denoise_step_index > htp_block_sparse_warmup_steps
+                    ? denoise_step_index - htp_block_sparse_warmup_steps
+                    : 0;
             if (htp_block_sparse_original &&
                 (htp_block_sparse_warmup_steps > 0 || htp_block_sparse_dense_tail_steps > 0)) {
                 work_diffusion_model->set_block_sparse_attention_enabled(htp_block_sparse_step_enabled);
-                LOG_DEBUG("HTP block sparse step=%zu/%zu warmup_dense=%d tail_dense=%d sparse=%d",
+                LOG_DEBUG("HTP block sparse step=%zu/%zu warmup_dense=%d tail_dense=%d sparse=%d sparse_step=%zu",
                           denoise_step_index,
                           steps,
                           htp_block_sparse_in_warmup ? 1 : 0,
                           htp_block_sparse_in_dense_tail ? 1 : 0,
-                          htp_block_sparse_step_enabled ? 1 : 0);
+                          htp_block_sparse_step_enabled ? 1 : 0,
+                          htp_block_sparse_step_index);
             }
 
             std::vector<float> scaling = denoiser->get_scalings(sigma);
@@ -2164,6 +2169,8 @@ public:
             DiffusionParams diffusion_params;
             diffusion_params.x                  = &noised_input;
             diffusion_params.timesteps          = &timesteps_tensor;
+            diffusion_params.denoise_step       = step;
+            diffusion_params.block_sparse_step_index = static_cast<int>(htp_block_sparse_step_index);
             diffusion_params.audio_timesteps    = audio_timesteps_tensor.empty() ? nullptr : &audio_timesteps_tensor;
             diffusion_params.guidance           = &guidance_tensor;
             diffusion_params.ref_latents        = &ref_latents;
