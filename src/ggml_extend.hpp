@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -357,6 +358,66 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_promote_16_mask_to_32_index(const i
             }
             GGML_ASSERT(kept < max_kept32);
             row[kept++] = kb32;
+        }
+    }
+}
+
+__STATIC_INLINE__ void ggml_ext_block_sparse_force_patch_halo_mask(int32_t* mask,
+                                                                   int n_q_blocks,
+                                                                   int n_k_blocks,
+                                                                   int image_q_blocks,
+                                                                   int image_k_blocks,
+                                                                   int n_heads,
+                                                                   int n_kv_heads) {
+    GGML_ASSERT(mask != nullptr);
+    GGML_ASSERT(n_q_blocks > 0 && n_k_blocks > 0);
+    n_heads = std::max(1, n_heads);
+    n_kv_heads = std::max(1, n_kv_heads);
+    GGML_ASSERT(n_heads % n_kv_heads == 0);
+    GGML_ASSERT(n_q_blocks % n_heads == 0);
+    GGML_ASSERT(n_k_blocks % n_kv_heads == 0);
+    const int gqa = std::max(1, n_heads / n_kv_heads);
+    const int q_blocks_per_head = n_q_blocks / n_heads;
+    const int k_blocks_per_head = n_k_blocks / n_kv_heads;
+    image_q_blocks = std::max(0, std::min(image_q_blocks, q_blocks_per_head));
+    image_k_blocks = std::max(0, std::min(image_k_blocks, k_blocks_per_head));
+    const int q_grid_w = static_cast<int>(std::sqrt(static_cast<double>(image_q_blocks)));
+    const int k_grid_w = static_cast<int>(std::sqrt(static_cast<double>(image_k_blocks)));
+    if (q_grid_w <= 0 || k_grid_w <= 0 ||
+        q_grid_w * q_grid_w != image_q_blocks ||
+        k_grid_w * k_grid_w != image_k_blocks ||
+        q_grid_w != k_grid_w) {
+        return;
+    }
+
+    const int grid_w = q_grid_w;
+    const int grid_h = image_q_blocks / grid_w;
+    for (int qb = 0; qb < n_q_blocks; ++qb) {
+        const int q_head = qb / q_blocks_per_head;
+        const int q_block_in_head = qb % q_blocks_per_head;
+        if (q_block_in_head >= image_q_blocks) {
+            continue;
+        }
+        const int kv_head = std::min(n_kv_heads - 1, q_head / gqa);
+        const int qy = q_block_in_head / grid_w;
+        const int qx = q_block_in_head % grid_w;
+        for (int dy = -1; dy <= 1; ++dy) {
+            const int ky = qy + dy;
+            if (ky < 0 || ky >= grid_h) {
+                continue;
+            }
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int kx = qx + dx;
+                if (kx < 0 || kx >= grid_w) {
+                    continue;
+                }
+                const int k_block_in_head = ky * grid_w + kx;
+                if (k_block_in_head >= image_k_blocks) {
+                    continue;
+                }
+                const int kb = kv_head * k_blocks_per_head + k_block_in_head;
+                mask[size_t(qb) * size_t(n_k_blocks) + size_t(kb)] = 0;
+            }
         }
     }
 }
@@ -3169,6 +3230,24 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_index_32_from_16_score_custom(ggml_
                                              params->protected_len,
                                              params->n_heads,
                                              params->n_kv_heads);
+    const bool patch_halo_enabled = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_PATCH_HALO");
+    if (patch_halo_enabled) {
+        const int q16_per_head = n_q16_blocks / std::max(1, params->n_heads);
+        const int k16_per_head = n_k16_blocks / std::max(1, params->n_kv_heads);
+        const int image_q16_blocks = params->protected_len > 0 ?
+            std::min(q16_per_head, (params->protected_start + SD_HTP_BLOCK_SPARSE_PATCH_BLOCK - 1) / SD_HTP_BLOCK_SPARSE_PATCH_BLOCK) :
+            q16_per_head;
+        const int image_k16_blocks = params->protected_len > 0 ?
+            std::min(k16_per_head, (params->protected_start + SD_HTP_BLOCK_SPARSE_PATCH_BLOCK - 1) / SD_HTP_BLOCK_SPARSE_PATCH_BLOCK) :
+            k16_per_head;
+        ggml_ext_block_sparse_force_patch_halo_mask(mask16.data(),
+                                                    n_q16_blocks,
+                                                    n_k16_blocks,
+                                                    image_q16_blocks,
+                                                    image_k16_blocks,
+                                                    params->n_heads,
+                                                    params->n_kv_heads);
+    }
 
     ggml_ext_block_sparse_promote_16_mask_to_32_index(mask16.data(),
                                                       static_cast<int32_t*>(dst->data),
@@ -3180,7 +3259,7 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_index_32_from_16_score_custom(ggml_
 
     if (trace_index) {
         std::fprintf(stderr,
-                     "block_sparse_index_step index_32_from_16_score=%lldms n_q16_blocks=%d n_k16_blocks=%d n_q32_blocks=%lld n_k32_blocks=%lld max_kept=%lld protected_start_tokens=%d protected_tokens=%d n_heads=%d n_kv_heads=%d top_k=%d keep_ratio=%.3f\n",
+                     "block_sparse_index_step index_32_from_16_score=%lldms n_q16_blocks=%d n_k16_blocks=%d n_q32_blocks=%lld n_k32_blocks=%lld max_kept=%lld protected_start_tokens=%d protected_tokens=%d n_heads=%d n_kv_heads=%d top_k=%d keep_ratio=%.3f patch_halo=%d\n",
                      static_cast<long long>(ggml_time_ms() - trace_begin),
                      n_q16_blocks,
                      n_k16_blocks,
@@ -3192,7 +3271,8 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_index_32_from_16_score_custom(ggml_
                      params->n_heads,
                      params->n_kv_heads,
                      params->top_k,
-                     sd_env_float_value("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", 0.8f));
+                     sd_env_float_value("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", 0.8f),
+                     patch_halo_enabled ? 1 : 0);
         ggml_ext_block_sparse_trace_index_rows(static_cast<const int32_t*>(dst->data),
                                                static_cast<int>(dst->ne[0]),
                                                static_cast<int>(dst->ne[1]),
