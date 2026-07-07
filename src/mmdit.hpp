@@ -765,8 +765,7 @@ public:
         // x: [N, H*W, hidden_size]
         // context: [N, n_context, d_context]
         // c: [N, hidden_size]
-        // return: [N, N*W, patch_size * patch_size * out_channels]
-        auto final_layer = std::dynamic_pointer_cast<FinalLayer>(blocks["final_layer"]);
+        // return: [N, H*W, hidden_size]
 
         for (int i = 0; i < depth; i++) {
             // skip iteration if i is in skip_layers
@@ -782,8 +781,6 @@ public:
             sd::ggml_graph_cut::mark_graph_cut(context, "mmdit.joint_blocks." + std::to_string(i), "context");
             sd::ggml_graph_cut::mark_graph_cut(x, "mmdit.joint_blocks." + std::to_string(i), "x");
         }
-
-        x = final_layer->forward(ctx, x, c_mod);  // (N, T, patch_size ** 2 * out_channels)
 
         return x;
     }
@@ -809,6 +806,14 @@ public:
         auto patch_embed = x_embedder->forward(ctx, x);                      // [N, H*W, hidden_size]
         auto pos_embed   = cropped_pos_embed(ctx->ggml_ctx, H, W);           // [1, H*W, hidden_size]
         x                = ggml_add(ctx->ggml_ctx, patch_embed, pos_embed);  // [N, H*W, hidden_size]
+        const int64_t token_h = (H + patch_size - 1) / patch_size;
+        const int64_t token_w = (W + patch_size - 1) / patch_size;
+        x = sd_patch_major_reorder_node(ctx->ggml_ctx,
+                                        x,
+                                        static_cast<int>(token_h),
+                                        static_cast<int>(token_w),
+                                        SD_HTP_BLOCK_SPARSE_PATCH_SIZE,
+                                        false);
 
         auto c = t_embedder->forward(ctx, t);  // [N, hidden_size]
         if (y != nullptr && adm_in_channels != -1) {
@@ -830,6 +835,15 @@ public:
         }
 
         x = forward_core_with_concat(ctx, x, c, context, skip_layers);  // (N, H*W, patch_size ** 2 * out_channels)
+        x = sd_patch_major_reorder_node(ctx->ggml_ctx,
+                                        x,
+                                        static_cast<int>(token_h),
+                                        static_cast<int>(token_w),
+                                        SD_HTP_BLOCK_SPARSE_PATCH_SIZE,
+                                        true);
+
+        auto final_layer = std::dynamic_pointer_cast<FinalLayer>(blocks["final_layer"]);
+        x = final_layer->forward(ctx, x, c);  // (N, T, patch_size ** 2 * out_channels)
 
         x = DiT::unpatchify_and_crop(ctx->ggml_ctx, x, H, W, patch_size, patch_size, /*patch_last*/ false);  // [N, C, H, W]
 
