@@ -1951,8 +1951,6 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
     ggml_tensor* q_htp_flash = nullptr;
     ggml_tensor* k_htp_flash_base = nullptr;
     ggml_tensor* v_htp_flash_base = nullptr;
-    const bool block_sparse_exact_rho_available = false;
-    (void) block_sparse_cached_rho;
     if (!skip_reshape) {
         L_q       = q->ne[1];
         L_k       = k->ne[1];
@@ -2204,17 +2202,21 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             if ((candidate_is_htp_layout && keep_for_htp_hybrid) || backend == nullptr || ggml_backend_supports_op(backend, candidate)) {
                 ggml_tensor* sparse_out = ggml_view_3d(ctx, candidate, d_head, n_head, L_q, candidate->nb[1], candidate->nb[2], 0);
                 ggml_tensor* sparse_reshape_out = sparse_out;
-                if (block_sparse_residual_exact_rho &&
-                    !block_sparse_exact_rho_available &&
-                    block_sparse_residual_mode != SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF &&
-                    sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
-                    std::fprintf(stderr,
-                                 "block_sparse_residual exact_rho=1 unavailable=1 fallback_rho=%.4f cache=%s rho_cache=%s\n",
-                                 block_sparse_residual_rho,
-                                 block_sparse_residual_cache_name != nullptr ? block_sparse_residual_cache_name : "<unnamed>",
-                                 block_sparse_residual_rho_cache_name != nullptr ? block_sparse_residual_rho_cache_name : "<unnamed>");
-                }
-                if (block_sparse_residual_rho != 1.0f) {
+                const bool can_cache_exact_rho =
+                    block_sparse_residual_exact_rho &&
+                    block_sparse_residual_rho_cache_name != nullptr &&
+                    block_sparse_cache_tensor != nullptr &&
+                    *block_sparse_cache_tensor;
+                const bool cached_exact_rho_valid =
+                    block_sparse_residual_exact_rho &&
+                    block_sparse_cached_rho != nullptr &&
+                    block_sparse_cached_rho->ne[0] == 1 &&
+                    block_sparse_cached_rho->ne[1] == sparse_out->ne[1] &&
+                    block_sparse_cached_rho->ne[2] == sparse_out->ne[2] &&
+                    block_sparse_cached_rho->ne[3] == 1;
+                if (cached_exact_rho_valid) {
+                    sparse_reshape_out = ggml_mul(ctx, sparse_reshape_out, block_sparse_cached_rho);
+                } else if (block_sparse_residual_rho != 1.0f) {
                     sparse_reshape_out = ggml_ext_scale(ctx, sparse_reshape_out, block_sparse_residual_rho);
                 }
                 if (block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
@@ -2233,14 +2235,35 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                           dense_candidate->nb[1],
                                                           dense_candidate->nb[2],
                                                           0);
+                    ggml_tensor* rho = nullptr;
+                    if (can_cache_exact_rho) {
+                        ggml_tensor* dense_lse = ggml_ext_attention_lse_node(ctx,
+                                                                             q,
+                                                                             k,
+                                                                             nullptr,
+                                                                             n_head,
+                                                                             scale / kv_scale);
+                        ggml_tensor* sparse_lse = ggml_ext_attention_lse_node(ctx,
+                                                                              q,
+                                                                              k,
+                                                                              block_mask,
+                                                                              n_head,
+                                                                              scale / kv_scale);
+                        rho = ggml_exp(ctx, ggml_sub(ctx, sparse_lse, dense_lse));
+                        ggml_set_name(rho, block_sparse_residual_rho_cache_name);
+                        (*block_sparse_cache_tensor)(block_sparse_residual_rho_cache_name, rho);
+                        sparse_reshape_out = ggml_mul(ctx, sparse_out, rho);
+                    }
                     ggml_tensor* residual = ggml_sub(ctx, dense_out, sparse_reshape_out);
                     ggml_set_name(residual, block_sparse_residual_cache_name);
                     (*block_sparse_cache_tensor)(block_sparse_residual_cache_name, residual);
                     if (sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
                         std::fprintf(stderr,
-                                     "block_sparse_residual anchor=1 rho=%.4f cache=%s shape=[%lld,%lld,%lld,%lld]\n",
+                                     "block_sparse_residual anchor=1 exact_rho=%d rho=%.4f cache=%s rho_cache=%s shape=[%lld,%lld,%lld,%lld]\n",
+                                     rho != nullptr ? 1 : 0,
                                      block_sparse_residual_rho,
                                      block_sparse_residual_cache_name,
+                                     block_sparse_residual_rho_cache_name != nullptr ? block_sparse_residual_rho_cache_name : "<unnamed>",
                                      (long long) residual->ne[0],
                                      (long long) residual->ne[1],
                                      (long long) residual->ne[2],
@@ -2260,10 +2283,12 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                     kqv = ggml_add(ctx, sparse_reshape_out, residual);
                     if (sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
                         std::fprintf(stderr,
-                                     "block_sparse_residual apply=1 cache_hit=1 scale=%.4f rho=%.4f cache=%s shape=[%lld,%lld,%lld,%lld]\n",
+                                     "block_sparse_residual apply=1 cache_hit=1 rho_cache_hit=%d scale=%.4f rho=%.4f cache=%s rho_cache=%s shape=[%lld,%lld,%lld,%lld]\n",
+                                     cached_exact_rho_valid ? 1 : 0,
                                      block_sparse_residual_scale,
                                      block_sparse_residual_rho,
                                      block_sparse_residual_cache_name != nullptr ? block_sparse_residual_cache_name : "<unnamed>",
+                                     block_sparse_residual_rho_cache_name != nullptr ? block_sparse_residual_rho_cache_name : "<unnamed>",
                                      (long long) sparse_out->ne[0],
                                      (long long) sparse_out->ne[1],
                                      (long long) sparse_out->ne[2],
@@ -2454,6 +2479,8 @@ __STATIC_INLINE__ float ggml_ext_tensor_get_scalar_f32(const ggml_tensor* tensor
 
 struct ggml_ext_attention_lse_params {
     int n_heads;
+    int block_q;
+    int block_k;
     float scale;
 };
 
@@ -2464,7 +2491,7 @@ __STATIC_INLINE__ void ggml_ext_attention_lse_custom(ggml_tensor* dst, int ith, 
     const ggml_tensor* mask = dst->src[2];
     GGML_ASSERT(params != nullptr && q != nullptr && k != nullptr);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(mask == nullptr || mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(mask == nullptr || mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32);
 
     const int head_dim = static_cast<int>(q->ne[0]);
     const int qo_len = static_cast<int>(q->ne[1]);
@@ -2472,14 +2499,42 @@ __STATIC_INLINE__ void ggml_ext_attention_lse_custom(ggml_tensor* dst, int ith, 
     const int kv_len = static_cast<int>(k->ne[1]);
     const int n_kv_heads = static_cast<int>(k->ne[2]);
     const int gqa = std::max(1, n_heads / std::max(1, n_kv_heads));
+    const int q_blocks_per_head = (qo_len + params->block_q - 1) / params->block_q;
+    const int k_blocks_per_head = (kv_len + params->block_k - 1) / params->block_k;
+    const int n_q_blocks = n_heads * q_blocks_per_head;
+    const int n_k_blocks = n_kv_heads * k_blocks_per_head;
 
     GGML_ASSERT(q->ne[2] == n_heads);
     GGML_ASSERT(k->ne[0] == head_dim);
     GGML_ASSERT(dst->ne[0] == 1 && dst->ne[1] == n_heads && dst->ne[2] == qo_len);
     if (mask != nullptr) {
-        GGML_ASSERT(mask->ne[0] == kv_len && mask->ne[1] == qo_len);
-        GGML_ASSERT(mask->ne[2] == 1 || mask->ne[2] == n_heads);
+        if (mask->type == GGML_TYPE_I32) {
+            GGML_ASSERT(mask->ne[1] == n_q_blocks);
+            GGML_ASSERT(mask->ne[0] == n_k_blocks || mask->ne[0] > 0);
+        } else {
+            GGML_ASSERT(mask->ne[0] == kv_len && mask->ne[1] == qo_len);
+            GGML_ASSERT(mask->ne[2] == 1 || mask->ne[2] == n_heads);
+        }
     }
+
+    auto block_sparse_keeps = [&](int qt, int h, int kt, int kv_head) -> bool {
+        GGML_ASSERT(mask != nullptr && mask->type == GGML_TYPE_I32);
+        const int qb = h * q_blocks_per_head + qt / params->block_q;
+        const int kb = kv_head * k_blocks_per_head + kt / params->block_k;
+        if (mask->ne[0] == n_k_blocks) {
+            return static_cast<int32_t>(ggml_ext_tensor_get_scalar_f32(mask, kb, qb)) == 0;
+        }
+        for (int i = 0; i < mask->ne[0]; ++i) {
+            const int kept = static_cast<int32_t>(ggml_ext_tensor_get_scalar_f32(mask, i, qb));
+            if (kept == kb) {
+                return true;
+            }
+            if (kept < 0) {
+                return false;
+            }
+        }
+        return false;
+    };
 
     auto* out = reinterpret_cast<float*>(dst->data);
     for (int row = ith; row < qo_len * n_heads; row += nth) {
@@ -2497,7 +2552,13 @@ __STATIC_INLINE__ void ggml_ext_attention_lse_custom(ggml_tensor* dst, int ith, 
             }
             score *= params->scale;
             if (mask != nullptr) {
-                score += ggml_ext_tensor_get_scalar_f32(mask, kt, qt, mask_head);
+                if (mask->type == GGML_TYPE_I32) {
+                    if (!block_sparse_keeps(qt, h, kt, kv_head)) {
+                        score = -std::numeric_limits<float>::infinity();
+                    }
+                } else {
+                    score += ggml_ext_tensor_get_scalar_f32(mask, kt, qt, mask_head);
+                }
             }
             max_score = std::max(max_score, score);
         }
@@ -2512,7 +2573,13 @@ __STATIC_INLINE__ void ggml_ext_attention_lse_custom(ggml_tensor* dst, int ith, 
                 }
                 score *= params->scale;
                 if (mask != nullptr) {
-                    score += ggml_ext_tensor_get_scalar_f32(mask, kt, qt, mask_head);
+                    if (mask->type == GGML_TYPE_I32) {
+                        if (!block_sparse_keeps(qt, h, kt, kv_head)) {
+                            score = -std::numeric_limits<float>::infinity();
+                        }
+                    } else {
+                        score += ggml_ext_tensor_get_scalar_f32(mask, kt, qt, mask_head);
+                    }
                 }
                 exp_sum += std::exp(double(score - max_score));
             }
@@ -2535,13 +2602,15 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_lse_node(ggml_context* ctx,
     GGML_ASSERT(q->ne[2] == n_heads);
     GGML_ASSERT(k->ne[0] == q->ne[0]);
     if (mask != nullptr) {
-        GGML_ASSERT(mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32);
     }
 
     ggml_tensor* args[] = {q, k, mask};
     auto* params = static_cast<ggml_ext_attention_lse_params*>(
         ggml_new_buffer(ctx, sizeof(ggml_ext_attention_lse_params)));
     params->n_heads = n_heads;
+    params->block_q = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    params->block_k = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
     params->scale = scale;
     return ggml_custom_4d(ctx,
                           GGML_TYPE_F32,
