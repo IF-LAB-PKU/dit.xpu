@@ -251,6 +251,7 @@ __STATIC_INLINE__ ggml_tensor* mmdit_residual_attention(GGMLRunnerContext* ctx,
                                   protected_len,
                                   ctx->block_sparse_residual_mode,
                                   ctx->block_sparse_residual_scale,
+                                  ctx->block_sparse_residual_rho,
                                   residual_cache_name.empty() ? nullptr : residual_cache_name.c_str(),
                                   cached_residual,
                                   &ctx->cache_tensor);
@@ -935,6 +936,7 @@ struct MMDiTRunner : public GGMLRunner {
                              int block_sparse_step_index             = 0,
                              int block_sparse_residual_mode          = SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
                              float block_sparse_residual_scale       = 1.0f,
+                             float block_sparse_residual_rho         = 1.0f,
                              int block_sparse_residual_branch_index  = 0) {
         ggml_cgraph* gf = new_graph_custom(MMDIT_GRAPH_SIZE);
 
@@ -946,6 +948,7 @@ struct MMDiTRunner : public GGMLRunner {
         auto runner_ctx = get_context();
         runner_ctx.block_sparse_residual_mode            = block_sparse_residual_mode;
         runner_ctx.block_sparse_residual_scale           = block_sparse_residual_scale;
+        runner_ctx.block_sparse_residual_rho             = block_sparse_residual_rho;
         runner_ctx.block_sparse_residual_branch_index    = block_sparse_residual_branch_index;
         runner_ctx.block_sparse_residual_attention_index = 0;
         ggml_tensor* out = mmdit.forward(&runner_ctx,
@@ -970,6 +973,7 @@ struct MMDiTRunner : public GGMLRunner {
                               int block_sparse_step_index      = 0,
                               int block_sparse_residual_mode   = SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
                               float block_sparse_residual_scale = 1.0f,
+                              float block_sparse_residual_rho = 1.0f,
                               int block_sparse_residual_branch_index = 0) {
         // x: [N, in_channels, h, w]
         // timesteps: [N, ]
@@ -984,6 +988,7 @@ struct MMDiTRunner : public GGMLRunner {
                                block_sparse_step_index,
                                block_sparse_residual_mode,
                                block_sparse_residual_scale,
+                               block_sparse_residual_rho,
                                block_sparse_residual_branch_index);
         };
 

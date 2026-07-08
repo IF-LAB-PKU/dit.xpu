@@ -166,6 +166,10 @@ __STATIC_INLINE__ bool sd_htp_block_sparse_warmup_residual_anchor_step(int step_
     return sd_htp_block_sparse_residual_anchor_has_sparse_consumer(step_index, total_steps, dense_tail_steps);
 }
 
+__STATIC_INLINE__ float sd_htp_block_sparse_residual_rho_value(float rho) {
+    return std::clamp(rho, 0.0f, 1.0f);
+}
+
 __STATIC_INLINE__ std::string sd_htp_block_sparse_residual_cache_key(int branch_index,
                                                                      const char* attention_kind,
                                                                      int attention_slot) {
@@ -1912,6 +1916,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                       int protected_len = 0,
                                                       int block_sparse_residual_mode = SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
                                                       float block_sparse_residual_scale = 1.0f,
+                                                      float block_sparse_residual_rho = 1.0f,
                                                       const char* block_sparse_residual_cache_name = nullptr,
                                                       ggml_tensor* block_sparse_cached_residual = nullptr,
                                                       const std::function<void(const std::string&, ggml_tensor*)>* block_sparse_cache_tensor = nullptr) {  // avoid overflow
@@ -2174,6 +2179,10 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             candidate->op_params[5] = block_k;
             if ((candidate_is_htp_layout && keep_for_htp_hybrid) || backend == nullptr || ggml_backend_supports_op(backend, candidate)) {
                 ggml_tensor* sparse_out = ggml_view_3d(ctx, candidate, d_head, n_head, L_q, candidate->nb[1], candidate->nb[2], 0);
+                ggml_tensor* sparse_reshape_out = sparse_out;
+                if (block_sparse_residual_rho != 1.0f) {
+                    sparse_reshape_out = ggml_ext_scale(ctx, sparse_reshape_out, block_sparse_residual_rho);
+                }
                 if (block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
                     block_sparse_residual_cache_name != nullptr &&
                     block_sparse_cache_tensor != nullptr &&
@@ -2190,12 +2199,13 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                           dense_candidate->nb[1],
                                                           dense_candidate->nb[2],
                                                           0);
-                    ggml_tensor* residual = ggml_sub(ctx, dense_out, sparse_out);
+                    ggml_tensor* residual = ggml_sub(ctx, dense_out, sparse_reshape_out);
                     ggml_set_name(residual, block_sparse_residual_cache_name);
                     (*block_sparse_cache_tensor)(block_sparse_residual_cache_name, residual);
                     if (sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
                         std::fprintf(stderr,
-                                     "block_sparse_residual anchor=1 cache=%s shape=[%lld,%lld,%lld,%lld]\n",
+                                     "block_sparse_residual anchor=1 rho=%.4f cache=%s shape=[%lld,%lld,%lld,%lld]\n",
+                                     block_sparse_residual_rho,
                                      block_sparse_residual_cache_name,
                                      (long long) residual->ne[0],
                                      (long long) residual->ne[1],
@@ -2213,11 +2223,12 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                     if (block_sparse_residual_scale != 1.0f) {
                         residual = ggml_ext_scale(ctx, residual, block_sparse_residual_scale);
                     }
-                    kqv = ggml_add(ctx, sparse_out, residual);
+                    kqv = ggml_add(ctx, sparse_reshape_out, residual);
                     if (sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
                         std::fprintf(stderr,
-                                     "block_sparse_residual apply=1 cache_hit=1 scale=%.4f cache=%s shape=[%lld,%lld,%lld,%lld]\n",
+                                     "block_sparse_residual apply=1 cache_hit=1 scale=%.4f rho=%.4f cache=%s shape=[%lld,%lld,%lld,%lld]\n",
                                      block_sparse_residual_scale,
+                                     block_sparse_residual_rho,
                                      block_sparse_residual_cache_name != nullptr ? block_sparse_residual_cache_name : "<unnamed>",
                                      (long long) sparse_out->ne[0],
                                      (long long) sparse_out->ne[1],
@@ -3796,6 +3807,7 @@ struct GGMLRunnerContext {
     bool circular_y_enabled                                          = false;
     int block_sparse_residual_mode                                   = SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF;
     float block_sparse_residual_scale                                = 1.0f;
+    float block_sparse_residual_rho                                  = 1.0f;
     int block_sparse_residual_branch_index                           = 0;
     int block_sparse_residual_attention_index                        = 0;
     std::shared_ptr<WeightAdapter> weight_adapter                    = nullptr;
@@ -4074,9 +4086,6 @@ protected:
     }
 
     bool alloc_compute_buffer(ggml_cgraph* gf) {
-        if (compute_allocr != nullptr) {
-            return true;
-        }
         ggml_backend_buffer_type_t runtime_buft = ggml_backend_get_default_buffer_type(runtime_backend);
         ggml_backend_buffer_type_t htp_buft     = htp_backend != nullptr ? ggml_backend_get_default_buffer_type(htp_backend) : nullptr;
         compute_node_buffer_ids_.clear();
@@ -4084,11 +4093,15 @@ protected:
 
         if (htp_op_routing_enabled() && htp_buft != nullptr) {
             // 为 CPU 与 HTP RPCMEM 同时创建 allocator，后续按节点/叶子打到不同 buffer。
-            ggml_backend_buffer_type_t bufts[] = {runtime_buft, htp_buft};
-            compute_allocr                    = ggml_gallocr_new_n(bufts, 2);
+            if (compute_allocr == nullptr) {
+                ggml_backend_buffer_type_t bufts[] = {runtime_buft, htp_buft};
+                compute_allocr                    = ggml_gallocr_new_n(bufts, 2);
+            }
             plan_compute_buffer_ids(gf, &compute_node_buffer_ids_, &compute_leaf_buffer_ids_);
         } else {
-            compute_allocr = ggml_gallocr_new(runtime_buft);
+            if (compute_allocr == nullptr) {
+                compute_allocr = ggml_gallocr_new(runtime_buft);
+            }
         }
 
         bool reserve_ok = false;
