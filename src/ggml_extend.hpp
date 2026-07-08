@@ -1908,6 +1908,12 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_index_32_from_16_score_node
 __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_full_keep_mask_node(ggml_context* ctx,
                                                                          int n_q_blocks,
                                                                          int n_k_blocks);
+__STATIC_INLINE__ ggml_tensor* ggml_ext_attention_lse_node(ggml_context* ctx,
+                                                           ggml_tensor* q,
+                                                           ggml_tensor* k,
+                                                           ggml_tensor* mask,
+                                                           int n_heads,
+                                                           float scale);
 
 // q: [N, L_q, C(n_head*d_head)] or [N*n_head, L_q, d_head]
 // k: [N, L_k, n_kv_head*d_head] or [N*n_kv_head, L_k, d_head]
@@ -2444,6 +2450,110 @@ __STATIC_INLINE__ float ggml_ext_tensor_get_scalar_f32(const ggml_tensor* tensor
         return (float)*reinterpret_cast<const int32_t*>(data + offset);
     }
     GGML_ABORT("unsupported tensor type %s for scalar routing read", ggml_type_name(tensor->type));
+}
+
+struct ggml_ext_attention_lse_params {
+    int n_heads;
+    float scale;
+};
+
+__STATIC_INLINE__ void ggml_ext_attention_lse_custom(ggml_tensor* dst, int ith, int nth, void* userdata) {
+    const auto* params = static_cast<const ggml_ext_attention_lse_params*>(userdata);
+    const ggml_tensor* q = dst->src[0];
+    const ggml_tensor* k = dst->src[1];
+    const ggml_tensor* mask = dst->src[2];
+    GGML_ASSERT(params != nullptr && q != nullptr && k != nullptr);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask == nullptr || mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16);
+
+    const int head_dim = static_cast<int>(q->ne[0]);
+    const int qo_len = static_cast<int>(q->ne[1]);
+    const int n_heads = params->n_heads;
+    const int kv_len = static_cast<int>(k->ne[1]);
+    const int n_kv_heads = static_cast<int>(k->ne[2]);
+    const int gqa = std::max(1, n_heads / std::max(1, n_kv_heads));
+
+    GGML_ASSERT(q->ne[2] == n_heads);
+    GGML_ASSERT(k->ne[0] == head_dim);
+    GGML_ASSERT(dst->ne[0] == 1 && dst->ne[1] == n_heads && dst->ne[2] == qo_len);
+    if (mask != nullptr) {
+        GGML_ASSERT(mask->ne[0] == kv_len && mask->ne[1] == qo_len);
+        GGML_ASSERT(mask->ne[2] == 1 || mask->ne[2] == n_heads);
+    }
+
+    auto* out = reinterpret_cast<float*>(dst->data);
+    for (int row = ith; row < qo_len * n_heads; row += nth) {
+        const int qt = row / n_heads;
+        const int h = row % n_heads;
+        const int kv_head = std::min(n_kv_heads - 1, h / gqa);
+        const int mask_head = mask != nullptr && mask->ne[2] == n_heads ? h : 0;
+
+        float max_score = -std::numeric_limits<float>::infinity();
+        for (int kt = 0; kt < kv_len; ++kt) {
+            float score = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                score += ggml_ext_tensor_get_scalar_f32(q, d, qt, h) *
+                         ggml_ext_tensor_get_scalar_f32(k, d, kt, kv_head);
+            }
+            score *= params->scale;
+            if (mask != nullptr) {
+                score += ggml_ext_tensor_get_scalar_f32(mask, kt, qt, mask_head);
+            }
+            max_score = std::max(max_score, score);
+        }
+
+        double exp_sum = 0.0;
+        if (std::isfinite(max_score)) {
+            for (int kt = 0; kt < kv_len; ++kt) {
+                float score = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    score += ggml_ext_tensor_get_scalar_f32(q, d, qt, h) *
+                             ggml_ext_tensor_get_scalar_f32(k, d, kt, kv_head);
+                }
+                score *= params->scale;
+                if (mask != nullptr) {
+                    score += ggml_ext_tensor_get_scalar_f32(mask, kt, qt, mask_head);
+                }
+                exp_sum += std::exp(double(score - max_score));
+            }
+        }
+
+        const float lse = exp_sum > 0.0 ? max_score + float(std::log(exp_sum))
+                                        : -std::numeric_limits<float>::infinity();
+        out[size_t(qt) * size_t(n_heads) + size_t(h)] = lse;
+    }
+}
+
+__STATIC_INLINE__ ggml_tensor* ggml_ext_attention_lse_node(ggml_context* ctx,
+                                                           ggml_tensor* q,
+                                                           ggml_tensor* k,
+                                                           ggml_tensor* mask,
+                                                           int n_heads,
+                                                           float scale) {
+    GGML_ASSERT(q != nullptr && k != nullptr);
+    GGML_ASSERT(n_heads > 0);
+    GGML_ASSERT(q->ne[2] == n_heads);
+    GGML_ASSERT(k->ne[0] == q->ne[0]);
+    if (mask != nullptr) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16);
+    }
+
+    ggml_tensor* args[] = {q, k, mask};
+    auto* params = static_cast<ggml_ext_attention_lse_params*>(
+        ggml_new_buffer(ctx, sizeof(ggml_ext_attention_lse_params)));
+    params->n_heads = n_heads;
+    params->scale = scale;
+    return ggml_custom_4d(ctx,
+                          GGML_TYPE_F32,
+                          1,
+                          n_heads,
+                          q->ne[1],
+                          1,
+                          args,
+                          mask != nullptr ? 3 : 2,
+                          ggml_ext_attention_lse_custom,
+                          GGML_N_TASKS_MAX,
+                          params);
 }
 
 __STATIC_INLINE__ std::vector<int32_t> ggml_ext_block_sparse_mask_mean_topk(const ggml_tensor* q,
