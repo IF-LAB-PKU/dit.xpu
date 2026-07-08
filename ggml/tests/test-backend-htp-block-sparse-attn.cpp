@@ -9,10 +9,12 @@
 #include <ggml-backend.h>
 #include <ggml-htp.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -119,6 +121,83 @@ static DiffStats diff_stats(const std::vector<float> & ref, const std::vector<fl
         stats.rel_rms = stats.ref_rms > 0.0 ? stats.rms_abs / stats.ref_rms : 0.0;
     }
     return stats;
+}
+
+struct RefAttentionWithLse {
+    std::vector<float> out;
+    std::vector<float> lse;
+};
+
+static RefAttentionWithLse reference_attention_with_lse(int qo_len,
+                                                        int kv_len,
+                                                        int n_heads,
+                                                        int n_kv_heads,
+                                                        int head_dim,
+                                                        const std::vector<float> & q,
+                                                        const std::vector<ggml_fp16_t> & k,
+                                                        const std::vector<ggml_fp16_t> & v,
+                                                        const std::vector<float> * dense_mask) {
+    GGML_ASSERT(int(q.size()) == qo_len * n_heads * head_dim);
+    GGML_ASSERT(int(k.size()) == kv_len * n_kv_heads * head_dim);
+    GGML_ASSERT(int(v.size()) == kv_len * n_kv_heads * head_dim);
+    if (dense_mask != nullptr) {
+        GGML_ASSERT(int(dense_mask->size()) == kv_len * qo_len * n_heads);
+    }
+
+    RefAttentionWithLse result;
+    result.out.resize(size_t(qo_len) * size_t(n_heads) * size_t(head_dim));
+    result.lse.resize(size_t(qo_len) * size_t(n_heads));
+
+    const float scale = 1.0f / std::sqrt(float(head_dim));
+    const int gqa = std::max(1, n_heads / n_kv_heads);
+    std::vector<float> scores;
+    scores.resize(size_t(kv_len));
+
+    for (int qt = 0; qt < qo_len; ++qt) {
+        for (int h = 0; h < n_heads; ++h) {
+            const int kv_head = std::min(n_kv_heads - 1, h / gqa);
+            float max_score = -std::numeric_limits<float>::infinity();
+            for (int kt = 0; kt < kv_len; ++kt) {
+                float score = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    const float qv = q[(size_t(qt) * size_t(n_heads) + size_t(h)) * size_t(head_dim) + size_t(d)];
+                    const float kv = ggml_fp16_to_fp32(k[(size_t(kt) * size_t(n_kv_heads) + size_t(kv_head)) * size_t(head_dim) + size_t(d)]);
+                    score += qv * kv;
+                }
+                score *= scale;
+                if (dense_mask != nullptr) {
+                    score += (*dense_mask)[(size_t(h) * size_t(qo_len) + size_t(qt)) * size_t(kv_len) + size_t(kt)];
+                }
+                scores[size_t(kt)] = score;
+                max_score = std::max(max_score, score);
+            }
+
+            float exp_sum = 0.0f;
+            if (std::isfinite(max_score)) {
+                for (int kt = 0; kt < kv_len; ++kt) {
+                    exp_sum += std::exp(scores[size_t(kt)] - max_score);
+                }
+            }
+            const float lse = exp_sum > 0.0f ? max_score + std::log(exp_sum)
+                                             : -std::numeric_limits<float>::infinity();
+            result.lse[size_t(qt) * size_t(n_heads) + size_t(h)] = lse;
+
+            for (int d = 0; d < head_dim; ++d) {
+                double out = 0.0;
+                if (exp_sum > 0.0f) {
+                    for (int kt = 0; kt < kv_len; ++kt) {
+                        const float weight = std::exp(scores[size_t(kt)] - lse);
+                        const float vv = ggml_fp16_to_fp32(v[(size_t(kt) * size_t(n_kv_heads) + size_t(kv_head)) * size_t(head_dim) + size_t(d)]);
+                        out += double(weight) * double(vv);
+                    }
+                }
+                result.out[(size_t(qt) * size_t(n_heads) + size_t(h)) * size_t(head_dim) + size_t(d)] =
+                    float(out);
+            }
+        }
+    }
+
+    return result;
 }
 
 struct AttentionRunner : GGMLRunner {
@@ -416,6 +495,55 @@ static std::vector<float> dense_mask_from_block_index(const std::vector<int32_t>
     return dense_mask;
 }
 
+static void test_exact_residual_rho_reference_formula(AttentionRunner & runner) {
+    constexpr int qo_len = 96;
+    constexpr int kv_len = 128;
+    constexpr int n_heads = 4;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    constexpr float keep_ratio = 0.50f;
+
+    std::vector<float> q = gen_q(qo_len, n_heads, head_dim, 11);
+    std::vector<ggml_fp16_t> k = gen_kv_f16(kv_len, n_kv_heads, head_dim, 12);
+    std::vector<ggml_fp16_t> v = gen_kv_f16(kv_len, n_kv_heads, head_dim, 13);
+
+    std::vector<int32_t> block_index =
+        runner.make_block_index(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, keep_ratio);
+    std::vector<float> sparse_dense_mask =
+        dense_mask_from_block_index(block_index, qo_len, kv_len, n_heads, n_kv_heads);
+
+    const RefAttentionWithLse dense_ref =
+        reference_attention_with_lse(qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, nullptr);
+    const RefAttentionWithLse sparse_ref =
+        reference_attention_with_lse(qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, &sparse_dense_mask);
+
+    std::vector<float> recovered(dense_ref.out.size());
+    double max_diff = 0.0;
+    size_t worst = 0;
+    for (int qt = 0; qt < qo_len; ++qt) {
+        for (int h = 0; h < n_heads; ++h) {
+            const float rho = std::exp(sparse_ref.lse[size_t(qt) * size_t(n_heads) + size_t(h)] -
+                                       dense_ref.lse[size_t(qt) * size_t(n_heads) + size_t(h)]);
+            GGML_ASSERT(rho >= 0.0f && rho <= 1.0001f);
+            for (int d = 0; d < head_dim; ++d) {
+                const size_t out_i = (size_t(qt) * size_t(n_heads) + size_t(h)) * size_t(head_dim) + size_t(d);
+                const float residual = dense_ref.out[out_i] - rho * sparse_ref.out[out_i];
+                recovered[out_i] = rho * sparse_ref.out[out_i] + residual;
+                const double diff = std::fabs(double(recovered[out_i]) - double(dense_ref.out[out_i]));
+                if (diff > max_diff) {
+                    max_diff = diff;
+                    worst = out_i;
+                }
+            }
+        }
+    }
+
+    std::printf("[PASS] exact residual rho reference formula max_abs=%.9g worst=%zu\n",
+                max_diff,
+                worst);
+    GGML_ASSERT(max_diff <= 1e-5);
+}
+
 static void run_case(AttentionRunner & runner, int qo_len, int kv_len, int n_heads, int n_kv_heads, int head_dim) {
     std::vector<float> q = gen_q(qo_len, n_heads, head_dim, 1);
     std::vector<ggml_fp16_t> k = gen_kv_f16(kv_len, n_kv_heads, head_dim, 2);
@@ -517,6 +645,8 @@ int main() {
     GGML_ASSERT(cpu != nullptr && htp != nullptr);
 
     AttentionRunner runner(cpu, htp);
+
+    test_exact_residual_rho_reference_formula(runner);
 
     run_case(runner, 256, 256, 24, 24, 64);
     run_case(runner, 410, 410, 24, 24, 64);
