@@ -2044,6 +2044,12 @@ public:
             htp_block_sparse_dense_tail_ratio > 0.0f
                 ? std::min(steps, static_cast<size_t>(std::ceil(float(steps) * htp_block_sparse_dense_tail_ratio)))
                 : 0;
+        const int htp_block_sparse_dense_every_n_sparse_steps =
+            std::max(0, sd_env_int_value("SD_HTP_BLOCK_SPARSE_DENSE_EVERY_N_SPARSE_STEPS", 0));
+        const bool htp_block_sparse_residual_cache_enabled =
+            sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE");
+        const float htp_block_sparse_residual_scale =
+            sd_env_float_value("SD_HTP_BLOCK_SPARSE_RESIDUAL_SCALE", 1.0f);
         const bool htp_block_sparse_original = work_diffusion_model != nullptr &&
                                                work_diffusion_model->is_block_sparse_attention_enabled();
         if (htp_block_sparse_original && htp_block_sparse_warmup_steps > 0) {
@@ -2057,6 +2063,14 @@ public:
                      htp_block_sparse_dense_tail_steps,
                      steps,
                      htp_block_sparse_dense_tail_ratio);
+        }
+        if (htp_block_sparse_original && htp_block_sparse_dense_every_n_sparse_steps > 0) {
+            LOG_INFO("HTP block sparse periodic dense enabled: dense_after_sparse_steps=%d",
+                     htp_block_sparse_dense_every_n_sparse_steps);
+        }
+        if (htp_block_sparse_original && htp_block_sparse_residual_cache_enabled) {
+            LOG_INFO("HTP block sparse residual cache enabled: scale=%.3f",
+                     htp_block_sparse_residual_scale);
         }
         bool has_skiplayer = slg_scale != 0.0f && !skip_layers.empty();
         if (has_skiplayer && !sd_version_is_dit(version)) {
@@ -2096,24 +2110,53 @@ public:
                 htp_block_sparse_warmup_steps > 0 &&
                 denoise_step_index > 0 &&
                 denoise_step_index <= htp_block_sparse_warmup_steps;
-            const bool htp_block_sparse_step_enabled =
+            const bool htp_block_sparse_candidate_enabled =
                 htp_block_sparse_original &&
                 !htp_block_sparse_in_warmup &&
                 !htp_block_sparse_in_dense_tail;
-            const size_t htp_block_sparse_step_index =
-                htp_block_sparse_step_enabled && denoise_step_index > htp_block_sparse_warmup_steps
-                    ? denoise_step_index - htp_block_sparse_warmup_steps
+            const int htp_block_sparse_candidate_step_index =
+                htp_block_sparse_candidate_enabled && denoise_step_index > htp_block_sparse_warmup_steps
+                    ? static_cast<int>(denoise_step_index - htp_block_sparse_warmup_steps)
                     : 0;
+            const int htp_block_sparse_step_index =
+                sd_htp_block_sparse_scheduled_step_index(htp_block_sparse_candidate_step_index,
+                                                         htp_block_sparse_dense_every_n_sparse_steps);
+            const bool htp_block_sparse_periodic_dense =
+                htp_block_sparse_candidate_step_index > 0 && htp_block_sparse_step_index == 0;
+            const bool htp_block_sparse_residual_anchor_has_sparse_consumer =
+                sd_htp_block_sparse_residual_anchor_has_sparse_consumer(static_cast<int>(denoise_step_index),
+                                                                        static_cast<int>(steps),
+                                                                        static_cast<int>(htp_block_sparse_dense_tail_steps));
+            const bool htp_block_sparse_warmup_residual_anchor =
+                sd_htp_block_sparse_warmup_residual_anchor_step(static_cast<int>(denoise_step_index),
+                                                                static_cast<int>(htp_block_sparse_warmup_steps),
+                                                                static_cast<int>(steps),
+                                                                static_cast<int>(htp_block_sparse_dense_tail_steps));
+            const bool htp_block_sparse_periodic_residual_anchor =
+                htp_block_sparse_periodic_dense && htp_block_sparse_residual_anchor_has_sparse_consumer;
+            const bool htp_block_sparse_step_enabled =
+                htp_block_sparse_candidate_enabled && htp_block_sparse_step_index > 0;
+            const int htp_block_sparse_residual_mode =
+                sd_htp_block_sparse_residual_mode(htp_block_sparse_original &&
+                                                      htp_block_sparse_residual_cache_enabled,
+                                                  htp_block_sparse_periodic_residual_anchor || htp_block_sparse_warmup_residual_anchor,
+                                                  htp_block_sparse_step_index);
             if (htp_block_sparse_original &&
-                (htp_block_sparse_warmup_steps > 0 || htp_block_sparse_dense_tail_steps > 0)) {
+                (htp_block_sparse_warmup_steps > 0 || htp_block_sparse_dense_tail_steps > 0 ||
+                 htp_block_sparse_dense_every_n_sparse_steps > 0 ||
+                 htp_block_sparse_residual_cache_enabled)) {
                 work_diffusion_model->set_block_sparse_attention_enabled(htp_block_sparse_step_enabled);
-                LOG_DEBUG("HTP block sparse step=%zu/%zu warmup_dense=%d tail_dense=%d sparse=%d sparse_step=%zu",
+                LOG_DEBUG("HTP block sparse step=%zu/%zu warmup_dense=%d tail_dense=%d periodic_dense=%d warmup_anchor=%d sparse=%d sparse_step=%d candidate_sparse_step=%d residual_mode=%d",
                           denoise_step_index,
                           steps,
                           htp_block_sparse_in_warmup ? 1 : 0,
                           htp_block_sparse_in_dense_tail ? 1 : 0,
+                          htp_block_sparse_periodic_dense ? 1 : 0,
+                          htp_block_sparse_warmup_residual_anchor ? 1 : 0,
                           htp_block_sparse_step_enabled ? 1 : 0,
-                          htp_block_sparse_step_index);
+                          htp_block_sparse_step_index,
+                          htp_block_sparse_candidate_step_index,
+                          htp_block_sparse_residual_mode);
             }
 
             std::vector<float> scaling = denoiser->get_scalings(sigma);
@@ -2171,6 +2214,8 @@ public:
             diffusion_params.timesteps          = &timesteps_tensor;
             diffusion_params.denoise_step       = step;
             diffusion_params.block_sparse_step_index = static_cast<int>(htp_block_sparse_step_index);
+            diffusion_params.block_sparse_residual_mode = htp_block_sparse_residual_mode;
+            diffusion_params.block_sparse_residual_scale = htp_block_sparse_residual_scale;
             diffusion_params.audio_timesteps    = audio_timesteps_tensor.empty() ? nullptr : &audio_timesteps_tensor;
             diffusion_params.guidance           = &guidance_tensor;
             diffusion_params.ref_latents        = &ref_latents;
@@ -2191,8 +2236,10 @@ public:
                                     &controls);
 
             auto run_condition = [&](const SDCondition& condition,
+                                     int block_sparse_residual_branch_index,
                                      const sd::Tensor<float>* c_concat_override = nullptr,
                                      const std::vector<int>* local_skip_layers  = nullptr) -> sd::Tensor<float> {
+                diffusion_params.block_sparse_residual_branch_index = block_sparse_residual_branch_index;
                 diffusion_params.context      = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
                 diffusion_params.c_concat     = c_concat_override != nullptr ? c_concat_override : (condition.c_concat.empty() ? nullptr : &condition.c_concat);
                 diffusion_params.y            = condition.c_vector.empty() ? nullptr : &condition.c_vector;
@@ -2222,13 +2269,14 @@ public:
             };
 
             if (start_merge_step == -1 || step <= start_merge_step) {
-                cond_out = run_condition(cond);
+                cond_out = run_condition(cond, 0);
                 if (cond_out.empty()) {
                     return {};
                 }
             } else {
                 GGML_ASSERT(!id_cond.empty());
                 cond_out = run_condition(id_cond,
+                                         0,
                                          cond.c_concat.empty() ? nullptr : &cond.c_concat);
                 if (cond_out.empty()) {
                     return {};
@@ -2243,13 +2291,14 @@ public:
                                             uncond,
                                             &controls);
                 }
-                uncond_out = run_condition(uncond);
+                uncond_out = run_condition(uncond, 1);
                 if (uncond_out.empty()) {
                     return {};
                 }
             }
             if (!img_cond.empty()) {
                 img_cond_out = run_condition(img_cond,
+                                             2,
                                              cond.c_concat.empty() ? nullptr : &cond.c_concat);
                 if (img_cond_out.empty()) {
                     return {};
@@ -2272,6 +2321,7 @@ public:
                 if (!step_cache.is_step_skipped()) {
                     guidance_input.predict_skip_layer = [&]() -> sd::Tensor<float> {
                         return run_condition(cond,
+                                             3,
                                              cond.c_concat.empty() ? nullptr : &cond.c_concat,
                                              &skip_layer_guidance.layers());
                     };
@@ -2306,7 +2356,8 @@ public:
 
         auto x0_opt = sample_k_diffusion(method, denoise, x_t, sigmas, sampler_rng, eta, is_flow_denoiser, extra_sample_args);
         if (htp_block_sparse_original &&
-            (htp_block_sparse_warmup_steps > 0 || htp_block_sparse_dense_tail_steps > 0)) {
+            (htp_block_sparse_warmup_steps > 0 || htp_block_sparse_dense_tail_steps > 0 ||
+             htp_block_sparse_dense_every_n_sparse_steps > 0)) {
             work_diffusion_model->set_block_sparse_attention_enabled(htp_block_sparse_original);
         }
         if (x0_opt.empty()) {

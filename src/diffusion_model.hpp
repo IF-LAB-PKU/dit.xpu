@@ -44,6 +44,9 @@ struct DiffusionParams {
     const std::vector<int>* skip_layers                                = nullptr;
     int denoise_step                                                   = 0;
     int block_sparse_step_index                                        = 0;
+    int block_sparse_residual_mode                                     = SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF;
+    float block_sparse_residual_scale                                  = 1.0f;
+    int block_sparse_residual_branch_index                             = 0;
 };
 
 template <typename T>
@@ -237,7 +240,10 @@ struct MMDiTModel : public DiffusionModel {
                              tensor_or_empty(diffusion_params.context),
                              tensor_or_empty(diffusion_params.y),
                              diffusion_params.skip_layers ? *diffusion_params.skip_layers : empty_skip_layers,
-                             diffusion_params.block_sparse_step_index);
+                             diffusion_params.block_sparse_step_index,
+                             diffusion_params.block_sparse_residual_mode,
+                             diffusion_params.block_sparse_residual_scale,
+                             diffusion_params.block_sparse_residual_branch_index);
     }
 };
 
