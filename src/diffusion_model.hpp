@@ -47,6 +47,7 @@ struct DiffusionParams {
     int block_sparse_residual_mode                                     = SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF;
     float block_sparse_residual_scale                                  = 1.0f;
     float block_sparse_residual_rho                                    = 1.0f;
+    bool block_sparse_residual_exact_rho                               = false;
     int block_sparse_residual_branch_index                             = 0;
 };
 
@@ -245,6 +246,7 @@ struct MMDiTModel : public DiffusionModel {
                              diffusion_params.block_sparse_residual_mode,
                              diffusion_params.block_sparse_residual_scale,
                              diffusion_params.block_sparse_residual_rho,
+                             diffusion_params.block_sparse_residual_exact_rho,
                              diffusion_params.block_sparse_residual_branch_index);
     }
 };

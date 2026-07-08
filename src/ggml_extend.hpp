@@ -183,6 +183,19 @@ __STATIC_INLINE__ std::string sd_htp_block_sparse_residual_cache_key(int branch_
     return key;
 }
 
+__STATIC_INLINE__ std::string sd_htp_block_sparse_residual_rho_cache_key(int branch_index,
+                                                                         const char* attention_kind,
+                                                                         int attention_slot) {
+    std::string key = "htp_block_sparse_residual_rho_b" + std::to_string(branch_index);
+    if (attention_kind != nullptr && attention_kind[0] != '\0') {
+        key += "_";
+        key += attention_kind;
+    }
+    key += "_s";
+    key += std::to_string(attention_slot);
+    return key;
+}
+
 __STATIC_INLINE__ int sd_patch_major_token_count(int token_h, int token_w) {
     return std::max(0, token_h) * std::max(0, token_w);
 }
@@ -1917,8 +1930,11 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                       int block_sparse_residual_mode = SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
                                                       float block_sparse_residual_scale = 1.0f,
                                                       float block_sparse_residual_rho = 1.0f,
+                                                      bool block_sparse_residual_exact_rho = false,
                                                       const char* block_sparse_residual_cache_name = nullptr,
                                                       ggml_tensor* block_sparse_cached_residual = nullptr,
+                                                      const char* block_sparse_residual_rho_cache_name = nullptr,
+                                                      ggml_tensor* block_sparse_cached_rho = nullptr,
                                                       const std::function<void(const std::string&, ggml_tensor*)>* block_sparse_cache_tensor = nullptr) {  // avoid overflow
     int64_t L_q;
     int64_t L_k;
@@ -1929,6 +1945,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
     ggml_tensor* q_htp_flash = nullptr;
     ggml_tensor* k_htp_flash_base = nullptr;
     ggml_tensor* v_htp_flash_base = nullptr;
+    const bool block_sparse_exact_rho_available = false;
+    (void) block_sparse_cached_rho;
     if (!skip_reshape) {
         L_q       = q->ne[1];
         L_k       = k->ne[1];
@@ -2180,6 +2198,16 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             if ((candidate_is_htp_layout && keep_for_htp_hybrid) || backend == nullptr || ggml_backend_supports_op(backend, candidate)) {
                 ggml_tensor* sparse_out = ggml_view_3d(ctx, candidate, d_head, n_head, L_q, candidate->nb[1], candidate->nb[2], 0);
                 ggml_tensor* sparse_reshape_out = sparse_out;
+                if (block_sparse_residual_exact_rho &&
+                    !block_sparse_exact_rho_available &&
+                    block_sparse_residual_mode != SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF &&
+                    sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
+                    std::fprintf(stderr,
+                                 "block_sparse_residual exact_rho=1 unavailable=1 fallback_rho=%.4f cache=%s rho_cache=%s\n",
+                                 block_sparse_residual_rho,
+                                 block_sparse_residual_cache_name != nullptr ? block_sparse_residual_cache_name : "<unnamed>",
+                                 block_sparse_residual_rho_cache_name != nullptr ? block_sparse_residual_rho_cache_name : "<unnamed>");
+                }
                 if (block_sparse_residual_rho != 1.0f) {
                     sparse_reshape_out = ggml_ext_scale(ctx, sparse_reshape_out, block_sparse_residual_rho);
                 }
@@ -3808,6 +3836,7 @@ struct GGMLRunnerContext {
     int block_sparse_residual_mode                                   = SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF;
     float block_sparse_residual_scale                                = 1.0f;
     float block_sparse_residual_rho                                  = 1.0f;
+    bool block_sparse_residual_exact_rho                             = false;
     int block_sparse_residual_branch_index                           = 0;
     int block_sparse_residual_attention_index                        = 0;
     std::shared_ptr<WeightAdapter> weight_adapter                    = nullptr;

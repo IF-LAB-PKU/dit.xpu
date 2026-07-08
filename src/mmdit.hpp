@@ -225,13 +225,23 @@ __STATIC_INLINE__ ggml_tensor* mmdit_residual_attention(GGMLRunnerContext* ctx,
                                                         int protected_len   = 0) {
     const int residual_attention_slot = ctx->block_sparse_residual_attention_index++;
     std::string residual_cache_name;
+    std::string rho_cache_name;
     ggml_tensor* cached_residual = nullptr;
+    ggml_tensor* cached_rho = nullptr;
     if (ctx->block_sparse_residual_mode != SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF) {
         residual_cache_name = sd_htp_block_sparse_residual_cache_key(ctx->block_sparse_residual_branch_index,
                                                                      residual_kind,
                                                                      residual_attention_slot);
+        if (ctx->block_sparse_residual_exact_rho) {
+            rho_cache_name = sd_htp_block_sparse_residual_rho_cache_key(ctx->block_sparse_residual_branch_index,
+                                                                        residual_kind,
+                                                                        residual_attention_slot);
+        }
         if (ctx->block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY) {
             cached_residual = ctx->cache_tensor_as_graph_input(residual_cache_name);
+            if (!rho_cache_name.empty()) {
+                cached_rho = ctx->cache_tensor_as_graph_input(rho_cache_name);
+            }
         }
     }
 
@@ -252,8 +262,11 @@ __STATIC_INLINE__ ggml_tensor* mmdit_residual_attention(GGMLRunnerContext* ctx,
                                   ctx->block_sparse_residual_mode,
                                   ctx->block_sparse_residual_scale,
                                   ctx->block_sparse_residual_rho,
+                                  ctx->block_sparse_residual_exact_rho,
                                   residual_cache_name.empty() ? nullptr : residual_cache_name.c_str(),
                                   cached_residual,
+                                  rho_cache_name.empty() ? nullptr : rho_cache_name.c_str(),
+                                  cached_rho,
                                   &ctx->cache_tensor);
 }
 
@@ -937,6 +950,7 @@ struct MMDiTRunner : public GGMLRunner {
                              int block_sparse_residual_mode          = SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
                              float block_sparse_residual_scale       = 1.0f,
                              float block_sparse_residual_rho         = 1.0f,
+                             bool block_sparse_residual_exact_rho    = false,
                              int block_sparse_residual_branch_index  = 0) {
         ggml_cgraph* gf = new_graph_custom(MMDIT_GRAPH_SIZE);
 
@@ -949,6 +963,7 @@ struct MMDiTRunner : public GGMLRunner {
         runner_ctx.block_sparse_residual_mode            = block_sparse_residual_mode;
         runner_ctx.block_sparse_residual_scale           = block_sparse_residual_scale;
         runner_ctx.block_sparse_residual_rho             = block_sparse_residual_rho;
+        runner_ctx.block_sparse_residual_exact_rho       = block_sparse_residual_exact_rho;
         runner_ctx.block_sparse_residual_branch_index    = block_sparse_residual_branch_index;
         runner_ctx.block_sparse_residual_attention_index = 0;
         ggml_tensor* out = mmdit.forward(&runner_ctx,
@@ -974,6 +989,7 @@ struct MMDiTRunner : public GGMLRunner {
                               int block_sparse_residual_mode   = SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
                               float block_sparse_residual_scale = 1.0f,
                               float block_sparse_residual_rho = 1.0f,
+                              bool block_sparse_residual_exact_rho = false,
                               int block_sparse_residual_branch_index = 0) {
         // x: [N, in_channels, h, w]
         // timesteps: [N, ]
@@ -989,6 +1005,7 @@ struct MMDiTRunner : public GGMLRunner {
                                block_sparse_residual_mode,
                                block_sparse_residual_scale,
                                block_sparse_residual_rho,
+                               block_sparse_residual_exact_rho,
                                block_sparse_residual_branch_index);
         };
 

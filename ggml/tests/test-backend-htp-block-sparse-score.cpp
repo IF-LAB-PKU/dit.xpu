@@ -447,6 +447,17 @@ static void test_block_sparse_residual_cache_key_policy() {
     std::printf("[PASS] block sparse residual cache key policy\n");
 }
 
+static void test_block_sparse_residual_rho_cache_key_policy() {
+    GGML_ASSERT(sd_htp_block_sparse_residual_rho_cache_key(0, "joint", 3) ==
+                "htp_block_sparse_residual_rho_b0_joint_s3");
+    GGML_ASSERT(sd_htp_block_sparse_residual_rho_cache_key(1, "self", 4) ==
+                "htp_block_sparse_residual_rho_b1_self_s4");
+    GGML_ASSERT(sd_htp_block_sparse_residual_rho_cache_key(2, "self2", 5) ==
+                "htp_block_sparse_residual_rho_b2_self2_s5");
+
+    std::printf("[PASS] block sparse residual rho cache key policy\n");
+}
+
 static void test_block_sparse_residual_rho_policy() {
     GGML_ASSERT(sd_htp_block_sparse_residual_rho_value(-0.5f) == 0.0f);
     GGML_ASSERT(sd_htp_block_sparse_residual_rho_value(0.0f) == 0.0f);
@@ -1171,6 +1182,7 @@ int main() {
     test_block_sparse_residual_warmup_anchor_policy();
     test_block_sparse_residual_anchor_has_sparse_consumer_policy();
     test_block_sparse_residual_cache_key_policy();
+    test_block_sparse_residual_rho_cache_key_policy();
     test_block_sparse_residual_rho_policy();
     test_patch_score_mask_promotes_to_dsp_index();
     test_patch_score_mask_2d_halo_keeps_surrounding_blocks();
