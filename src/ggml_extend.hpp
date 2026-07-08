@@ -103,6 +103,82 @@ __STATIC_INLINE__ int sd_htp_block_sparse_step_shift(bool enabled, int sparse_st
     return sparse_step_index % SD_HTP_BLOCK_SPARSE_STEP_SHIFT_PERIOD == 0 ? -2 : 0;
 }
 
+__STATIC_INLINE__ int sd_htp_block_sparse_scheduled_step_index(int candidate_sparse_step_index,
+                                                              int dense_after_sparse_steps) {
+    if (candidate_sparse_step_index <= 0) {
+        return 0;
+    }
+    if (dense_after_sparse_steps <= 0) {
+        return candidate_sparse_step_index;
+    }
+    const int cycle = dense_after_sparse_steps + 1;
+    if (candidate_sparse_step_index % cycle == 0) {
+        return 0;
+    }
+    return candidate_sparse_step_index - candidate_sparse_step_index / cycle;
+}
+
+enum sd_htp_block_sparse_residual_mode {
+    SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF    = 0,
+    SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY  = 1,
+    SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR = 2,
+};
+
+__STATIC_INLINE__ sd_htp_block_sparse_residual_mode sd_htp_block_sparse_residual_mode(bool enabled,
+                                                                                      bool periodic_dense,
+                                                                                      int sparse_step_index) {
+    if (!enabled) {
+        return SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF;
+    }
+    if (periodic_dense) {
+        return SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR;
+    }
+    if (sparse_step_index > 0) {
+        return SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY;
+    }
+    return SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF;
+}
+
+__STATIC_INLINE__ bool sd_htp_block_sparse_residual_anchor_has_sparse_consumer(int step_index,
+                                                                               int total_steps,
+                                                                               int dense_tail_steps) {
+    if (step_index <= 0 || total_steps <= 0) {
+        return false;
+    }
+    const int next_step = step_index + 1;
+    if (next_step > total_steps) {
+        return false;
+    }
+    const int first_tail_step = dense_tail_steps > 0 ? total_steps - dense_tail_steps + 1 : total_steps + 1;
+    return next_step < first_tail_step;
+}
+
+__STATIC_INLINE__ bool sd_htp_block_sparse_warmup_residual_anchor_step(int step_index,
+                                                                       int warmup_steps,
+                                                                       int total_steps,
+                                                                       int dense_tail_steps) {
+    if (step_index <= 0 || warmup_steps <= 0 || total_steps <= 0) {
+        return false;
+    }
+    if (step_index != warmup_steps) {
+        return false;
+    }
+    return sd_htp_block_sparse_residual_anchor_has_sparse_consumer(step_index, total_steps, dense_tail_steps);
+}
+
+__STATIC_INLINE__ std::string sd_htp_block_sparse_residual_cache_key(int branch_index,
+                                                                     const char* attention_kind,
+                                                                     int attention_slot) {
+    std::string key = "htp_block_sparse_residual_b" + std::to_string(branch_index);
+    if (attention_kind != nullptr && attention_kind[0] != '\0') {
+        key += "_";
+        key += attention_kind;
+    }
+    key += "_s";
+    key += std::to_string(attention_slot);
+    return key;
+}
+
 __STATIC_INLINE__ int sd_patch_major_token_count(int token_h, int token_w) {
     return std::max(0, token_h) * std::max(0, token_w);
 }
@@ -1833,7 +1909,12 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                       float kv_scale    = 1.0f,
                                                       bool block_sparse_attn = false,
                                                       int protected_start = 0,
-                                                      int protected_len = 0) {  // avoid overflow
+                                                      int protected_len = 0,
+                                                      int block_sparse_residual_mode = SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
+                                                      float block_sparse_residual_scale = 1.0f,
+                                                      const char* block_sparse_residual_cache_name = nullptr,
+                                                      ggml_tensor* block_sparse_cached_residual = nullptr,
+                                                      const std::function<void(const std::string&, ggml_tensor*)>* block_sparse_cache_tensor = nullptr) {  // avoid overflow
     int64_t L_q;
     int64_t L_k;
     int64_t C;
@@ -2092,7 +2173,66 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             candidate->op_params[4] = block_q;
             candidate->op_params[5] = block_k;
             if ((candidate_is_htp_layout && keep_for_htp_hybrid) || backend == nullptr || ggml_backend_supports_op(backend, candidate)) {
-                kqv = ggml_view_3d(ctx, candidate, d_head, n_head, L_q, candidate->nb[1], candidate->nb[2], 0);
+                ggml_tensor* sparse_out = ggml_view_3d(ctx, candidate, d_head, n_head, L_q, candidate->nb[1], candidate->nb[2], 0);
+                if (block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
+                    block_sparse_residual_cache_name != nullptr &&
+                    block_sparse_cache_tensor != nullptr &&
+                    *block_sparse_cache_tensor) {
+                    ggml_tensor* dense_candidate = build_htp_kqv(nullptr);
+                    if (dense_candidate == nullptr) {
+                        dense_candidate = build_kqv(q, k, v, nullptr);
+                    }
+                    ggml_tensor* dense_out = ggml_view_3d(ctx,
+                                                          dense_candidate,
+                                                          d_head,
+                                                          n_head,
+                                                          L_q,
+                                                          dense_candidate->nb[1],
+                                                          dense_candidate->nb[2],
+                                                          0);
+                    ggml_tensor* residual = ggml_sub(ctx, dense_out, sparse_out);
+                    ggml_set_name(residual, block_sparse_residual_cache_name);
+                    (*block_sparse_cache_tensor)(block_sparse_residual_cache_name, residual);
+                    if (sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
+                        std::fprintf(stderr,
+                                     "block_sparse_residual anchor=1 cache=%s shape=[%lld,%lld,%lld,%lld]\n",
+                                     block_sparse_residual_cache_name,
+                                     (long long) residual->ne[0],
+                                     (long long) residual->ne[1],
+                                     (long long) residual->ne[2],
+                                     (long long) residual->ne[3]);
+                    }
+                    kqv = dense_out;
+                } else if (block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY &&
+                           block_sparse_cached_residual != nullptr &&
+                           block_sparse_cached_residual->ne[0] == sparse_out->ne[0] &&
+                           block_sparse_cached_residual->ne[1] == sparse_out->ne[1] &&
+                           block_sparse_cached_residual->ne[2] == sparse_out->ne[2] &&
+                           block_sparse_cached_residual->ne[3] == sparse_out->ne[3]) {
+                    ggml_tensor* residual = block_sparse_cached_residual;
+                    if (block_sparse_residual_scale != 1.0f) {
+                        residual = ggml_ext_scale(ctx, residual, block_sparse_residual_scale);
+                    }
+                    kqv = ggml_add(ctx, sparse_out, residual);
+                    if (sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
+                        std::fprintf(stderr,
+                                     "block_sparse_residual apply=1 cache_hit=1 scale=%.4f cache=%s shape=[%lld,%lld,%lld,%lld]\n",
+                                     block_sparse_residual_scale,
+                                     block_sparse_residual_cache_name != nullptr ? block_sparse_residual_cache_name : "<unnamed>",
+                                     (long long) sparse_out->ne[0],
+                                     (long long) sparse_out->ne[1],
+                                     (long long) sparse_out->ne[2],
+                                     (long long) sparse_out->ne[3]);
+                    }
+                } else {
+                    if (block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY &&
+                        sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
+                        std::fprintf(stderr,
+                                     "block_sparse_residual apply=1 cache_hit=0 cache=%s\n",
+                                     block_sparse_residual_cache_name != nullptr ? block_sparse_residual_cache_name : "<unnamed>");
+                    }
+                    kqv = sparse_out;
+                }
             }
             kv_pad = saved_kv_pad;
         }
@@ -3654,10 +3794,15 @@ struct GGMLRunnerContext {
     bool conv2d_direct_enabled                                       = false;
     bool circular_x_enabled                                          = false;
     bool circular_y_enabled                                          = false;
+    int block_sparse_residual_mode                                   = SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF;
+    float block_sparse_residual_scale                                = 1.0f;
+    int block_sparse_residual_branch_index                           = 0;
+    int block_sparse_residual_attention_index                        = 0;
     std::shared_ptr<WeightAdapter> weight_adapter                    = nullptr;
     std::vector<std::pair<ggml_tensor*, std::string>>* debug_tensors = nullptr;
     std::function<ggml_tensor*(const std::string&)> get_cache_tensor;
     std::function<void(const std::string&, ggml_tensor*)> cache_tensor;
+    std::function<void(const std::string&, ggml_tensor*)> bind_cache_tensor;
 
     void capture_tensor(const std::string& name, ggml_tensor* tensor) {
         if (debug_tensors == nullptr || tensor == nullptr) {
@@ -3682,6 +3827,17 @@ struct GGMLRunnerContext {
             return;
         }
         cache_tensor(name, tensor);
+    }
+
+    ggml_tensor* cache_tensor_as_graph_input(const std::string& name) const {
+        ggml_tensor* cached = load_cache_tensor(name);
+        if (cached == nullptr || bind_cache_tensor == nullptr || ggml_ctx == nullptr) {
+            return nullptr;
+        }
+        ggml_tensor* graph_tensor = ggml_dup_tensor(ggml_ctx, cached);
+        ggml_set_name(graph_tensor, name.c_str());
+        bind_cache_tensor(name, graph_tensor);
+        return graph_tensor;
     }
 };
 
@@ -3730,6 +3886,7 @@ protected:
     ggml_tensor* zero_int_tensor  = nullptr;
 
     std::map<ggml_tensor*, const void*> backend_tensor_data_map;
+    std::map<ggml_tensor*, std::string> cache_backed_tensor_name_map;
     std::map<std::string, ggml_tensor*> cache_tensor_map;  // name -> tensor
     std::vector<std::pair<ggml_tensor*, std::string>> debug_tensors;
     const std::string final_result_name = "ggml_runner_final_result_tensor";
@@ -3845,6 +4002,7 @@ protected:
             compute_ctx = nullptr;
         }
         backend_tensor_data_map.clear();
+        cache_backed_tensor_name_map.clear();
     }
 
     void rebuild_params_tensor_set() {
@@ -4668,6 +4826,43 @@ protected:
         }
     }
 
+    bool bind_cache_backed_tensors() {
+        for (const auto& kv : cache_backed_tensor_name_map) {
+            ggml_tensor* graph_tensor = kv.first;
+            ggml_tensor* cache_tensor = get_cache_tensor_by_name(kv.second);
+            if (graph_tensor == nullptr || cache_tensor == nullptr) {
+                LOG_WARN("%s block sparse residual cache miss while binding: %s",
+                         get_desc().c_str(),
+                         kv.second.c_str());
+                return false;
+            }
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                if (graph_tensor->ne[i] != cache_tensor->ne[i]) {
+                    LOG_WARN("%s block sparse residual cache shape mismatch while binding: %s graph=[%lld,%lld,%lld,%lld] cache=[%lld,%lld,%lld,%lld]",
+                             get_desc().c_str(),
+                             kv.second.c_str(),
+                             (long long) graph_tensor->ne[0],
+                             (long long) graph_tensor->ne[1],
+                             (long long) graph_tensor->ne[2],
+                             (long long) graph_tensor->ne[3],
+                             (long long) cache_tensor->ne[0],
+                             (long long) cache_tensor->ne[1],
+                             (long long) cache_tensor->ne[2],
+                             (long long) cache_tensor->ne[3]);
+                    return false;
+                }
+            }
+            graph_tensor->buffer = cache_tensor->buffer;
+            graph_tensor->data   = cache_tensor->data;
+            graph_tensor->extra  = cache_tensor->extra;
+            for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
+                graph_tensor->src[src_idx] = nullptr;
+            }
+            graph_tensor->op = GGML_OP_NONE;
+        }
+        return true;
+    }
+
     bool offload_all_params() {
         restore_partial_params();
         if (params_backend == runtime_backend) {
@@ -5042,6 +5237,14 @@ protected:
         int64_t t_alloc_end = ggml_time_ms();
 
         int64_t t_copy_begin = ggml_time_ms();
+        if (!bind_cache_backed_tensors()) {
+            if (free_compute_buffer_immediately) {
+                free_compute_buffer();
+            } else if (use_partial_param_offload) {
+                restore_partial_params();
+            }
+            return std::nullopt;
+        }
         copy_data_to_backend_tensor(gf, !preserve_backend_tensor_data_map);
         int64_t t_copy_end = ggml_time_ms();
         if (ggml_backend_is_cpu(runtime_backend)) {
@@ -5254,6 +5457,11 @@ public:
         runner_ctx.cache_tensor = [this](const std::string& name, ggml_tensor* tensor) {
             this->cache(name, tensor);
         };
+        runner_ctx.bind_cache_tensor = [this](const std::string& name, ggml_tensor* tensor) {
+            if (tensor != nullptr) {
+                this->cache_backed_tensor_name_map[tensor] = name;
+            }
+        };
         return runner_ctx;
     }
 
@@ -5423,7 +5631,9 @@ public:
             return std::nullopt;
         }
 
-        if (can_attempt_graph_cut_segmented_compute()) {
+        const bool uses_cross_step_cache =
+            !cache_tensor_map.empty() || !cache_backed_tensor_name_map.empty();
+        if (!uses_cross_step_cache && can_attempt_graph_cut_segmented_compute()) {
             GraphCutPlan plan;
             if (!resolve_graph_cut_plan(gf, &plan)) {
                 free_compute_ctx();

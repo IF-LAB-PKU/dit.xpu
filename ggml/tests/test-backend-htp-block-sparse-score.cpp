@@ -381,6 +381,72 @@ static void test_block_sparse_step_shift_policy() {
     std::printf("[PASS] block sparse step shift policy\n");
 }
 
+static void test_block_sparse_dense_interval_policy() {
+    GGML_ASSERT(sd_htp_block_sparse_scheduled_step_index(0, 0) == 0);
+    GGML_ASSERT(sd_htp_block_sparse_scheduled_step_index(1, 0) == 1);
+    GGML_ASSERT(sd_htp_block_sparse_scheduled_step_index(4, 0) == 4);
+    GGML_ASSERT(sd_htp_block_sparse_scheduled_step_index(1, -3) == 1);
+
+    GGML_ASSERT(sd_htp_block_sparse_scheduled_step_index(1, 2) == 1);
+    GGML_ASSERT(sd_htp_block_sparse_scheduled_step_index(2, 2) == 2);
+    GGML_ASSERT(sd_htp_block_sparse_scheduled_step_index(3, 2) == 0);
+    GGML_ASSERT(sd_htp_block_sparse_scheduled_step_index(4, 2) == 3);
+    GGML_ASSERT(sd_htp_block_sparse_scheduled_step_index(5, 2) == 4);
+    GGML_ASSERT(sd_htp_block_sparse_scheduled_step_index(6, 2) == 0);
+
+    GGML_ASSERT(sd_htp_block_sparse_scheduled_step_index(1, 1) == 1);
+    GGML_ASSERT(sd_htp_block_sparse_scheduled_step_index(2, 1) == 0);
+    GGML_ASSERT(sd_htp_block_sparse_scheduled_step_index(3, 1) == 2);
+    GGML_ASSERT(sd_htp_block_sparse_scheduled_step_index(4, 1) == 0);
+
+    std::printf("[PASS] block sparse dense interval policy\n");
+}
+
+static void test_block_sparse_residual_mode_policy() {
+    GGML_ASSERT(sd_htp_block_sparse_residual_mode(false, false, 0) == SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF);
+    GGML_ASSERT(sd_htp_block_sparse_residual_mode(false, true, 0) == SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF);
+    GGML_ASSERT(sd_htp_block_sparse_residual_mode(true, false, 0) == SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF);
+    GGML_ASSERT(sd_htp_block_sparse_residual_mode(true, false, 1) == SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY);
+    GGML_ASSERT(sd_htp_block_sparse_residual_mode(true, false, 3) == SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY);
+    GGML_ASSERT(sd_htp_block_sparse_residual_mode(true, true, 0) == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR);
+    GGML_ASSERT(sd_htp_block_sparse_residual_mode(true, true, 3) == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR);
+
+    std::printf("[PASS] block sparse residual mode policy\n");
+}
+
+static void test_block_sparse_residual_warmup_anchor_policy() {
+    GGML_ASSERT(!sd_htp_block_sparse_warmup_residual_anchor_step(0, 4, 20, 4));
+    GGML_ASSERT(!sd_htp_block_sparse_warmup_residual_anchor_step(3, 4, 20, 4));
+    GGML_ASSERT(sd_htp_block_sparse_warmup_residual_anchor_step(4, 4, 20, 4));
+    GGML_ASSERT(!sd_htp_block_sparse_warmup_residual_anchor_step(5, 4, 20, 4));
+    GGML_ASSERT(!sd_htp_block_sparse_warmup_residual_anchor_step(4, 0, 20, 4));
+    GGML_ASSERT(!sd_htp_block_sparse_warmup_residual_anchor_step(20, 20, 20, 0));
+    GGML_ASSERT(!sd_htp_block_sparse_warmup_residual_anchor_step(16, 16, 20, 4));
+
+    std::printf("[PASS] block sparse residual warmup anchor policy\n");
+}
+
+static void test_block_sparse_residual_anchor_has_sparse_consumer_policy() {
+    GGML_ASSERT(sd_htp_block_sparse_residual_anchor_has_sparse_consumer(4, 20, 4));
+    GGML_ASSERT(sd_htp_block_sparse_residual_anchor_has_sparse_consumer(8, 20, 4));
+    GGML_ASSERT(sd_htp_block_sparse_residual_anchor_has_sparse_consumer(12, 20, 4));
+    GGML_ASSERT(!sd_htp_block_sparse_residual_anchor_has_sparse_consumer(16, 20, 4));
+    GGML_ASSERT(!sd_htp_block_sparse_residual_anchor_has_sparse_consumer(20, 20, 0));
+
+    std::printf("[PASS] block sparse residual anchor consumer policy\n");
+}
+
+static void test_block_sparse_residual_cache_key_policy() {
+    GGML_ASSERT(sd_htp_block_sparse_residual_cache_key(0, "joint", 3) ==
+                "htp_block_sparse_residual_b0_joint_s3");
+    GGML_ASSERT(sd_htp_block_sparse_residual_cache_key(1, "self", 4) ==
+                "htp_block_sparse_residual_b1_self_s4");
+    GGML_ASSERT(sd_htp_block_sparse_residual_cache_key(2, "self2", 5) ==
+                "htp_block_sparse_residual_b2_self2_s5");
+
+    std::printf("[PASS] block sparse residual cache key policy\n");
+}
+
 static void test_patch_score_mask_promotes_to_dsp_index() {
     constexpr int n_q16 = 4;
     constexpr int n_k16 = 5;
@@ -1090,6 +1156,11 @@ int main() {
     test_patch_major_shifted_reorder_tensor_roundtrip();
     test_patch_major_shifted_to_shifted_reorder_tensor_roundtrip();
     test_block_sparse_step_shift_policy();
+    test_block_sparse_dense_interval_policy();
+    test_block_sparse_residual_mode_policy();
+    test_block_sparse_residual_warmup_anchor_policy();
+    test_block_sparse_residual_anchor_has_sparse_consumer_policy();
+    test_block_sparse_residual_cache_key_policy();
     test_patch_score_mask_promotes_to_dsp_index();
     test_patch_score_mask_2d_halo_keeps_surrounding_blocks();
     test_patch_score_mask_center_sink_keeps_center_blocks();

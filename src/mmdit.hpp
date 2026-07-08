@@ -217,6 +217,45 @@ public:
     }
 };
 
+__STATIC_INLINE__ ggml_tensor* mmdit_residual_attention(GGMLRunnerContext* ctx,
+                                                        const std::vector<ggml_tensor*>& qkv,
+                                                        int64_t num_heads,
+                                                        const char* residual_kind,
+                                                        int protected_start = 0,
+                                                        int protected_len   = 0) {
+    const int residual_attention_slot = ctx->block_sparse_residual_attention_index++;
+    std::string residual_cache_name;
+    ggml_tensor* cached_residual = nullptr;
+    if (ctx->block_sparse_residual_mode != SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF) {
+        residual_cache_name = sd_htp_block_sparse_residual_cache_key(ctx->block_sparse_residual_branch_index,
+                                                                     residual_kind,
+                                                                     residual_attention_slot);
+        if (ctx->block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY) {
+            cached_residual = ctx->cache_tensor_as_graph_input(residual_cache_name);
+        }
+    }
+
+    return ggml_ext_attention_ext(ctx->ggml_ctx,
+                                  ctx->backend,
+                                  qkv[0],
+                                  qkv[1],
+                                  qkv[2],
+                                  num_heads,
+                                  nullptr,
+                                  false,
+                                  ctx->flash_attn_enabled,
+                                  1.0f,
+                                  ctx->block_sparse_attn_enabled ||
+                                      ctx->block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR,
+                                  protected_start,
+                                  protected_len,
+                                  ctx->block_sparse_residual_mode,
+                                  ctx->block_sparse_residual_scale,
+                                  residual_cache_name.empty() ? nullptr : residual_cache_name.c_str(),
+                                  cached_residual,
+                                  &ctx->cache_tensor);
+}
+
 __STATIC_INLINE__ ggml_tensor* modulate(ggml_context* ctx,
                                         ggml_tensor* x,
                                         ggml_tensor* shift,
@@ -433,8 +472,8 @@ public:
             auto qkv2          = std::get<1>(qkv_intermediates);
             auto intermediates = std::get<2>(qkv_intermediates);
 
-            auto attn_out  = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, qkv[0], qkv[1], qkv[2], num_heads, nullptr, false, ctx->flash_attn_enabled, 1.0f, ctx->block_sparse_attn_enabled);     // [N, n_token, dim]
-            auto attn2_out = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, qkv2[0], qkv2[1], qkv2[2], num_heads, nullptr, false, ctx->flash_attn_enabled, 1.0f, ctx->block_sparse_attn_enabled);  // [N, n_token, dim]
+            auto attn_out  = mmdit_residual_attention(ctx, qkv, num_heads, "self");   // [N, n_token, dim]
+            auto attn2_out = mmdit_residual_attention(ctx, qkv2, num_heads, "self2"); // [N, n_token, dim]
             x              = post_attention_x(ctx,
                                               attn_out,
                                               attn2_out,
@@ -450,7 +489,7 @@ public:
             auto qkv               = qkv_intermediates.first;
             auto intermediates     = qkv_intermediates.second;
 
-            auto attn_out = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, qkv[0], qkv[1], qkv[2], num_heads, nullptr, false, ctx->flash_attn_enabled, 1.0f, ctx->block_sparse_attn_enabled);  // [N, n_token, dim]
+            auto attn_out = mmdit_residual_attention(ctx, qkv, num_heads, "self");  // [N, n_token, dim]
             x             = post_attention(ctx,
                                            attn_out,
                                            intermediates[0],
@@ -494,19 +533,12 @@ block_mixing(GGMLRunnerContext* ctx,
         qkv.push_back(ggml_concat(ctx->ggml_ctx, x_qkv[i], context_qkv[i], 1));
     }
 
-    auto attn = ggml_ext_attention_ext(ctx->ggml_ctx,
-                                       ctx->backend,
-                                       qkv[0],
-                                       qkv[1],
-                                       qkv[2],
-                                       x_block->num_heads,
-                                       nullptr,
-                                       false,
-                                       ctx->flash_attn_enabled,
-                                       1.0f,
-                                       ctx->block_sparse_attn_enabled,
-                                       static_cast<int>(x->ne[1]),
-                                       static_cast<int>(context->ne[1]));  // [N, n_token + n_context, hidden_size]
+    auto attn = mmdit_residual_attention(ctx,
+                                         qkv,
+                                         x_block->num_heads,
+                                         "joint",
+                                         static_cast<int>(x->ne[1]),
+                                         static_cast<int>(context->ne[1]));  // [N, n_token + n_context, hidden_size]
 
     auto x_attn       = ggml_view_3d(ctx->ggml_ctx,
                                      attn,
@@ -538,7 +570,7 @@ block_mixing(GGMLRunnerContext* ctx,
     }
 
     if (x_block->self_attn) {
-        auto attn2 = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, x_qkv2[0], x_qkv2[1], x_qkv2[2], x_block->num_heads, nullptr, false, ctx->flash_attn_enabled, 1.0f, ctx->block_sparse_attn_enabled);  // [N, n_token, hidden_size]
+        auto attn2 = mmdit_residual_attention(ctx, x_qkv2, x_block->num_heads, "self2");  // [N, n_token, hidden_size]
 
         x = x_block->post_attention_x(ctx,
                                       x_attn,
@@ -900,7 +932,10 @@ struct MMDiTRunner : public GGMLRunner {
                              const sd::Tensor<float>& context_tensor = {},
                              const sd::Tensor<float>& y_tensor       = {},
                              std::vector<int> skip_layers            = std::vector<int>(),
-                             int block_sparse_step_index             = 0) {
+                             int block_sparse_step_index             = 0,
+                             int block_sparse_residual_mode          = SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
+                             float block_sparse_residual_scale       = 1.0f,
+                             int block_sparse_residual_branch_index  = 0) {
         ggml_cgraph* gf = new_graph_custom(MMDIT_GRAPH_SIZE);
 
         ggml_tensor* x         = make_input(x_tensor);
@@ -908,7 +943,11 @@ struct MMDiTRunner : public GGMLRunner {
         ggml_tensor* context   = make_optional_input(context_tensor);
         ggml_tensor* y         = make_optional_input(y_tensor);
 
-        auto runner_ctx  = get_context();
+        auto runner_ctx = get_context();
+        runner_ctx.block_sparse_residual_mode            = block_sparse_residual_mode;
+        runner_ctx.block_sparse_residual_scale           = block_sparse_residual_scale;
+        runner_ctx.block_sparse_residual_branch_index    = block_sparse_residual_branch_index;
+        runner_ctx.block_sparse_residual_attention_index = 0;
         ggml_tensor* out = mmdit.forward(&runner_ctx,
                                          x,
                                          timesteps,
@@ -928,13 +967,24 @@ struct MMDiTRunner : public GGMLRunner {
                               const sd::Tensor<float>& context = {},
                               const sd::Tensor<float>& y       = {},
                               std::vector<int> skip_layers     = std::vector<int>(),
-                              int block_sparse_step_index      = 0) {
+                              int block_sparse_step_index      = 0,
+                              int block_sparse_residual_mode   = SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
+                              float block_sparse_residual_scale = 1.0f,
+                              int block_sparse_residual_branch_index = 0) {
         // x: [N, in_channels, h, w]
         // timesteps: [N, ]
         // context: [N, max_position, hidden_size]([N, 154, 4096]) or [1, max_position, hidden_size]
         // y: [N, adm_in_channels] or [1, adm_in_channels]
         auto get_graph = [&]() -> ggml_cgraph* {
-            return build_graph(x, timesteps, context, y, skip_layers, block_sparse_step_index);
+            return build_graph(x,
+                               timesteps,
+                               context,
+                               y,
+                               skip_layers,
+                               block_sparse_step_index,
+                               block_sparse_residual_mode,
+                               block_sparse_residual_scale,
+                               block_sparse_residual_branch_index);
         };
 
         return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
