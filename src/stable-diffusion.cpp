@@ -2050,6 +2050,8 @@ public:
             sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE");
         const float htp_block_sparse_residual_scale =
             sd_env_float_value("SD_HTP_BLOCK_SPARSE_RESIDUAL_SCALE", 1.0f);
+        const float htp_block_sparse_residual_rho =
+            sd_htp_block_sparse_residual_rho_value(sd_env_float_value("SD_HTP_BLOCK_SPARSE_RESIDUAL_RHO", 1.0f));
         const bool htp_block_sparse_original = work_diffusion_model != nullptr &&
                                                work_diffusion_model->is_block_sparse_attention_enabled();
         if (htp_block_sparse_original && htp_block_sparse_warmup_steps > 0) {
@@ -2069,8 +2071,9 @@ public:
                      htp_block_sparse_dense_every_n_sparse_steps);
         }
         if (htp_block_sparse_original && htp_block_sparse_residual_cache_enabled) {
-            LOG_INFO("HTP block sparse residual cache enabled: scale=%.3f",
-                     htp_block_sparse_residual_scale);
+            LOG_INFO("HTP block sparse residual cache enabled: scale=%.3f rho=%.3f",
+                     htp_block_sparse_residual_scale,
+                     htp_block_sparse_residual_rho);
         }
         bool has_skiplayer = slg_scale != 0.0f && !skip_layers.empty();
         if (has_skiplayer && !sd_version_is_dit(version)) {
@@ -2216,6 +2219,7 @@ public:
             diffusion_params.block_sparse_step_index = static_cast<int>(htp_block_sparse_step_index);
             diffusion_params.block_sparse_residual_mode = htp_block_sparse_residual_mode;
             diffusion_params.block_sparse_residual_scale = htp_block_sparse_residual_scale;
+            diffusion_params.block_sparse_residual_rho = htp_block_sparse_residual_rho;
             diffusion_params.audio_timesteps    = audio_timesteps_tensor.empty() ? nullptr : &audio_timesteps_tensor;
             diffusion_params.guidance           = &guidance_tensor;
             diffusion_params.ref_latents        = &ref_latents;
