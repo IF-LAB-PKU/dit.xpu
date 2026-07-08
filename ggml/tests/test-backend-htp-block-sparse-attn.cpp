@@ -452,6 +452,59 @@ struct AttentionRunner : GGMLRunner {
         GGML_ASSERT(result.has_value());
         return result->values();
     }
+
+    std::vector<float> run_cpu_lse(int n_threads,
+                                   int qo_len,
+                                   int kv_len,
+                                   int n_heads,
+                                   int n_kv_heads,
+                                   int head_dim,
+                                   const std::vector<float> & q_data,
+                                   const std::vector<ggml_fp16_t> & k_data,
+                                   const std::vector<float> * dense_mask_data) {
+        set_flash_attention_enabled(false);
+        set_htp_attention_enabled(false);
+        set_block_sparse_attention_enabled(false);
+
+        EnvGuard htp_ops("SD_HTP_OPS", "0");
+        EnvGuard htp_compute("SD_HTP_COMPUTE", "0");
+        EnvGuard htp_attention("SD_HTP_ATTENTION", "0");
+
+        sd::Tensor<float> q_tensor({n_heads * head_dim, qo_len, 1}, q_data);
+        sd::Tensor<ggml_fp16_t> k_tensor({n_kv_heads * head_dim, kv_len, 1}, k_data);
+        std::vector<float> zero_mask_data(size_t(kv_len) * size_t(qo_len) * size_t(n_heads), 0.0f);
+        sd::Tensor<float> mask_tensor({kv_len, qo_len, n_heads, 1},
+                                      dense_mask_data != nullptr ? *dense_mask_data : zero_mask_data);
+
+        auto get_graph = [&]() -> ggml_cgraph * {
+            GGMLRunnerContext runner_ctx = get_context();
+
+            ggml_tensor * q_orig = make_input(q_tensor);
+            ggml_tensor * k_orig = make_input(k_tensor);
+            ggml_tensor * mask = dense_mask_data != nullptr ? make_input(mask_tensor) : nullptr;
+
+            ggml_tensor * q3 = ggml_reshape_3d(runner_ctx.ggml_ctx, q_orig, head_dim, n_heads, qo_len);
+            ggml_tensor * q = ggml_permute(runner_ctx.ggml_ctx, q3, 0, 2, 1, 3);
+            ggml_tensor * k_base = ggml_reshape_3d(runner_ctx.ggml_ctx, k_orig, head_dim, n_kv_heads, kv_len);
+            ggml_tensor * k = ggml_permute(runner_ctx.ggml_ctx, k_base, 0, 2, 1, 3);
+
+            ggml_tensor * lse = ggml_ext_attention_lse_node(runner_ctx.ggml_ctx,
+                                                            q,
+                                                            k,
+                                                            mask,
+                                                            n_heads,
+                                                            1.0f / std::sqrt(float(head_dim)));
+            GGML_ASSERT(lse != nullptr);
+
+            ggml_cgraph * graph = ggml_new_graph(runner_ctx.ggml_ctx);
+            ggml_build_forward_expand(graph, lse);
+            return graph;
+        };
+
+        auto result = GGMLRunner::compute<float>(get_graph, n_threads, true);
+        GGML_ASSERT(result.has_value());
+        return result->values();
+    }
 };
 
 static std::vector<float> dense_mask_from_block_index(const std::vector<int32_t> & block_index,
@@ -542,6 +595,48 @@ static void test_exact_residual_rho_reference_formula(AttentionRunner & runner) 
                 max_diff,
                 worst);
     GGML_ASSERT(max_diff <= 1e-5);
+}
+
+static void test_attention_lse_node_matches_reference(AttentionRunner & runner) {
+    constexpr int qo_len = 64;
+    constexpr int kv_len = 96;
+    constexpr int n_heads = 4;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 32;
+    constexpr float keep_ratio = 0.50f;
+
+    std::vector<float> q = gen_q(qo_len, n_heads, head_dim, 21);
+    std::vector<ggml_fp16_t> k = gen_kv_f16(kv_len, n_kv_heads, head_dim, 22);
+    std::vector<ggml_fp16_t> v = gen_kv_f16(kv_len, n_kv_heads, head_dim, 23);
+
+    std::vector<int32_t> block_index =
+        runner.make_block_index(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, keep_ratio);
+    std::vector<float> sparse_dense_mask =
+        dense_mask_from_block_index(block_index, qo_len, kv_len, n_heads, n_kv_heads);
+
+    const RefAttentionWithLse dense_ref =
+        reference_attention_with_lse(qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, nullptr);
+    const RefAttentionWithLse sparse_ref =
+        reference_attention_with_lse(qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, &sparse_dense_mask);
+
+    const std::vector<float> dense_lse =
+        runner.run_cpu_lse(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, nullptr);
+    const std::vector<float> sparse_lse =
+        runner.run_cpu_lse(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, &sparse_dense_mask);
+
+    GGML_ASSERT(dense_lse.size() == dense_ref.lse.size());
+    GGML_ASSERT(sparse_lse.size() == sparse_ref.lse.size());
+    size_t worst_dense = 0;
+    size_t worst_sparse = 0;
+    const double dense_diff = max_abs_diff(dense_ref.lse, dense_lse, &worst_dense);
+    const double sparse_diff = max_abs_diff(sparse_ref.lse, sparse_lse, &worst_sparse);
+    std::printf("[PASS] attention lse node dense_max_abs=%.9g sparse_max_abs=%.9g worst_dense=%zu worst_sparse=%zu\n",
+                dense_diff,
+                sparse_diff,
+                worst_dense,
+                worst_sparse);
+    GGML_ASSERT(dense_diff <= 1e-5);
+    GGML_ASSERT(sparse_diff <= 1e-5);
 }
 
 static void run_case(AttentionRunner & runner, int qo_len, int kv_len, int n_heads, int n_kv_heads, int head_dim) {
@@ -647,6 +742,7 @@ int main() {
     AttentionRunner runner(cpu, htp);
 
     test_exact_residual_rho_reference_formula(runner);
+    test_attention_lse_node_matches_reference(runner);
 
     run_case(runner, 256, 256, 24, 24, 64);
     run_case(runner, 410, 410, 24, 24, 64);
