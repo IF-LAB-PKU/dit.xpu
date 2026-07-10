@@ -368,9 +368,18 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                     return false;
                 }
 
+                const bool with_lse = ggml_get_op_params_i32(dst, 6) != 0;
+                const bool shape_ok =
+                    q->ne[0] == k->ne[0] &&
+                    q->ne[0] == v->ne[0] &&
+                    dst->ne[0] == v->ne[0] + (with_lse ? 1 : 0) &&
+                    dst->ne[1] == q->ne[2] &&
+                    dst->ne[2] == q->ne[1] &&
+                    dst->ne[3] == q->ne[3];
+
                 return dst->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
                        v->type == GGML_TYPE_F16 && (mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32) &&
-                       max_bias == 0 && logit_softcap == 0;
+                       shape_ok && max_bias == 0 && logit_softcap == 0;
             }
         case GGML_OP_CUSTOM:
             return is_block_sparse_score_custom(dst);
@@ -573,6 +582,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 auto [mask_fd, mask_offset] = mappings[4];
 
                 auto * mask = dst->src[3];
+                const bool with_lse = ggml_get_op_params_i32(dst, 6) != 0;
                 if (mask->type == GGML_TYPE_I32) {
                     const int32_t block_q = ggml_get_op_params_i32(dst, 4);
                     const int32_t block_k = ggml_get_op_params_i32(dst, 5);
@@ -604,6 +614,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                         .n_k_blocks = computed_n_k_blocks,
                         .mask_format = is_index ? 1 : 0,
                         .max_kept_blocks = is_index ? (int32_t) mask->ne[0] : 0,
+                        .with_lse = with_lse ? 1 : 0,
                     };
                     *reinterpret_cast<BlockSparseAttnParams *>(param_buf) = op_params;
 
@@ -625,6 +636,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                         .n_kv_heads = (int32_t) k->ne[2],
                         .head_dim   = (int32_t) q->ne[0],
                         .impl       = htp_attention_impl_is_normal() ? 1 : 0,
+                        .with_lse   = with_lse ? 1 : 0,
                     };
                     *reinterpret_cast<FlashAttnParams *>(param_buf) = op_params;
 

@@ -5326,7 +5326,7 @@ struct ggml_tensor * ggml_arange(
 
 // ggml_flash_attn_ext
 
-struct ggml_tensor * ggml_flash_attn_ext(
+static struct ggml_tensor * ggml_flash_attn_ext_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
@@ -5334,7 +5334,8 @@ struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_tensor  * mask,
         float                 scale,
         float                 max_bias,
-        float                 logit_softcap) {
+        float                 logit_softcap,
+        bool                  with_lse) {
     GGML_ASSERT(ggml_can_mul_mat(k, q));
     // TODO: check if vT can be multiplied by (k*qT)
 
@@ -5355,11 +5356,12 @@ struct ggml_tensor * ggml_flash_attn_ext(
     }
 
     // permute(0, 2, 1, 3)
-    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    int64_t ne[4] = { v->ne[0] + (with_lse ? 1 : 0), q->ne[2], q->ne[1], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     float params[] = { scale, max_bias, logit_softcap };
     ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_i32(result, 6, with_lse ? 1 : 0);
 
     result->op     = GGML_OP_FLASH_ATTN_EXT;
     result->src[0] = q;
@@ -5368,6 +5370,30 @@ struct ggml_tensor * ggml_flash_attn_ext(
     result->src[3] = mask;
 
     return result;
+}
+
+struct ggml_tensor * ggml_flash_attn_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, scale, max_bias, logit_softcap, false);
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_with_lse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, scale, max_bias, logit_softcap, true);
 }
 
 void ggml_flash_attn_ext_set_prec(

@@ -2015,7 +2015,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         return ggml_transpose(ctx, mask_in);
     };
 
-    auto build_kqv = [&](ggml_tensor* q_in, ggml_tensor* k_in, ggml_tensor* v_in, ggml_tensor* mask_in) -> ggml_tensor* {
+    auto build_kqv = [&](ggml_tensor* q_in, ggml_tensor* k_in, ggml_tensor* v_in, ggml_tensor* mask_in, bool with_lse = false) -> ggml_tensor* {
         // htp_attention_layout removed - pack/unpack not used with diffusion_flash_attn=false
         if (kv_pad != 0) {
             k_in = ggml_pad(ctx, k_in, 0, kv_pad, 0, 0);
@@ -2068,15 +2068,16 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             }
         }
 
-        auto out = ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0);
+        auto out = with_lse ? ggml_flash_attn_ext_with_lse(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0)
+                            : ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0);
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
-        if (kv_scale != 1.0f) {
+        if (!with_lse && kv_scale != 1.0f) {
             out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
         }
         return out;
     };
 
-    auto build_htp_kqv = [&](ggml_tensor* mask_in) -> ggml_tensor* {
+    auto build_htp_kqv = [&](ggml_tensor* mask_in, bool with_lse = false) -> ggml_tensor* {
         const bool block_sparse_mask = mask_in != nullptr && mask_in->type == GGML_TYPE_I32;
         if (!use_htp_flash_layout) {
             return nullptr;
@@ -2126,12 +2127,29 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             }
         }
 
-        auto out = ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0);
+        auto out = with_lse ? ggml_flash_attn_ext_with_lse(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0)
+                            : ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0);
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
-        if (kv_scale != 1.0f) {
+        if (!with_lse && kv_scale != 1.0f) {
             out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
         }
         return out;
+    };
+
+    auto flash_attn_o_view = [&](ggml_tensor* packed, bool with_lse = false) -> ggml_tensor* {
+        GGML_ASSERT(packed != nullptr);
+        GGML_ASSERT(!with_lse || packed->ne[0] == d_head + 1);
+        ggml_tensor* out = ggml_view_3d(ctx, packed, d_head, n_head, L_q, packed->nb[1], packed->nb[2], 0);
+        if (with_lse && kv_scale != 1.0f) {
+            out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
+        }
+        return out;
+    };
+
+    auto flash_attn_lse_view = [&](ggml_tensor* packed) -> ggml_tensor* {
+        GGML_ASSERT(packed != nullptr);
+        GGML_ASSERT(packed->ne[0] == d_head + 1);
+        return ggml_view_3d(ctx, packed, 1, n_head, L_q, packed->nb[1], packed->nb[2], d_head * packed->nb[0]);
     };
 
     if (flash_attn) {
@@ -2192,21 +2210,28 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             }
             const int saved_kv_pad  = kv_pad;
             kv_pad                  = 0;
-            ggml_tensor* candidate  = build_htp_kqv(block_mask);
+            const bool can_cache_exact_rho =
+                block_sparse_residual_exact_rho &&
+                block_sparse_residual_rho_cache_name != nullptr &&
+                block_sparse_cache_tensor != nullptr &&
+                *block_sparse_cache_tensor;
+            const bool anchor_can_cache_residual =
+                block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
+                block_sparse_residual_cache_name != nullptr &&
+                block_sparse_cache_tensor != nullptr &&
+                *block_sparse_cache_tensor;
+            const bool sparse_with_lse = anchor_can_cache_residual && can_cache_exact_rho;
+            ggml_tensor* candidate  = build_htp_kqv(block_mask, sparse_with_lse);
             const bool candidate_is_htp_layout = candidate != nullptr;
             if (candidate == nullptr) {
-                candidate = build_kqv(q, k, v, block_mask);
+                candidate = build_kqv(q, k, v, block_mask, sparse_with_lse);
             }
             candidate->op_params[4] = block_q;
             candidate->op_params[5] = block_k;
             if ((candidate_is_htp_layout && keep_for_htp_hybrid) || backend == nullptr || ggml_backend_supports_op(backend, candidate)) {
-                ggml_tensor* sparse_out = ggml_view_3d(ctx, candidate, d_head, n_head, L_q, candidate->nb[1], candidate->nb[2], 0);
+                ggml_tensor* sparse_out = flash_attn_o_view(candidate, sparse_with_lse);
+                ggml_tensor* sparse_lse = sparse_with_lse ? flash_attn_lse_view(candidate) : nullptr;
                 ggml_tensor* sparse_reshape_out = sparse_out;
-                const bool can_cache_exact_rho =
-                    block_sparse_residual_exact_rho &&
-                    block_sparse_residual_rho_cache_name != nullptr &&
-                    block_sparse_cache_tensor != nullptr &&
-                    *block_sparse_cache_tensor;
                 const bool cached_exact_rho_valid =
                     block_sparse_residual_exact_rho &&
                     block_sparse_cached_rho != nullptr &&
@@ -2219,36 +2244,27 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                 } else if (block_sparse_residual_rho != 1.0f) {
                     sparse_reshape_out = ggml_ext_scale(ctx, sparse_reshape_out, block_sparse_residual_rho);
                 }
-                if (block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
-                    block_sparse_residual_cache_name != nullptr &&
-                    block_sparse_cache_tensor != nullptr &&
-                    *block_sparse_cache_tensor) {
-                    ggml_tensor* dense_candidate = build_htp_kqv(nullptr);
-                    if (dense_candidate == nullptr) {
-                        dense_candidate = build_kqv(q, k, v, nullptr);
+                if (anchor_can_cache_residual) {
+                    ggml_tensor* dense_candidate = nullptr;
+                    ggml_tensor* dense_lse = nullptr;
+                    if (can_cache_exact_rho) {
+                        dense_candidate = build_htp_kqv(nullptr, true);
+                        if (dense_candidate == nullptr) {
+                            dense_candidate = build_kqv(q, k, v, nullptr, true);
+                        }
+                    } else {
+                        dense_candidate = build_htp_kqv(nullptr);
+                        if (dense_candidate == nullptr) {
+                            dense_candidate = build_kqv(q, k, v, nullptr);
+                        }
                     }
-                    ggml_tensor* dense_out = ggml_view_3d(ctx,
-                                                          dense_candidate,
-                                                          d_head,
-                                                          n_head,
-                                                          L_q,
-                                                          dense_candidate->nb[1],
-                                                          dense_candidate->nb[2],
-                                                          0);
+                    ggml_tensor* dense_out = flash_attn_o_view(dense_candidate, can_cache_exact_rho);
+                    if (can_cache_exact_rho) {
+                        dense_lse = flash_attn_lse_view(dense_candidate);
+                    }
                     ggml_tensor* rho = nullptr;
                     if (can_cache_exact_rho) {
-                        ggml_tensor* dense_lse = ggml_ext_attention_lse_node(ctx,
-                                                                             q,
-                                                                             k,
-                                                                             nullptr,
-                                                                             n_head,
-                                                                             scale / kv_scale);
-                        ggml_tensor* sparse_lse = ggml_ext_attention_lse_node(ctx,
-                                                                              q,
-                                                                              k,
-                                                                              block_mask,
-                                                                              n_head,
-                                                                              scale / kv_scale);
+                        GGML_ASSERT(dense_lse != nullptr && sparse_lse != nullptr);
                         rho = ggml_exp(ctx, ggml_sub(ctx, sparse_lse, dense_lse));
                         ggml_set_name(rho, block_sparse_residual_rho_cache_name);
                         (*block_sparse_cache_tensor)(block_sparse_residual_rho_cache_name, rho);
@@ -4271,6 +4287,7 @@ protected:
         }
         for (const auto& entry : cache_tensor_map) {
             if (entry.second != nullptr) {
+                ggml_set_output(entry.second);
                 ggml_build_forward_expand(gf, entry.second);
             }
         }

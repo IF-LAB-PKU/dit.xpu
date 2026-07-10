@@ -2405,6 +2405,18 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // Like ggml_flash_attn_ext(), but packs the per-(head, query) LSE in res[ne0 - 1].
+    // res: [n_embd_v + 1, n_head, n_batch, ne3]
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_with_lse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);

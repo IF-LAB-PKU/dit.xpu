@@ -33,6 +33,7 @@ struct RpcMemMapper {
 
     void validate(const struct ggml_tensor * dst, const struct ggml_tensor * extra = nullptr);
     std::pair<int, ssize_t> get_tensor_mapping(const struct ggml_tensor * tensor) const;
+    void release_buffer(void * buf_base);
 
     struct UnmapRequest {
         int fd;

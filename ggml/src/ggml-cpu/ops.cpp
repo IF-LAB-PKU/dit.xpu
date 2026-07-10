@@ -8237,8 +8237,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const int64_t DK = nek0;
     const int64_t DV = nev0;
     const int64_t N  = neq1;
+    const bool with_lse = ggml_get_op_params_i32(dst, 6) != 0;
 
-    GGML_ASSERT(ne0 == DV);
+    GGML_ASSERT(ne0 == DV + (with_lse ? 1 : 0));
     GGML_ASSERT(ne2 == N);
 
     // input tensor rows must be contiguous
@@ -8437,6 +8438,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             // V /= S
             const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
             ggml_vec_scale_f32(DV, VKQ32, S_inv);
+            if (with_lse) {
+                VKQ32[DV] = S == 0.0f ? -INFINITY : M + logf(S);
+            }
 
             // dst indices
             const int i1 = iq1;
@@ -8753,6 +8757,7 @@ static void ggml_flash_attn_ext_reduce_partials(
     const int64_t DV        = v->ne[0];
     const int64_t nek1      = k->ne[1];
     const int64_t n_q_heads = q->ne[2];
+    const bool with_lse = ggml_get_op_params_i32(dst, 6) != 0;
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -8804,6 +8809,9 @@ static void ggml_flash_attn_ext_reduce_partials(
             const float S_inv = 1.0f / S_final;
             ggml_vec_scale_f32(DV, VKQ_final, S_inv);
         }
+        if (with_lse) {
+            VKQ_final[DV] = S_final == 0.0f ? -INFINITY : M_final + logf(S_final);
+        }
         // iq1=0, iq3=0 for decode
         memcpy((char *) dst->data + (0*ne2*ne1 + q_head + 0*ne1)*nb1, VKQ_final, nb1);
     }
@@ -8829,9 +8837,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t DK = nek0;
     const int64_t DV = nev0;
     const int64_t N  = neq1;
+    const bool with_lse = ggml_get_op_params_i32(dst, 6) != 0;
 
 
-    GGML_ASSERT(ne0 == DV);
+    GGML_ASSERT(ne0 == DV + (with_lse ? 1 : 0));
     GGML_ASSERT(ne2 == N);
 
     // input tensor rows must be contiguous
@@ -8915,7 +8924,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !use_ref && !with_lse &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&

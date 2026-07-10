@@ -51,6 +51,7 @@ struct FlashAttnParams {
     int32_t n_kv_heads;
     int32_t head_dim;
     int32_t impl;
+    int32_t with_lse;
 } __attribute__((packed));
 
 struct BlockSparseAttnParams {
@@ -70,6 +71,7 @@ struct BlockSparseAttnParams {
     int32_t n_k_blocks;
     int32_t mask_format;
     int32_t max_kept_blocks;
+    int32_t with_lse;
 } __attribute__((packed));
 
 struct BlockSparseScoreParams {
