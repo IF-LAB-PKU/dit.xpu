@@ -279,6 +279,32 @@ std::pair<int, ssize_t> RpcMemMapper::get_tensor_mapping(const ggml_tensor * ten
     return { fd, offset };
 }
 
+void RpcMemMapper::release_buffer(void * buf_base) {
+    auto pending_it = std::find_if(
+        pending_unmap_reqs.begin(), pending_unmap_reqs.end(),
+        [buf_base](const auto & req) { return req.buf_base == buf_base; });
+    if (pending_it != pending_unmap_reqs.end()) {
+        flush_pending_unmaps();
+        return;
+    }
+
+    auto mapping_it = buf_mapping.find(buf_base);
+    if (mapping_it == buf_mapping.end()) {
+        return;
+    }
+
+    const auto [fd, buf_size] = mapping_it->second;
+    pending_unmap_reqs.push_back({fd, buf_base, buf_size, false});
+    accessed_bufs.erase(buf_iters.at(buf_base));
+    buf_iters.erase(buf_base);
+    buf_mapping.erase(mapping_it);
+    active_map_size -= buf_size;
+
+    // The rpcmem allocation is about to be freed, so both DSP and host mappings
+    // must be gone before the fd or virtual address can be reused.
+    flush_pending_unmaps();
+}
+
 void RpcMemMapper::flush_pending_unmaps() {
     send_rpcmem_puts_to_dsp(pending_unmap_reqs);
     unmap_all_pending_buffers();

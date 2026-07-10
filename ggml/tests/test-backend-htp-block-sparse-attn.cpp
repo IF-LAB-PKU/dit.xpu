@@ -123,6 +123,68 @@ static DiffStats diff_stats(const std::vector<float> & ref, const std::vector<fl
     return stats;
 }
 
+struct PackedWithLseDiffStats {
+    double out_max_abs = 0.0;
+    double lse_max_abs = 0.0;
+    size_t out_worst = 0;
+    size_t lse_worst = 0;
+};
+
+static PackedWithLseDiffStats packed_with_lse_diff_stats(const std::vector<float> & ref_out,
+                                                         const std::vector<float> & ref_lse,
+                                                         const std::vector<float> & got_packed,
+                                                         int qo_len,
+                                                         int n_heads,
+                                                         int head_dim) {
+    GGML_ASSERT(ref_out.size() == size_t(qo_len) * size_t(n_heads) * size_t(head_dim));
+    GGML_ASSERT(ref_lse.size() == size_t(qo_len) * size_t(n_heads));
+    GGML_ASSERT(got_packed.size() == size_t(qo_len) * size_t(n_heads) * size_t(head_dim + 1));
+
+    PackedWithLseDiffStats stats;
+    for (int qt = 0; qt < qo_len; ++qt) {
+        for (int h = 0; h < n_heads; ++h) {
+            const size_t packed_base = (size_t(qt) * size_t(n_heads) + size_t(h)) * size_t(head_dim + 1);
+            const size_t out_base = (size_t(qt) * size_t(n_heads) + size_t(h)) * size_t(head_dim);
+            for (int d = 0; d < head_dim; ++d) {
+                const size_t out_idx = out_base + size_t(d);
+                const double diff = std::fabs(double(got_packed[packed_base + size_t(d)]) - double(ref_out[out_idx]));
+                if (diff > stats.out_max_abs) {
+                    stats.out_max_abs = diff;
+                    stats.out_worst = out_idx;
+                }
+            }
+
+            const size_t lse_idx = size_t(qt) * size_t(n_heads) + size_t(h);
+            const double lse_diff =
+                std::fabs(double(got_packed[packed_base + size_t(head_dim)]) - double(ref_lse[lse_idx]));
+            if (lse_diff > stats.lse_max_abs) {
+                stats.lse_max_abs = lse_diff;
+                stats.lse_worst = lse_idx;
+            }
+        }
+    }
+    return stats;
+}
+
+static double packed_linear_prefix_diff(const std::vector<float> & ref_linear,
+                                        const std::vector<float> & got_packed,
+                                        size_t * worst = nullptr) {
+    GGML_ASSERT(got_packed.size() >= ref_linear.size());
+    double max_diff = 0.0;
+    size_t worst_idx = 0;
+    for (size_t i = 0; i < ref_linear.size(); ++i) {
+        const double diff = std::fabs(double(got_packed[i]) - double(ref_linear[i]));
+        if (diff > max_diff) {
+            max_diff = diff;
+            worst_idx = i;
+        }
+    }
+    if (worst != nullptr) {
+        *worst = worst_idx;
+    }
+    return max_diff;
+}
+
 struct RefAttentionWithLse {
     std::vector<float> out;
     std::vector<float> lse;
@@ -208,6 +270,52 @@ struct AttentionRunner : GGMLRunner {
 
     std::string get_desc() override {
         return "htp-block-sparse-attn";
+    }
+
+    std::vector<float> run_cache_output_lifetime_test(int n_tensors, int n_elements) {
+        GGML_ASSERT(n_tensors > 1 && n_elements > 0);
+        cache_tensor_map.clear();
+        cache_backed_tensor_name_map.clear();
+        free_cache_ctx_and_buffer();
+
+        std::vector<std::string> names;
+        names.reserve(size_t(n_tensors));
+        auto get_graph = [&]() -> ggml_cgraph * {
+            GGMLRunnerContext runner_ctx = get_context();
+            ggml_cgraph * graph = ggml_new_graph(runner_ctx.ggml_ctx);
+            for (int i = 0; i < n_tensors; ++i) {
+                names.push_back("cache_output_lifetime_" + std::to_string(i));
+                ggml_tensor * value = ggml_ext_full(runner_ctx.ggml_ctx,
+                                                    float(i + 1),
+                                                    n_elements,
+                                                    1,
+                                                    1,
+                                                    1);
+                ggml_set_name(value, names.back().c_str());
+                runner_ctx.cache_tensor(names.back(), value);
+                ggml_tensor * consumer = ggml_ext_scale(runner_ctx.ggml_ctx, value, -1.0f);
+                ggml_build_forward_expand(graph, consumer);
+            }
+            return graph;
+        };
+
+        const auto result = GGMLRunner::compute<float>(get_graph, 4, true, true);
+        GGML_ASSERT(result.has_value());
+
+        std::vector<float> first_values;
+        first_values.reserve(size_t(n_tensors));
+        for (const std::string & name : names) {
+            ggml_tensor * cached = get_cache_tensor_by_name(name);
+            GGML_ASSERT(cached != nullptr && ggml_nelements(cached) == n_elements);
+            std::vector<float> values(static_cast<size_t>(n_elements));
+            ggml_backend_tensor_get(cached, values.data(), 0, values.size() * sizeof(float));
+            first_values.push_back(values.front());
+        }
+
+        cache_tensor_map.clear();
+        cache_backed_tensor_name_map.clear();
+        free_cache_ctx_and_buffer();
+        return first_values;
     }
 
     std::vector<float> run(int n_threads,
@@ -451,6 +559,192 @@ struct AttentionRunner : GGMLRunner {
         auto result = GGMLRunner::compute<float>(get_graph, n_threads, true);
         GGML_ASSERT(result.has_value());
         return result->values();
+    }
+
+    std::vector<float> run_htp_flash_with_lse_packed(int n_threads,
+                                                     int qo_len,
+                                                     int kv_len,
+                                                     int n_heads,
+                                                     int n_kv_heads,
+                                                     int head_dim,
+                                                     const std::vector<float> & q_data,
+                                                     const std::vector<ggml_fp16_t> & k_data,
+                                                     const std::vector<ggml_fp16_t> & v_data,
+                                                     const std::vector<int32_t> * block_index) {
+        set_flash_attention_enabled(true);
+        set_htp_attention_enabled(true);
+        set_block_sparse_attention_enabled(block_index != nullptr);
+
+        EnvGuard htp_ops("SD_HTP_OPS", "1");
+        EnvGuard htp_compute("SD_HTP_COMPUTE", "1");
+        EnvGuard htp_attention("SD_HTP_ATTENTION", "1");
+
+        const int block_q = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+        const int block_k = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+        const int n_q_blocks = n_heads * ((qo_len + block_q - 1) / block_q);
+        const int max_kept = block_index != nullptr ? int(block_index->size()) / n_q_blocks : 1;
+
+        const int kv_pad_len = ((kv_len + 63) / 64) * 64;
+        std::vector<ggml_fp16_t> zero_mask_data(size_t(kv_pad_len) * size_t(qo_len),
+                                                ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity()));
+        for (int qt = 0; qt < qo_len; ++qt) {
+            for (int kt = 0; kt < kv_len; ++kt) {
+                zero_mask_data[size_t(qt) * size_t(kv_pad_len) + size_t(kt)] = ggml_fp32_to_fp16(0.0f);
+            }
+        }
+        std::vector<int32_t> dummy_index(size_t(n_q_blocks), 0);
+        const std::vector<int32_t> & index_data = block_index != nullptr ? *block_index : dummy_index;
+
+        sd::Tensor<float> q_tensor({n_heads * head_dim, qo_len, 1}, q_data);
+        sd::Tensor<ggml_fp16_t> k_tensor({n_kv_heads * head_dim, kv_len, 1}, k_data);
+        sd::Tensor<ggml_fp16_t> v_tensor({n_kv_heads * head_dim, kv_len, 1}, v_data);
+        sd::Tensor<ggml_fp16_t> zero_mask({kv_pad_len, qo_len, 1, 1}, zero_mask_data);
+        sd::Tensor<int32_t> index_tensor({max_kept, n_q_blocks, 1, 1}, index_data);
+
+        auto get_graph = [&]() -> ggml_cgraph * {
+            GGMLRunnerContext runner_ctx = get_context();
+
+            ggml_tensor * q_orig = make_input(q_tensor);
+            ggml_tensor * k_orig = make_input(k_tensor);
+            ggml_tensor * v_orig = make_input(v_tensor);
+
+            ggml_tensor * q3 = ggml_reshape_3d(runner_ctx.ggml_ctx, q_orig, head_dim, n_heads, qo_len);
+            ggml_tensor * q  = ggml_permute(runner_ctx.ggml_ctx, q3, 0, 2, 1, 3);
+            ggml_tensor * k_base = ggml_reshape_3d(runner_ctx.ggml_ctx, k_orig, head_dim, n_kv_heads, kv_len);
+            ggml_tensor * v_base = ggml_reshape_3d(runner_ctx.ggml_ctx, v_orig, head_dim, n_kv_heads, kv_len);
+            ggml_tensor * k = ggml_permute(runner_ctx.ggml_ctx, k_base, 0, 2, 1, 3);
+            ggml_tensor * v = ggml_permute(runner_ctx.ggml_ctx, v_base, 0, 2, 1, 3);
+
+            ggml_tensor * mask = nullptr;
+            if (block_index != nullptr) {
+                mask = make_input(index_tensor);
+                ggml_set_name(mask, "block_sparse_index");
+            } else {
+                mask = make_input(zero_mask);
+            }
+
+            ggml_tensor * packed = ggml_flash_attn_ext_with_lse(runner_ctx.ggml_ctx,
+                                                                q,
+                                                                k,
+                                                                v,
+                                                                mask,
+                                                                1.0f / std::sqrt(float(head_dim)),
+                                                                0.0f,
+                                                                0.0f);
+            ggml_flash_attn_ext_set_prec(packed, GGML_PREC_F32);
+            if (block_index != nullptr) {
+                packed->op_params[4] = block_q;
+                packed->op_params[5] = block_k;
+            }
+            GGML_ASSERT(packed->ne[0] == head_dim + 1);
+
+            ggml_cgraph * graph = ggml_new_graph(runner_ctx.ggml_ctx);
+            ggml_build_forward_expand(graph, packed);
+            return graph;
+        };
+
+        auto result = GGMLRunner::compute<float>(get_graph, n_threads, true);
+        GGML_ASSERT(result.has_value());
+        return result->values();
+    }
+
+    int count_exact_rho_anchor_flash_nodes_missing_block_params(int qo_len,
+                                                                int kv_len,
+                                                                int n_heads,
+                                                                int n_kv_heads,
+                                                                int head_dim,
+                                                                const std::vector<float> & q_data,
+                                                                const std::vector<ggml_fp16_t> & k_data,
+                                                                const std::vector<ggml_fp16_t> & v_data) {
+        set_flash_attention_enabled(true);
+        set_htp_attention_enabled(true);
+        set_block_sparse_attention_enabled(true);
+
+        EnvGuard htp_ops("SD_HTP_OPS", "1");
+        EnvGuard htp_compute("SD_HTP_COMPUTE", "1");
+        EnvGuard htp_attention("SD_HTP_ATTENTION", "1");
+        EnvGuard block_sparse_attn("SD_HTP_BLOCK_SPARSE_ATTN", "1");
+        EnvGuard keep_ratio("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", "0.5");
+
+        sd::Tensor<float> q_tensor({n_heads * head_dim, qo_len, 1}, q_data);
+        sd::Tensor<ggml_fp16_t> k_tensor({n_kv_heads * head_dim, kv_len, 1}, k_data);
+        sd::Tensor<ggml_fp16_t> v_tensor({n_kv_heads * head_dim, kv_len, 1}, v_data);
+
+        auto get_graph = [&]() -> ggml_cgraph * {
+            GGMLRunnerContext runner_ctx = get_context();
+
+            ggml_tensor * q = make_input(q_tensor);
+            ggml_tensor * k = make_input(k_tensor);
+            ggml_tensor * v = make_input(v_tensor);
+
+            ggml_tensor * out = ggml_ext_attention_ext(runner_ctx.ggml_ctx,
+                                                       runner_ctx.backend,
+                                                       q,
+                                                       k,
+                                                       v,
+                                                       n_heads,
+                                                       nullptr,
+                                                       false,
+                                                       runner_ctx.flash_attn_enabled,
+                                                       1.0f,
+                                                       true,
+                                                       0,
+                                                       0,
+                                                       SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR,
+                                                       1.0f,
+                                                       1.0f,
+                                                       true,
+                                                       "test_exact_rho_residual",
+                                                       nullptr,
+                                                       "test_exact_rho_rho",
+                                                       nullptr,
+                                                       &runner_ctx.cache_tensor);
+            GGML_ASSERT(out != nullptr);
+
+            ggml_cgraph * graph = ggml_new_graph(runner_ctx.ggml_ctx);
+            ggml_build_forward_expand(graph, out);
+            return graph;
+        };
+
+        ggml_cgraph * graph = nullptr;
+        GGML_ASSERT(prepare_compute_graph(get_graph, &graph));
+        GGML_ASSERT(graph != nullptr);
+
+        int sparse_flash_nodes = 0;
+        int missing_params = 0;
+        const int n_nodes = ggml_graph_n_nodes(graph);
+        for (int i = 0; i < n_nodes; ++i) {
+            ggml_tensor * node = ggml_graph_node(graph, i);
+            if (node == nullptr || node->op != GGML_OP_FLASH_ATTN_EXT || node->src[3] == nullptr ||
+                node->src[3]->type != GGML_TYPE_I32) {
+                continue;
+            }
+            ++sparse_flash_nodes;
+            const int32_t block_q = node->op_params[4];
+            const int32_t block_k = node->op_params[5];
+            if (block_q <= 0 || block_k <= 0) {
+                ++missing_params;
+                std::fprintf(stderr,
+                             "[FAIL] exact-rho anchor sparse flash node missing block params idx=%d "
+                             "block_q=%d block_k=%d with_lse=%d shape=[%lld,%lld,%lld,%lld]\n",
+                             i,
+                             block_q,
+                             block_k,
+                             node->op_params[6],
+                             (long long) node->ne[0],
+                             (long long) node->ne[1],
+                             (long long) node->ne[2],
+                             (long long) node->ne[3]);
+            }
+        }
+        std::printf("[CHECK] exact-rho anchor sparse flash nodes=%d missing_block_params=%d\n",
+                    sparse_flash_nodes,
+                    missing_params);
+        GGML_ASSERT(sparse_flash_nodes > 0);
+        cache_tensor_map.clear();
+        cache_backed_tensor_name_map.clear();
+        free_compute_ctx();
+        return missing_params;
     }
 
     std::vector<float> run_cpu_lse(int n_threads,
@@ -715,6 +1009,20 @@ static std::vector<float> dense_mask_from_block_index(const std::vector<int32_t>
     return dense_mask;
 }
 
+static std::vector<int32_t> full_keep_block_index(int qo_len, int kv_len, int n_heads, int n_kv_heads) {
+    const int block_q = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    const int block_k = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    const int n_q_blocks = n_heads * ((qo_len + block_q - 1) / block_q);
+    const int n_k_blocks = n_kv_heads * ((kv_len + block_k - 1) / block_k);
+    std::vector<int32_t> index(size_t(n_q_blocks) * size_t(n_k_blocks));
+    for (int qb = 0; qb < n_q_blocks; ++qb) {
+        for (int kb = 0; kb < n_k_blocks; ++kb) {
+            index[size_t(qb) * size_t(n_k_blocks) + size_t(kb)] = kb;
+        }
+    }
+    return index;
+}
+
 static void test_exact_residual_rho_reference_formula(AttentionRunner & runner) {
     constexpr int qo_len = 96;
     constexpr int kv_len = 128;
@@ -762,6 +1070,20 @@ static void test_exact_residual_rho_reference_formula(AttentionRunner & runner) 
                 max_diff,
                 worst);
     GGML_ASSERT(max_diff <= 1e-5);
+}
+
+static void test_cache_outputs_survive_until_persistence(AttentionRunner & runner) {
+    constexpr int n_tensors = 8;
+    const std::vector<float> values = runner.run_cache_output_lifetime_test(n_tensors, 4096);
+    GGML_ASSERT(values.size() == n_tensors);
+    for (int i = 0; i < n_tensors; ++i) {
+        std::fprintf(stderr,
+                     "[CACHE-LIFETIME] index=%d expected=%.1f got=%.9g\n",
+                     i,
+                     double(i + 1),
+                     double(values[size_t(i)]));
+        GGML_ASSERT(std::fabs(values[size_t(i)] - float(i + 1)) <= 1e-6f);
+    }
 }
 
 static void test_attention_lse_node_matches_reference(AttentionRunner & runner) {
@@ -812,6 +1134,210 @@ static void test_attention_lse_node_matches_reference(AttentionRunner & runner) 
     GGML_ASSERT(dense_diff <= 1e-5);
     GGML_ASSERT(sparse_diff <= 1e-5);
     GGML_ASSERT(sparse_index_diff <= 1e-5);
+}
+
+static void test_htp_flash_attn_with_lse_matches_reference(AttentionRunner & runner) {
+    {
+        constexpr int qo_len = 64;
+        constexpr int kv_len = 96;
+        constexpr int n_heads = 1;
+        constexpr int n_kv_heads = 1;
+        constexpr int head_dim = 64;
+
+        std::vector<float> q = gen_q(qo_len, n_heads, head_dim, 61);
+        std::vector<ggml_fp16_t> k = gen_kv_f16(kv_len, n_kv_heads, head_dim, 62);
+        std::vector<ggml_fp16_t> v = gen_kv_f16(kv_len, n_kv_heads, head_dim, 63);
+        const RefAttentionWithLse dense_ref =
+            reference_attention_with_lse(qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, nullptr);
+        const std::vector<float> dense_no_lse =
+            runner.run(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, false, false);
+        const std::vector<int32_t> full_index =
+            full_keep_block_index(qo_len, kv_len, n_heads, n_kv_heads);
+        const std::vector<float> sparse_packed =
+            runner.run_htp_flash_with_lse_packed(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, &full_index);
+        const PackedWithLseDiffStats stats =
+            packed_with_lse_diff_stats(dense_no_lse, dense_ref.lse, sparse_packed, qo_len, n_heads, head_dim);
+        std::printf("[DIAG] single-head full-keep sparse with-lse out_max_abs=%.9g lse_max_abs=%.9g out_worst=%zu lse_worst=%zu\n",
+                    stats.out_max_abs,
+                    stats.lse_max_abs,
+                    stats.out_worst,
+                    stats.lse_worst);
+    }
+    {
+        constexpr int qo_len = 64;
+        constexpr int kv_len = 96;
+        constexpr int n_heads = 4;
+        constexpr int n_kv_heads = 1;
+        constexpr int head_dim = 64;
+
+        std::vector<float> q = gen_q(qo_len, n_heads, head_dim, 71);
+        std::vector<ggml_fp16_t> k = gen_kv_f16(kv_len, n_kv_heads, head_dim, 72);
+        std::vector<ggml_fp16_t> v = gen_kv_f16(kv_len, n_kv_heads, head_dim, 73);
+        const RefAttentionWithLse dense_ref =
+            reference_attention_with_lse(qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, nullptr);
+        const std::vector<float> dense_no_lse =
+            runner.run(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, false, false);
+        const std::vector<int32_t> full_index =
+            full_keep_block_index(qo_len, kv_len, n_heads, n_kv_heads);
+        const std::vector<float> sparse_packed =
+            runner.run_htp_flash_with_lse_packed(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, &full_index);
+        const PackedWithLseDiffStats stats =
+            packed_with_lse_diff_stats(dense_no_lse, dense_ref.lse, sparse_packed, qo_len, n_heads, head_dim);
+        std::printf("[DIAG] multi-q-head single-kv full-keep sparse with-lse out_max_abs=%.9g lse_max_abs=%.9g out_worst=%zu lse_worst=%zu\n",
+                    stats.out_max_abs,
+                    stats.lse_max_abs,
+                    stats.out_worst,
+                    stats.lse_worst);
+    }
+
+    constexpr int qo_len = 64;
+    constexpr int kv_len = 96;
+    constexpr int n_heads = 4;
+    constexpr int n_kv_heads = 4;
+    constexpr int head_dim = 64;
+    constexpr float keep_ratio = 0.50f;
+
+    std::vector<float> q = gen_q(qo_len, n_heads, head_dim, 41);
+    std::vector<ggml_fp16_t> k = gen_kv_f16(kv_len, n_kv_heads, head_dim, 42);
+    std::vector<ggml_fp16_t> v = gen_kv_f16(kv_len, n_kv_heads, head_dim, 43);
+
+    std::vector<int32_t> block_index =
+        runner.make_block_index(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, keep_ratio);
+    std::vector<float> sparse_dense_mask =
+        dense_mask_from_block_index(block_index, qo_len, kv_len, n_heads, n_kv_heads);
+
+    const RefAttentionWithLse dense_ref =
+        reference_attention_with_lse(qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, nullptr);
+    const RefAttentionWithLse sparse_ref =
+        reference_attention_with_lse(qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, &sparse_dense_mask);
+
+    std::fprintf(stderr, "[EXPECT] dense_htp_with_lse op_index=5 qo=%d kv=%d heads=%d kv_heads=%d d=%d\n",
+                 qo_len, kv_len, n_heads, n_kv_heads, head_dim);
+    const std::vector<float> dense_no_lse =
+        runner.run(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, false, false);
+    const std::vector<float> dense_packed =
+        runner.run_htp_flash_with_lse_packed(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, nullptr);
+    std::fprintf(stderr, "[EXPECT] sparse_htp_with_lse op_index=6 qo=%d kv=%d heads=%d kv_heads=%d d=%d\n",
+                 qo_len, kv_len, n_heads, n_kv_heads, head_dim);
+    const std::vector<float> sparse_no_lse =
+        runner.run_htp_sparse_index(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, block_index);
+    const std::vector<float> sparse_packed =
+        runner.run_htp_flash_with_lse_packed(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, &block_index);
+    const std::vector<int32_t> full_index =
+        full_keep_block_index(qo_len, kv_len, n_heads, n_kv_heads);
+    const std::vector<float> full_sparse_packed =
+        runner.run_htp_flash_with_lse_packed(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, &full_index);
+
+    GGML_ASSERT(dense_packed.size() == size_t(qo_len) * size_t(n_heads) * size_t(head_dim + 1));
+    GGML_ASSERT(sparse_packed.size() == size_t(qo_len) * size_t(n_heads) * size_t(head_dim + 1));
+    GGML_ASSERT(full_sparse_packed.size() == size_t(qo_len) * size_t(n_heads) * size_t(head_dim + 1));
+
+    const PackedWithLseDiffStats dense_stats =
+        packed_with_lse_diff_stats(dense_no_lse, dense_ref.lse, dense_packed, qo_len, n_heads, head_dim);
+    const PackedWithLseDiffStats sparse_stats =
+        packed_with_lse_diff_stats(sparse_no_lse, sparse_ref.lse, sparse_packed, qo_len, n_heads, head_dim);
+    size_t sparse_linear_worst = 0;
+    const double sparse_linear_prefix_diff =
+        packed_linear_prefix_diff(sparse_no_lse, sparse_packed, &sparse_linear_worst);
+    size_t sparse_no_lse_ref_worst = 0;
+    const double sparse_no_lse_ref_diff =
+        max_abs_diff(sparse_ref.out, sparse_no_lse, &sparse_no_lse_ref_worst);
+    const PackedWithLseDiffStats full_sparse_stats =
+        packed_with_lse_diff_stats(dense_no_lse, dense_ref.lse, full_sparse_packed, qo_len, n_heads, head_dim);
+    std::printf("[PASS] htp flash-attn with-lse packed "
+                "dense_out_max_abs=%.9g dense_lse_max_abs=%.9g dense_out_worst=%zu dense_lse_worst=%zu "
+                "sparse_out_max_abs=%.9g sparse_lse_max_abs=%.9g sparse_out_worst=%zu sparse_lse_worst=%zu "
+                "sparse_no_lse_linear_prefix_max_abs=%.9g sparse_no_lse_linear_worst=%zu "
+                "sparse_no_lse_ref_max_abs=%.9g sparse_no_lse_ref_worst=%zu "
+                "full_sparse_out_max_abs=%.9g full_sparse_lse_max_abs=%.9g "
+                "full_sparse_out_worst=%zu full_sparse_lse_worst=%zu\n",
+                dense_stats.out_max_abs,
+                dense_stats.lse_max_abs,
+                dense_stats.out_worst,
+                dense_stats.lse_worst,
+                sparse_stats.out_max_abs,
+                sparse_stats.lse_max_abs,
+                sparse_stats.out_worst,
+                sparse_stats.lse_worst,
+                sparse_linear_prefix_diff,
+                sparse_linear_worst,
+                sparse_no_lse_ref_diff,
+                sparse_no_lse_ref_worst,
+                full_sparse_stats.out_max_abs,
+                full_sparse_stats.lse_max_abs,
+                full_sparse_stats.out_worst,
+                full_sparse_stats.lse_worst);
+    GGML_ASSERT(dense_stats.out_max_abs <= 1e-5);
+    GGML_ASSERT(dense_stats.lse_max_abs <= 5e-3);
+    GGML_ASSERT(sparse_stats.out_max_abs <= 1e-5);
+    GGML_ASSERT(sparse_stats.lse_max_abs <= 5e-3);
+    GGML_ASSERT(full_sparse_stats.out_max_abs <= 1e-5);
+    GGML_ASSERT(full_sparse_stats.lse_max_abs <= 5e-3);
+}
+
+static void test_htp_flash_attn_with_lse_production_layout(AttentionRunner & runner) {
+    constexpr int qo_len = 410;
+    constexpr int kv_len = 410;
+    constexpr int n_heads = 24;
+    constexpr int n_kv_heads = 24;
+    constexpr int head_dim = 64;
+
+    std::vector<float> q = gen_q(qo_len, n_heads, head_dim, 81);
+    std::vector<ggml_fp16_t> k = gen_kv_f16(kv_len, n_kv_heads, head_dim, 82);
+    std::vector<ggml_fp16_t> v = gen_kv_f16(kv_len, n_kv_heads, head_dim, 83);
+    const std::vector<int32_t> block_index =
+        runner.make_block_index(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, 0.99f);
+
+    const std::vector<float> dense_no_lse =
+        runner.run(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, false, false);
+    const std::vector<float> dense_lse =
+        runner.run_cpu_lse(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, nullptr);
+    const std::vector<float> dense_packed =
+        runner.run_htp_flash_with_lse_packed(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, nullptr);
+    const PackedWithLseDiffStats dense_stats =
+        packed_with_lse_diff_stats(dense_no_lse, dense_lse, dense_packed, qo_len, n_heads, head_dim);
+
+    const std::vector<float> sparse_no_lse =
+        runner.run_htp_sparse_index(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, block_index);
+    const std::vector<float> sparse_lse =
+        runner.run_cpu_lse_index(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, block_index);
+    const std::vector<float> sparse_packed =
+        runner.run_htp_flash_with_lse_packed(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, &block_index);
+    const PackedWithLseDiffStats sparse_stats =
+        packed_with_lse_diff_stats(sparse_no_lse, sparse_lse, sparse_packed, qo_len, n_heads, head_dim);
+
+    std::printf("[PRODUCTION] htp flash-attn with-lse packed "
+                "dense_out_max_abs=%.9g dense_lse_max_abs=%.9g dense_out_worst=%zu dense_lse_worst=%zu "
+                "sparse_out_max_abs=%.9g sparse_lse_max_abs=%.9g sparse_out_worst=%zu sparse_lse_worst=%zu\n",
+                dense_stats.out_max_abs,
+                dense_stats.lse_max_abs,
+                dense_stats.out_worst,
+                dense_stats.lse_worst,
+                sparse_stats.out_max_abs,
+                sparse_stats.lse_max_abs,
+                sparse_stats.out_worst,
+                sparse_stats.lse_worst);
+
+    GGML_ASSERT(dense_stats.out_max_abs <= 1e-5);
+    GGML_ASSERT(dense_stats.lse_max_abs <= 5e-3);
+    GGML_ASSERT(sparse_stats.out_max_abs <= 1e-5);
+    GGML_ASSERT(sparse_stats.lse_max_abs <= 5e-3);
+}
+
+static void test_exact_rho_anchor_graph_sets_sparse_flash_block_params(AttentionRunner & runner) {
+    constexpr int qo_len = 64;
+    constexpr int kv_len = 96;
+    constexpr int n_heads = 4;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+
+    std::vector<float> q = gen_q(qo_len, n_heads, head_dim, 51);
+    std::vector<ggml_fp16_t> k = gen_kv_f16(kv_len, n_kv_heads, head_dim, 52);
+    std::vector<ggml_fp16_t> v = gen_kv_f16(kv_len, n_kv_heads, head_dim, 53);
+
+    const int missing =
+        runner.count_exact_rho_anchor_flash_nodes_missing_block_params(qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v);
+    GGML_ASSERT(missing == 0);
 }
 
 static void test_exact_rho_recovered_graph_matches_dense(AttentionRunner & runner) {
@@ -945,8 +1471,12 @@ int main() {
 
     AttentionRunner runner(cpu, htp);
 
+    test_cache_outputs_survive_until_persistence(runner);
     test_exact_residual_rho_reference_formula(runner);
     test_attention_lse_node_matches_reference(runner);
+    test_exact_rho_anchor_graph_sets_sparse_flash_block_params(runner);
+    test_htp_flash_attn_with_lse_matches_reference(runner);
+    test_htp_flash_attn_with_lse_production_layout(runner);
     test_exact_rho_recovered_graph_matches_dense(runner);
 
     run_case(runner, 256, 256, 24, 24, 64);

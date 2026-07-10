@@ -258,6 +258,7 @@ static void * ggml_backend_htp_buffer_get_base(ggml_backend_buffer_t buffer) {
 static void ggml_backend_htp_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<ggml_backend_htp_buffer_context *>(buffer->context);
     if (ctx->is_rpcmem) {
+        ggml_backend_htp_context::instance()->mapper.release_buffer(ctx->data);
         rpcmem_free(ctx->data);
     } else {
         ggml_backend_htp_aligned_free(ctx->data);

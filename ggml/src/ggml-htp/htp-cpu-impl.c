@@ -2049,10 +2049,12 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                         const struct ggml_tensor * v = tensor->src[2];
                         const struct ggml_tensor * mask = tensor->src[3];
                         const bool is_block_sparse = mask != NULL && mask->type == GGML_TYPE_I32;
+                        const int with_lse = ggml_get_op_params_i32(tensor, 6) != 0;
                         const int64_t mask_nnz = is_block_sparse ? ggml_htp_count_nonzero_i32(mask) : -1;
                         const int64_t mask_total = mask != NULL ? ggml_nelements(mask) : 0;
                         fprintf(stderr,
                                 "attention_timing route=htp mask_type=%s total=%lldms qo=%lld kv=%lld heads=%lld d=%lld "
+                                "with_lse=%d out_d=%lld "
                                 "q_hash=%016" PRIx64 " k_hash=%016" PRIx64 " v_hash=%016" PRIx64
                                 " block_sparse=%d mask_nnz=%lld mask_total=%lld\n",
                                 mask != NULL ? ggml_type_name(mask->type) : "none",
@@ -2061,6 +2063,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                                 (long long) tensor->src[1]->ne[1],
                                 (long long) tensor->src[0]->ne[2],
                                 (long long) tensor->src[0]->ne[0],
+                                with_lse,
+                                (long long) tensor->ne[0],
                                 ggml_htp_hash_tensor_bytes(q),
                                 ggml_htp_hash_tensor_bytes(k),
                                 ggml_htp_hash_tensor_bytes(v),
@@ -2076,10 +2080,12 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                         const struct ggml_tensor * v = tensor->src[2];
                         const struct ggml_tensor * mask = tensor->src[3];
                         const bool is_block_sparse = mask != NULL && mask->type == GGML_TYPE_I32;
+                        const int with_lse = ggml_get_op_params_i32(tensor, 6) != 0;
                         const int64_t mask_nnz = is_block_sparse ? ggml_htp_count_nonzero_i32(mask) : -1;
                         const int64_t mask_total = mask != NULL ? ggml_nelements(mask) : 0;
                         fprintf(stderr,
                                 "attention_timing route=cpu mask_type=%s total=%lldms qo=%lld kv=%lld heads=%lld d=%lld "
+                                "with_lse=%d out_d=%lld "
                                 "q_hash=%016" PRIx64 " k_hash=%016" PRIx64 " v_hash=%016" PRIx64
                                 " block_sparse=%d mask_nnz=%lld mask_total=%lld\n",
                                 mask != NULL ? ggml_type_name(mask->type) : "none",
@@ -2088,6 +2094,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                                 (long long) tensor->src[1]->ne[1],
                                 (long long) tensor->src[0]->ne[2],
                                 (long long) tensor->src[0]->ne[0],
+                                with_lse,
+                                (long long) tensor->ne[0],
                                 ggml_htp_hash_tensor_bytes(q),
                                 ggml_htp_hash_tensor_bytes(k),
                                 ggml_htp_hash_tensor_bytes(v),
