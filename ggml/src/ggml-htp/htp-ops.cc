@@ -222,7 +222,7 @@ uint64_t htp_hash_tensor_bytes(const ggml_tensor * tensor) {
 std::atomic<int> htp_debug_hash_counter{0};
 
 bool is_block_sparse_score_custom(const ggml_tensor * dst) {
-    if (dst == nullptr || dst->op != GGML_OP_CUSTOM || std::strcmp(dst->name, "block_sparse_score_topk") != 0) {
+    if (dst == nullptr || dst->op != GGML_OP_CUSTOM || std::strcmp(dst->name, "block_sparse_score") != 0) {
         return false;
     }
 

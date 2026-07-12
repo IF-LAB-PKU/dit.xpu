@@ -96,6 +96,18 @@ constexpr int SD_HTP_BLOCK_SPARSE_PATCH_BLOCK = 16;
 constexpr int SD_HTP_BLOCK_SPARSE_PATCH_SIZE = 4;
 constexpr int SD_HTP_BLOCK_SPARSE_STEP_SHIFT_PERIOD = 2;
 
+__STATIC_INLINE__ float sd_htp_block_sparse_keep_ratio() {
+    return std::clamp(sd_env_float_value("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", 0.0f), 0.0f, 1.0f);
+}
+
+__STATIC_INLINE__ bool sd_htp_block_sparse_score_enabled(float keep_ratio) {
+    return keep_ratio != 0.0f && keep_ratio != 1.0f;
+}
+
+__STATIC_INLINE__ bool sd_htp_block_sparse_score_enabled() {
+    return sd_htp_block_sparse_score_enabled(sd_htp_block_sparse_keep_ratio());
+}
+
 __STATIC_INLINE__ int sd_htp_block_sparse_step_shift(bool enabled, int sparse_step_index) {
     if (!enabled || sparse_step_index <= 0) {
         return 0;
@@ -1870,18 +1882,16 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_k_mean_node(ggml_context* c
 __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_q_mean_node(ggml_context* ctx,
                                                                  ggml_tensor* q,
                                                                  int block_q);
-__STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_score_topk_node(ggml_context* ctx,
-                                                                     ggml_tensor* q_mean,
-                                                                     ggml_tensor* k_mean,
-                                                                     int block_q,
-                                                                     int block_k,
-                                                                     int top_k,
-                                                                     bool causal);
+__STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_score_node(ggml_context* ctx,
+                                                                ggml_tensor* q_mean,
+                                                                ggml_tensor* k_mean,
+                                                                int block_q,
+                                                                int block_k,
+                                                                bool causal);
 __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_mask_from_score_node(ggml_context* ctx,
                                                                           ggml_tensor* score,
                                                                           int block_q,
                                                                           int block_k,
-                                                                          int top_k,
                                                                           bool causal,
                                                                           int protected_start = 0,
                                                                           int protected_len = 0,
@@ -1891,7 +1901,6 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_index_from_score_node(ggml_
                                                                            ggml_tensor* score,
                                                                            int block_q,
                                                                            int block_k,
-                                                                           int top_k,
                                                                            bool causal,
                                                                            int protected_start = 0,
                                                                            int protected_len = 0,
@@ -1899,7 +1908,6 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_index_from_score_node(ggml_
                                                                            int n_kv_heads = 1);
 __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_index_32_from_16_score_node(ggml_context* ctx,
                                                                                  ggml_tensor* score,
-                                                                                 int top_k,
                                                                                  bool causal,
                                                                                  int protected_start = 0,
                                                                                  int protected_len = 0,
@@ -1908,6 +1916,18 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_index_32_from_16_score_node
 __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_full_keep_mask_node(ggml_context* ctx,
                                                                          int n_q_blocks,
                                                                          int n_k_blocks);
+__STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_full_mask_node(ggml_context* ctx,
+                                                                    int n_q_blocks,
+                                                                    int n_k_blocks);
+__STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_structural_index_32_node(ggml_context* ctx,
+                                                                              int qo_len,
+                                                                              int kv_len,
+                                                                              int protected_start,
+                                                                              int protected_len,
+                                                                              int n_heads,
+                                                                              int n_kv_heads,
+                                                                              bool patch_halo,
+                                                                              bool center_sink);
 __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_lse_node(ggml_context* ctx,
                                                            ggml_tensor* q,
                                                            ggml_tensor* k,
@@ -2160,8 +2180,6 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             can_use_flash_attn = can_use_flash_attn && mask->ne[3] == 1;
         }
 
-        const float block_sparse_keep_ratio =
-            std::clamp(sd_env_float_value("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", 0.8f), 0.0f, 1.0f);
         const bool block_sparse_force_full_keep =
             sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_FORCE_FULL_KEEP");
         const bool block_sparse_host_index =
@@ -2172,35 +2190,47 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             const int n_k_blocks = n_kv_head * static_cast<int>((L_k + block_k - 1) / block_k);
             const int n_q_blocks = n_head * static_cast<int>((L_q + block_q - 1) / block_q);
             ggml_tensor* block_mask = nullptr;
-            if (block_sparse_force_full_keep) {
+            const float block_sparse_keep_ratio = sd_htp_block_sparse_keep_ratio();
+            const bool block_sparse_patch_halo = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_PATCH_HALO");
+            const bool block_sparse_center_sink = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_CENTER_SINK");
+            if (block_sparse_force_full_keep || block_sparse_keep_ratio == 1.0f) {
                 block_mask = ggml_ext_block_sparse_full_keep_mask_node(ctx, n_q_blocks, n_k_blocks);
+            } else if (!sd_htp_block_sparse_score_enabled(block_sparse_keep_ratio)) {
+                if (block_sparse_patch_halo || block_sparse_center_sink) {
+                    block_mask = ggml_ext_block_sparse_structural_index_32_node(ctx,
+                                                                                static_cast<int>(L_q),
+                                                                                static_cast<int>(L_k),
+                                                                                protected_start,
+                                                                                protected_len,
+                                                                                static_cast<int>(n_head),
+                                                                                static_cast<int>(n_kv_head),
+                                                                                block_sparse_patch_halo,
+                                                                                block_sparse_center_sink);
+                } else {
+                    block_mask = ggml_ext_block_sparse_full_mask_node(ctx, n_q_blocks, n_k_blocks);
+                }
             } else {
                 if (block_sparse_host_index) {
                     const int score_block_q = SD_HTP_BLOCK_SPARSE_PATCH_BLOCK;
                     const int score_block_k = SD_HTP_BLOCK_SPARSE_PATCH_BLOCK;
-                    const int n_score_k_blocks = n_kv_head * static_cast<int>((L_k + score_block_k - 1) / score_block_k);
-                    const int top_k = std::max(1, std::min(sd_env_int_value("SD_HTP_BLOCK_SPARSE_TOPK", 2), n_score_k_blocks));
                     ggml_tensor* q_mean = ggml_ext_block_sparse_q_mean_node(ctx, q, score_block_q);
                     ggml_tensor* k_mean = ggml_ext_block_sparse_k_mean_node(ctx, k, score_block_k);
-                    ggml_tensor* score  = ggml_ext_block_sparse_score_topk_node(ctx, q_mean, k_mean, score_block_q, score_block_k, top_k, false);
+                    ggml_tensor* score  = ggml_ext_block_sparse_score_node(ctx, q_mean, k_mean, score_block_q, score_block_k, false);
                     block_mask = ggml_ext_block_sparse_index_32_from_16_score_node(ctx,
                                                                                    score,
-                                                                                   top_k,
                                                                                    false,
                                                                                    protected_start,
                                                                                    protected_len,
                                                                                    n_head,
                                                                                    n_kv_head);
                 } else {
-                    const int top_k = std::max(1, std::min(sd_env_int_value("SD_HTP_BLOCK_SPARSE_TOPK", 2), n_k_blocks));
                     ggml_tensor* q_mean = ggml_ext_block_sparse_q_mean_node(ctx, q, block_q);
                     ggml_tensor* k_mean = ggml_ext_block_sparse_k_mean_node(ctx, k, block_k);
-                    ggml_tensor* score  = ggml_ext_block_sparse_score_topk_node(ctx, q_mean, k_mean, block_q, block_k, top_k, false);
+                    ggml_tensor* score  = ggml_ext_block_sparse_score_node(ctx, q_mean, k_mean, block_q, block_k, false);
                     block_mask = ggml_ext_block_sparse_mask_from_score_node(ctx,
                                                                             score,
                                                                             block_q,
                                                                             block_k,
-                                                                            top_k,
                                                                             false,
                                                                             protected_start,
                                                                             protected_len,
@@ -2719,7 +2749,7 @@ __STATIC_INLINE__ std::vector<int32_t> ggml_ext_block_sparse_mask_mean_topk(cons
 
     protected_prefix_len = std::max(0, std::min<int>(protected_prefix_len, n_k_blocks * block_k));
     top_k = std::max(1, std::min(top_k, n_k_blocks));
-    const float keep_ratio = std::clamp(sd_env_float_value("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", 0.8f), 0.0f, 1.0f);
+    const float keep_ratio = sd_htp_block_sparse_keep_ratio();
     const int protected_q_blocks = std::min<int>(n_q_blocks, (protected_prefix_len + block_q - 1) / block_q);
     const int protected_k_blocks = std::min<int>(n_k_blocks, (protected_prefix_len + block_k - 1) / block_k);
     for (int qb = 0; qb < n_q_blocks; ++qb) {
@@ -2964,11 +2994,10 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_k_mean_node(ggml_context* c
 struct ggml_ext_block_sparse_score_params {
     int block_q;
     int block_k;
-    int top_k;
     int causal;
 };
 
-__STATIC_INLINE__ void ggml_ext_block_sparse_score_topk_custom(ggml_tensor* dst, int ith, int nth, void* userdata) {
+__STATIC_INLINE__ void ggml_ext_block_sparse_score_custom(ggml_tensor* dst, int ith, int nth, void* userdata) {
     if (ith != 0) {
         return;
     }
@@ -2994,13 +3023,12 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_score_topk_custom(ggml_tensor* dst,
     }
 }
 
-__STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_score_topk_node(ggml_context* ctx,
-                                                                     ggml_tensor* q_mean,
-                                                                     ggml_tensor* k_mean,
-                                                                     int block_q,
-                                                                     int block_k,
-                                                                     int top_k,
-                                                                     bool causal) {
+__STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_score_node(ggml_context* ctx,
+                                                                ggml_tensor* q_mean,
+                                                                ggml_tensor* k_mean,
+                                                                int block_q,
+                                                                int block_k,
+                                                                bool causal) {
     GGML_ASSERT(q_mean != nullptr && k_mean != nullptr);
     const int n_q_blocks = static_cast<int>(q_mean->ne[1]);
     const int n_k_blocks = static_cast<int>(k_mean->ne[1]);
@@ -3009,7 +3037,6 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_score_topk_node(ggml_contex
         ggml_new_buffer(ctx, sizeof(ggml_ext_block_sparse_score_params)));
     params->block_q = block_q;
     params->block_k = block_k;
-    params->top_k   = top_k;
     params->causal  = causal ? 1 : 0;
     ggml_tensor* result = ggml_custom_4d(ctx,
                                          GGML_TYPE_F16,
@@ -3019,10 +3046,10 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_score_topk_node(ggml_contex
                                          1,
                                          args,
                                          2,
-                                         ggml_ext_block_sparse_score_topk_custom,
+                                         ggml_ext_block_sparse_score_custom,
                                          1,
                                          params);
-    ggml_set_name(result, "block_sparse_score_topk");
+    ggml_set_name(result, "block_sparse_score");
     return result;
 }
 
@@ -3045,7 +3072,6 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_score_to_mask_rows(const ggml_tenso
                                                                 int qb_step,
                                                                 int block_q,
                                                                 int block_k,
-                                                                int top_k,
                                                                 bool causal = false,
                                                                 int protected_start = 0,
                                                                 int protected_len = 0,
@@ -3070,8 +3096,7 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_score_to_mask_rows(const ggml_tenso
     n_kv_heads = std::max(1, n_kv_heads);
     protected_start = std::max(0, protected_start);
     protected_len = std::max(0, protected_len);
-    top_k = std::max(1, std::min(top_k, n_k_blocks));
-    const float keep_ratio = std::clamp(sd_env_float_value("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", 0.8f), 0.0f, 1.0f);
+    const float keep_ratio = sd_htp_block_sparse_keep_ratio();
     const ggml_fp16_t* scores = reinterpret_cast<const ggml_fp16_t*>(score->data);
     GGML_ASSERT(n_heads % n_kv_heads == 0);
     const int gqa = std::max(1, n_heads / n_kv_heads);
@@ -3167,7 +3192,6 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_score_to_mask_rows(const ggml_tenso
 __STATIC_INLINE__ std::vector<int32_t> ggml_ext_block_sparse_score_to_mask(const ggml_tensor* score,
                                                                            int block_q,
                                                                            int block_k,
-                                                                           int top_k,
                                                                            bool causal = false,
                                                                            int protected_start = 0,
                                                                            int protected_len = 0,
@@ -3184,7 +3208,6 @@ __STATIC_INLINE__ std::vector<int32_t> ggml_ext_block_sparse_score_to_mask(const
                                              1,
                                              block_q,
                                              block_k,
-                                             top_k,
                                              causal,
                                              protected_start,
                                              protected_len,
@@ -3212,7 +3235,6 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_score_to_index_rows(const ggml_tens
                                                                  int qb_step,
                                                                  int block_q,
                                                                  int block_k,
-                                                                 int top_k,
                                                                  bool causal = false,
                                                                  int protected_start = 0,
                                                                  int protected_len = 0,
@@ -3234,7 +3256,6 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_score_to_index_rows(const ggml_tens
                                              qb_step,
                                              block_q,
                                              block_k,
-                                             top_k,
                                              causal,
                                              protected_start,
                                              protected_len,
@@ -3256,10 +3277,12 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_score_to_index_rows(const ggml_tens
 }
 
 __STATIC_INLINE__ void ggml_ext_block_sparse_trace_index_rows(const int32_t* block_index,
-                                                             int max_kept,
-                                                             int n_q_blocks,
-                                                             int n_k_blocks) {
-    if (!sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
+                                                              int max_kept,
+                                                              int n_q_blocks,
+                                                              int n_k_blocks) {
+    const bool trace_rows = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE");
+    const bool trace_summary = trace_rows || sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_SUMMARY");
+    if (!trace_summary) {
         return;
     }
 
@@ -3271,21 +3294,25 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_trace_index_rows(const int32_t* blo
         int kept = 0;
         std::ostringstream kept_list;
         for (int i = 0; i < max_kept && row[i] >= 0; ++i) {
-            if (i != 0) {
-                kept_list << ',';
+            if (trace_rows) {
+                if (i != 0) {
+                    kept_list << ',';
+                }
+                kept_list << row[i];
             }
-            kept_list << row[i];
             ++kept;
         }
         min_kept = std::min(min_kept, kept);
         max_seen = std::max(max_seen, kept);
         total_kept += kept;
-        std::fprintf(stderr,
-                     "block_sparse_index_row qb=%d kept=%d/%d kept_k=[%s]\n",
-                     qb,
-                     kept,
-                     n_k_blocks,
-                     kept_list.str().c_str());
+        if (trace_rows) {
+            std::fprintf(stderr,
+                         "block_sparse_index_row qb=%d kept=%d/%d kept_k=[%s]\n",
+                         qb,
+                         kept,
+                         n_k_blocks,
+                         kept_list.str().c_str());
+        }
     }
 
     const double avg_kept = n_q_blocks > 0 ? double(total_kept) / double(n_q_blocks) : 0.0;
@@ -3384,7 +3411,6 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_trace_mask_rows(const std::vector<i
 struct ggml_ext_block_sparse_mask_from_score_params {
     int block_q;
     int block_k;
-    int top_k;
     int causal;
     int protected_start;
     int protected_len;
@@ -3395,7 +3421,6 @@ struct ggml_ext_block_sparse_mask_from_score_params {
 struct ggml_ext_block_sparse_index_from_score_params {
     int block_q;
     int block_k;
-    int top_k;
     int causal;
     int protected_start;
     int protected_len;
@@ -3404,12 +3429,22 @@ struct ggml_ext_block_sparse_index_from_score_params {
 };
 
 struct ggml_ext_block_sparse_index_32_from_16_score_params {
-    int top_k;
     int causal;
     int protected_start;
     int protected_len;
     int n_heads;
     int n_kv_heads;
+};
+
+struct ggml_ext_block_sparse_structural_index_32_params {
+    int qo_len;
+    int kv_len;
+    int protected_start;
+    int protected_len;
+    int n_heads;
+    int n_kv_heads;
+    int patch_halo;
+    int center_sink;
 };
 
 __STATIC_INLINE__ void ggml_ext_block_sparse_full_keep_mask_custom(ggml_tensor* dst, int ith, int nth, void* userdata) {
@@ -3446,6 +3481,147 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_full_keep_mask_node(ggml_co
                           nullptr);
 }
 
+__STATIC_INLINE__ void ggml_ext_block_sparse_full_mask_custom(ggml_tensor* dst, int ith, int nth, void* userdata) {
+    SD_UNUSED(nth);
+    SD_UNUSED(userdata);
+    if (ith != 0) {
+        return;
+    }
+    GGML_ASSERT(dst != nullptr && dst->type == GGML_TYPE_I32);
+    std::fill_n(static_cast<int32_t*>(dst->data), ggml_nelements(dst), 1);
+    if (sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
+        std::fprintf(stderr,
+                     "block_sparse_mask_step full_mask=0ms n_q_blocks=%lld n_k_blocks=%lld\n",
+                     static_cast<long long>(dst->ne[1]),
+                     static_cast<long long>(dst->ne[0]));
+    }
+}
+
+__STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_full_mask_node(ggml_context* ctx,
+                                                                    int n_q_blocks,
+                                                                    int n_k_blocks) {
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(n_q_blocks > 0 && n_k_blocks > 0);
+    return ggml_custom_4d(ctx,
+                          GGML_TYPE_I32,
+                          n_k_blocks,
+                          n_q_blocks,
+                          1,
+                          1,
+                          nullptr,
+                          0,
+                          ggml_ext_block_sparse_full_mask_custom,
+                          1,
+                          nullptr);
+}
+
+__STATIC_INLINE__ void ggml_ext_block_sparse_structural_index_32_custom(ggml_tensor* dst,
+                                                                        int ith,
+                                                                        int nth,
+                                                                        void* userdata) {
+    SD_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+
+    const auto* params = static_cast<const ggml_ext_block_sparse_structural_index_32_params*>(userdata);
+    GGML_ASSERT(params != nullptr);
+    GGML_ASSERT(dst != nullptr && dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->src[0] == nullptr);
+
+    const int q16_per_head = (params->qo_len + SD_HTP_BLOCK_SPARSE_PATCH_BLOCK - 1) /
+                             SD_HTP_BLOCK_SPARSE_PATCH_BLOCK;
+    const int k16_per_head = (params->kv_len + SD_HTP_BLOCK_SPARSE_PATCH_BLOCK - 1) /
+                             SD_HTP_BLOCK_SPARSE_PATCH_BLOCK;
+    const int n_q16_blocks = params->n_heads * q16_per_head;
+    const int n_k16_blocks = params->n_kv_heads * k16_per_head;
+    const int image_q16_blocks = params->protected_len > 0
+                                     ? std::min(q16_per_head,
+                                                (params->protected_start + SD_HTP_BLOCK_SPARSE_PATCH_BLOCK - 1) /
+                                                    SD_HTP_BLOCK_SPARSE_PATCH_BLOCK)
+                                     : q16_per_head;
+    const int image_k16_blocks = params->protected_len > 0
+                                     ? std::min(k16_per_head,
+                                                (params->protected_start + SD_HTP_BLOCK_SPARSE_PATCH_BLOCK - 1) /
+                                                    SD_HTP_BLOCK_SPARSE_PATCH_BLOCK)
+                                     : k16_per_head;
+
+    std::vector<int32_t> mask16(size_t(n_q16_blocks) * size_t(n_k16_blocks), 1);
+    if (params->patch_halo != 0) {
+        ggml_ext_block_sparse_force_patch_halo_mask(mask16.data(),
+                                                    n_q16_blocks,
+                                                    n_k16_blocks,
+                                                    image_q16_blocks,
+                                                    image_k16_blocks,
+                                                    params->n_heads,
+                                                    params->n_kv_heads);
+    }
+    if (params->center_sink != 0) {
+        ggml_ext_block_sparse_force_center_sink_mask(mask16.data(),
+                                                     n_q16_blocks,
+                                                     n_k16_blocks,
+                                                     image_q16_blocks,
+                                                     image_k16_blocks,
+                                                     params->n_heads,
+                                                     params->n_kv_heads);
+    }
+
+    ggml_ext_block_sparse_promote_16_mask_to_32_index(mask16.data(),
+                                                      static_cast<int32_t*>(dst->data),
+                                                      n_q16_blocks,
+                                                      n_k16_blocks,
+                                                      static_cast<int>(dst->ne[0]),
+                                                      params->n_heads,
+                                                      params->n_kv_heads);
+}
+
+__STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_structural_index_32_node(ggml_context* ctx,
+                                                                              int qo_len,
+                                                                              int kv_len,
+                                                                              int protected_start,
+                                                                              int protected_len,
+                                                                              int n_heads,
+                                                                              int n_kv_heads,
+                                                                              bool patch_halo,
+                                                                              bool center_sink) {
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(qo_len > 0 && kv_len > 0);
+    GGML_ASSERT(n_heads > 0 && n_kv_heads > 0);
+    GGML_ASSERT(patch_halo || center_sink);
+
+    const int q16_per_head = (qo_len + SD_HTP_BLOCK_SPARSE_PATCH_BLOCK - 1) /
+                             SD_HTP_BLOCK_SPARSE_PATCH_BLOCK;
+    const int k16_per_head = (kv_len + SD_HTP_BLOCK_SPARSE_PATCH_BLOCK - 1) /
+                             SD_HTP_BLOCK_SPARSE_PATCH_BLOCK;
+    const int n_q32_blocks = n_heads * ((q16_per_head + 1) / 2);
+    const int max_kept32 = std::max(1, (k16_per_head + 1) / 2);
+
+    auto* params = static_cast<ggml_ext_block_sparse_structural_index_32_params*>(
+        ggml_new_buffer(ctx, sizeof(ggml_ext_block_sparse_structural_index_32_params)));
+    params->qo_len = qo_len;
+    params->kv_len = kv_len;
+    params->protected_start = std::max(0, protected_start);
+    params->protected_len = std::max(0, protected_len);
+    params->n_heads = n_heads;
+    params->n_kv_heads = n_kv_heads;
+    params->patch_halo = patch_halo ? 1 : 0;
+    params->center_sink = center_sink ? 1 : 0;
+
+    ggml_tensor* result = ggml_custom_4d(ctx,
+                                         GGML_TYPE_I32,
+                                         max_kept32,
+                                         n_q32_blocks,
+                                         1,
+                                         1,
+                                         nullptr,
+                                         0,
+                                         ggml_ext_block_sparse_structural_index_32_custom,
+                                         1,
+                                         params);
+    ggml_set_name(result, "block_sparse_index");
+    return result;
+}
+
 __STATIC_INLINE__ void ggml_ext_block_sparse_mask_from_score_custom(ggml_tensor* dst, int ith, int nth, void* userdata) {
     const bool trace_mask = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE");
     const int64_t trace_begin = trace_mask ? ggml_time_ms() : 0;
@@ -3460,7 +3636,6 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_mask_from_score_custom(ggml_tensor*
                                              nth,
                                              params->block_q,
                                              params->block_k,
-                                             params->top_k,
                                              params->causal != 0,
                                              params->protected_start,
                                              params->protected_len,
@@ -3478,11 +3653,11 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_mask_from_score_custom(ggml_tensor*
                                               params->protected_len,
                                               params->n_heads,
                                               params->n_kv_heads,
-                                              sd_env_float_value("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", 0.8f));
+                                              sd_htp_block_sparse_keep_ratio());
     }
     if (trace_mask && ith == 0) {
         std::fprintf(stderr,
-                     "block_sparse_mask_step mask_from_score_thread0=%lldms n_q_blocks=%lld n_k_blocks=%lld block_q=%d block_k=%d protected_start_tokens=%d protected_tokens=%d n_heads=%d n_kv_heads=%d top_k=%d keep_ratio=%.3f nth=%d\n",
+                     "block_sparse_mask_step mask_from_score_thread0=%lldms n_q_blocks=%lld n_k_blocks=%lld block_q=%d block_k=%d protected_start_tokens=%d protected_tokens=%d n_heads=%d n_kv_heads=%d keep_ratio=%.3f nth=%d\n",
                      static_cast<long long>(ggml_time_ms() - trace_begin),
                      static_cast<long long>(dst->ne[1]),
                      static_cast<long long>(dst->ne[0]),
@@ -3492,8 +3667,7 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_mask_from_score_custom(ggml_tensor*
                      params->protected_len,
                      params->n_heads,
                      params->n_kv_heads,
-                     params->top_k,
-                     sd_env_float_value("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", 0.8f),
+                     sd_htp_block_sparse_keep_ratio(),
                      nth);
     }
 }
@@ -3502,7 +3676,6 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_mask_from_score_node(ggml_c
                                                                           ggml_tensor* score,
                                                                           int block_q,
                                                                           int block_k,
-                                                                          int top_k,
                                                                           bool causal,
                                                                           int protected_start,
                                                                           int protected_len,
@@ -3516,7 +3689,6 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_mask_from_score_node(ggml_c
         ggml_new_buffer(ctx, sizeof(ggml_ext_block_sparse_mask_from_score_params)));
     params->block_q = block_q;
     params->block_k = block_k;
-    params->top_k   = top_k;
     params->causal  = causal ? 1 : 0;
     params->protected_start = std::max(0, protected_start);
     params->protected_len = std::max(0, protected_len);
@@ -3540,7 +3712,8 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_index_from_score_custom(ggml_tensor
                                                                      int ith,
                                                                      int nth,
                                                                      void* userdata) {
-    const bool trace_index = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE");
+    const bool trace_index = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE") ||
+                             sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_SUMMARY");
     const int64_t trace_begin = trace_index ? ggml_time_ms() : 0;
     const auto* params = static_cast<const ggml_ext_block_sparse_index_from_score_params*>(userdata);
     GGML_ASSERT(params != nullptr);
@@ -3554,7 +3727,6 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_index_from_score_custom(ggml_tensor
                                               nth,
                                               params->block_q,
                                               params->block_k,
-                                              params->top_k,
                                               params->causal != 0,
                                               params->protected_start,
                                               params->protected_len,
@@ -3563,7 +3735,7 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_index_from_score_custom(ggml_tensor
 
     if (trace_index && ith == 0) {
         std::fprintf(stderr,
-                     "block_sparse_index_step index_from_score_thread0=%lldms n_q_blocks=%lld n_k_blocks=%lld max_kept=%lld block_q=%d block_k=%d protected_start_tokens=%d protected_tokens=%d n_heads=%d n_kv_heads=%d top_k=%d keep_ratio=%.3f nth=%d\n",
+                     "block_sparse_index_step index_from_score_thread0=%lldms n_q_blocks=%lld n_k_blocks=%lld max_kept=%lld block_q=%d block_k=%d protected_start_tokens=%d protected_tokens=%d n_heads=%d n_kv_heads=%d keep_ratio=%.3f nth=%d\n",
                      static_cast<long long>(ggml_time_ms() - trace_begin),
                      static_cast<long long>(dst->ne[1]),
                      static_cast<long long>(dst->src[0]->ne[0]),
@@ -3574,8 +3746,7 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_index_from_score_custom(ggml_tensor
                      params->protected_len,
                      params->n_heads,
                      params->n_kv_heads,
-                     params->top_k,
-                     sd_env_float_value("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", 0.8f),
+                     sd_htp_block_sparse_keep_ratio(),
                      nth);
     }
     if (trace_index && ith == 0 && nth == 1) {
@@ -3590,7 +3761,6 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_index_from_score_node(ggml_
                                                                            ggml_tensor* score,
                                                                            int block_q,
                                                                            int block_k,
-                                                                           int top_k,
                                                                            bool causal,
                                                                            int protected_start,
                                                                            int protected_len,
@@ -3605,7 +3775,6 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_index_from_score_node(ggml_
         ggml_new_buffer(ctx, sizeof(ggml_ext_block_sparse_index_from_score_params)));
     params->block_q = block_q;
     params->block_k = block_k;
-    params->top_k   = top_k;
     params->causal  = causal ? 1 : 0;
     params->protected_start = std::max(0, protected_start);
     params->protected_len = std::max(0, protected_len);
@@ -3635,7 +3804,8 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_index_32_from_16_score_custom(ggml_
         return;
     }
 
-    const bool trace_index = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE");
+    const bool trace_index = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE") ||
+                             sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_SUMMARY");
     const int64_t trace_begin = trace_index ? ggml_time_ms() : 0;
     const auto* params = static_cast<const ggml_ext_block_sparse_index_32_from_16_score_params*>(userdata);
     GGML_ASSERT(params != nullptr);
@@ -3652,7 +3822,6 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_index_32_from_16_score_custom(ggml_
                                              1,
                                              SD_HTP_BLOCK_SPARSE_PATCH_BLOCK,
                                              SD_HTP_BLOCK_SPARSE_PATCH_BLOCK,
-                                             params->top_k,
                                              params->causal != 0,
                                              params->protected_start,
                                              params->protected_len,
@@ -3697,7 +3866,7 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_index_32_from_16_score_custom(ggml_
 
     if (trace_index) {
         std::fprintf(stderr,
-                     "block_sparse_index_step index_32_from_16_score=%lldms n_q16_blocks=%d n_k16_blocks=%d n_q32_blocks=%lld n_k32_blocks=%lld max_kept=%lld protected_start_tokens=%d protected_tokens=%d n_heads=%d n_kv_heads=%d top_k=%d keep_ratio=%.3f patch_halo=%d center_sink=%d\n",
+                     "block_sparse_index_step index_32_from_16_score=%lldms n_q16_blocks=%d n_k16_blocks=%d n_q32_blocks=%lld n_k32_blocks=%lld max_kept=%lld protected_start_tokens=%d protected_tokens=%d n_heads=%d n_kv_heads=%d keep_ratio=%.3f patch_halo=%d center_sink=%d\n",
                      static_cast<long long>(ggml_time_ms() - trace_begin),
                      n_q16_blocks,
                      n_k16_blocks,
@@ -3708,8 +3877,7 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_index_32_from_16_score_custom(ggml_
                      params->protected_len,
                      params->n_heads,
                      params->n_kv_heads,
-                     params->top_k,
-                     sd_env_float_value("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", 0.8f),
+                     sd_htp_block_sparse_keep_ratio(),
                      patch_halo_enabled ? 1 : 0,
                      center_sink_enabled ? 1 : 0);
         ggml_ext_block_sparse_trace_index_rows(static_cast<const int32_t*>(dst->data),
@@ -3721,7 +3889,6 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_index_32_from_16_score_custom(ggml_
 
 __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_index_32_from_16_score_node(ggml_context* ctx,
                                                                                  ggml_tensor* score,
-                                                                                 int top_k,
                                                                                  bool causal,
                                                                                  int protected_start,
                                                                                  int protected_len,
@@ -3747,7 +3914,6 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_index_32_from_16_score_node
     ggml_tensor* args[] = {score};
     auto* params = static_cast<ggml_ext_block_sparse_index_32_from_16_score_params*>(
         ggml_new_buffer(ctx, sizeof(ggml_ext_block_sparse_index_32_from_16_score_params)));
-    params->top_k = std::max(1, std::min(top_k, n_k16_blocks));
     params->causal = causal ? 1 : 0;
     params->protected_start = std::max(0, protected_start);
     params->protected_len = std::max(0, protected_len);
