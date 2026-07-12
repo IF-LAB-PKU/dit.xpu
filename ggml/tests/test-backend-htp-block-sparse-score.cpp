@@ -581,7 +581,6 @@ static void test_patch_score_node_promotes_to_dsp_index() {
     ggml_tensor * score_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_k16, n_q16);
     ggml_tensor * index_t = ggml_ext_block_sparse_index_32_from_16_score_node(ctx,
                                                                               score_t,
-                                                                              2,
                                                                               false,
                                                                               0,
                                                                               0,
@@ -617,6 +616,95 @@ static void test_patch_score_node_promotes_to_dsp_index() {
     std::printf("[PASS] patch score node promotes to dsp index\n");
 }
 
+static void test_full_mask_node_masks_all_blocks() {
+    constexpr int n_q_blocks = 3;
+    constexpr int n_k_blocks = 5;
+
+    ggml_context * ctx = make_ctx(4);
+    ggml_tensor * mask_t = ggml_ext_block_sparse_full_mask_node(ctx, n_q_blocks, n_k_blocks);
+    GGML_ASSERT(mask_t != nullptr);
+
+    ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);
+    GGML_ASSERT(cpu != nullptr);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(cpu));
+    GGML_ASSERT(buffer != nullptr);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, mask_t);
+    GGML_ASSERT(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(cpu);
+
+    const std::vector<int32_t> mask = read_i32_tensor(mask_t);
+    GGML_ASSERT(mask.size() == size_t(n_q_blocks * n_k_blocks));
+    GGML_ASSERT(std::all_of(mask.begin(), mask.end(), [](int32_t value) { return value == 1; }));
+
+    ggml_backend_buffer_free(buffer);
+    ggml_backend_free(cpu);
+    ggml_free(ctx);
+
+    std::printf("[PASS] full mask node masks all blocks\n");
+}
+
+static void test_structural_index_node_without_score(bool patch_halo, bool center_sink) {
+    constexpr int seq_len = 256;
+    constexpr int n_heads = 1;
+    constexpr int n_kv_heads = 1;
+    constexpr int n_q16 = seq_len / SD_HTP_BLOCK_SPARSE_PATCH_BLOCK;
+    constexpr int n_k16 = seq_len / SD_HTP_BLOCK_SPARSE_PATCH_BLOCK;
+    constexpr int n_q32 = seq_len / SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    constexpr int n_k32 = seq_len / SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+
+    ggml_context * ctx = make_ctx(4);
+    ggml_tensor * index_t = ggml_ext_block_sparse_structural_index_32_node(ctx,
+                                                                           seq_len,
+                                                                           seq_len,
+                                                                           0,
+                                                                           0,
+                                                                           n_heads,
+                                                                           n_kv_heads,
+                                                                           patch_halo,
+                                                                           center_sink);
+    GGML_ASSERT(index_t != nullptr);
+    GGML_ASSERT(index_t->src[0] == nullptr);
+    GGML_ASSERT(std::strcmp(index_t->name, "block_sparse_index") == 0);
+
+    ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);
+    GGML_ASSERT(cpu != nullptr);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(cpu));
+    GGML_ASSERT(buffer != nullptr);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, index_t);
+    GGML_ASSERT(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(cpu);
+    const std::vector<int32_t> actual = read_i32_tensor(index_t);
+
+    std::vector<int32_t> mask16(size_t(n_q16) * size_t(n_k16), 1);
+    if (patch_halo) {
+        ggml_ext_block_sparse_force_patch_halo_mask(mask16.data(), n_q16, n_k16, n_q16, n_k16, n_heads, n_kv_heads);
+    }
+    if (center_sink) {
+        ggml_ext_block_sparse_force_center_sink_mask(mask16.data(), n_q16, n_k16, n_q16, n_k16, n_heads, n_kv_heads);
+    }
+    std::vector<int32_t> expected(size_t(n_q32) * size_t(n_k32), -1);
+    ggml_ext_block_sparse_promote_16_mask_to_32_index(mask16.data(),
+                                                      expected.data(),
+                                                      n_q16,
+                                                      n_k16,
+                                                      n_k32,
+                                                      n_heads,
+                                                      n_kv_heads);
+    GGML_ASSERT(actual == expected);
+
+    ggml_backend_buffer_free(buffer);
+    ggml_backend_free(cpu);
+    ggml_free(ctx);
+
+    std::printf("[PASS] structural index without score patch_halo=%d center_sink=%d\n",
+                patch_halo ? 1 : 0,
+                center_sink ? 1 : 0);
+}
+
 static std::vector<int32_t> run_mask_node_cpu(int n_q_blocks,
                                               int n_k_blocks,
                                               int block_q,
@@ -632,7 +720,6 @@ static std::vector<int32_t> run_mask_node_cpu(int n_q_blocks,
                                                                       score_t,
                                                                       block_q,
                                                                       block_k,
-                                                                      2,
                                                                       causal,
                                                                       0,
                                                                       protected_prefix_len,
@@ -675,7 +762,6 @@ static std::vector<int32_t> run_index_node_cpu(int n_q_blocks,
                                                                         score_t,
                                                                         block_q,
                                                                         block_k,
-                                                                        2,
                                                                         causal,
                                                                         0,
                                                                         protected_prefix_len,
@@ -722,7 +808,6 @@ static std::vector<int32_t> run_index_node_cpu_range(int n_q_blocks,
                                                                         score_t,
                                                                         block_q,
                                                                         block_k,
-                                                                        2,
                                                                         causal,
                                                                         protected_start,
                                                                         protected_len,
@@ -947,7 +1032,6 @@ static void test_score_to_mask_reference(int n_q_blocks, int n_k_blocks, float k
     const std::vector<int32_t> actual = ggml_ext_block_sparse_score_to_mask(score_t,
                                                                             block_q,
                                                                             block_k,
-                                                                            2,
                                                                             causal,
                                                                             0,
                                                                             protected_prefix_len,
@@ -1028,7 +1112,7 @@ static std::vector<ggml_fp16_t> run_score_node(ggml_backend_t backend,
 
     ggml_tensor * q_mean_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, head_dim, n_q_blocks);
     ggml_tensor * k_mean_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, head_dim, n_k_blocks);
-    ggml_tensor * score_t = ggml_ext_block_sparse_score_topk_node(ctx, q_mean_t, k_mean_t, block_q, block_k, 2, false);
+    ggml_tensor * score_t = ggml_ext_block_sparse_score_node(ctx, q_mean_t, k_mean_t, block_q, block_k, false);
     GGML_ASSERT(q_mean_t && k_mean_t && score_t);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(backend));
@@ -1088,7 +1172,7 @@ static void test_flat_mean_score_shape(int qo_len, int kv_len, int n_heads, int 
     ggml_tensor * k_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, head_dim, kv_len, n_kv_heads);
     ggml_tensor * q_mean_t = ggml_ext_block_sparse_q_mean_node(ctx, q_t, block_q);
     ggml_tensor * k_mean_t = ggml_ext_block_sparse_k_mean_node(ctx, k_t, block_k);
-    ggml_tensor * score_t = ggml_ext_block_sparse_score_topk_node(ctx, q_mean_t, k_mean_t, block_q, block_k, 2, false);
+    ggml_tensor * score_t = ggml_ext_block_sparse_score_node(ctx, q_mean_t, k_mean_t, block_q, block_k, false);
     GGML_ASSERT(q_mean_t != nullptr && k_mean_t != nullptr && score_t != nullptr);
     if (q_mean_t->ne[0] != head_dim || q_mean_t->ne[1] != n_q_blocks || q_mean_t->ne[2] != 1 ||
         k_mean_t->ne[0] != head_dim || k_mean_t->ne[1] != n_k_blocks || k_mean_t->ne[2] != 1 ||
@@ -1150,7 +1234,7 @@ static void test_score_shape(int qo_len, int kv_len, int n_heads, int n_kv_heads
         ggml_context * probe_ctx = make_ctx(8);
         ggml_tensor * q_mean_t = ggml_new_tensor_2d(probe_ctx, GGML_TYPE_F16, head_dim, n_q_blocks);
         ggml_tensor * k_mean_t = ggml_new_tensor_2d(probe_ctx, GGML_TYPE_F16, head_dim, n_k_blocks);
-        ggml_tensor * score_t = ggml_ext_block_sparse_score_topk_node(probe_ctx, q_mean_t, k_mean_t, block_q, block_k, 2, false);
+        ggml_tensor * score_t = ggml_ext_block_sparse_score_node(probe_ctx, q_mean_t, k_mean_t, block_q, block_k, false);
         GGML_ASSERT(score_t != nullptr);
         GGML_ASSERT(ggml_backend_supports_op(htp, score_t));
         ggml_free(probe_ctx);
@@ -1188,6 +1272,10 @@ int main() {
     test_patch_score_mask_2d_halo_keeps_surrounding_blocks();
     test_patch_score_mask_center_sink_keeps_center_blocks();
     test_patch_score_node_promotes_to_dsp_index();
+    test_full_mask_node_masks_all_blocks();
+    test_structural_index_node_without_score(true, false);
+    test_structural_index_node_without_score(false, true);
+    test_structural_index_node_without_score(true, true);
     test_score_to_mask_reference(24, 24, 0.95f, 0);
     test_score_to_mask_reference(192, 192, 0.95f, 0);
     test_score_to_mask_reference(312, 312, 0.95f, 154);

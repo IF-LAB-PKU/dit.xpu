@@ -29,7 +29,11 @@ struct EnvGuard {
             had_old   = true;
             old_value = old;
         }
-        setenv(name, value, 1);
+        if (value != nullptr) {
+            setenv(name, value, 1);
+        } else {
+            unsetenv(name);
+        }
     }
 
     ~EnvGuard() {
@@ -40,6 +44,24 @@ struct EnvGuard {
         }
     }
 };
+
+static void test_block_sparse_keep_ratio_policy() {
+    {
+        EnvGuard keep_ratio("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", nullptr);
+        GGML_ASSERT(sd_htp_block_sparse_keep_ratio() == 0.0f);
+        GGML_ASSERT(!sd_htp_block_sparse_score_enabled());
+    }
+    {
+        EnvGuard keep_ratio("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", "0.8");
+        GGML_ASSERT(sd_htp_block_sparse_keep_ratio() == 0.8f);
+        GGML_ASSERT(sd_htp_block_sparse_score_enabled());
+    }
+    {
+        EnvGuard keep_ratio("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", "1");
+        GGML_ASSERT(sd_htp_block_sparse_keep_ratio() == 1.0f);
+        GGML_ASSERT(!sd_htp_block_sparse_score_enabled());
+    }
+}
 
 static float gen_value(int t, int h, int d, int seed) {
     return 0.01f * float(((t * 17 + h * 37 + d * 11 + seed * 13) % 257) - 128);
@@ -71,12 +93,25 @@ static std::vector<ggml_fp16_t> gen_kv_f16(int seq_len, int n_heads, int head_di
     return data;
 }
 
+static double element_abs_diff(float a, float b) {
+    const double da = double(a);
+    const double db = double(b);
+    if (da == db) {
+        return 0.0;
+    }
+    if (!std::isfinite(da) || !std::isfinite(db)) {
+        return std::numeric_limits<double>::infinity();
+    }
+    const double diff = std::fabs(da - db);
+    return std::isfinite(diff) ? diff : std::numeric_limits<double>::infinity();
+}
+
 static double max_abs_diff(const std::vector<float> & a, const std::vector<float> & b, size_t * worst = nullptr) {
     GGML_ASSERT(a.size() == b.size());
     double max_diff = 0.0;
     size_t worst_idx = 0;
     for (size_t i = 0; i < a.size(); ++i) {
-        const double diff = std::fabs(double(a[i]) - double(b[i]));
+        const double diff = element_abs_diff(a[i], b[i]);
         if (diff > max_diff) {
             max_diff = diff;
             worst_idx = i;
@@ -104,23 +139,46 @@ static DiffStats diff_stats(const std::vector<float> & ref, const std::vector<fl
     double sum_sq = 0.0;
     double ref_sq = 0.0;
     for (size_t i = 0; i < ref.size(); ++i) {
-        const double diff = double(got[i]) - double(ref[i]);
-        const double abs_diff = std::fabs(diff);
+        const double abs_diff = element_abs_diff(ref[i], got[i]);
         if (abs_diff > stats.max_abs) {
             stats.max_abs = abs_diff;
             stats.worst = i;
         }
         sum_abs += abs_diff;
-        sum_sq += diff * diff;
-        ref_sq += double(ref[i]) * double(ref[i]);
+        sum_sq += abs_diff * abs_diff;
+        const double ref_value = double(ref[i]);
+        ref_sq += std::isfinite(ref_value) ? ref_value * ref_value : std::numeric_limits<double>::infinity();
     }
     if (!ref.empty()) {
         stats.mean_abs = sum_abs / double(ref.size());
         stats.rms_abs = std::sqrt(sum_sq / double(ref.size()));
         stats.ref_rms = std::sqrt(ref_sq / double(ref.size()));
-        stats.rel_rms = stats.ref_rms > 0.0 ? stats.rms_abs / stats.ref_rms : 0.0;
+        if (stats.rms_abs == 0.0) {
+            stats.rel_rms = 0.0;
+        } else if (std::isfinite(stats.ref_rms) && stats.ref_rms > 0.0) {
+            stats.rel_rms = stats.rms_abs / stats.ref_rms;
+        } else {
+            stats.rel_rms = std::numeric_limits<double>::infinity();
+        }
     }
     return stats;
+}
+
+static void test_diff_helpers_handle_non_finite_values() {
+    const float inf = std::numeric_limits<float>::infinity();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+
+    const std::vector<float> equal_infinities = {-inf, inf};
+    GGML_ASSERT(max_abs_diff(equal_infinities, equal_infinities) == 0.0);
+    const DiffStats equal_stats = diff_stats(equal_infinities, equal_infinities);
+    GGML_ASSERT(equal_stats.max_abs == 0.0);
+    GGML_ASSERT(equal_stats.rms_abs == 0.0);
+
+    GGML_ASSERT(std::isinf(max_abs_diff({inf}, {-inf})));
+    GGML_ASSERT(std::isinf(max_abs_diff({nan}, {nan})));
+    const DiffStats nan_stats = diff_stats({nan}, {nan});
+    GGML_ASSERT(std::isinf(nan_stats.max_abs));
+    GGML_ASSERT(std::isinf(nan_stats.rms_abs));
 }
 
 struct PackedWithLseDiffStats {
@@ -147,7 +205,7 @@ static PackedWithLseDiffStats packed_with_lse_diff_stats(const std::vector<float
             const size_t out_base = (size_t(qt) * size_t(n_heads) + size_t(h)) * size_t(head_dim);
             for (int d = 0; d < head_dim; ++d) {
                 const size_t out_idx = out_base + size_t(d);
-                const double diff = std::fabs(double(got_packed[packed_base + size_t(d)]) - double(ref_out[out_idx]));
+                const double diff = element_abs_diff(ref_out[out_idx], got_packed[packed_base + size_t(d)]);
                 if (diff > stats.out_max_abs) {
                     stats.out_max_abs = diff;
                     stats.out_worst = out_idx;
@@ -155,8 +213,7 @@ static PackedWithLseDiffStats packed_with_lse_diff_stats(const std::vector<float
             }
 
             const size_t lse_idx = size_t(qt) * size_t(n_heads) + size_t(h);
-            const double lse_diff =
-                std::fabs(double(got_packed[packed_base + size_t(head_dim)]) - double(ref_lse[lse_idx]));
+            const double lse_diff = element_abs_diff(ref_lse[lse_idx], got_packed[packed_base + size_t(head_dim)]);
             if (lse_diff > stats.lse_max_abs) {
                 stats.lse_max_abs = lse_diff;
                 stats.lse_worst = lse_idx;
@@ -173,7 +230,7 @@ static double packed_linear_prefix_diff(const std::vector<float> & ref_linear,
     double max_diff = 0.0;
     size_t worst_idx = 0;
     for (size_t i = 0; i < ref_linear.size(); ++i) {
-        const double diff = std::fabs(double(got_packed[i]) - double(ref_linear[i]));
+        const double diff = element_abs_diff(ref_linear[i], got_packed[i]);
         if (diff > max_diff) {
             max_diff = diff;
             worst_idx = i;
@@ -183,6 +240,28 @@ static double packed_linear_prefix_diff(const std::vector<float> & ref_linear,
         *worst = worst_idx;
     }
     return max_diff;
+}
+
+static void test_packed_diff_helpers_handle_non_finite_values() {
+    const float inf = std::numeric_limits<float>::infinity();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+
+    const std::vector<float> ref_out = {1.0f, -2.0f};
+    const std::vector<float> ref_lse = {-inf};
+    const std::vector<float> matching_packed = {1.0f, -2.0f, -inf};
+    const PackedWithLseDiffStats matching_stats =
+        packed_with_lse_diff_stats(ref_out, ref_lse, matching_packed, 1, 1, 2);
+    GGML_ASSERT(matching_stats.out_max_abs == 0.0);
+    GGML_ASSERT(matching_stats.lse_max_abs == 0.0);
+
+    const PackedWithLseDiffStats out_nan_stats =
+        packed_with_lse_diff_stats(ref_out, ref_lse, {1.0f, nan, -inf}, 1, 1, 2);
+    GGML_ASSERT(std::isinf(out_nan_stats.out_max_abs));
+
+    const PackedWithLseDiffStats lse_nan_stats =
+        packed_with_lse_diff_stats(ref_out, ref_lse, {1.0f, -2.0f, nan}, 1, 1, 2);
+    GGML_ASSERT(std::isinf(lse_nan_stats.lse_max_abs));
+    GGML_ASSERT(std::isinf(packed_linear_prefix_diff(ref_out, {1.0f, nan, -inf})));
 }
 
 struct RefAttentionWithLse {
@@ -342,7 +421,7 @@ struct AttentionRunner : GGMLRunner {
         EnvGuard htp_attention("SD_HTP_ATTENTION", "1");
         EnvGuard block_sparse_attn("SD_HTP_BLOCK_SPARSE_ATTN", block_sparse_enabled ? "1" : "0");
         EnvGuard full_keep_flag("SD_HTP_BLOCK_SPARSE_FORCE_FULL_KEEP", force_full_keep ? "1" : "0");
-        EnvGuard keep_ratio("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", block_sparse_enabled ? keep_ratio_buf : "0.8");
+        EnvGuard keep_ratio("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", block_sparse_enabled ? keep_ratio_buf : "1");
 
         sd::Tensor<float> q_tensor({n_heads * head_dim, qo_len, 1}, q_data);
         sd::Tensor<ggml_fp16_t> k_tensor({n_kv_heads * head_dim, kv_len, 1}, k_data);
@@ -389,7 +468,10 @@ struct AttentionRunner : GGMLRunner {
                                           int head_dim,
                                           const std::vector<float> & q_data,
                                           const std::vector<ggml_fp16_t> & k_data,
-                                          float keep_ratio_value) {
+                                          float keep_ratio_value,
+                                          int protected_start = 0,
+                                          int protected_len = 0,
+                                          bool production_index = false) {
         set_flash_attention_enabled(true);
         set_htp_attention_enabled(true);
         set_block_sparse_attention_enabled(true);
@@ -419,14 +501,30 @@ struct AttentionRunner : GGMLRunner {
             k = ggml_ext_cont(runner_ctx.ggml_ctx, ggml_permute(runner_ctx.ggml_ctx, k, 0, 2, 1, 3));
             k = ggml_reshape_3d(runner_ctx.ggml_ctx, k, head_dim, kv_len, n_kv_heads);
 
-            const int block_q = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
-            const int block_k = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
-            const int n_k_blocks = n_kv_heads * ((kv_len + block_k - 1) / block_k);
-            const int top_k = std::max(1, std::min(sd_env_int_value("SD_HTP_BLOCK_SPARSE_TOPK", 2), n_k_blocks));
+            const int block_q = production_index ? SD_HTP_BLOCK_SPARSE_PATCH_BLOCK :
+                                                   SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+            const int block_k = production_index ? SD_HTP_BLOCK_SPARSE_PATCH_BLOCK :
+                                                   SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
             ggml_tensor * q_mean = ggml_ext_block_sparse_q_mean_node(runner_ctx.ggml_ctx, q, block_q);
             ggml_tensor * k_mean = ggml_ext_block_sparse_k_mean_node(runner_ctx.ggml_ctx, k, block_k);
-            ggml_tensor * score  = ggml_ext_block_sparse_score_topk_node(runner_ctx.ggml_ctx, q_mean, k_mean, block_q, block_k, top_k, false);
-            ggml_tensor * index  = ggml_ext_block_sparse_index_from_score_node(runner_ctx.ggml_ctx, score, block_q, block_k, top_k, false, 0, 0, n_heads, n_kv_heads);
+            ggml_tensor * score  = ggml_ext_block_sparse_score_node(runner_ctx.ggml_ctx, q_mean, k_mean, block_q, block_k, false);
+            ggml_tensor * index = production_index ?
+                ggml_ext_block_sparse_index_32_from_16_score_node(runner_ctx.ggml_ctx,
+                                                                   score,
+                                                                   false,
+                                                                   protected_start,
+                                                                   protected_len,
+                                                                   n_heads,
+                                                                   n_kv_heads) :
+                ggml_ext_block_sparse_index_from_score_node(runner_ctx.ggml_ctx,
+                                                             score,
+                                                             block_q,
+                                                             block_k,
+                                                             false,
+                                                             protected_start,
+                                                             protected_len,
+                                                             n_heads,
+                                                             n_kv_heads);
 
             ggml_cgraph * graph = ggml_new_graph(runner_ctx.ggml_ctx);
             ggml_build_forward_expand(graph, index);
@@ -481,6 +579,70 @@ struct AttentionRunner : GGMLRunner {
                                                        1.0f,
                                                        false);
             GGML_ASSERT(out != nullptr);
+
+            ggml_cgraph * graph = ggml_new_graph(runner_ctx.ggml_ctx);
+            ggml_build_forward_expand(graph, out);
+            return graph;
+        };
+
+        auto result = GGMLRunner::compute<float>(get_graph, n_threads, true);
+        GGML_ASSERT(result.has_value());
+        return result->values();
+    }
+
+    std::vector<float> run_htp_dense_f16_mask(int n_threads,
+                                              int qo_len,
+                                              int kv_len,
+                                              int n_heads,
+                                              int n_kv_heads,
+                                              int head_dim,
+                                              const std::vector<float> & q_data,
+                                              const std::vector<ggml_fp16_t> & k_data,
+                                              const std::vector<ggml_fp16_t> & v_data,
+                                              const std::vector<ggml_fp16_t> & dense_mask_data) {
+        set_flash_attention_enabled(true);
+        set_htp_attention_enabled(true);
+        set_block_sparse_attention_enabled(false);
+
+        EnvGuard htp_ops("SD_HTP_OPS", "1");
+        EnvGuard htp_compute("SD_HTP_COMPUTE", "1");
+        EnvGuard htp_attention("SD_HTP_ATTENTION", "1");
+
+        const int kv_pad_len = ((kv_len + 63) / 64) * 64;
+        GGML_ASSERT(dense_mask_data.size() == size_t(kv_pad_len) * size_t(qo_len));
+
+        sd::Tensor<float> q_tensor({n_heads * head_dim, qo_len, 1}, q_data);
+        sd::Tensor<ggml_fp16_t> k_tensor({n_kv_heads * head_dim, kv_len, 1}, k_data);
+        sd::Tensor<ggml_fp16_t> v_tensor({n_kv_heads * head_dim, kv_len, 1}, v_data);
+        sd::Tensor<ggml_fp16_t> mask_tensor({kv_pad_len, qo_len, 1, 1}, dense_mask_data);
+
+        auto get_graph = [&]() -> ggml_cgraph * {
+            GGMLRunnerContext runner_ctx = get_context();
+
+            ggml_tensor * q_orig = make_input(q_tensor);
+            ggml_tensor * k_orig = make_input(k_tensor);
+            ggml_tensor * v_orig = make_input(v_tensor);
+            ggml_tensor * mask   = make_input(mask_tensor);
+
+            ggml_tensor * q3 = ggml_reshape_3d(runner_ctx.ggml_ctx, q_orig, head_dim, n_heads, qo_len);
+            ggml_tensor * q  = ggml_permute(runner_ctx.ggml_ctx, q3, 0, 2, 1, 3);
+            ggml_tensor * k_base = ggml_reshape_3d(runner_ctx.ggml_ctx, k_orig, head_dim, n_kv_heads, kv_len);
+            ggml_tensor * v_base = ggml_reshape_3d(runner_ctx.ggml_ctx, v_orig, head_dim, n_kv_heads, kv_len);
+            ggml_tensor * k = ggml_permute(runner_ctx.ggml_ctx, k_base, 0, 2, 1, 3);
+            ggml_tensor * v = ggml_permute(runner_ctx.ggml_ctx, v_base, 0, 2, 1, 3);
+
+            ggml_tensor * out = ggml_flash_attn_ext(runner_ctx.ggml_ctx,
+                                                    q,
+                                                    k,
+                                                    v,
+                                                    mask,
+                                                    1.0f / std::sqrt(float(head_dim)),
+                                                    0.0f,
+                                                    0.0f);
+            ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+            out = ggml_view_3d(runner_ctx.ggml_ctx, out, head_dim, n_heads, qo_len, out->nb[1], out->nb[2], 0);
+            out = ggml_ext_cont(runner_ctx.ggml_ctx, out);
+            out = ggml_reshape_3d(runner_ctx.ggml_ctx, out, head_dim * n_heads, qo_len, 1);
 
             ggml_cgraph * graph = ggml_new_graph(runner_ctx.ggml_ctx);
             ggml_build_forward_expand(graph, out);
@@ -1023,6 +1185,280 @@ static std::vector<int32_t> full_keep_block_index(int qo_len, int kv_len, int n_
     return index;
 }
 
+static std::vector<int32_t> fragmented_per_head_block_index(int qo_len,
+                                                            int kv_len,
+                                                            int n_heads,
+                                                            int n_kv_heads) {
+    GGML_ASSERT(n_heads == n_kv_heads);
+    const int block_q = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    const int block_k = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    const int q_blocks_per_head = (qo_len + block_q - 1) / block_q;
+    const int k_blocks_per_head = (kv_len + block_k - 1) / block_k;
+    constexpr int max_kept = 5;
+    GGML_ASSERT(q_blocks_per_head > 0 && k_blocks_per_head > 96);
+
+    std::vector<int32_t> index(size_t(n_heads) * size_t(q_blocks_per_head) * max_kept, -1);
+    for (int h = 0; h < n_heads; ++h) {
+        const int head_base = h * k_blocks_per_head;
+        for (int qb = 0; qb < q_blocks_per_head; ++qb) {
+            const int run0 = 1 + (h * 7 + qb * 11) % 24;
+            const int run1 = 64 + (h * 13 + qb * 5) % 24;
+            const int blocks[max_kept] = {
+                head_base + run0,
+                head_base + run0 + 1,
+                head_base + run1,
+                head_base + run1 + 1,
+                head_base + k_blocks_per_head - 1,
+            };
+            const size_t row = size_t(h * q_blocks_per_head + qb) * max_kept;
+            for (int i = 0; i < max_kept; ++i) {
+                index[row + size_t(i)] = blocks[i];
+            }
+        }
+    }
+    return index;
+}
+
+static void test_cache_full_k_4250_d128(AttentionRunner & runner) {
+    constexpr int qo_len = 96;
+    constexpr int kv_len = 4250;
+    constexpr int n_heads = 2;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 128;
+
+    const std::vector<float> q = gen_q(qo_len, n_heads, head_dim, 201);
+    const std::vector<ggml_fp16_t> k = gen_kv_f16(kv_len, n_kv_heads, head_dim, 202);
+    std::vector<ggml_fp16_t> v = gen_kv_f16(kv_len, n_kv_heads, head_dim, 203);
+    for (ggml_fp16_t & value : v) {
+        value = ggml_fp32_to_fp16(0.5f * ggml_fp16_to_fp32(value));
+    }
+    const std::vector<int32_t> block_index =
+        fragmented_per_head_block_index(qo_len, kv_len, n_heads, n_kv_heads);
+    const std::vector<float> dense_mask =
+        dense_mask_from_block_index(block_index, qo_len, kv_len, n_heads, n_kv_heads);
+
+    const std::vector<float> cpu =
+        runner.run_cpu_dense_masked(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, dense_mask);
+    std::fprintf(stderr,
+                 "[EXPECT] cache-mode expected=FULL_K qo=%d kv=%d heads=%d kv_heads=%d d=%d\n",
+                 qo_len,
+                 kv_len,
+                 n_heads,
+                 n_kv_heads,
+                 head_dim);
+    const std::vector<float> sparse =
+        runner.run_htp_sparse_index(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, block_index);
+    const DiffStats out_stats = diff_stats(cpu, sparse);
+    std::printf("[CACHE_MODE_DIAG] expected=FULL_K out_max_abs=%.9g mean_abs=%.9g rms_abs=%.9g "
+                "worst=%zu cpu=%.9g sparse=%.9g\n",
+                out_stats.max_abs,
+                out_stats.mean_abs,
+                out_stats.rms_abs,
+                out_stats.worst,
+                double(cpu[out_stats.worst]),
+                double(sparse[out_stats.worst]));
+    std::fflush(stdout);
+    GGML_ASSERT(out_stats.max_abs <= 3e-3);
+
+    const RefAttentionWithLse ref =
+        reference_attention_with_lse(qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, &dense_mask);
+    const std::vector<float> packed =
+        runner.run_htp_flash_with_lse_packed(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, &block_index);
+    const PackedWithLseDiffStats packed_stats =
+        packed_with_lse_diff_stats(ref.out, ref.lse, packed, qo_len, n_heads, head_dim);
+    std::printf("[CACHE_MODE] expected=FULL_K out_max_abs=%.9g packed_out_max_abs=%.9g "
+                "lse_max_abs=%.9g out_worst=%zu packed_out_worst=%zu lse_worst=%zu\n",
+                out_stats.max_abs,
+                packed_stats.out_max_abs,
+                packed_stats.lse_max_abs,
+                out_stats.worst,
+                packed_stats.out_worst,
+                packed_stats.lse_worst);
+    GGML_ASSERT(packed_stats.out_max_abs <= 3e-3);
+    GGML_ASSERT(packed_stats.lse_max_abs <= 5e-3);
+}
+
+static void test_cache_mode_output(AttentionRunner & runner,
+                                   const char * expected_mode,
+                                   int kv_len,
+                                   int head_dim,
+                                   int seed) {
+    constexpr int qo_len = 96;
+    constexpr int n_heads = 2;
+    constexpr int n_kv_heads = 2;
+
+    const std::vector<float> q = gen_q(qo_len, n_heads, head_dim, seed);
+    const std::vector<ggml_fp16_t> k = gen_kv_f16(kv_len, n_kv_heads, head_dim, seed + 1);
+    std::vector<ggml_fp16_t> v = gen_kv_f16(kv_len, n_kv_heads, head_dim, seed + 2);
+    for (ggml_fp16_t & value : v) {
+        value = ggml_fp32_to_fp16(0.5f * ggml_fp16_to_fp32(value));
+    }
+    const std::vector<int32_t> block_index =
+        fragmented_per_head_block_index(qo_len, kv_len, n_heads, n_kv_heads);
+    const std::vector<float> dense_mask =
+        dense_mask_from_block_index(block_index, qo_len, kv_len, n_heads, n_kv_heads);
+    const std::vector<float> cpu =
+        runner.run_cpu_dense_masked(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, dense_mask);
+
+    std::fprintf(stderr,
+                 "[EXPECT] cache-mode expected=%s qo=%d kv=%d heads=%d kv_heads=%d d=%d\n",
+                 expected_mode,
+                 qo_len,
+                 kv_len,
+                 n_heads,
+                 n_kv_heads,
+                 head_dim);
+    const std::vector<float> sparse =
+        runner.run_htp_sparse_index(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, block_index);
+    const DiffStats stats = diff_stats(cpu, sparse);
+    std::printf("[CACHE_MODE] expected=%s out_max_abs=%.9g mean_abs=%.9g rms_abs=%.9g "
+                "worst=%zu cpu=%.9g sparse=%.9g\n",
+                expected_mode,
+                stats.max_abs,
+                stats.mean_abs,
+                stats.rms_abs,
+                stats.worst,
+                double(cpu[stats.worst]),
+                double(sparse[stats.worst]));
+    std::fflush(stdout);
+    GGML_ASSERT(stats.max_abs <= 3e-3);
+}
+
+static void test_cache_full_kv_4250(AttentionRunner & runner) {
+    test_cache_mode_output(runner, "FULL_KV", 4250, 64, 211);
+}
+
+static void test_cache_chunked_5281_d128(AttentionRunner & runner) {
+    test_cache_mode_output(runner, "CHUNKED", 5281, 128, 221);
+}
+
+static void test_cache_d128_multi_kv(AttentionRunner & runner) {
+    constexpr int qo_len = 96;
+    constexpr int kv_len = 4250;
+    constexpr int n_heads = 2;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 128;
+    constexpr int max_kept = 5;
+    constexpr int q_blocks_per_head = 3;
+    const int k_blocks_per_head = (kv_len + SD_HTP_BLOCK_SPARSE_MASK_BLOCK - 1) /
+                                  SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+
+    const std::vector<float> q = gen_q(qo_len, n_heads, head_dim, 231);
+    const std::vector<ggml_fp16_t> k = gen_kv_f16(kv_len, n_kv_heads, head_dim, 232);
+    std::vector<ggml_fp16_t> v = gen_kv_f16(kv_len, n_kv_heads, head_dim, 233);
+    for (ggml_fp16_t & value : v) {
+        value = ggml_fp32_to_fp16(0.5f * ggml_fp16_to_fp32(value));
+    }
+
+    std::vector<int32_t> block_index =
+        fragmented_per_head_block_index(qo_len, kv_len, n_heads, n_kv_heads);
+    const size_t tail_only_row = size_t(1 * q_blocks_per_head + 2) * max_kept;
+    block_index[tail_only_row] = 1 * k_blocks_per_head + k_blocks_per_head - 1;
+    for (int i = 1; i < max_kept; ++i) {
+        block_index[tail_only_row + size_t(i)] = -1;
+    }
+
+    const std::vector<float> dense_mask =
+        dense_mask_from_block_index(block_index, qo_len, kv_len, n_heads, n_kv_heads);
+    const RefAttentionWithLse ref =
+        reference_attention_with_lse(qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, &dense_mask);
+    const std::vector<float> sparse =
+        runner.run_htp_sparse_index(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, block_index);
+    const DiffStats out_stats = diff_stats(ref.out, sparse);
+    const std::vector<float> packed =
+        runner.run_htp_flash_with_lse_packed(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, &block_index);
+    const PackedWithLseDiffStats packed_stats =
+        packed_with_lse_diff_stats(ref.out, ref.lse, packed, qo_len, n_heads, head_dim);
+    std::printf("[CACHE_MULTI_KV] expected=FULL_K out_max_abs=%.9g packed_out_max_abs=%.9g "
+                "lse_max_abs=%.9g out_worst=%zu packed_out_worst=%zu lse_worst=%zu\n",
+                out_stats.max_abs,
+                packed_stats.out_max_abs,
+                packed_stats.lse_max_abs,
+                out_stats.worst,
+                packed_stats.out_worst,
+                packed_stats.lse_worst);
+    GGML_ASSERT(out_stats.max_abs <= 3e-3);
+    GGML_ASSERT(packed_stats.out_max_abs <= 3e-3);
+    GGML_ASSERT(packed_stats.lse_max_abs <= 5e-3);
+}
+
+struct EquivalentBenchmarkMasks {
+    std::vector<int32_t> sparse_index;
+    std::vector<ggml_fp16_t> dense_mask;
+    int max_kept = 0;
+    int min_kept = 0;
+    double mean_kept = 0.0;
+};
+
+static EquivalentBenchmarkMasks make_equivalent_benchmark_masks(int qo_len,
+                                                                 int kv_len,
+                                                                 int n_heads,
+                                                                 int n_kv_heads) {
+    GGML_ASSERT(n_heads == n_kv_heads);
+    const int block_q = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    const int block_k = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    const int q_blocks_per_head = (qo_len + block_q - 1) / block_q;
+    const int k_blocks_per_head = (kv_len + block_k - 1) / block_k;
+    const int n_q_blocks = n_heads * q_blocks_per_head;
+    GGML_ASSERT(q_blocks_per_head == 13 && k_blocks_per_head == 13);
+    const int max_kept = k_blocks_per_head;
+
+    // Captured from the first 410-token joint-attention r99 mask in the production trace.
+    const std::vector<std::vector<int32_t>> local_rows = {
+        {0, 1, 2, 8, 9, 10, 11, 12},
+        {1, 8, 9, 10, 11, 12},
+        {0, 1, 2, 8, 9, 10, 11, 12},
+        {1, 8, 9, 10, 11, 12},
+        {0, 1, 2, 8, 9, 10, 11, 12},
+        {1, 8, 9, 10, 11, 12},
+        {0, 1, 2, 8, 9, 10, 11, 12},
+        {1, 8, 9, 10, 11, 12},
+        {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+        {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+        {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+        {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+        {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+    };
+    int min_kept = max_kept;
+    int total_kept = 0;
+    for (int qb = 0; qb < q_blocks_per_head; ++qb) {
+        const auto & row = local_rows[size_t(qb)];
+        min_kept = std::min(min_kept, int(row.size()));
+        total_kept += int(row.size());
+    }
+
+    EquivalentBenchmarkMasks masks;
+    masks.max_kept = max_kept;
+    masks.min_kept = min_kept;
+    masks.mean_kept = double(total_kept) / double(q_blocks_per_head);
+    masks.sparse_index.assign(size_t(n_q_blocks) * size_t(max_kept), -1);
+    for (int h = 0; h < n_heads; ++h) {
+        const int k_block_base = h * k_blocks_per_head;
+        for (int qb = 0; qb < q_blocks_per_head; ++qb) {
+            const int dst_qb = h * q_blocks_per_head + qb;
+            const auto & row = local_rows[size_t(qb)];
+            for (size_t slot = 0; slot < row.size(); ++slot) {
+                masks.sparse_index[size_t(dst_qb) * size_t(max_kept) + slot] = k_block_base + row[slot];
+            }
+        }
+    }
+
+    const int kv_pad_len = ((kv_len + 63) / 64) * 64;
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
+    masks.dense_mask.assign(size_t(kv_pad_len) * size_t(qo_len), neg_inf);
+    for (int qt = 0; qt < qo_len; ++qt) {
+        const auto & row = local_rows[size_t(qt / block_q)];
+        for (int kt = 0; kt < kv_len; ++kt) {
+            const int kb = kt / block_k;
+            if (std::find(row.begin(), row.end(), kb) != row.end()) {
+                masks.dense_mask[size_t(qt) * size_t(kv_pad_len) + size_t(kt)] = zero;
+            }
+        }
+    }
+    return masks;
+}
+
 static void test_exact_residual_rho_reference_formula(AttentionRunner & runner) {
     constexpr int qo_len = 96;
     constexpr int kv_len = 128;
@@ -1239,6 +1675,10 @@ static void test_htp_flash_attn_with_lse_matches_reference(AttentionRunner & run
     size_t sparse_linear_worst = 0;
     const double sparse_linear_prefix_diff =
         packed_linear_prefix_diff(sparse_no_lse, sparse_packed, &sparse_linear_worst);
+    const size_t expected_out_size = size_t(qo_len) * size_t(n_heads) * size_t(head_dim);
+    GGML_ASSERT(expected_out_size > 0);
+    GGML_ASSERT(!sparse_ref.out.empty() && sparse_ref.out.size() == expected_out_size);
+    GGML_ASSERT(!sparse_no_lse.empty() && sparse_no_lse.size() == expected_out_size);
     size_t sparse_no_lse_ref_worst = 0;
     const double sparse_no_lse_ref_diff =
         max_abs_diff(sparse_ref.out, sparse_no_lse, &sparse_no_lse_ref_worst);
@@ -1271,6 +1711,7 @@ static void test_htp_flash_attn_with_lse_matches_reference(AttentionRunner & run
     GGML_ASSERT(dense_stats.lse_max_abs <= 5e-3);
     GGML_ASSERT(sparse_stats.out_max_abs <= 1e-5);
     GGML_ASSERT(sparse_stats.lse_max_abs <= 5e-3);
+    GGML_ASSERT(sparse_no_lse_ref_diff <= 3e-3);
     GGML_ASSERT(full_sparse_stats.out_max_abs <= 1e-5);
     GGML_ASSERT(full_sparse_stats.lse_max_abs <= 5e-3);
 }
@@ -1369,6 +1810,95 @@ static void test_exact_rho_recovered_graph_matches_dense(AttentionRunner & runne
                 recovered.empty() ? 0.0 : double(recovered[worst]));
 }
 
+static void test_dense_exp2_paths_match_cpu(AttentionRunner & runner) {
+    test_diff_helpers_handle_non_finite_values();
+    test_packed_diff_helpers_handle_non_finite_values();
+
+    struct DenseExp2Case {
+        int qo_len;
+        int kv_len;
+        int n_heads;
+        int n_kv_heads;
+        int head_dim;
+        const char * name;
+    };
+
+    const DenseExp2Case cases[] = {
+        {65, 95, 4, 4, 64, "dense-d64-tail"},
+        {65, 95, 4, 4, 80, "sp-hdim-d80-tail"},
+        {33, 97, 4, 2, 96, "sp-hdim-d96-gqa-tail"},
+    };
+
+    bool all_passed = true;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const DenseExp2Case & test_case = cases[i];
+        std::vector<float> q =
+            gen_q(test_case.qo_len, test_case.n_heads, test_case.head_dim, 101 + int(i) * 3);
+        std::vector<ggml_fp16_t> k =
+            gen_kv_f16(test_case.kv_len, test_case.n_kv_heads, test_case.head_dim, 102 + int(i) * 3);
+        std::vector<ggml_fp16_t> v =
+            gen_kv_f16(test_case.kv_len, test_case.n_kv_heads, test_case.head_dim, 103 + int(i) * 3);
+        std::vector<float> dense_mask(size_t(test_case.kv_len) * size_t(test_case.qo_len) *
+                                         size_t(test_case.n_heads),
+                                     0.0f);
+
+        const std::vector<float> cpu =
+            runner.run_cpu_dense_masked(4,
+                                        test_case.qo_len,
+                                        test_case.kv_len,
+                                        test_case.n_heads,
+                                        test_case.n_kv_heads,
+                                        test_case.head_dim,
+                                        q,
+                                        k,
+                                        v,
+                                        dense_mask);
+        std::fprintf(stderr,
+                     "[EXPECT] phase1-exp2 case=%s expected_htp_core=%s qo=%d kv=%d heads=%d kv_heads=%d d=%d\n",
+                     test_case.name,
+                     test_case.head_dim % 64 == 0 ? "simple_flash_attn" : "simple_flash_attn_sp_hdim",
+                     test_case.qo_len,
+                     test_case.kv_len,
+                     test_case.n_heads,
+                     test_case.n_kv_heads,
+                     test_case.head_dim);
+        const std::vector<float> htp =
+            runner.run(4,
+                       test_case.qo_len,
+                       test_case.kv_len,
+                       test_case.n_heads,
+                       test_case.n_kv_heads,
+                       test_case.head_dim,
+                       q,
+                       k,
+                       v,
+                       false,
+                       false);
+        const size_t expected_output_size =
+            size_t(test_case.qo_len) * size_t(test_case.n_heads) * size_t(test_case.head_dim);
+        GGML_ASSERT(expected_output_size > 0);
+        GGML_ASSERT(!cpu.empty() && cpu.size() == expected_output_size);
+        GGML_ASSERT(!htp.empty() && htp.size() == expected_output_size);
+        const DiffStats stats = diff_stats(cpu, htp);
+        const bool passed = stats.max_abs <= 1e-2 && stats.rms_abs <= 1e-2;
+        std::printf("[%s] phase1-exp2 case=%s max_abs=%.9g mean_abs=%.9g rms_abs=%.9g "
+                    "ref_rms=%.9g rel_rms=%.9g worst=%zu cpu=%.9g htp=%.9g\n",
+                    passed ? "PASS" : "FAIL",
+                    test_case.name,
+                    stats.max_abs,
+                    stats.mean_abs,
+                    stats.rms_abs,
+                    stats.ref_rms,
+                    stats.rel_rms,
+                    stats.worst,
+                    cpu.empty() ? 0.0 : double(cpu[stats.worst]),
+                    htp.empty() ? 0.0 : double(htp[stats.worst]));
+        std::fflush(stdout);
+        all_passed = all_passed && passed;
+    }
+    GGML_ASSERT(all_passed);
+}
+
 static void run_case(AttentionRunner & runner, int qo_len, int kv_len, int n_heads, int n_kv_heads, int head_dim) {
     std::vector<float> q = gen_q(qo_len, n_heads, head_dim, 1);
     std::vector<ggml_fp16_t> k = gen_kv_f16(kv_len, n_kv_heads, head_dim, 2);
@@ -1439,6 +1969,10 @@ static void run_case(AttentionRunner & runner, int qo_len, int kv_len, int n_hea
             runner.run_cpu_dense_masked(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, dense_mask);
         std::vector<float> htp_sparse_same_mask =
             runner.run_htp_sparse_index(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, block_index);
+        const size_t expected_output_size = size_t(qo_len) * size_t(n_heads) * size_t(head_dim);
+        GGML_ASSERT(expected_output_size > 0);
+        GGML_ASSERT(!cpu_masked.empty() && cpu_masked.size() == expected_output_size);
+        GGML_ASSERT(!htp_sparse_same_mask.empty() && htp_sparse_same_mask.size() == expected_output_size);
         const DiffStats same_mask_stats = diff_stats(cpu_masked, htp_sparse_same_mask);
         std::printf("[SAME_MASK_DIFF] ratio=%.2f qo=%d kv=%d heads=%d kv_heads=%d d=%d max_abs=%.9g mean_abs=%.9g rms_abs=%.9g ref_rms=%.9g rel_rms=%.9g worst=%zu cpu=%.9g sparse=%.9g\n",
                     double(keep_ratio),
@@ -1455,10 +1989,265 @@ static void run_case(AttentionRunner & runner, int qo_len, int kv_len, int n_hea
                     same_mask_stats.worst,
                     cpu_masked.empty() ? 0.0 : double(cpu_masked[same_mask_stats.worst]),
                     htp_sparse_same_mask.empty() ? 0.0 : double(htp_sparse_same_mask[same_mask_stats.worst]));
+        GGML_ASSERT(same_mask_stats.max_abs <= 3e-3);
     }
 }
 
-int main() {
+static void run_equivalent_mask_benchmark(AttentionRunner & runner) {
+    constexpr int qo_len = 410;
+    constexpr int kv_len = 410;
+    constexpr int n_heads = 24;
+    constexpr int n_kv_heads = 24;
+    constexpr int head_dim = 64;
+    constexpr int warmup_pairs = 5;
+    constexpr int measured_pairs = 30;
+
+    std::vector<float> q = gen_q(qo_len, n_heads, head_dim, 91);
+    std::vector<ggml_fp16_t> k = gen_kv_f16(kv_len, n_kv_heads, head_dim, 92);
+    std::vector<ggml_fp16_t> v = gen_kv_f16(kv_len, n_kv_heads, head_dim, 93);
+    const EquivalentBenchmarkMasks masks =
+        make_equivalent_benchmark_masks(qo_len, kv_len, n_heads, n_kv_heads);
+    GGML_ASSERT(masks.min_kept < masks.max_kept);
+
+    std::fprintf(stderr,
+                 "[HTP_ATTN_BENCH] begin qo=%d kv=%d heads=%d kv_heads=%d d=%d "
+                 "warmup_pairs=%d measured_pairs=%d min_kept=%d max_kept=%d mean_kept=%.3f\n",
+                 qo_len,
+                 kv_len,
+                 n_heads,
+                 n_kv_heads,
+                 head_dim,
+                 warmup_pairs,
+                 measured_pairs,
+                 masks.min_kept,
+                 masks.max_kept,
+                 masks.mean_kept);
+
+    for (int pair = 0; pair < warmup_pairs + measured_pairs; ++pair) {
+        std::vector<float> simple;
+        std::vector<float> sparse;
+        const bool simple_first = (pair % 2) == 0;
+        if (simple_first) {
+            simple = runner.run_htp_dense_f16_mask(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, masks.dense_mask);
+            sparse = runner.run_htp_sparse_index(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, masks.sparse_index);
+        } else {
+            sparse = runner.run_htp_sparse_index(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, masks.sparse_index);
+            simple = runner.run_htp_dense_f16_mask(4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, masks.dense_mask);
+        }
+
+        if (pair == 0) {
+            size_t worst = 0;
+            const double diff = max_abs_diff(simple, sparse, &worst);
+            std::fprintf(stderr,
+                         "[HTP_ATTN_BENCH] equivalent_mask_max_abs=%.9g worst=%zu simple=%.9g sparse=%.9g\n",
+                         diff,
+                         worst,
+                         double(simple[worst]),
+                         double(sparse[worst]));
+            GGML_ASSERT(diff <= 3e-3);
+        }
+        if (pair + 1 == warmup_pairs) {
+            std::fprintf(stderr, "[HTP_ATTN_BENCH] warmup_complete\n");
+        }
+    }
+    std::fprintf(stderr, "[HTP_ATTN_BENCH] complete\n");
+}
+
+static void run_image_size_r90_benchmark(AttentionRunner & runner) {
+    struct BenchmarkCase {
+        const char * attention;
+        int image_size;
+        int seq_len;
+    };
+
+    constexpr int n_heads = 24;
+    constexpr int n_kv_heads = 24;
+    constexpr int head_dim = 64;
+    constexpr float keep_ratio = 0.90f;
+    constexpr int warmup_pairs = 3;
+    constexpr int measured_pairs = 15;
+    const BenchmarkCase cases[] = {
+        {"self", 256, 256},
+        {"joint", 256, 410},
+        {"self", 512, 1024},
+        {"joint", 512, 1178},
+        {"self", 1024, 4096},
+        {"joint", 1024, 4250},
+    };
+
+    GGML_ASSERT(sd_htp_block_sparse_score_enabled(keep_ratio));
+    for (size_t case_idx = 0; case_idx < std::size(cases); ++case_idx) {
+        const BenchmarkCase & test_case = cases[case_idx];
+        const int qo_len = test_case.seq_len;
+        const int kv_len = test_case.seq_len;
+        std::vector<float> q = gen_q(qo_len, n_heads, head_dim, 101 + int(case_idx) * 3);
+        std::vector<ggml_fp16_t> k =
+            gen_kv_f16(kv_len, n_kv_heads, head_dim, 102 + int(case_idx) * 3);
+        std::vector<ggml_fp16_t> v =
+            gen_kv_f16(kv_len, n_kv_heads, head_dim, 103 + int(case_idx) * 3);
+
+        const bool is_joint = std::strcmp(test_case.attention, "joint") == 0;
+        const int protected_start = is_joint ? test_case.image_size * test_case.image_size / 256 : 0;
+        const int protected_len = is_joint ? 154 : 0;
+        std::vector<int32_t> sparse_index = runner.make_block_index(4,
+                                                                    qo_len,
+                                                                    kv_len,
+                                                                    n_heads,
+                                                                    n_kv_heads,
+                                                                    head_dim,
+                                                                    q,
+                                                                    k,
+                                                                    keep_ratio,
+                                                                    protected_start,
+                                                                    protected_len,
+                                                                    true);
+        const int q_blocks_per_head = (qo_len + SD_HTP_BLOCK_SPARSE_MASK_BLOCK - 1) /
+                                      SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+        const int k_blocks_per_head = (kv_len + SD_HTP_BLOCK_SPARSE_MASK_BLOCK - 1) /
+                                      SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+        GGML_ASSERT(sparse_index.size() ==
+                    size_t(n_heads) * size_t(q_blocks_per_head) * size_t(k_blocks_per_head));
+        size_t kept_blocks = 0;
+        for (const int32_t block : sparse_index) {
+            kept_blocks += block >= 0 ? 1 : 0;
+        }
+        const size_t total_blocks = size_t(n_heads) * size_t(q_blocks_per_head) * size_t(k_blocks_per_head);
+        const double actual_keep = total_blocks == 0 ? 0.0 : double(kept_blocks) / double(total_blocks);
+
+        const int kv_pad_len = ((kv_len + 63) / 64) * 64;
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        std::vector<ggml_fp16_t> dense_mask(size_t(qo_len) * size_t(kv_pad_len), zero);
+
+        std::fprintf(stderr,
+                     "[HTP_IMAGE_ATTN_BENCH] begin image=%d attention=%s qo=%d kv=%d heads=%d "
+                     "kv_heads=%d d=%d requested_keep=%.3f actual_block_keep=%.6f kept=%zu total=%zu "
+                     "protected_start=%d protected_len=%d "
+                     "warmup_pairs=%d measured_pairs=%d\n",
+                     test_case.image_size,
+                     test_case.attention,
+                     qo_len,
+                     kv_len,
+                     n_heads,
+                     n_kv_heads,
+                     head_dim,
+                     double(keep_ratio),
+                     actual_keep,
+                     kept_blocks,
+                     total_blocks,
+                     protected_start,
+                     protected_len,
+                     warmup_pairs,
+                     measured_pairs);
+        std::fflush(stderr);
+
+        for (int pair = 0; pair < warmup_pairs + measured_pairs; ++pair) {
+            const bool dense_first = (pair % 2) == 0;
+            if (dense_first) {
+                (void) runner.run_htp_dense_f16_mask(
+                    4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, dense_mask);
+                (void) runner.run_htp_sparse_index(
+                    4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, sparse_index);
+            } else {
+                (void) runner.run_htp_sparse_index(
+                    4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, sparse_index);
+                (void) runner.run_htp_dense_f16_mask(
+                    4, qo_len, kv_len, n_heads, n_kv_heads, head_dim, q, k, v, dense_mask);
+            }
+            if (pair + 1 == warmup_pairs) {
+                std::fprintf(stderr,
+                             "[HTP_IMAGE_ATTN_BENCH] warmup_complete image=%d attention=%s\n",
+                             test_case.image_size,
+                             test_case.attention);
+                std::fflush(stderr);
+            }
+        }
+        std::fprintf(stderr,
+                     "[HTP_IMAGE_ATTN_BENCH] case_complete image=%d attention=%s\n",
+                     test_case.image_size,
+                     test_case.attention);
+        std::fflush(stderr);
+    }
+    std::fprintf(stderr, "[HTP_IMAGE_ATTN_BENCH] complete\n");
+}
+
+struct NamedTestCase {
+    const char * name;
+    bool implemented;
+};
+
+static const NamedTestCase named_test_cases[] = {
+    {"phase1-exp2", true},
+    {"phase1-lse-rho", true},
+    {"production-410", true},
+    {"cache-full-kv-4250", true},
+    {"cache-full-k-4250-d128", true},
+    {"cache-chunked-5281-d128", true},
+    {"cache-d128-multi-kv", true},
+    {"benchmark-410", true},
+    {"benchmark-image-sizes-r90", true},
+};
+
+static void print_named_test_cases(FILE * stream) {
+    std::fprintf(stream, "Available test cases:\n");
+    for (const NamedTestCase & test_case : named_test_cases) {
+        std::fprintf(stream, "  %s%s\n", test_case.name, test_case.implemented ? "" : " (not implemented)");
+    }
+}
+
+static const NamedTestCase * find_named_test_case(const std::string & name) {
+    for (const NamedTestCase & test_case : named_test_cases) {
+        if (name == test_case.name) {
+            return &test_case;
+        }
+    }
+    return nullptr;
+}
+
+static void run_phase1_lse_rho_tests(AttentionRunner & runner) {
+    test_exact_residual_rho_reference_formula(runner);
+    test_attention_lse_node_matches_reference(runner);
+    test_exact_rho_anchor_graph_sets_sparse_flash_block_params(runner);
+    test_htp_flash_attn_with_lse_matches_reference(runner);
+    test_htp_flash_attn_with_lse_production_layout(runner);
+    test_exact_rho_recovered_graph_matches_dense(runner);
+}
+
+int main(int argc, char ** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--list") {
+        print_named_test_cases(stdout);
+        return 0;
+    }
+
+    std::string selected_case;
+    if (argc == 1) {
+        if (sd_env_flag_enabled("SD_HTP_ATTENTION_BENCHMARK")) {
+            selected_case = "benchmark-410";
+        }
+    } else if (argc == 3 && std::string(argv[1]) == "--case" && argv[2][0] != '\0') {
+        selected_case = argv[2];
+    } else {
+        std::fprintf(stderr, "Usage: %s [--list | --case NAME]\n", argv[0]);
+        print_named_test_cases(stderr);
+        return 2;
+    }
+
+    if (!selected_case.empty()) {
+        const NamedTestCase * test_case = find_named_test_case(selected_case);
+        if (test_case == nullptr) {
+            std::fprintf(stderr, "Unknown test case: %s\n", selected_case.c_str());
+            print_named_test_cases(stderr);
+            return 2;
+        }
+        if (!test_case->implemented) {
+            std::fprintf(stderr,
+                         "[UNIMPLEMENTED] test case %s is reserved for phase 2\n",
+                         selected_case.c_str());
+            return 3;
+        }
+    }
+
+    test_block_sparse_keep_ratio_policy();
+
     if (!ggml_backend_htp_runtime_available()) {
         std::printf("[SKIP] HTP runtime unavailable (%s)\n", ggml_backend_htp_runtime_error());
         return 0;
@@ -1471,21 +2260,42 @@ int main() {
 
     AttentionRunner runner(cpu, htp);
 
-    test_cache_outputs_survive_until_persistence(runner);
-    test_exact_residual_rho_reference_formula(runner);
-    test_attention_lse_node_matches_reference(runner);
-    test_exact_rho_anchor_graph_sets_sparse_flash_block_params(runner);
-    test_htp_flash_attn_with_lse_matches_reference(runner);
-    test_htp_flash_attn_with_lse_production_layout(runner);
-    test_exact_rho_recovered_graph_matches_dense(runner);
+    if (selected_case == "benchmark-410") {
+        run_equivalent_mask_benchmark(runner);
+    } else if (selected_case == "benchmark-image-sizes-r90") {
+        run_image_size_r90_benchmark(runner);
+    } else if (selected_case == "phase1-exp2") {
+        test_dense_exp2_paths_match_cpu(runner);
+    } else if (selected_case == "phase1-lse-rho") {
+        run_phase1_lse_rho_tests(runner);
+    } else if (selected_case == "production-410") {
+        test_htp_flash_attn_with_lse_production_layout(runner);
+        run_case(runner, 410, 410, 24, 24, 64);
+    } else if (selected_case == "cache-full-k-4250-d128") {
+        test_cache_full_k_4250_d128(runner);
+    } else if (selected_case == "cache-full-kv-4250") {
+        test_cache_full_kv_4250(runner);
+    } else if (selected_case == "cache-chunked-5281-d128") {
+        test_cache_chunked_5281_d128(runner);
+    } else if (selected_case == "cache-d128-multi-kv") {
+        test_cache_d128_multi_kv(runner);
+    } else {
+        test_cache_outputs_survive_until_persistence(runner);
+        test_dense_exp2_paths_match_cpu(runner);
+        run_phase1_lse_rho_tests(runner);
 
-    run_case(runner, 256, 256, 24, 24, 64);
-    run_case(runner, 410, 410, 24, 24, 64);
-    run_case(runner, 512, 512, 24, 24, 64);
+        run_case(runner, 256, 256, 24, 24, 64);
+        run_case(runner, 410, 410, 24, 24, 64);
+        run_case(runner, 512, 512, 24, 24, 64);
+    }
 
     ggml_backend_free(htp);
     ggml_backend_free(cpu);
 
-    std::printf("\n=== HTP dense vs sparse full-keep test PASSED ===\n");
+    if (selected_case.empty()) {
+        std::printf("\n=== HTP dense vs sparse full-keep test PASSED ===\n");
+    } else {
+        std::printf("\n[PASS] test case %s\n", selected_case.c_str());
+    }
     return 0;
 }
