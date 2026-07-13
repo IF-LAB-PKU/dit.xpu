@@ -197,14 +197,16 @@ ggml_opencl_htp_sidecar * ggml_backend_opencl_htp_sidecar_create(
         }
     }
 
-    cl_uint page_size = 0;
+    size_t page_size = 0;
+    static_assert(sizeof(page_size) == sizeof(size_t), "QCOM page size queries use size_t values");
     err = clGetDeviceInfo(sidecar->device, CL_DEVICE_PAGE_SIZE_QCOM, sizeof(page_size), &page_size, nullptr);
     if (err != CL_SUCCESS || page_size == 0) {
         set_reason(reason, reason_capacity, "failed to query QCOM page size (error %d)", err);
         return nullptr;
     }
 
-    cl_uint ext_mem_padding = 0;
+    size_t ext_mem_padding = 0;
+    static_assert(sizeof(ext_mem_padding) == sizeof(size_t), "QCOM padding queries use size_t values");
     err = clGetDeviceInfo(sidecar->device, CL_DEVICE_EXT_MEM_PADDING_IN_BYTES_QCOM,
                           sizeof(ext_mem_padding), &ext_mem_padding, nullptr);
     if (err != CL_SUCCESS) {
