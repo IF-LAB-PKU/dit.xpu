@@ -5,7 +5,10 @@ set(TARGET_NAME ggml-opencl)
 
 ggml_add_backend_library(${TARGET_NAME}
                          ggml-opencl.cpp
-                         ../../include/ggml-opencl.h)
+                         ggml-opencl-sparse-sidecar.cpp
+                         ggml-opencl-qcom.h
+                         ../../include/ggml-opencl.h
+                         ../../include/ggml-opencl-htp.h)
 target_link_libraries(${TARGET_NAME} PRIVATE ${OpenCL_LIBRARIES})
 target_include_directories(${TARGET_NAME} PRIVATE ${OpenCL_INCLUDE_DIRS})
 
