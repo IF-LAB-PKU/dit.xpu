@@ -17,6 +17,18 @@ GGML_BACKEND_API bool ggml_backend_htp_runtime_available(void);
 
 GGML_BACKEND_API const char * ggml_backend_htp_runtime_error(void);
 
+struct ggml_backend_htp_rpcmem_info {
+    void * base;
+    // Borrowed from RPCMEM. Valid only while the backing buffer is alive; do not close it.
+    int fd;
+    size_t logical_size;
+    size_t allocation_size;
+};
+
+GGML_BACKEND_API bool ggml_backend_htp_get_rpcmem_info(
+    ggml_backend_buffer_t buffer,
+    struct ggml_backend_htp_rpcmem_info * info);
+
 GGML_BACKEND_API bool ggml_backend_buft_is_rpcmem(ggml_backend_buffer_type_t buft);
 GGML_BACKEND_API void ggml_backend_htp_set_n_threads(ggml_backend_t backend, int n_threads);
 GGML_BACKEND_API void ggml_backend_htp_pack_f16_weight(ggml_fp16_t * dst, const ggml_fp16_t * src, int64_t k, int64_t n);
