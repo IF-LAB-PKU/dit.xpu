@@ -1933,7 +1933,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_lse_node(ggml_context* ctx,
                                                            ggml_tensor* k,
                                                            ggml_tensor* mask,
                                                            int n_heads,
-                                                           float scale);
+                                                           float scale,
+                                                           ggml_flash_attn_ext_mask_format mask_format =
+                                                               GGML_FLASH_ATTN_EXT_MASK_DEFAULT);
 
 // q: [N, L_q, C(n_head*d_head)] or [N*n_head, L_q, d_head]
 // k: [N, L_k, n_kv_head*d_head] or [N*n_kv_head, L_k, d_head]
@@ -2190,11 +2192,13 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             const int n_k_blocks = n_kv_head * static_cast<int>((L_k + block_k - 1) / block_k);
             const int n_q_blocks = n_head * static_cast<int>((L_q + block_q - 1) / block_q);
             ggml_tensor* block_mask = nullptr;
+            ggml_flash_attn_ext_mask_format block_mask_format = GGML_FLASH_ATTN_EXT_MASK_DEFAULT;
             const float block_sparse_keep_ratio = sd_htp_block_sparse_keep_ratio();
             const bool block_sparse_patch_halo = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_PATCH_HALO");
             const bool block_sparse_center_sink = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_CENTER_SINK");
             if (block_sparse_force_full_keep || block_sparse_keep_ratio == 1.0f) {
                 block_mask = ggml_ext_block_sparse_full_keep_mask_node(ctx, n_q_blocks, n_k_blocks);
+                block_mask_format = GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX;
             } else if (!sd_htp_block_sparse_score_enabled(block_sparse_keep_ratio)) {
                 if (block_sparse_patch_halo || block_sparse_center_sink) {
                     block_mask = ggml_ext_block_sparse_structural_index_32_node(ctx,
@@ -2206,8 +2210,10 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                                                 static_cast<int>(n_kv_head),
                                                                                 block_sparse_patch_halo,
                                                                                 block_sparse_center_sink);
+                    block_mask_format = GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX;
                 } else {
                     block_mask = ggml_ext_block_sparse_full_mask_node(ctx, n_q_blocks, n_k_blocks);
+                    block_mask_format = GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX;
                 }
             } else {
                 if (block_sparse_host_index) {
@@ -2223,6 +2229,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                                                    protected_len,
                                                                                    n_head,
                                                                                    n_kv_head);
+                    block_mask_format = GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX;
                 } else {
                     ggml_tensor* q_mean = ggml_ext_block_sparse_q_mean_node(ctx, q, block_q);
                     ggml_tensor* k_mean = ggml_ext_block_sparse_k_mean_node(ctx, k, block_k);
@@ -2236,6 +2243,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                                             protected_len,
                                                                             n_head,
                                                                             n_kv_head);
+                    block_mask_format = GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX;
                 }
             }
             const int saved_kv_pad  = kv_pad;
@@ -2256,8 +2264,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             if (candidate == nullptr) {
                 candidate = build_kqv(q, k, v, block_mask, sparse_with_lse);
             }
-            candidate->op_params[4] = block_q;
-            candidate->op_params[5] = block_k;
+            GGML_ASSERT(block_mask_format != GGML_FLASH_ATTN_EXT_MASK_DEFAULT);
+            ggml_flash_attn_ext_set_block_sparse(candidate, block_q, block_k, block_mask_format);
             if ((candidate_is_htp_layout && keep_for_htp_hybrid) || backend == nullptr || ggml_backend_supports_op(backend, candidate)) {
                 ggml_tensor* sparse_out = flash_attn_o_view(candidate, sparse_with_lse);
                 ggml_tensor* sparse_lse = sparse_with_lse ? flash_attn_lse_view(candidate) : nullptr;
@@ -2527,6 +2535,7 @@ struct ggml_ext_attention_lse_params {
     int n_heads;
     int block_q;
     int block_k;
+    ggml_flash_attn_ext_mask_format mask_format;
     float scale;
 };
 
@@ -2549,27 +2558,38 @@ __STATIC_INLINE__ void ggml_ext_attention_lse_custom(ggml_tensor* dst, int ith, 
     const int k_blocks_per_head = (kv_len + params->block_k - 1) / params->block_k;
     const int n_q_blocks = n_heads * q_blocks_per_head;
     const int n_k_blocks = n_kv_heads * k_blocks_per_head;
+    const ggml_flash_attn_ext_mask_format mask_format = params->mask_format;
 
     GGML_ASSERT(q->ne[2] == n_heads);
     GGML_ASSERT(k->ne[0] == head_dim);
     GGML_ASSERT(dst->ne[0] == 1 && dst->ne[1] == n_heads && dst->ne[2] == qo_len);
     if (mask != nullptr) {
         if (mask->type == GGML_TYPE_I32) {
+            GGML_ASSERT(mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX ||
+                        mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
             GGML_ASSERT(mask->ne[1] == n_q_blocks);
-            GGML_ASSERT(mask->ne[0] == n_k_blocks || mask->ne[0] > 0);
+            if (mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX) {
+                GGML_ASSERT(mask->ne[0] == n_k_blocks);
+            } else {
+                GGML_ASSERT(mask->ne[0] > 0);
+            }
         } else {
+            GGML_ASSERT(mask_format == GGML_FLASH_ATTN_EXT_MASK_DEFAULT);
             GGML_ASSERT(mask->ne[0] == kv_len && mask->ne[1] == qo_len);
             GGML_ASSERT(mask->ne[2] == 1 || mask->ne[2] == n_heads);
         }
+    } else {
+        GGML_ASSERT(mask_format == GGML_FLASH_ATTN_EXT_MASK_DEFAULT);
     }
 
     auto block_sparse_keeps = [&](int qt, int h, int kt, int kv_head) -> bool {
         GGML_ASSERT(mask != nullptr && mask->type == GGML_TYPE_I32);
         const int qb = h * q_blocks_per_head + qt / params->block_q;
         const int kb = kv_head * k_blocks_per_head + kt / params->block_k;
-        if (mask->ne[0] == n_k_blocks) {
+        if (mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX) {
             return static_cast<int32_t>(ggml_ext_tensor_get_scalar_f32(mask, kb, qb)) == 0;
         }
+        GGML_ASSERT(mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
         for (int i = 0; i < mask->ne[0]; ++i) {
             const int kept = static_cast<int32_t>(ggml_ext_tensor_get_scalar_f32(mask, i, qb));
             if (kept == kb) {
@@ -2642,13 +2662,20 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_lse_node(ggml_context* ctx,
                                                            ggml_tensor* k,
                                                            ggml_tensor* mask,
                                                            int n_heads,
-                                                           float scale) {
+                                                           float scale,
+                                                           ggml_flash_attn_ext_mask_format mask_format) {
     GGML_ASSERT(q != nullptr && k != nullptr);
     GGML_ASSERT(n_heads > 0);
     GGML_ASSERT(q->ne[2] == n_heads);
     GGML_ASSERT(k->ne[0] == q->ne[0]);
     if (mask != nullptr) {
         GGML_ASSERT(mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32);
+    }
+    if (mask != nullptr && mask->type == GGML_TYPE_I32) {
+        GGML_ASSERT(mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX ||
+                    mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
+    } else {
+        GGML_ASSERT(mask_format == GGML_FLASH_ATTN_EXT_MASK_DEFAULT);
     }
 
     ggml_tensor* args[] = {q, k, mask};
@@ -2657,6 +2684,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_lse_node(ggml_context* ctx,
     params->n_heads = n_heads;
     params->block_q = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
     params->block_k = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    params->mask_format = mask_format;
     params->scale = scale;
     return ggml_custom_4d(ctx,
                           GGML_TYPE_F32,

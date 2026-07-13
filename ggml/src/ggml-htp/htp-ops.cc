@@ -369,6 +369,13 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                 }
 
                 const bool with_lse = ggml_get_op_params_i32(dst, 6) != 0;
+                const ggml_flash_attn_ext_mask_format mask_format =
+                    ggml_flash_attn_ext_get_mask_format(dst);
+                const bool mask_format_ok =
+                    (mask->type == GGML_TYPE_F16 && mask_format == GGML_FLASH_ATTN_EXT_MASK_DEFAULT) ||
+                    (mask->type == GGML_TYPE_I32 &&
+                     (mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX ||
+                      mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX));
                 const bool shape_ok =
                     q->ne[0] == k->ne[0] &&
                     q->ne[0] == v->ne[0] &&
@@ -379,7 +386,7 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
 
                 return dst->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
                        v->type == GGML_TYPE_F16 && (mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32) &&
-                       shape_ok && max_bias == 0 && logit_softcap == 0;
+                       mask_format_ok && shape_ok && max_bias == 0 && logit_softcap == 0;
             }
         case GGML_OP_CUSTOM:
             return is_block_sparse_score_custom(dst);
@@ -587,7 +594,11 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     const int32_t block_q = ggml_get_op_params_i32(dst, 4);
                     const int32_t block_k = ggml_get_op_params_i32(dst, 5);
                     GGML_ASSERT(block_q > 0 && block_k > 0);
-                    const bool is_index = std::strcmp(mask->name, "block_sparse_index") == 0;
+                    const ggml_flash_attn_ext_mask_format mask_format =
+                        ggml_flash_attn_ext_get_mask_format(dst);
+                    GGML_ASSERT(mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX ||
+                                mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
+                    const bool is_index = mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX;
                     const int32_t computed_n_q_blocks =
                         (int32_t) q->ne[2] * (int32_t) ((q->ne[1] + block_q - 1) / block_q);
                     const int32_t computed_n_k_blocks =
