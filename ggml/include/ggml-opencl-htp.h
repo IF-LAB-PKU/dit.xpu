@@ -5,6 +5,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,6 +17,14 @@ typedef struct ggml_opencl_htp_graph ggml_opencl_htp_graph;
 struct ggml_opencl_qcom_requirements {
     size_t ext_mem_padding;
     size_t page_size;
+};
+
+struct ggml_opencl_htp_import_descriptor {
+    ggml_backend_buffer_t backing;
+    void * base;
+    int fd;
+    size_t logical_size;
+    size_t allocation_size;
 };
 
 enum ggml_opencl_htp_result {
@@ -47,6 +56,54 @@ GGML_BACKEND_API bool ggml_backend_opencl_htp_sidecar_has_extension(
 
 GGML_BACKEND_API bool ggml_backend_opencl_htp_sidecar_queue_is_in_order(
     const ggml_opencl_htp_sidecar * sidecar);
+
+GGML_BACKEND_API enum ggml_opencl_htp_result ggml_backend_opencl_htp_graph_create(
+    ggml_opencl_htp_sidecar * sidecar,
+    ggml_opencl_htp_graph ** graph,
+    char * reason,
+    size_t reason_capacity);
+
+// The sidecar must outlive the graph. Imported backing storage and its borrowed fd/base must
+// remain valid until graph finish or free; the descriptor itself is copied during import.
+GGML_BACKEND_API enum ggml_opencl_htp_result ggml_backend_opencl_htp_graph_import(
+    ggml_opencl_htp_graph * graph,
+    const struct ggml_opencl_htp_import_descriptor * descriptor,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API enum ggml_opencl_htp_result ggml_backend_opencl_htp_graph_fill(
+    ggml_opencl_htp_graph * graph,
+    ggml_backend_buffer_t backing,
+    size_t offset,
+    size_t size,
+    uint32_t pattern,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API enum ggml_opencl_htp_result ggml_backend_opencl_htp_graph_fill_tensor(
+    ggml_opencl_htp_graph * graph,
+    const struct ggml_tensor * tensor,
+    uint32_t pattern,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API enum ggml_opencl_htp_result ggml_backend_opencl_htp_graph_finish(
+    ggml_opencl_htp_graph * graph,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API void ggml_backend_opencl_htp_graph_free(
+    ggml_opencl_htp_graph ** graph);
+
+GGML_BACKEND_API size_t ggml_backend_opencl_htp_graph_live_alias_count(
+    const ggml_opencl_htp_graph * graph);
+
+GGML_BACKEND_API size_t ggml_backend_opencl_htp_graph_live_event_count(
+    const ggml_opencl_htp_graph * graph);
+
+// Diagnostic fault injection used by the shared-memory lifecycle test.
+GGML_BACKEND_API void ggml_backend_opencl_htp_graph_test_fail_next_event_cache(
+    ggml_opencl_htp_graph * graph);
 
 #ifdef __cplusplus
 }
