@@ -12,6 +12,10 @@
 
 static const char * HTP_OPS_DL_PATH = "libhtp_ops.so";
 
+#ifdef GGML_HTP_OPENCL_SIDECAR
+struct ggml_opencl_htp_sidecar;
+#endif
+
 struct ggml_backend_htp_context {
     static constexpr size_t MAX_MSG_SIZE = 4096;
 
@@ -33,12 +37,19 @@ struct ggml_backend_htp_context {
     std::string runtime_error;
     std::unordered_map<const ggml_tensor *, ggml_tensor *> packed_f16_weights;
 
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    ggml_opencl_htp_sidecar * sparse_opencl_sidecar = nullptr;
+    size_t sparse_opencl_page_size = 0;
+    size_t sparse_opencl_ext_mem_padding = 0;
+    std::string sparse_opencl_error;
+#endif
+
     ggml_backend_htp_context();
     ~ggml_backend_htp_context();
 
     int init_message_channel();
 
     static ggml_backend_htp_context * instance();
-    static void retain_instance();
+    static ggml_backend_htp_context * acquire_instance();
     static void release_instance();
 };

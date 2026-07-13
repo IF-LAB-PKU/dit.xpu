@@ -14,6 +14,11 @@ set(GGML_SOURCES_HTP
 
 ggml_add_backend_library(ggml-htp ${GGML_SOURCES_HTP})
 
+if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+    target_compile_definitions(ggml-htp PRIVATE GGML_HTP_OPENCL_SIDECAR)
+    target_link_libraries(ggml-htp PRIVATE ggml-opencl)
+endif()
+
 if (UNIX AND NOT APPLE)
     target_link_libraries(ggml-htp PRIVATE dl)
 endif()

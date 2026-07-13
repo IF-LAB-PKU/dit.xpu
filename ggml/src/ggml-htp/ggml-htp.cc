@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -22,6 +23,10 @@
 #include "ggml-htp-impl.h"
 #include "htp-ops.h"
 
+#ifdef GGML_HTP_OPENCL_SIDECAR
+#include "ggml-opencl-htp.h"
+#endif
+
 extern "C" {
 struct ggml_threadpool;
 enum ggml_status ggml_graph_compute_htp_hybrid(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
@@ -30,8 +35,17 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
 
 struct ggml_backend_htp_buffer_context {
     void * data;
+    int fd;
+    size_t logical_size;
+    size_t allocation_size;
     bool is_rpcmem;
+    ggml_backend_htp_context * owner;
 };
+
+static bool ggml_backend_htp_env_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
 
 static void * ggml_backend_htp_aligned_alloc(size_t size) {
     constexpr size_t alignment = 128;
@@ -155,6 +169,26 @@ ggml_backend_htp_context::ggml_backend_htp_context() : mapper(ggml_backend_htp_g
     }
 
     ops_backend_initialized = true;
+
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL")) {
+        ggml_opencl_qcom_requirements requirements = {};
+        char reason[512] = {};
+        sparse_opencl_sidecar =
+            ggml_backend_opencl_htp_sidecar_create(&requirements, reason, sizeof(reason));
+        if (sparse_opencl_sidecar != nullptr) {
+            sparse_opencl_page_size = requirements.page_size;
+            sparse_opencl_ext_mem_padding = requirements.ext_mem_padding;
+        } else {
+            sparse_opencl_error = reason[0] != '\0' ? reason : "unknown OpenCL sidecar error";
+            if (ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_STRICT")) {
+                runtime_error = "OpenCL sidecar initialization failed: " + sparse_opencl_error;
+                return;
+            }
+        }
+    }
+#endif
+
     runtime_available       = true;
 
     if (std::getenv("SKIP_HTP_OPS") != nullptr) {
@@ -169,6 +203,11 @@ int g_ctx_ref_count = 0;
 } // namespace
 
 ggml_backend_htp_context::~ggml_backend_htp_context() {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    ggml_backend_opencl_htp_sidecar_free(sparse_opencl_sidecar);
+    sparse_opencl_sidecar = nullptr;
+#endif
+
     ggml_backend_htp_aligned_free(work_data);
 
     if (ops_dl_handle != nullptr) {
@@ -231,9 +270,13 @@ ggml_backend_htp_context * ggml_backend_htp_context::instance() {
     return g_ctx_ptr.get();
 }
 
-void ggml_backend_htp_context::retain_instance() {
+ggml_backend_htp_context * ggml_backend_htp_context::acquire_instance() {
     std::lock_guard<std::mutex> lock(g_ctx_mutex);
+    if (g_ctx_ptr == nullptr) {
+        g_ctx_ptr.reset(new ggml_backend_htp_context());
+    }
     ++g_ctx_ref_count;
+    return g_ctx_ptr.get();
 }
 
 void ggml_backend_htp_context::release_instance() {
@@ -258,12 +301,13 @@ static void * ggml_backend_htp_buffer_get_base(ggml_backend_buffer_t buffer) {
 static void ggml_backend_htp_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<ggml_backend_htp_buffer_context *>(buffer->context);
     if (ctx->is_rpcmem) {
-        ggml_backend_htp_context::instance()->mapper.release_buffer(ctx->data);
+        ctx->owner->mapper.release_buffer(ctx->data);
         rpcmem_free(ctx->data);
     } else {
         ggml_backend_htp_aligned_free(ctx->data);
     }
     delete ctx;
+    ggml_backend_htp_context::release_instance();
 }
 
 static void ggml_backend_htp_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
@@ -321,14 +365,49 @@ static const char * ggml_backend_htp_buffer_type_get_name(ggml_backend_buffer_ty
 
 static ggml_backend_buffer_t ggml_backend_htp_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     auto * ctx            = new ggml_backend_htp_buffer_context();
-    auto * htp_ctx        = ggml_backend_htp_context::instance();
+    auto * htp_ctx        = ggml_backend_htp_context::acquire_instance();
+    ctx->owner            = htp_ctx;
     ctx->is_rpcmem        = htp_ctx->runtime_available;
-    ctx->data             = ctx->is_rpcmem ? rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED,
-                                                          static_cast<int>(size))
-                                           : ggml_backend_htp_aligned_alloc(size);
+    ctx->fd               = -1;
+    ctx->logical_size     = size;
+    ctx->allocation_size  = size;
+
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    const size_t ext_mem_padding = htp_ctx->sparse_opencl_sidecar != nullptr
+        ? htp_ctx->sparse_opencl_ext_mem_padding
+        : 0;
+#else
+    const size_t ext_mem_padding = 0;
+#endif
+
+    if (ctx->is_rpcmem) {
+        if (size > std::numeric_limits<size_t>::max() - ext_mem_padding) {
+            delete ctx;
+            ggml_backend_htp_context::release_instance();
+            return nullptr;
+        }
+        ctx->allocation_size = size + ext_mem_padding;
+        if (ctx->allocation_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            delete ctx;
+            ggml_backend_htp_context::release_instance();
+            return nullptr;
+        }
+        ctx->data = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED,
+                                 static_cast<int>(ctx->allocation_size));
+        if (ctx->data != nullptr) {
+            ctx->fd = rpcmem_to_fd(ctx->data);
+            if (ctx->fd < 0) {
+                rpcmem_free(ctx->data);
+                ctx->data = nullptr;
+            }
+        }
+    } else {
+        ctx->data = ggml_backend_htp_aligned_alloc(size);
+    }
 
     if (ctx->data == nullptr) {
         delete ctx;
+        ggml_backend_htp_context::release_instance();
         return nullptr;
     }
 
@@ -377,6 +456,32 @@ static ggml_backend_buffer_type_t ggml_backend_htp_buffer_type(void) {
 
 bool ggml_backend_buft_is_rpcmem(ggml_backend_buffer_type_t buft) {
     return buft != nullptr && buft->iface.get_name == ggml_backend_htp_buffer_type_get_name;
+}
+
+bool ggml_backend_htp_get_rpcmem_info(
+        ggml_backend_buffer_t buffer,
+        struct ggml_backend_htp_rpcmem_info * info) {
+    if (info == nullptr) {
+        return false;
+    }
+
+    *info = { nullptr, -1, 0, 0 };
+    if (buffer == nullptr ||
+        !ggml_backend_buft_is_rpcmem(ggml_backend_buffer_get_type(buffer)) ||
+        buffer->context == nullptr) {
+        return false;
+    }
+
+    auto * ctx = static_cast<ggml_backend_htp_buffer_context *>(buffer->context);
+    if (!ctx->is_rpcmem || ctx->data == nullptr || ctx->fd < 0) {
+        return false;
+    }
+
+    info->base = ctx->data;
+    info->fd = ctx->fd;
+    info->logical_size = ctx->logical_size;
+    info->allocation_size = ctx->allocation_size;
+    return true;
 }
 
 void ggml_backend_htp_pack_f16_weight(ggml_fp16_t * dst, const ggml_fp16_t * src, int64_t k, int64_t n) {
@@ -564,8 +669,7 @@ static const struct ggml_backend_i ggml_backend_htp_i = {
 };
 
 ggml_backend_t ggml_backend_htp_init(void) {
-    auto * ctx = ggml_backend_htp_context::instance();
-    ggml_backend_htp_context::retain_instance();
+    auto * ctx = ggml_backend_htp_context::acquire_instance();
     if (ctx->n_threads <= 0) {
         // Keep hybrid execution single-threaded for now. The HTP op bridge is
         // correctness-first at this stage and still needs dedicated validation
