@@ -63,6 +63,52 @@ static void test_block_sparse_keep_ratio_policy() {
     }
 }
 
+static void test_block_sparse_mask_format_is_explicit_for_ambiguous_shapes() {
+    constexpr int head_dim = 4;
+    constexpr int seq_len = 64;
+    constexpr int block_size = 32;
+    constexpr int n_blocks = seq_len / block_size;
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+    GGML_ASSERT(ctx != nullptr);
+
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, seq_len, 1, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, seq_len, 1, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, seq_len, 1, 1);
+
+    // With one KV head, an index row can have the same width as the full block matrix.
+    // Deliberately misleading names prove that format is not inferred from names either.
+    ggml_tensor * matrix_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_blocks, n_blocks);
+    ggml_tensor * index_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_blocks, n_blocks);
+    ggml_set_name(matrix_mask, "block_sparse_index");
+    ggml_set_name(index_mask, "matrix_named_mask");
+
+    ggml_tensor * matrix_attn = ggml_flash_attn_ext(ctx, q, k, v, matrix_mask, 1.0f, 0.0f, 0.0f);
+    ggml_tensor * index_attn = ggml_flash_attn_ext(ctx, q, k, v, index_mask, 1.0f, 0.0f, 0.0f);
+
+    GGML_ASSERT(ggml_flash_attn_ext_get_mask_format(matrix_attn) == GGML_FLASH_ATTN_EXT_MASK_DEFAULT);
+    GGML_ASSERT(ggml_flash_attn_ext_get_mask_format(index_attn) == GGML_FLASH_ATTN_EXT_MASK_DEFAULT);
+
+    ggml_flash_attn_ext_set_block_sparse(
+        matrix_attn, block_size, block_size, GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX);
+    ggml_flash_attn_ext_set_block_sparse(
+        index_attn, block_size, block_size, GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
+
+    GGML_ASSERT(matrix_attn->op_params[4] == block_size);
+    GGML_ASSERT(matrix_attn->op_params[5] == block_size);
+    GGML_ASSERT(index_attn->op_params[4] == block_size);
+    GGML_ASSERT(index_attn->op_params[5] == block_size);
+    GGML_ASSERT(ggml_flash_attn_ext_get_mask_format(matrix_attn) == GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX);
+    GGML_ASSERT(ggml_flash_attn_ext_get_mask_format(index_attn) == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
+
+    ggml_free(ctx);
+}
+
 static float gen_value(int t, int h, int d, int seed) {
     return 0.01f * float(((t * 17 + h * 37 + d * 11 + seed * 13) % 257) - 128);
 }
@@ -707,8 +753,8 @@ struct AttentionRunner : GGMLRunner {
                                                     0.0f,
                                                     0.0f);
             ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
-            out->op_params[4] = block_q;
-            out->op_params[5] = block_k;
+            ggml_flash_attn_ext_set_block_sparse(
+                out, block_q, block_k, GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
             out = ggml_view_3d(runner_ctx.ggml_ctx, out, head_dim, n_heads, qo_len, out->nb[1], out->nb[2], 0);
             out = ggml_ext_cont(runner_ctx.ggml_ctx, out);
             out = ggml_reshape_3d(runner_ctx.ggml_ctx, out, head_dim * n_heads, qo_len, 1);
@@ -795,8 +841,8 @@ struct AttentionRunner : GGMLRunner {
                                                                 0.0f);
             ggml_flash_attn_ext_set_prec(packed, GGML_PREC_F32);
             if (block_index != nullptr) {
-                packed->op_params[4] = block_q;
-                packed->op_params[5] = block_k;
+                ggml_flash_attn_ext_set_block_sparse(
+                    packed, block_q, block_k, GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
             }
             GGML_ASSERT(packed->ne[0] == head_dim + 1);
 
@@ -1005,7 +1051,8 @@ struct AttentionRunner : GGMLRunner {
                                                             k,
                                                             index,
                                                             n_heads,
-                                                            1.0f / std::sqrt(float(head_dim)));
+                                                            1.0f / std::sqrt(float(head_dim)),
+                                                            GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
             GGML_ASSERT(lse != nullptr);
 
             ggml_cgraph * graph = ggml_new_graph(runner_ctx.ggml_ctx);
@@ -1089,8 +1136,8 @@ struct AttentionRunner : GGMLRunner {
                                                            0.0f,
                                                            0.0f);
             ggml_flash_attn_ext_set_prec(sparse_out, GGML_PREC_F32);
-            sparse_out->op_params[4] = block_q;
-            sparse_out->op_params[5] = block_k;
+            ggml_flash_attn_ext_set_block_sparse(
+                sparse_out, block_q, block_k, GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
             sparse_out = ggml_view_3d(runner_ctx.ggml_ctx,
                                       sparse_out,
                                       head_dim,
@@ -1111,7 +1158,8 @@ struct AttentionRunner : GGMLRunner {
                                                                    k,
                                                                    index,
                                                                    n_heads,
-                                                                   1.0f / std::sqrt(float(head_dim)));
+                                                                   1.0f / std::sqrt(float(head_dim)),
+                                                                   GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
             ggml_tensor * rho = ggml_exp(runner_ctx.ggml_ctx, ggml_sub(runner_ctx.ggml_ctx, sparse_lse, dense_lse));
             ggml_tensor * scaled_sparse = ggml_mul(runner_ctx.ggml_ctx, sparse_out, rho);
             ggml_tensor * residual = ggml_sub(runner_ctx.ggml_ctx, dense_out, scaled_sparse);
@@ -2247,6 +2295,7 @@ int main(int argc, char ** argv) {
     }
 
     test_block_sparse_keep_ratio_policy();
+    test_block_sparse_mask_format_is_explicit_for_ambiguous_shapes();
 
     if (!ggml_backend_htp_runtime_available()) {
         std::printf("[SKIP] HTP runtime unavailable (%s)\n", ggml_backend_htp_runtime_error());

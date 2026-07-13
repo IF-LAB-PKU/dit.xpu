@@ -2395,6 +2395,12 @@ extern "C" {
     //   n_head % ne32      == 0
     //   ne3    % ne33      == 0
     //
+    enum ggml_flash_attn_ext_mask_format {
+        GGML_FLASH_ATTN_EXT_MASK_DEFAULT      = 0,
+        GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX = 1,
+        GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX  = 2,
+    };
+
     GGML_API struct ggml_tensor * ggml_flash_attn_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2423,6 +2429,15 @@ extern "C" {
 
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
+
+    GGML_API void ggml_flash_attn_ext_set_block_sparse(
+            struct ggml_tensor                    * tensor,
+            int32_t                                 block_q,
+            int32_t                                 block_k,
+            enum ggml_flash_attn_ext_mask_format   format);
+
+    GGML_API enum ggml_flash_attn_ext_mask_format ggml_flash_attn_ext_get_mask_format(
+            const struct ggml_tensor * tensor);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,

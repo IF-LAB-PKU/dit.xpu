@@ -5362,6 +5362,7 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
     float params[] = { scale, max_bias, logit_softcap };
     ggml_set_op_params(result, params, sizeof(params));
     ggml_set_op_params_i32(result, 6, with_lse ? 1 : 0);
+    ggml_set_op_params_i32(result, 7, GGML_FLASH_ATTN_EXT_MASK_DEFAULT);
 
     result->op     = GGML_OP_FLASH_ATTN_EXT;
     result->src[0] = q;
@@ -5413,6 +5414,41 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
     const int32_t prec_i32 = ggml_get_op_params_i32(a, 3);
 
     return (enum ggml_prec) prec_i32;
+}
+
+void ggml_flash_attn_ext_set_block_sparse(
+        struct ggml_tensor                   * tensor,
+        int32_t                                block_q,
+        int32_t                                block_k,
+        enum ggml_flash_attn_ext_mask_format  format) {
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(format >= GGML_FLASH_ATTN_EXT_MASK_DEFAULT &&
+                format <= GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
+
+    const struct ggml_tensor * mask = tensor->src[3];
+    if (format == GGML_FLASH_ATTN_EXT_MASK_DEFAULT) {
+        GGML_ASSERT(mask == NULL || mask->type != GGML_TYPE_I32);
+        GGML_ASSERT(block_q == 0 && block_k == 0);
+    } else {
+        GGML_ASSERT(mask != NULL && mask->type == GGML_TYPE_I32);
+        GGML_ASSERT(block_q > 0 && block_k > 0);
+    }
+
+    ggml_set_op_params_i32(tensor, 4, block_q);
+    ggml_set_op_params_i32(tensor, 5, block_k);
+    ggml_set_op_params_i32(tensor, 7, format);
+}
+
+enum ggml_flash_attn_ext_mask_format ggml_flash_attn_ext_get_mask_format(
+        const struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_FLASH_ATTN_EXT);
+
+    const int32_t format = ggml_get_op_params_i32(tensor, 7);
+    GGML_ASSERT(format >= GGML_FLASH_ATTN_EXT_MASK_DEFAULT &&
+                format <= GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
+    return (enum ggml_flash_attn_ext_mask_format) format;
 }
 
 void ggml_flash_attn_ext_add_sinks(
