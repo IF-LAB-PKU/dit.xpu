@@ -72,6 +72,7 @@ __kernel void flash_attn_block_sparse_f32_f16(
 
     const int candidate_count =
         mask_format == MASK_FORMAT_BLOCK_INDEX ? max_kept_blocks : k_blocks_per_head;
+    // Production index rows contain unique valid block ids; duplicates are outside this format contract.
     for (int candidate = 0; candidate < candidate_count; ++candidate) {
         int kb_local = candidate;
         if (mask_format == MASK_FORMAT_BLOCK_INDEX) {
