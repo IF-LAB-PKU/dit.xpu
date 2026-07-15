@@ -282,7 +282,7 @@ owned_rpcmem_buffer allocate_tensor_buffer(
     owned_rpcmem_buffer owned;
     const size_t tensor_size = ggml_backend_buft_get_alloc_size(
         ggml_backend_get_default_buffer_type(htp), tensor);
-    const size_t total_size = offset + tensor_size + 256;
+    const size_t total_size = offset + tensor_size + 4096;
     owned.buffer = ggml_backend_alloc_buffer(htp, total_size);
     GGML_ASSERT(owned.buffer != nullptr);
     GGML_ASSERT(ggml_backend_htp_get_rpcmem_info(owned.buffer, &owned.info));
@@ -627,24 +627,94 @@ void run_case(
     const std::vector<uint8_t> k_snapshot = snapshot(buffers[1]);
     const std::vector<uint8_t> v_snapshot = snapshot(buffers[2]);
     const std::vector<uint8_t> mask_snapshot = snapshot(buffers[3]);
+    const std::vector<uint8_t> output_snapshot = snapshot(buffers[4]);
 
     char reason[1024] = {};
     ggml_opencl_htp_graph * graph = nullptr;
     GGML_ASSERT(ggml_backend_opencl_htp_graph_create(
         sidecar, &graph, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    auto expect_pre_enqueue_unsupported = [&](
+        const char * name,
+        const ggml_tensor * node,
+        size_t expected_alias_count) {
+        reason[0] = '\0';
+        const ggml_opencl_htp_result rejected =
+            ggml_backend_opencl_htp_graph_compute_block_sparse_attn_sync(
+                graph, node, reason, sizeof(reason));
+        const bool output_unchanged = snapshot(buffers[4]) == output_snapshot;
+        if (rejected != GGML_OPENCL_HTP_UNSUPPORTED || reason[0] == '\0' ||
+            ggml_backend_opencl_htp_graph_live_alias_count(graph) != expected_alias_count ||
+            ggml_backend_opencl_htp_graph_live_event_count(graph) != 0 || !output_unchanged) {
+            std::fprintf(
+                stderr,
+                "%s pre-enqueue rejection failed: result=%d aliases=%zu events=%zu output_unchanged=%s reason=%s\n",
+                name,
+                rejected,
+                ggml_backend_opencl_htp_graph_live_alias_count(graph),
+                ggml_backend_opencl_htp_graph_live_event_count(graph),
+                output_unchanged ? "yes" : "no",
+                reason);
+        }
+        GGML_ASSERT(rejected == GGML_OPENCL_HTP_UNSUPPORTED);
+        GGML_ASSERT(reason[0] != '\0');
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_live_alias_count(graph) == expected_alias_count);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_live_event_count(graph) == 0);
+        GGML_ASSERT(output_unchanged);
+    };
     if (check_preconditions) {
-        GGML_ASSERT(ggml_backend_opencl_htp_graph_compute_block_sparse_attn_sync(
-            graph, packed, reason, sizeof(reason)) == GGML_OPENCL_HTP_UNSUPPORTED);
-        GGML_ASSERT(snapshot(buffers[4]) == std::vector<uint8_t>(buffers[4].info.logical_size, k_guard));
+        expect_pre_enqueue_unsupported("missing imports", packed, 0);
     }
     for (const owned_rpcmem_buffer & buffer : buffers) {
         import_buffer(graph, buffer, reason, sizeof(reason));
     }
     if (check_preconditions) {
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_live_alias_count(graph) == 5);
+
+        ggml_tensor unsupported_op = *packed;
+        unsupported_op.op = GGML_OP_ADD;
+        expect_pre_enqueue_unsupported("unsupported op", &unsupported_op, 5);
+
+        ggml_tensor overlapping_q = *q;
+        overlapping_q.buffer = packed->buffer;
+        overlapping_q.data = packed->data;
+        ggml_tensor overlapping_input = *packed;
+        overlapping_input.src[0] = &overlapping_q;
+        expect_pre_enqueue_unsupported("output/input overlap", &overlapping_input, 5);
+
         ggml_tensor overlapping_rows = *packed;
         overlapping_rows.nb[2] = overlapping_rows.nb[0];
-        GGML_ASSERT(ggml_backend_opencl_htp_graph_compute_block_sparse_attn_sync(
-            graph, &overlapping_rows, reason, sizeof(reason)) == GGML_OPENCL_HTP_UNSUPPORTED);
+        expect_pre_enqueue_unsupported("overlapping output rows", &overlapping_rows, 5);
+
+        auto set_row_stride = [](ggml_tensor * tensor, size_t row_stride) {
+            tensor->nb[1] = row_stride;
+            tensor->nb[2] = row_stride * static_cast<size_t>(tensor->ne[1]);
+            tensor->nb[3] = tensor->nb[2] * static_cast<size_t>(tensor->ne[2]);
+        };
+        const size_t kv_row_bytes = static_cast<size_t>(k_head_dim) * sizeof(ggml_fp16_t);
+
+        ggml_tensor gapped_k = *k;
+        set_row_stride(&gapped_k, kv_row_bytes + sizeof(ggml_fp16_t));
+        ggml_tensor gapped_k_output = *packed;
+        gapped_k_output.src[1] = &gapped_k;
+        expect_pre_enqueue_unsupported("gapped K strides", &gapped_k_output, 5);
+
+        ggml_tensor overlapping_k = *k;
+        set_row_stride(&overlapping_k, kv_row_bytes - sizeof(ggml_fp16_t));
+        ggml_tensor overlapping_k_output = *packed;
+        overlapping_k_output.src[1] = &overlapping_k;
+        expect_pre_enqueue_unsupported("overlapping K strides", &overlapping_k_output, 5);
+
+        ggml_tensor gapped_v = *v;
+        set_row_stride(&gapped_v, kv_row_bytes + sizeof(ggml_fp16_t));
+        ggml_tensor gapped_v_output = *packed;
+        gapped_v_output.src[2] = &gapped_v;
+        expect_pre_enqueue_unsupported("gapped V strides", &gapped_v_output, 5);
+
+        ggml_tensor overlapping_v = *v;
+        set_row_stride(&overlapping_v, kv_row_bytes - sizeof(ggml_fp16_t));
+        ggml_tensor overlapping_v_output = *packed;
+        overlapping_v_output.src[2] = &overlapping_v;
+        expect_pre_enqueue_unsupported("overlapping V strides", &overlapping_v_output, 5);
     }
 
     const ggml_opencl_htp_result result =
@@ -667,6 +737,19 @@ void run_case(
     GGML_ASSERT(cpu_stats.valid);
     GGML_ASSERT(cpu_stats.out_max_abs <= 3e-3f);
     GGML_ASSERT(cpu_stats.lse_max_abs <= 5e-3f);
+    if (c.pattern == mask_pattern::empty) {
+        for (int64_t b = 0; b < c.batch; ++b) {
+            for (int64_t qt = 0; qt < c.lq; ++qt) {
+                for (int64_t h = 0; h < c.heads; ++h) {
+                    for (int64_t d = 0; d < k_head_dim; ++d) {
+                        GGML_ASSERT(read_scalar<float>(packed, d, h, qt, b) == 0.0f);
+                    }
+                    const float lse = read_scalar<float>(packed, k_head_dim, h, qt, b);
+                    GGML_ASSERT(std::isinf(lse) && std::signbit(lse));
+                }
+            }
+        }
+    }
 
     if (c.compare_htp_sparse || c.compare_htp_dense) {
         std::vector<float> htp_sparse_all;
@@ -761,6 +844,9 @@ int main() {
           false, false, false, false },
         { "matrix_empty", 32, 32, 1, 1, 1,
           GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX, mask_pattern::empty,
+          false, false, false, false },
+        { "index_empty", 33, 65, 2, 2, 1,
+          GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX, mask_pattern::empty,
           false, false, false, false },
         { "index_full_keep_tail", 65, 97, 4, 4, 1,
           GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX, mask_pattern::full,
