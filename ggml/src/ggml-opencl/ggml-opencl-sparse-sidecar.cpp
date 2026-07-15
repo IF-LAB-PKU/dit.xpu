@@ -726,6 +726,8 @@ struct ggml_opencl_htp_sparse_dispatch {
     cl_int heads = 0;
     cl_int kv_heads = 0;
     cl_int batch = 0;
+    cl_int mask_format = 0;
+    cl_int max_kept_blocks = 0;
 };
 
 ggml_opencl_htp_result unsupported_sparse_node(
@@ -784,9 +786,10 @@ ggml_opencl_htp_result validate_block_sparse_node(
     if (with_lse != 1) {
         return unsupported_sparse_node(reason, reason_capacity, "with_lse must equal 1");
     }
-    if (mask_format != GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX) {
+    if (mask_format != GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX &&
+        mask_format != GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX) {
         return unsupported_sparse_node(
-            reason, reason_capacity, "mask format must be BLOCK_MATRIX");
+            reason, reason_capacity, "mask format must be BLOCK_MATRIX or BLOCK_INDEX");
     }
     if (block_q != 32 || block_k != 32) {
         return unsupported_sparse_node(
@@ -851,11 +854,18 @@ ggml_opencl_htp_result validate_block_sparse_node(
         return unsupported_sparse_node(
             reason, reason_capacity, "flattened mask block dimensions exceed cl_int range");
     }
-    if (mask->ne[0] != expected_k_blocks || mask->ne[1] != expected_q_blocks ||
-        mask->ne[2] != 1 || mask->ne[3] != 1) {
+    if (mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX) {
+        if (mask->ne[0] != expected_k_blocks || mask->ne[1] != expected_q_blocks ||
+            mask->ne[2] != 1 || mask->ne[3] != 1) {
+            return unsupported_sparse_node(
+                reason, reason_capacity,
+                "matrix mask must have shape [Hkv*ceil(Lk/32),H*ceil(Lq/32),1,1]");
+        }
+    } else if (!valid_cl_int_dimension(mask->ne[0]) ||
+               mask->ne[1] != expected_q_blocks || mask->ne[2] != 1 || mask->ne[3] != 1) {
         return unsupported_sparse_node(
             reason, reason_capacity,
-            "matrix mask must have shape [Hkv*ceil(Lk/32),H*ceil(Lq/32),1,1]");
+            "index mask must have shape [max_kept,H*ceil(Lq/32),1,1]");
     }
 
     if (q->nb[0] != sizeof(float) || k->nb[0] != sizeof(ggml_fp16_t) ||
@@ -864,10 +874,39 @@ ggml_opencl_htp_result validate_block_sparse_node(
         return unsupported_sparse_node(
             reason, reason_capacity, "tensor dimension-zero strides do not match their types");
     }
-    if (!ggml_is_contiguous(q) || !ggml_is_contiguous(k) || !ggml_is_contiguous(v) ||
+    auto is_dense_scalar_permutation = [](const ggml_tensor * tensor, size_t scalar_size) {
+        struct active_dimension {
+            size_t stride;
+            int64_t count;
+        } dimensions[3];
+        size_t active_count = 0;
+        for (size_t dimension = 1; dimension < GGML_MAX_DIMS; ++dimension) {
+            if (tensor->ne[dimension] > 1) {
+                dimensions[active_count++] = { tensor->nb[dimension], tensor->ne[dimension] };
+            }
+        }
+        std::sort(
+            dimensions, dimensions + active_count,
+            [](const active_dimension & lhs, const active_dimension & rhs) {
+                return lhs.stride < rhs.stride;
+            });
+        size_t expected_stride = scalar_size * static_cast<size_t>(tensor->ne[0]);
+        for (size_t i = 0; i < active_count; ++i) {
+            if (dimensions[i].stride != expected_stride ||
+                static_cast<uint64_t>(dimensions[i].count) > SIZE_MAX / expected_stride) {
+                return false;
+            }
+            expected_stride *= static_cast<size_t>(dimensions[i].count);
+        }
+        return true;
+    };
+    if (!ggml_is_contiguous(q) ||
+        !is_dense_scalar_permutation(k, sizeof(ggml_fp16_t)) ||
+        !is_dense_scalar_permutation(v, sizeof(ggml_fp16_t)) ||
         !ggml_is_contiguous(mask) || !ggml_is_contiguous(node)) {
         return unsupported_sparse_node(
-            reason, reason_capacity, "Task 6 sparse sidecar tensors must be contiguous");
+            reason, reason_capacity,
+            "Q, mask, and output must be contiguous; K and V must be dense scalar permutations");
     }
     auto strides_are_aligned = [](const ggml_tensor * tensor, size_t alignment) {
         for (size_t dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
@@ -897,6 +936,9 @@ ggml_opencl_htp_result validate_block_sparse_node(
     dispatch->heads = static_cast<cl_int>(heads);
     dispatch->kv_heads = static_cast<cl_int>(kv_heads);
     dispatch->batch = static_cast<cl_int>(batch);
+    dispatch->mask_format = static_cast<cl_int>(mask_format);
+    dispatch->max_kept_blocks = mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX ?
+        static_cast<cl_int>(mask->ne[0]) : 0;
     set_reason(reason, reason_capacity, "ok");
     return GGML_OPENCL_HTP_OK;
 }
@@ -1195,6 +1237,8 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_s
     const cl_int lk = dispatch.lk;
     const cl_int heads = dispatch.heads;
     const cl_int kv_heads = dispatch.kv_heads;
+    const cl_int mask_format = dispatch.mask_format;
+    const cl_int max_kept_blocks = dispatch.max_kept_blocks;
     const cl_ulong q_nb1 = static_cast<cl_ulong>(dispatch.q->nb[1]);
     const cl_ulong q_nb2 = static_cast<cl_ulong>(dispatch.q->nb[2]);
     const cl_ulong q_nb3 = static_cast<cl_ulong>(dispatch.q->nb[3]);
@@ -1244,6 +1288,8 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_s
         { sizeof(lk), &lk },
         { sizeof(heads), &heads },
         { sizeof(kv_heads), &kv_heads },
+        { sizeof(mask_format), &mask_format },
+        { sizeof(max_kept_blocks), &max_kept_blocks },
         { sizeof(q_nb1), &q_nb1 },
         { sizeof(q_nb2), &q_nb2 },
         { sizeof(q_nb3), &q_nb3 },
@@ -1259,7 +1305,7 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_s
         { sizeof(mask_nb0), &mask_nb0 },
         { sizeof(mask_nb1), &mask_nb1 },
     };
-    static_assert(sizeof(args) / sizeof(args[0]) == 29, "block-sparse kernel ABI changed");
+    static_assert(sizeof(args) / sizeof(args[0]) == 31, "block-sparse kernel ABI changed");
     for (cl_uint index = 0; index < sizeof(args) / sizeof(args[0]); ++index) {
         const cl_int err = clSetKernelArg(
             graph->sidecar->block_sparse_kernel, index, args[index].size, args[index].value);

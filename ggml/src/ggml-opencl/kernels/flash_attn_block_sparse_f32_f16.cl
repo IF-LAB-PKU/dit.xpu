@@ -3,6 +3,7 @@
 #define HEAD_DIM 64
 #define BLOCK_SIZE 32
 #define VEC_COUNT 16
+#define MASK_FORMAT_BLOCK_INDEX 2
 
 __attribute__((reqd_work_group_size(BLOCK_SIZE, 1, 1)))
 __kernel void flash_attn_block_sparse_f32_f16(
@@ -21,6 +22,8 @@ __kernel void flash_attn_block_sparse_f32_f16(
         int Lk,
         int H,
         int Hkv,
+        int mask_format,
+        int max_kept_blocks,
         ulong q_nb1,
         ulong q_nb2,
         ulong q_nb3,
@@ -67,13 +70,28 @@ __kernel void flash_attn_block_sparse_f32_f16(
     float maximum = -INFINITY;
     float sum = 0.0f;
 
-    for (int kb_local = 0; kb_local < k_blocks_per_head; ++kb_local) {
-        const int kb_abs = kvh * k_blocks_per_head + kb_local;
-        __global const int * mask_value = (__global const int *)(
-            mask_base + mask_offset + (ulong)kb_abs * mask_nb0 + (ulong)qb_abs * mask_nb1);
-        const int skip = *mask_value != 0;
-        if (skip) {
-            continue;
+    const int candidate_count =
+        mask_format == MASK_FORMAT_BLOCK_INDEX ? max_kept_blocks : k_blocks_per_head;
+    for (int candidate = 0; candidate < candidate_count; ++candidate) {
+        int kb_local = candidate;
+        if (mask_format == MASK_FORMAT_BLOCK_INDEX) {
+            const int kb_abs = *(__global const int *)(
+                mask_base + mask_offset + (ulong)candidate * mask_nb0 + (ulong)qb_abs * mask_nb1);
+            if (kb_abs == -1) {
+                break;
+            }
+            if (kb_abs < 0 || kb_abs >= Hkv * k_blocks_per_head ||
+                    kb_abs / k_blocks_per_head != kvh) {
+                continue;
+            }
+            kb_local = kb_abs - kvh * k_blocks_per_head;
+        } else {
+            const int kb_abs = kvh * k_blocks_per_head + kb_local;
+            const int mask_value = *(__global const int *)(
+                mask_base + mask_offset + (ulong)kb_abs * mask_nb0 + (ulong)qb_abs * mask_nb1);
+            if (mask_value != 0) {
+                continue;
+            }
         }
 
         const int key_start = kb_local * BLOCK_SIZE;
