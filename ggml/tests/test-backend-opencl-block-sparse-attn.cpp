@@ -8,36 +8,293 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <string>
 #include <vector>
 
 namespace {
 
 constexpr int64_t k_head_dim = 64;
 constexpr int64_t k_block_size = 32;
+constexpr uint8_t k_guard = 0xa5;
+
+enum class mask_pattern {
+    full,
+    sparse_terminated,
+    invalid_ids,
+    empty,
+};
+
+struct attention_case {
+    const char * name;
+    int64_t lq;
+    int64_t lk;
+    int64_t heads;
+    int64_t kv_heads;
+    int64_t batch;
+    ggml_flash_attn_ext_mask_format format;
+    mask_pattern pattern;
+    bool nonzero_offsets;
+    bool permuted_kv;
+    bool compare_htp_sparse;
+    bool compare_htp_dense;
+};
+
+struct mask_data {
+    int64_t ne0 = 0;
+    int64_t ne1 = 0;
+    std::vector<int32_t> values;
+};
+
+struct generated_inputs {
+    std::vector<float> q;
+    std::vector<ggml_fp16_t> k;
+    std::vector<ggml_fp16_t> v;
+    std::vector<float> k_f32;
+    std::vector<float> v_f32;
+};
 
 struct owned_rpcmem_buffer {
     ggml_backend_buffer_t buffer = nullptr;
     ggml_backend_htp_rpcmem_info info = {};
+    size_t tensor_offset = 0;
 };
 
-owned_rpcmem_buffer allocate_tensor_buffer(ggml_backend_t htp, ggml_tensor * tensor) {
+size_t q_index(const attention_case & c, int64_t d, int64_t qt, int64_t h, int64_t b) {
+    return static_cast<size_t>(d + k_head_dim * (qt + c.lq * (h + c.heads * b)));
+}
+
+size_t kv_index(const attention_case & c, int64_t d, int64_t kt, int64_t h, int64_t b) {
+    return static_cast<size_t>(d + k_head_dim * (kt + c.lk * (h + c.kv_heads * b)));
+}
+
+size_t packed_index(const attention_case & c, int64_t d, int64_t h, int64_t qt, int64_t b) {
+    return static_cast<size_t>(d + (k_head_dim + 1) * (h + c.heads * (qt + c.lq * b)));
+}
+
+int64_t q_blocks_per_head(const attention_case & c) {
+    return (c.lq + k_block_size - 1) / k_block_size;
+}
+
+int64_t k_blocks_per_head(const attention_case & c) {
+    return (c.lk + k_block_size - 1) / k_block_size;
+}
+
+mask_data make_mask(const attention_case & c) {
+    const int64_t q_blocks = q_blocks_per_head(c);
+    const int64_t k_blocks = k_blocks_per_head(c);
+    const int64_t total_q_blocks = c.heads * q_blocks;
+    const int64_t total_k_blocks = c.kv_heads * k_blocks;
+    const int64_t heads_per_kv = c.heads / c.kv_heads;
+    mask_data result;
+    result.ne1 = total_q_blocks;
+
+    if (c.format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX) {
+        result.ne0 = total_k_blocks;
+        result.values.assign(
+            static_cast<size_t>(result.ne0 * result.ne1), c.pattern == mask_pattern::full ? 0 : 1);
+        if (c.pattern == mask_pattern::sparse_terminated) {
+            for (int64_t h = 0; h < c.heads; ++h) {
+                const int64_t kvh = h / heads_per_kv;
+                for (int64_t qb = 0; qb < q_blocks; ++qb) {
+                    const int64_t qb_abs = h * q_blocks + qb;
+                    const int64_t first = kvh * k_blocks + qb % k_blocks;
+                    const int64_t last = (kvh + 1) * k_blocks - 1;
+                    result.values[static_cast<size_t>(first + result.ne0 * qb_abs)] = 0;
+                    result.values[static_cast<size_t>(last + result.ne0 * qb_abs)] = 0;
+                }
+            }
+        }
+        return result;
+    }
+
+    if (c.pattern == mask_pattern::full) {
+        result.ne0 = k_blocks;
+    } else if (c.pattern == mask_pattern::invalid_ids) {
+        result.ne0 = 7;
+    } else {
+        result.ne0 = 4;
+    }
+    result.values.assign(static_cast<size_t>(result.ne0 * result.ne1), -1);
+    for (int64_t h = 0; h < c.heads; ++h) {
+        const int64_t kvh = h / heads_per_kv;
+        const int64_t local_base = kvh * k_blocks;
+        for (int64_t qb = 0; qb < q_blocks; ++qb) {
+            int32_t * row = result.values.data() + (h * q_blocks + qb) * result.ne0;
+            if (c.pattern == mask_pattern::full) {
+                for (int64_t kb = 0; kb < k_blocks; ++kb) {
+                    row[kb] = static_cast<int32_t>(local_base + kb);
+                }
+            } else if (c.pattern == mask_pattern::sparse_terminated) {
+                row[0] = static_cast<int32_t>(local_base + qb % k_blocks);
+                row[1] = static_cast<int32_t>(local_base + (qb + 1) % k_blocks);
+                row[2] = -1;
+                row[3] = -1;
+            } else if (c.pattern == mask_pattern::invalid_ids) {
+                const int64_t foreign_kvh = c.kv_heads > 1 ? (kvh + 1) % c.kv_heads : kvh;
+                row[0] = static_cast<int32_t>(foreign_kvh * k_blocks);
+                row[1] = static_cast<int32_t>(total_k_blocks + 9);
+                row[2] = static_cast<int32_t>(local_base + qb % k_blocks);
+                row[3] = -7;
+                row[4] = static_cast<int32_t>(local_base + k_blocks - 1);
+                row[5] = -1;
+                row[6] = -1;
+            }
+        }
+    }
+    return result;
+}
+
+bool block_is_kept(
+    const attention_case & c,
+    const mask_data & mask,
+    int64_t query_head,
+    int64_t query_block,
+    int64_t kv_head,
+    int64_t key_block) {
+    const int64_t q_blocks = q_blocks_per_head(c);
+    const int64_t k_blocks = k_blocks_per_head(c);
+    const int64_t qb_abs = query_head * q_blocks + query_block;
+    const int64_t kb_abs = kv_head * k_blocks + key_block;
+    if (c.format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX) {
+        return mask.values[static_cast<size_t>(kb_abs + mask.ne0 * qb_abs)] == 0;
+    }
+
+    const int32_t * row = mask.values.data() + qb_abs * mask.ne0;
+    for (int64_t i = 0; i < mask.ne0; ++i) {
+        const int32_t candidate = row[i];
+        if (candidate == -1) {
+            break;
+        }
+        if (candidate < 0 || candidate >= c.kv_heads * k_blocks ||
+            candidate / k_blocks != kv_head) {
+            continue;
+        }
+        if (candidate == kb_abs) {
+            return true;
+        }
+    }
+    return false;
+}
+
+generated_inputs make_inputs(const attention_case & c) {
+    generated_inputs inputs;
+    inputs.q.resize(static_cast<size_t>(k_head_dim * c.lq * c.heads * c.batch));
+    inputs.k.resize(static_cast<size_t>(k_head_dim * c.lk * c.kv_heads * c.batch));
+    inputs.v.resize(inputs.k.size());
+    inputs.k_f32.resize(inputs.k.size());
+    inputs.v_f32.resize(inputs.v.size());
+
+    for (int64_t b = 0; b < c.batch; ++b) {
+        for (int64_t h = 0; h < c.heads; ++h) {
+            for (int64_t qt = 0; qt < c.lq; ++qt) {
+                for (int64_t d = 0; d < k_head_dim; ++d) {
+                    const float phase =
+                        0.017f * float((d + 1) * (qt + 1)) + 0.61f * float(h) + 0.29f * float(b);
+                    inputs.q[q_index(c, d, qt, h, b)] =
+                        0.45f * std::sin(phase) + 0.05f * std::cos(0.13f * float(d + 3 * h));
+                }
+            }
+        }
+        for (int64_t h = 0; h < c.kv_heads; ++h) {
+            for (int64_t kt = 0; kt < c.lk; ++kt) {
+                for (int64_t d = 0; d < k_head_dim; ++d) {
+                    const size_t index = kv_index(c, d, kt, h, b);
+                    const float k_value =
+                        0.42f * std::cos(0.011f * float((d + 2) * (kt + 1)) +
+                                         0.83f * float(h) + 0.23f * float(b)) +
+                        0.025f * float(h);
+                    const float v_value = 0.75f * (
+                        0.36f * std::sin(0.019f * float((d + 1) * (kt + 3)) +
+                                         0.97f * float(h) + 0.31f * float(b)) +
+                        0.4f * float(h) + 0.07f * float(b));
+                    inputs.k[index] = ggml_fp32_to_fp16(k_value);
+                    inputs.v[index] = ggml_fp32_to_fp16(v_value);
+                    inputs.k_f32[index] = ggml_fp16_to_fp32(inputs.k[index]);
+                    inputs.v_f32[index] = ggml_fp16_to_fp32(inputs.v[index]);
+                }
+            }
+        }
+    }
+    return inputs;
+}
+
+std::vector<float> reference_attention(
+    const attention_case & c,
+    const generated_inputs & inputs,
+    const mask_data & mask,
+    float scale) {
+    const int64_t heads_per_kv = c.heads / c.kv_heads;
+    std::vector<float> packed(
+        static_cast<size_t>((k_head_dim + 1) * c.heads * c.lq * c.batch), 0.0f);
+    std::vector<float> scores(static_cast<size_t>(c.lk));
+
+    for (int64_t b = 0; b < c.batch; ++b) {
+        for (int64_t qt = 0; qt < c.lq; ++qt) {
+            for (int64_t h = 0; h < c.heads; ++h) {
+                const int64_t kvh = h / heads_per_kv;
+                float maximum = -std::numeric_limits<float>::infinity();
+                std::fill(scores.begin(), scores.end(), -std::numeric_limits<float>::infinity());
+                for (int64_t kt = 0; kt < c.lk; ++kt) {
+                    if (!block_is_kept(c, mask, h, qt / k_block_size, kvh, kt / k_block_size)) {
+                        continue;
+                    }
+                    float dot = 0.0f;
+                    for (int64_t d = 0; d < k_head_dim; ++d) {
+                        dot += inputs.q[q_index(c, d, qt, h, b)] *
+                               inputs.k_f32[kv_index(c, d, kt, kvh, b)];
+                    }
+                    scores[static_cast<size_t>(kt)] = dot * scale;
+                    maximum = std::max(maximum, scores[static_cast<size_t>(kt)]);
+                }
+
+                const size_t row = packed_index(c, 0, h, qt, b);
+                if (!std::isfinite(maximum)) {
+                    packed[row + k_head_dim] = -std::numeric_limits<float>::infinity();
+                    continue;
+                }
+                float sum = 0.0f;
+                for (int64_t kt = 0; kt < c.lk; ++kt) {
+                    const float score = scores[static_cast<size_t>(kt)];
+                    if (!std::isfinite(score)) {
+                        continue;
+                    }
+                    const float weight = std::exp(score - maximum);
+                    sum += weight;
+                    for (int64_t d = 0; d < k_head_dim; ++d) {
+                        packed[row + static_cast<size_t>(d)] +=
+                            weight * inputs.v_f32[kv_index(c, d, kt, kvh, b)];
+                    }
+                }
+                GGML_ASSERT(sum > 0.0f);
+                for (int64_t d = 0; d < k_head_dim; ++d) {
+                    packed[row + static_cast<size_t>(d)] /= sum;
+                }
+                packed[row + k_head_dim] = maximum + std::log(sum);
+            }
+        }
+    }
+    return packed;
+}
+
+owned_rpcmem_buffer allocate_tensor_buffer(
+    ggml_backend_t htp,
+    ggml_tensor * tensor,
+    size_t offset) {
     owned_rpcmem_buffer owned;
-    const size_t size = ggml_backend_buft_get_alloc_size(
+    const size_t tensor_size = ggml_backend_buft_get_alloc_size(
         ggml_backend_get_default_buffer_type(htp), tensor);
-    GGML_ASSERT(size >= ggml_nbytes(tensor));
-    owned.buffer = ggml_backend_alloc_buffer(htp, size);
+    const size_t total_size = offset + tensor_size + 256;
+    owned.buffer = ggml_backend_alloc_buffer(htp, total_size);
     GGML_ASSERT(owned.buffer != nullptr);
-    GGML_ASSERT(ggml_backend_buffer_get_size(owned.buffer) == size);
     GGML_ASSERT(ggml_backend_htp_get_rpcmem_info(owned.buffer, &owned.info));
-    GGML_ASSERT(owned.info.logical_size == size);
+    GGML_ASSERT(owned.info.logical_size == total_size);
+    owned.tensor_offset = offset;
     GGML_ASSERT(ggml_backend_tensor_alloc(
-        owned.buffer, tensor, owned.info.base) == GGML_STATUS_SUCCESS);
+        owned.buffer, tensor, static_cast<uint8_t *>(owned.info.base) + offset) == GGML_STATUS_SUCCESS);
+    std::memset(owned.info.base, k_guard, owned.info.logical_size);
     return owned;
 }
 
-ggml_opencl_htp_import_descriptor make_import_descriptor(
-    const owned_rpcmem_buffer & owned) {
+ggml_opencl_htp_import_descriptor make_import_descriptor(const owned_rpcmem_buffer & owned) {
     return {
         /* .backing         = */ owned.buffer,
         /* .base            = */ owned.info.base,
@@ -61,361 +318,428 @@ void import_buffer(
     GGML_ASSERT(result == GGML_OPENCL_HTP_OK);
 }
 
-void free_buffers(std::vector<owned_rpcmem_buffer> & buffers) {
-    for (auto it = buffers.rbegin(); it != buffers.rend(); ++it) {
-        ggml_backend_buffer_free(it->buffer);
-    }
-    buffers.clear();
+template<typename T>
+void write_scalar(ggml_tensor * tensor, int64_t i0, int64_t i1, int64_t i2, int64_t i3, T value) {
+    uint8_t * address = static_cast<uint8_t *>(tensor->data) +
+        i0 * tensor->nb[0] + i1 * tensor->nb[1] + i2 * tensor->nb[2] + i3 * tensor->nb[3];
+    std::memcpy(address, &value, sizeof(value));
 }
 
-size_t q_index(int64_t d, int64_t qt, int64_t h, int64_t b, int64_t lq, int64_t heads) {
-    return static_cast<size_t>(d + k_head_dim * (qt + lq * (h + heads * b)));
+template<typename T>
+T read_scalar(const ggml_tensor * tensor, int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
+    const uint8_t * address = static_cast<const uint8_t *>(tensor->data) +
+        i0 * tensor->nb[0] + i1 * tensor->nb[1] + i2 * tensor->nb[2] + i3 * tensor->nb[3];
+    T value;
+    std::memcpy(&value, address, sizeof(value));
+    return value;
 }
 
-size_t kv_index(int64_t d, int64_t kt, int64_t h, int64_t b, int64_t lk, int64_t heads) {
-    return static_cast<size_t>(d + k_head_dim * (kt + lk * (h + heads * b)));
-}
-
-size_t packed_index(int64_t d, int64_t h, int64_t qt, int64_t b, int64_t lq, int64_t heads) {
-    return static_cast<size_t>(d + (k_head_dim + 1) * (h + heads * (qt + lq * b)));
-}
-
-size_t mask_index(int64_t kb_abs, int64_t qb_abs, int64_t total_k_blocks) {
-    return static_cast<size_t>(kb_abs + total_k_blocks * qb_abs);
-}
-
-struct attention_case {
-    const char * name;
-    int64_t lq;
-    int64_t lk;
-    int64_t heads;
-    int64_t kv_heads;
-    bool sparse;
-    bool empty;
-};
-
-std::vector<int32_t> make_mask(const attention_case & test_case) {
-    const int64_t q_blocks_per_head = (test_case.lq + k_block_size - 1) / k_block_size;
-    const int64_t k_blocks_per_head = (test_case.lk + k_block_size - 1) / k_block_size;
-    const int64_t total_q_blocks = test_case.heads * q_blocks_per_head;
-    const int64_t total_k_blocks = test_case.kv_heads * k_blocks_per_head;
-    std::vector<int32_t> mask(
-        static_cast<size_t>(total_q_blocks * total_k_blocks),
-        (test_case.sparse || test_case.empty) ? 1 : 0);
-
-    if (test_case.sparse) {
-        GGML_ASSERT(q_blocks_per_head == 2 && k_blocks_per_head == 3);
-        GGML_ASSERT(test_case.heads == test_case.kv_heads);
-        for (int64_t h = 0; h < test_case.heads; ++h) {
-            const int64_t qb0 = h * q_blocks_per_head;
-            const int64_t qb1 = qb0 + 1;
-            mask[mask_index(h * k_blocks_per_head + 0, qb0, total_k_blocks)] = 0;
-            mask[mask_index(h * k_blocks_per_head + 2, qb0, total_k_blocks)] = 0;
-            mask[mask_index(h * k_blocks_per_head + 1, qb1, total_k_blocks)] = 0;
-        }
-    }
-    return mask;
-}
-
-struct generated_inputs {
-    std::vector<float> q;
-    std::vector<ggml_fp16_t> k;
-    std::vector<ggml_fp16_t> v;
-    std::vector<float> k_f32;
-    std::vector<float> v_f32;
-};
-
-generated_inputs make_inputs(const attention_case & test_case) {
-    constexpr int64_t batch = 1;
-    generated_inputs inputs;
-    inputs.q.resize(static_cast<size_t>(k_head_dim * test_case.lq * test_case.heads * batch));
-    inputs.k.resize(static_cast<size_t>(k_head_dim * test_case.lk * test_case.kv_heads * batch));
-    inputs.v.resize(inputs.k.size());
-    inputs.k_f32.resize(inputs.k.size());
-    inputs.v_f32.resize(inputs.v.size());
-
-    for (int64_t b = 0; b < batch; ++b) {
-        for (int64_t h = 0; h < test_case.heads; ++h) {
-            for (int64_t qt = 0; qt < test_case.lq; ++qt) {
-                for (int64_t d = 0; d < k_head_dim; ++d) {
-                    const float phase = 0.017f * float((d + 1) * (qt + 1)) + 0.61f * float(h);
-                    inputs.q[q_index(d, qt, h, b, test_case.lq, test_case.heads)] =
-                        0.45f * std::sin(phase) + 0.05f * std::cos(0.13f * float(d + 3 * h));
-                }
-            }
-        }
-        for (int64_t h = 0; h < test_case.kv_heads; ++h) {
-            for (int64_t kt = 0; kt < test_case.lk; ++kt) {
-                for (int64_t d = 0; d < k_head_dim; ++d) {
-                    const size_t index = kv_index(d, kt, h, b, test_case.lk, test_case.kv_heads);
-                    const float k_value =
-                        0.42f * std::cos(0.011f * float((d + 2) * (kt + 1)) + 0.83f * float(h)) +
-                        0.025f * float(h);
-                    const float v_value =
-                        0.36f * std::sin(0.019f * float((d + 1) * (kt + 3)) + 0.97f * float(h)) +
-                        0.4f * float(h);
-                    inputs.k[index] = ggml_fp32_to_fp16(k_value);
-                    inputs.v[index] = ggml_fp32_to_fp16(v_value);
-                    inputs.k_f32[index] = ggml_fp16_to_fp32(inputs.k[index]);
-                    inputs.v_f32[index] = ggml_fp16_to_fp32(inputs.v[index]);
-                }
-            }
-        }
-    }
-    return inputs;
-}
-
-std::vector<float> reference_attention(
-    const attention_case & test_case,
+void fill_tensors(
+    const attention_case & c,
     const generated_inputs & inputs,
-    const std::vector<int32_t> & mask,
-    float scale) {
-    constexpr int64_t batch = 1;
-    const int64_t q_blocks_per_head = (test_case.lq + k_block_size - 1) / k_block_size;
-    const int64_t k_blocks_per_head = (test_case.lk + k_block_size - 1) / k_block_size;
-    const int64_t total_k_blocks = test_case.kv_heads * k_blocks_per_head;
-    const int64_t heads_per_kv = test_case.heads / test_case.kv_heads;
-    std::vector<float> packed(
-        static_cast<size_t>((k_head_dim + 1) * test_case.heads * test_case.lq * batch), 0.0f);
-    std::vector<float> scores(static_cast<size_t>(test_case.lk));
-
-    for (int64_t b = 0; b < batch; ++b) {
-        for (int64_t qt = 0; qt < test_case.lq; ++qt) {
-            for (int64_t h = 0; h < test_case.heads; ++h) {
-                const int64_t kv_head = h / heads_per_kv;
-                const int64_t qb_abs = h * q_blocks_per_head + qt / k_block_size;
-                float maximum = -std::numeric_limits<float>::infinity();
-                std::fill(scores.begin(), scores.end(), -std::numeric_limits<float>::infinity());
-
-                for (int64_t kt = 0; kt < test_case.lk; ++kt) {
-                    const int64_t kb_abs = kv_head * k_blocks_per_head + kt / k_block_size;
-                    if (mask[mask_index(kb_abs, qb_abs, total_k_blocks)] != 0) {
-                        continue;
-                    }
-                    float dot = 0.0f;
-                    for (int64_t d = 0; d < k_head_dim; ++d) {
-                        dot += inputs.q[q_index(d, qt, h, b, test_case.lq, test_case.heads)] *
-                               inputs.k_f32[kv_index(
-                                   d, kt, kv_head, b, test_case.lk, test_case.kv_heads)];
-                    }
-                    const float score = dot * scale;
-                    scores[static_cast<size_t>(kt)] = score;
-                    maximum = std::max(maximum, score);
-                }
-
-                const size_t row = packed_index(0, h, qt, b, test_case.lq, test_case.heads);
-                if (!std::isfinite(maximum)) {
-                    packed[row + k_head_dim] = -std::numeric_limits<float>::infinity();
-                    continue;
-                }
-
-                float sum = 0.0f;
-                for (int64_t kt = 0; kt < test_case.lk; ++kt) {
-                    const float score = scores[static_cast<size_t>(kt)];
-                    if (!std::isfinite(score)) {
-                        continue;
-                    }
-                    const float weight = std::exp(score - maximum);
-                    sum += weight;
-                    for (int64_t d = 0; d < k_head_dim; ++d) {
-                        packed[row + static_cast<size_t>(d)] += weight * inputs.v_f32[kv_index(
-                            d, kt, kv_head, b, test_case.lk, test_case.kv_heads)];
-                    }
-                }
-                GGML_ASSERT(sum > 0.0f);
+    const mask_data & mask_data,
+    ggml_tensor * q,
+    ggml_tensor * k,
+    ggml_tensor * v,
+    ggml_tensor * mask) {
+    for (int64_t b = 0; b < c.batch; ++b) {
+        for (int64_t h = 0; h < c.heads; ++h) {
+            for (int64_t qt = 0; qt < c.lq; ++qt) {
                 for (int64_t d = 0; d < k_head_dim; ++d) {
-                    packed[row + static_cast<size_t>(d)] /= sum;
+                    write_scalar(q, d, qt, h, b, inputs.q[q_index(c, d, qt, h, b)]);
                 }
-                packed[row + k_head_dim] = maximum + std::log(sum);
+            }
+        }
+        for (int64_t h = 0; h < c.kv_heads; ++h) {
+            for (int64_t kt = 0; kt < c.lk; ++kt) {
+                for (int64_t d = 0; d < k_head_dim; ++d) {
+                    const size_t index = kv_index(c, d, kt, h, b);
+                    write_scalar(k, d, kt, h, b, inputs.k[index]);
+                    write_scalar(v, d, kt, h, b, inputs.v[index]);
+                }
             }
         }
     }
-    return packed;
+    for (int64_t i1 = 0; i1 < mask_data.ne1; ++i1) {
+        for (int64_t i0 = 0; i0 < mask_data.ne0; ++i0) {
+            write_scalar(mask, i0, i1, 0, 0, mask_data.values[static_cast<size_t>(i0 + mask_data.ne0 * i1)]);
+        }
+    }
 }
 
-void run_case(
-    ggml_opencl_htp_sidecar * sidecar,
-    ggml_backend_t htp,
-    const attention_case & test_case) {
-    constexpr int64_t batch = 1;
-    const float scale = 1.0f / std::sqrt(float(k_head_dim));
-    const int64_t q_blocks_per_head = (test_case.lq + k_block_size - 1) / k_block_size;
-    const int64_t k_blocks_per_head = (test_case.lk + k_block_size - 1) / k_block_size;
-    const int64_t total_q_blocks = test_case.heads * q_blocks_per_head;
-    const int64_t total_k_blocks = test_case.kv_heads * k_blocks_per_head;
-    const std::vector<int32_t> mask_data = make_mask(test_case);
-    const generated_inputs inputs = make_inputs(test_case);
-    const std::vector<float> reference = reference_attention(test_case, inputs, mask_data, scale);
+std::vector<uint8_t> snapshot(const owned_rpcmem_buffer & owned) {
+    const uint8_t * data = static_cast<const uint8_t *>(owned.info.base);
+    return std::vector<uint8_t>(data, data + owned.info.logical_size);
+}
 
+void assert_output_guards(const attention_case & c, const ggml_tensor * packed, const owned_rpcmem_buffer & owned) {
+    std::vector<uint8_t> touched(owned.info.logical_size, 0);
+    const size_t base_offset = static_cast<const uint8_t *>(packed->data) -
+                               static_cast<const uint8_t *>(owned.info.base);
+    for (int64_t b = 0; b < c.batch; ++b) {
+        for (int64_t qt = 0; qt < c.lq; ++qt) {
+            for (int64_t h = 0; h < c.heads; ++h) {
+                for (int64_t d = 0; d <= k_head_dim; ++d) {
+                    const size_t offset = base_offset + d * packed->nb[0] + h * packed->nb[1] +
+                                          qt * packed->nb[2] + b * packed->nb[3];
+                    GGML_ASSERT(offset + sizeof(float) <= touched.size());
+                    std::fill(touched.begin() + offset, touched.begin() + offset + sizeof(float), 1);
+                }
+            }
+        }
+    }
+    const uint8_t * bytes = static_cast<const uint8_t *>(owned.info.base);
+    for (size_t i = 0; i < touched.size(); ++i) {
+        if (!touched[i]) {
+            GGML_ASSERT(bytes[i] == k_guard);
+        }
+    }
+}
+
+struct diff_stats {
+    float out_max_abs = 0.0f;
+    float lse_max_abs = 0.0f;
+    bool valid = true;
+};
+
+diff_stats compare_packed(
+    const attention_case & c,
+    const ggml_tensor * actual_tensor,
+    const std::vector<float> & expected) {
+    diff_stats stats;
+    for (int64_t b = 0; b < c.batch; ++b) {
+        for (int64_t qt = 0; qt < c.lq; ++qt) {
+            for (int64_t h = 0; h < c.heads; ++h) {
+                const size_t row = packed_index(c, 0, h, qt, b);
+                for (int64_t d = 0; d < k_head_dim; ++d) {
+                    const float actual = read_scalar<float>(actual_tensor, d, h, qt, b);
+                    const float reference = expected[row + static_cast<size_t>(d)];
+                    stats.valid = stats.valid && std::isfinite(actual) && std::isfinite(reference);
+                    if (std::isfinite(actual) && std::isfinite(reference)) {
+                        stats.out_max_abs = std::max(stats.out_max_abs, std::fabs(actual - reference));
+                    }
+                }
+                const float actual_lse = read_scalar<float>(actual_tensor, k_head_dim, h, qt, b);
+                const float reference_lse = expected[row + k_head_dim];
+                if (std::isfinite(reference_lse)) {
+                    stats.valid = stats.valid && std::isfinite(actual_lse);
+                    if (std::isfinite(actual_lse)) {
+                        stats.lse_max_abs = std::max(stats.lse_max_abs, std::fabs(actual_lse - reference_lse));
+                    }
+                } else {
+                    stats.valid = stats.valid && std::isinf(actual_lse) && std::signbit(actual_lse);
+                }
+            }
+        }
+    }
+    return stats;
+}
+
+diff_stats compare_vectors(
+    const attention_case & c,
+    const std::vector<float> & actual,
+    const std::vector<float> & expected) {
+    GGML_ASSERT(actual.size() == expected.size());
+    ggml_tensor tensor = {};
+    tensor.type = GGML_TYPE_F32;
+    tensor.ne[0] = k_head_dim + 1;
+    tensor.ne[1] = c.heads;
+    tensor.ne[2] = c.lq;
+    tensor.ne[3] = c.batch;
+    tensor.nb[0] = sizeof(float);
+    tensor.nb[1] = tensor.nb[0] * tensor.ne[0];
+    tensor.nb[2] = tensor.nb[1] * tensor.ne[1];
+    tensor.nb[3] = tensor.nb[2] * tensor.ne[2];
+    tensor.data = const_cast<float *>(actual.data());
+    return compare_packed(c, &tensor, expected);
+}
+
+generated_inputs batch_slice_inputs(
+    const attention_case & c,
+    const generated_inputs & inputs,
+    int64_t batch) {
+    generated_inputs result;
+    const size_t q_count = static_cast<size_t>(k_head_dim * c.lq * c.heads);
+    const size_t kv_count = static_cast<size_t>(k_head_dim * c.lk * c.kv_heads);
+    result.q.assign(inputs.q.begin() + batch * q_count, inputs.q.begin() + (batch + 1) * q_count);
+    result.k.assign(inputs.k.begin() + batch * kv_count, inputs.k.begin() + (batch + 1) * kv_count);
+    result.v.assign(inputs.v.begin() + batch * kv_count, inputs.v.begin() + (batch + 1) * kv_count);
+    return result;
+}
+
+std::vector<float> run_htp_packed(
+    ggml_backend_t htp,
+    const attention_case & source_case,
+    const generated_inputs & source_inputs,
+    const mask_data & sparse_mask,
+    bool dense) {
+    attention_case c = source_case;
+    c.batch = 1;
     const ggml_init_params params = {
-        /* .mem_size   = */ ggml_tensor_overhead() * 12 + 4096,
+        /* .mem_size   = */ 1024 * 1024,
         /* .mem_buffer = */ nullptr,
         /* .no_alloc   = */ true,
     };
     ggml_context * ctx = ggml_init(params);
     GGML_ASSERT(ctx != nullptr);
+    ggml_tensor * q_storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k_head_dim, c.heads, c.lq, 1);
+    ggml_tensor * k_storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k_head_dim, c.kv_heads, c.lk, 1);
+    ggml_tensor * v_storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k_head_dim, c.kv_heads, c.lk, 1);
+    ggml_tensor * q = ggml_view_4d(
+        ctx, q_storage, k_head_dim, c.lq, c.heads, 1,
+        q_storage->nb[2], q_storage->nb[1], q_storage->nb[3], 0);
+    ggml_tensor * k = ggml_view_4d(
+        ctx, k_storage, k_head_dim, c.lk, c.kv_heads, 1,
+        k_storage->nb[2], k_storage->nb[1], k_storage->nb[3], 0);
+    ggml_tensor * v = ggml_view_4d(
+        ctx, v_storage, k_head_dim, c.lk, c.kv_heads, 1,
+        v_storage->nb[2], v_storage->nb[1], v_storage->nb[3], 0);
+    q->op = GGML_OP_NONE;
+    k->op = GGML_OP_NONE;
+    v->op = GGML_OP_NONE;
 
-    ggml_tensor * q = ggml_new_tensor_4d(
-        ctx, GGML_TYPE_F32, k_head_dim, test_case.lq, test_case.heads, batch);
-    ggml_tensor * k = ggml_new_tensor_4d(
-        ctx, GGML_TYPE_F16, k_head_dim, test_case.lk, test_case.kv_heads, batch);
-    ggml_tensor * v = ggml_new_tensor_4d(
-        ctx, GGML_TYPE_F16, k_head_dim, test_case.lk, test_case.kv_heads, batch);
-    ggml_tensor * mask = ggml_new_tensor_4d(
-        ctx, GGML_TYPE_I32, total_k_blocks, total_q_blocks, 1, 1);
+    std::vector<float> q_physical(source_inputs.q.size());
+    std::vector<ggml_fp16_t> k_physical(source_inputs.k.size());
+    std::vector<ggml_fp16_t> v_physical(source_inputs.v.size());
+    for (int64_t h = 0; h < c.heads; ++h) {
+        for (int64_t qt = 0; qt < c.lq; ++qt) {
+            for (int64_t d = 0; d < k_head_dim; ++d) {
+                q_physical[static_cast<size_t>(d + k_head_dim * (h + c.heads * qt))] =
+                    source_inputs.q[q_index(c, d, qt, h, 0)];
+            }
+        }
+    }
+    for (int64_t h = 0; h < c.kv_heads; ++h) {
+        for (int64_t kt = 0; kt < c.lk; ++kt) {
+            for (int64_t d = 0; d < k_head_dim; ++d) {
+                const size_t physical = static_cast<size_t>(d + k_head_dim * (h + c.kv_heads * kt));
+                const size_t logical = kv_index(c, d, kt, h, 0);
+                k_physical[physical] = source_inputs.k[logical];
+                v_physical[physical] = source_inputs.v[logical];
+            }
+        }
+    }
+
+    std::vector<ggml_fp16_t> dense_mask;
+    ggml_tensor * mask = nullptr;
+    if (dense) {
+        const int64_t padded_lk = ((c.lk + 63) / 64) * 64;
+        dense_mask.assign(
+            static_cast<size_t>(padded_lk * c.lq),
+            ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity()));
+        for (int64_t qt = 0; qt < c.lq; ++qt) {
+            std::fill_n(dense_mask.data() + qt * padded_lk, c.lk, ggml_fp32_to_fp16(0.0f));
+        }
+        mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, padded_lk, c.lq, 1, 1);
+    } else {
+        mask = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, sparse_mask.ne0, sparse_mask.ne1, 1, 1);
+    }
     ggml_tensor * packed = ggml_flash_attn_ext_with_lse(
-        ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+        ctx, q, k, v, mask, 1.0f / std::sqrt(float(k_head_dim)), 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(packed, GGML_PREC_F32);
-    ggml_flash_attn_ext_set_block_sparse(
-        packed, k_block_size, k_block_size, GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX);
+    if (!dense) {
+        ggml_flash_attn_ext_set_block_sparse(packed, k_block_size, k_block_size, c.format);
+    }
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, packed);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(
+        ctx, ggml_backend_get_default_buffer_type(htp));
+    GGML_ASSERT(buffer != nullptr);
+    ggml_backend_tensor_set(q_storage, q_physical.data(), 0, q_physical.size() * sizeof(float));
+    ggml_backend_tensor_set(k_storage, k_physical.data(), 0, k_physical.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(v_storage, v_physical.data(), 0, v_physical.size() * sizeof(ggml_fp16_t));
+    if (dense) {
+        ggml_backend_tensor_set(mask, dense_mask.data(), 0, dense_mask.size() * sizeof(ggml_fp16_t));
+    } else {
+        ggml_backend_tensor_set(mask, sparse_mask.values.data(), 0, sparse_mask.values.size() * sizeof(int32_t));
+    }
+    GGML_ASSERT(packed->buffer != nullptr && ggml_is_contiguous(packed));
+    GGML_ASSERT(q->view_src == q_storage && q_storage->buffer != nullptr && ggml_is_contiguous(q_storage));
+    GGML_ASSERT(k->view_src == k_storage && k_storage->buffer != nullptr && ggml_is_contiguous(k_storage));
+    GGML_ASSERT(v->view_src == v_storage && v_storage->buffer != nullptr && ggml_is_contiguous(v_storage));
+    GGML_ASSERT(mask->buffer != nullptr && ggml_is_contiguous(mask));
+    GGML_ASSERT(ggml_backend_buft_is_rpcmem(ggml_backend_buffer_get_type(packed->buffer)));
+    GGML_ASSERT(ggml_backend_buft_is_rpcmem(ggml_backend_buffer_get_type(q_storage->buffer)));
+    GGML_ASSERT(ggml_backend_buft_is_rpcmem(ggml_backend_buffer_get_type(mask->buffer)));
+    GGML_ASSERT(ggml_backend_supports_op(htp, packed));
+    const bool hybrid_was_enabled = ggml_backend_htp_get_hybrid_enabled();
+    ggml_backend_htp_set_hybrid_enabled(true);
+    const ggml_status status = ggml_backend_graph_compute(htp, graph);
+    ggml_backend_htp_set_hybrid_enabled(hybrid_was_enabled);
+    if (status != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "%s HTP %s packed compute failed: %d\n",
+                     c.name, dense ? "dense" : "sparse", int(status));
+    }
+    GGML_ASSERT(status == GGML_STATUS_SUCCESS);
+    std::vector<float> result(static_cast<size_t>(ggml_nelements(packed)));
+    ggml_backend_tensor_get(packed, result.data(), 0, result.size() * sizeof(float));
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return result;
+}
 
-    GGML_ASSERT(packed->ne[0] == k_head_dim + 1);
-    GGML_ASSERT(packed->ne[1] == test_case.heads);
-    GGML_ASSERT(packed->ne[2] == test_case.lq);
-    GGML_ASSERT(packed->ne[3] == batch);
-
-    std::vector<owned_rpcmem_buffer> buffers;
-    buffers.reserve(5);
-    buffers.push_back(allocate_tensor_buffer(htp, q));
-    buffers.push_back(allocate_tensor_buffer(htp, k));
-    buffers.push_back(allocate_tensor_buffer(htp, v));
-    buffers.push_back(allocate_tensor_buffer(htp, mask));
-    buffers.push_back(allocate_tensor_buffer(htp, packed));
-
-    std::memcpy(q->data, inputs.q.data(), inputs.q.size() * sizeof(inputs.q[0]));
-    std::memcpy(k->data, inputs.k.data(), inputs.k.size() * sizeof(inputs.k[0]));
-    std::memcpy(v->data, inputs.v.data(), inputs.v.size() * sizeof(inputs.v[0]));
-    std::memcpy(mask->data, mask_data.data(), mask_data.size() * sizeof(mask_data[0]));
-    std::fill_n(
-        static_cast<float *>(packed->data), ggml_nelements(packed),
-        std::numeric_limits<float>::quiet_NaN());
-    auto output_is_sentinel = [&]() {
-        const float * values = static_cast<const float *>(packed->data);
-        return std::all_of(
-            values, values + ggml_nelements(packed),
-            [](float value) { return std::isnan(value); });
+void run_case(
+    ggml_opencl_htp_sidecar * sidecar,
+    ggml_backend_t htp,
+    const attention_case & c,
+    bool check_preconditions) {
+    GGML_ASSERT(c.heads % c.kv_heads == 0);
+    const float scale = 1.0f / std::sqrt(float(k_head_dim));
+    const mask_data sparse_mask = make_mask(c);
+    const generated_inputs inputs = make_inputs(c);
+    const std::vector<float> reference = reference_attention(c, inputs, sparse_mask, scale);
+    const ggml_init_params params = {
+        /* .mem_size   = */ 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
     };
+    ggml_context * ctx = ggml_init(params);
+    GGML_ASSERT(ctx != nullptr);
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k_head_dim, c.lq, c.heads, c.batch);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k_head_dim, c.lk, c.kv_heads, c.batch);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k_head_dim, c.lk, c.kv_heads, c.batch);
+    if (c.permuted_kv) {
+        k->nb[0] = sizeof(ggml_fp16_t);
+        k->nb[2] = k_head_dim * k->nb[0];
+        k->nb[1] = c.kv_heads * k->nb[2];
+        k->nb[3] = c.lk * k->nb[1];
+        std::copy(std::begin(k->nb), std::end(k->nb), std::begin(v->nb));
+    }
+    ggml_tensor * mask = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_I32, sparse_mask.ne0, sparse_mask.ne1, 1, 1);
+    ggml_tensor * packed = ggml_flash_attn_ext_with_lse(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(packed, GGML_PREC_F32);
+    ggml_flash_attn_ext_set_block_sparse(packed, k_block_size, k_block_size, c.format);
+
+    const size_t q_offset = c.nonzero_offsets ? 64 : 0;
+    const size_t k_offset = c.nonzero_offsets ? 96 : 0;
+    const size_t v_offset = c.nonzero_offsets ? 128 : 0;
+    const size_t mask_offset = c.nonzero_offsets ? 160 : 0;
+    const size_t output_offset = c.nonzero_offsets ? 192 : 0;
+    std::vector<owned_rpcmem_buffer> buffers;
+    buffers.push_back(allocate_tensor_buffer(htp, q, q_offset));
+    buffers.push_back(allocate_tensor_buffer(htp, k, k_offset));
+    buffers.push_back(allocate_tensor_buffer(htp, v, v_offset));
+    buffers.push_back(allocate_tensor_buffer(htp, mask, mask_offset));
+    buffers.push_back(allocate_tensor_buffer(htp, packed, output_offset));
+    fill_tensors(c, inputs, sparse_mask, q, k, v, mask);
+    const std::vector<uint8_t> q_snapshot = snapshot(buffers[0]);
+    const std::vector<uint8_t> k_snapshot = snapshot(buffers[1]);
+    const std::vector<uint8_t> v_snapshot = snapshot(buffers[2]);
+    const std::vector<uint8_t> mask_snapshot = snapshot(buffers[3]);
 
     char reason[1024] = {};
     ggml_opencl_htp_graph * graph = nullptr;
     GGML_ASSERT(ggml_backend_opencl_htp_graph_create(
         sidecar, &graph, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
-
-    GGML_ASSERT(ggml_backend_opencl_htp_graph_compute_block_sparse_attn_sync(
-        graph, packed, reason, sizeof(reason)) == GGML_OPENCL_HTP_UNSUPPORTED);
-    GGML_ASSERT(reason[0] != '\0');
-    GGML_ASSERT(ggml_backend_opencl_htp_graph_live_alias_count(graph) == 0);
-    GGML_ASSERT(ggml_backend_opencl_htp_graph_live_event_count(graph) == 0);
-    GGML_ASSERT(output_is_sentinel());
-
+    if (check_preconditions) {
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_compute_block_sparse_attn_sync(
+            graph, packed, reason, sizeof(reason)) == GGML_OPENCL_HTP_UNSUPPORTED);
+        GGML_ASSERT(snapshot(buffers[4]) == std::vector<uint8_t>(buffers[4].info.logical_size, k_guard));
+    }
     for (const owned_rpcmem_buffer & buffer : buffers) {
         import_buffer(graph, buffer, reason, sizeof(reason));
     }
-    GGML_ASSERT(ggml_backend_opencl_htp_graph_live_alias_count(graph) == 5);
-
-    ggml_tensor unsupported = *packed;
-    unsupported.op = GGML_OP_ADD;
-    GGML_ASSERT(ggml_backend_opencl_htp_graph_compute_block_sparse_attn_sync(
-        graph, &unsupported, reason, sizeof(reason)) == GGML_OPENCL_HTP_UNSUPPORTED);
-    GGML_ASSERT(reason[0] != '\0');
-    GGML_ASSERT(ggml_backend_opencl_htp_graph_live_alias_count(graph) == 5);
-    GGML_ASSERT(ggml_backend_opencl_htp_graph_live_event_count(graph) == 0);
-    GGML_ASSERT(output_is_sentinel());
-
-    ggml_tensor overlapping_q = *q;
-    overlapping_q.buffer = packed->buffer;
-    overlapping_q.data = packed->data;
-    ggml_tensor overlapping_output = *packed;
-    overlapping_output.src[0] = &overlapping_q;
-    GGML_ASSERT(ggml_backend_opencl_htp_graph_compute_block_sparse_attn_sync(
-        graph, &overlapping_output, reason, sizeof(reason)) == GGML_OPENCL_HTP_UNSUPPORTED);
-    GGML_ASSERT(reason[0] != '\0');
-    GGML_ASSERT(ggml_backend_opencl_htp_graph_live_alias_count(graph) == 5);
-    GGML_ASSERT(ggml_backend_opencl_htp_graph_live_event_count(graph) == 0);
-    GGML_ASSERT(output_is_sentinel());
-
-    ggml_tensor overlapping_rows = *packed;
-    overlapping_rows.nb[2] = overlapping_rows.nb[0];
-    const ggml_opencl_htp_result overlapping_rows_result =
-        ggml_backend_opencl_htp_graph_compute_block_sparse_attn_sync(
-            graph, &overlapping_rows, reason, sizeof(reason));
-    const bool overlapping_rows_preserved_sentinel = output_is_sentinel();
-    if (overlapping_rows_result != GGML_OPENCL_HTP_UNSUPPORTED ||
-        !overlapping_rows_preserved_sentinel) {
-        std::fprintf(
-            stderr,
-            "[EXPECTED_RED] overlapping output rows result=%d sentinel_preserved=%s reason=%s\n",
-            overlapping_rows_result,
-            overlapping_rows_preserved_sentinel ? "yes" : "no",
-            reason);
+    if (check_preconditions) {
+        ggml_tensor overlapping_rows = *packed;
+        overlapping_rows.nb[2] = overlapping_rows.nb[0];
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_compute_block_sparse_attn_sync(
+            graph, &overlapping_rows, reason, sizeof(reason)) == GGML_OPENCL_HTP_UNSUPPORTED);
     }
-    GGML_ASSERT(overlapping_rows_result == GGML_OPENCL_HTP_UNSUPPORTED);
-    GGML_ASSERT(overlapping_rows_preserved_sentinel);
-    GGML_ASSERT(ggml_backend_opencl_htp_graph_live_alias_count(graph) == 5);
-    GGML_ASSERT(ggml_backend_opencl_htp_graph_live_event_count(graph) == 0);
 
-    const ggml_opencl_htp_result compute_result =
+    const ggml_opencl_htp_result result =
         ggml_backend_opencl_htp_graph_compute_block_sparse_attn_sync(
             graph, packed, reason, sizeof(reason));
-    if (compute_result != GGML_OPENCL_HTP_OK) {
-        std::fprintf(stderr, "%s compute failed: %s\n", test_case.name, reason);
+    if (result != GGML_OPENCL_HTP_OK) {
+        std::fprintf(stderr, "%s compute failed: %s\n", c.name, reason);
     }
-    GGML_ASSERT(compute_result == GGML_OPENCL_HTP_OK);
-    GGML_ASSERT(ggml_backend_opencl_htp_graph_live_event_count(graph) == 0);
+    GGML_ASSERT(result == GGML_OPENCL_HTP_OK);
+    GGML_ASSERT(snapshot(buffers[0]) == q_snapshot);
+    GGML_ASSERT(snapshot(buffers[1]) == k_snapshot);
+    GGML_ASSERT(snapshot(buffers[2]) == v_snapshot);
+    GGML_ASSERT(snapshot(buffers[3]) == mask_snapshot);
+    assert_output_guards(c, packed, buffers[4]);
 
-    const float * actual = static_cast<const float *>(packed->data);
-    float out_max_abs = 0.0f;
-    float lse_max_abs = 0.0f;
-    bool values_valid = true;
-    for (int64_t qt = 0; qt < test_case.lq; ++qt) {
-        for (int64_t h = 0; h < test_case.heads; ++h) {
-            const size_t row = packed_index(0, h, qt, 0, test_case.lq, test_case.heads);
-            for (int64_t d = 0; d < k_head_dim; ++d) {
-                const float expected_value = reference[row + static_cast<size_t>(d)];
-                const float actual_value = actual[row + static_cast<size_t>(d)];
-                values_valid = values_valid && std::isfinite(expected_value) && std::isfinite(actual_value);
-                if (std::isfinite(expected_value) && std::isfinite(actual_value)) {
-                    out_max_abs = std::max(out_max_abs, std::fabs(expected_value - actual_value));
-                }
-                if (test_case.empty) {
-                    values_valid = values_valid && actual_value == 0.0f;
-                }
+    const diff_stats cpu_stats = compare_packed(c, packed, reference);
+    std::printf(
+        "[OPENCL_BLOCK_SPARSE] case=%s opencl_cpu_out=%.9g opencl_cpu_lse=%.9g valid=%s guards=yes",
+        c.name, cpu_stats.out_max_abs, cpu_stats.lse_max_abs, cpu_stats.valid ? "yes" : "no");
+    GGML_ASSERT(cpu_stats.valid);
+    GGML_ASSERT(cpu_stats.out_max_abs <= 3e-3f);
+    GGML_ASSERT(cpu_stats.lse_max_abs <= 5e-3f);
+
+    if (c.compare_htp_sparse || c.compare_htp_dense) {
+        std::vector<float> htp_sparse_all;
+        std::vector<float> htp_dense_all;
+        for (int64_t b = 0; b < c.batch; ++b) {
+            const generated_inputs one_batch_inputs = batch_slice_inputs(c, inputs, b);
+            if (c.compare_htp_sparse) {
+                const std::vector<float> one = run_htp_packed(htp, c, one_batch_inputs, sparse_mask, false);
+                htp_sparse_all.insert(htp_sparse_all.end(), one.begin(), one.end());
             }
-
-            const float expected_lse = reference[row + k_head_dim];
-            const float actual_lse = actual[row + k_head_dim];
-            if (std::isfinite(expected_lse)) {
-                values_valid = values_valid && std::isfinite(actual_lse);
-                if (std::isfinite(actual_lse)) {
-                    lse_max_abs = std::max(lse_max_abs, std::fabs(expected_lse - actual_lse));
-                }
-            } else {
-                values_valid = values_valid && std::isinf(actual_lse) && std::signbit(actual_lse) &&
-                               std::isinf(expected_lse) && std::signbit(expected_lse);
+            if (c.compare_htp_dense) {
+                const std::vector<float> one = run_htp_packed(htp, c, one_batch_inputs, sparse_mask, true);
+                htp_dense_all.insert(htp_dense_all.end(), one.begin(), one.end());
             }
         }
+        if (c.compare_htp_sparse) {
+            const diff_stats htp_cpu = compare_vectors(c, htp_sparse_all, reference);
+            const diff_stats opencl_htp = compare_packed(c, packed, htp_sparse_all);
+            std::printf(
+                " htp_sparse_cpu_out=%.9g htp_sparse_cpu_lse=%.9g"
+                " opencl_htp_sparse_out=%.9g opencl_htp_sparse_lse=%.9g",
+                htp_cpu.out_max_abs, htp_cpu.lse_max_abs,
+                opencl_htp.out_max_abs, opencl_htp.lse_max_abs);
+            GGML_ASSERT(htp_cpu.valid && htp_cpu.out_max_abs <= 3e-3f && htp_cpu.lse_max_abs <= 5e-3f);
+            GGML_ASSERT(opencl_htp.valid && opencl_htp.out_max_abs <= 3e-3f && opencl_htp.lse_max_abs <= 5e-3f);
+        }
+        if (c.compare_htp_dense) {
+            const diff_stats htp_cpu = compare_vectors(c, htp_dense_all, reference);
+            const diff_stats opencl_htp = compare_packed(c, packed, htp_dense_all);
+            float rho_max_abs = 0.0f;
+            for (int64_t b = 0; b < c.batch; ++b) {
+                for (int64_t qt = 0; qt < c.lq; ++qt) {
+                    for (int64_t h = 0; h < c.heads; ++h) {
+                        const size_t lse = packed_index(c, k_head_dim, h, qt, b);
+                        rho_max_abs = std::max(
+                            rho_max_abs,
+                            std::fabs(std::exp(read_scalar<float>(packed, k_head_dim, h, qt, b) -
+                                                    htp_dense_all[lse]) - 1.0f));
+                    }
+                }
+            }
+            std::printf(
+                " htp_dense_cpu_out=%.9g htp_dense_cpu_lse=%.9g"
+                " opencl_htp_dense_out=%.9g opencl_htp_dense_lse=%.9g rho=%.9g",
+                htp_cpu.out_max_abs, htp_cpu.lse_max_abs,
+                opencl_htp.out_max_abs, opencl_htp.lse_max_abs, rho_max_abs);
+            GGML_ASSERT(htp_cpu.valid && htp_cpu.out_max_abs <= 3e-3f && htp_cpu.lse_max_abs <= 5e-3f);
+            GGML_ASSERT(opencl_htp.valid && opencl_htp.out_max_abs <= 3e-3f && opencl_htp.lse_max_abs <= 5e-3f);
+            GGML_ASSERT(rho_max_abs <= 5e-3f);
+        }
     }
-
-    std::printf(
-        "[OPENCL_BLOCK_SPARSE] case=%s out_max_abs=%.9g lse_max_abs=%.9g valid=%s\n",
-        test_case.name, out_max_abs, lse_max_abs, values_valid ? "yes" : "no");
-    GGML_ASSERT(values_valid);
-    GGML_ASSERT(out_max_abs <= 3e-3f);
-    GGML_ASSERT(lse_max_abs <= 5e-3f);
+    if (c.heads != c.kv_heads) {
+        // Existing HTP sparse-index GQA coverage is diagnostic-only, so CPU is the correctness oracle here.
+        std::printf(" htp_gqa_oracle=skipped_existing_diagnostic_only");
+    }
+    std::printf("\n");
 
     GGML_ASSERT(ggml_backend_opencl_htp_graph_finish(
         graph, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
-    GGML_ASSERT(ggml_backend_opencl_htp_graph_live_alias_count(graph) == 0);
-    GGML_ASSERT(ggml_backend_opencl_htp_graph_live_event_count(graph) == 0);
     ggml_backend_opencl_htp_graph_free(&graph);
     ggml_free(ctx);
-    free_buffers(buffers);
+    for (auto it = buffers.rbegin(); it != buffers.rend(); ++it) {
+        ggml_backend_buffer_free(it->buffer);
+    }
 }
 
 } // namespace
 
 int main() {
     GGML_ASSERT(setenv("SD_HTP_SPARSE_OPENCL", "1", 1) == 0);
+    GGML_ASSERT(setenv("SD_HTP_OPS", "1", 1) == 0);
+    GGML_ASSERT(setenv("SD_HTP_COMPUTE", "1", 1) == 0);
+    GGML_ASSERT(setenv("SD_HTP_ATTENTION", "1", 1) == 0);
 
     ggml_opencl_qcom_requirements requirements = {};
     char reason[1024] = {};
@@ -425,14 +749,41 @@ int main() {
         std::fprintf(stderr, "OpenCL HTP sidecar creation failed: %s\n", reason);
         return 1;
     }
-
     ggml_backend_t htp = ggml_backend_htp_init();
-    GGML_ASSERT(htp != nullptr);
-    GGML_ASSERT(ggml_backend_htp_runtime_available());
+    GGML_ASSERT(htp != nullptr && ggml_backend_htp_runtime_available());
 
-    run_case(sidecar, htp, {"full_keep", 64, 96, 4, 4, false, false});
-    run_case(sidecar, htp, {"sparse_heads", 64, 96, 4, 4, true, false});
-    run_case(sidecar, htp, {"empty", 32, 32, 1, 1, false, true});
+    const attention_case cases[] = {
+        { "matrix_full_keep", 64, 96, 4, 4, 1,
+          GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX, mask_pattern::full,
+          false, false, true, true },
+        { "matrix_sparse", 64, 96, 4, 4, 1,
+          GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX, mask_pattern::sparse_terminated,
+          false, false, false, false },
+        { "matrix_empty", 32, 32, 1, 1, 1,
+          GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX, mask_pattern::empty,
+          false, false, false, false },
+        { "index_full_keep_tail", 65, 97, 4, 4, 1,
+          GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX, mask_pattern::full,
+          false, false, true, true },
+        { "index_sparse_terminated", 65, 97, 4, 4, 1,
+          GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX, mask_pattern::sparse_terminated,
+          false, false, true, false },
+        { "index_invalid_ids_gqa", 65, 97, 4, 2, 1,
+          GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX, mask_pattern::invalid_ids,
+          false, false, false, false },
+        { "gqa_4_to_1", 65, 97, 4, 1, 1,
+          GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX, mask_pattern::sparse_terminated,
+          false, false, false, false },
+        { "batch2_offsets_permuted", 65, 97, 4, 4, 2,
+          GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX, mask_pattern::sparse_terminated,
+          true, true, true, false },
+        { "production_410x24_tail", 410, 410, 24, 24, 1,
+          GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX, mask_pattern::sparse_terminated,
+          false, false, false, false },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        run_case(sidecar, htp, cases[i], i == 0);
+    }
 
     ggml_backend_free(htp);
     ggml_backend_opencl_htp_sidecar_free(sidecar);
