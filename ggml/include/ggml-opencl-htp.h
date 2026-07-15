@@ -63,6 +63,26 @@ GGML_BACKEND_API enum ggml_opencl_htp_result ggml_backend_opencl_htp_graph_creat
     char * reason,
     size_t reason_capacity);
 
+// Preflight freezes the sparse nodes routed to the sidecar and imports each distinct backing.
+// Descriptors and graph tensors are borrowed. Their backing storage and fd/base metadata must
+// remain valid until graph finish/free. On any non-OK result, *graph is null and partial imports
+// have been released; no OpenCL command has been enqueued.
+GGML_BACKEND_API enum ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
+    ggml_opencl_htp_sidecar * sidecar,
+    const struct ggml_cgraph * cgraph,
+    const struct ggml_opencl_htp_import_descriptor * descriptors,
+    size_t descriptor_count,
+    ggml_opencl_htp_graph ** graph,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API size_t ggml_backend_opencl_htp_graph_routed_node_count(
+    const ggml_opencl_htp_graph * graph);
+
+GGML_BACKEND_API bool ggml_backend_opencl_htp_graph_routes_node(
+    const ggml_opencl_htp_graph * graph,
+    const struct ggml_tensor * node);
+
 // The sidecar must outlive the graph. Imported backing storage and its borrowed fd/base must
 // remain valid until graph finish or free; the descriptor itself is copied during import.
 GGML_BACKEND_API enum ggml_opencl_htp_result ggml_backend_opencl_htp_graph_import(

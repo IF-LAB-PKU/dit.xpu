@@ -1,5 +1,6 @@
 #include "ggml-htp.h"
 #include "ggml-opencl-htp.h"
+#include "ggml-opencl.h"
 
 #include <algorithm>
 #include <cmath>
@@ -9,6 +10,8 @@
 #include <cstring>
 #include <limits>
 #include <vector>
+
+#include <fcntl.h>
 
 namespace {
 
@@ -57,6 +60,67 @@ struct owned_rpcmem_buffer {
     ggml_backend_htp_rpcmem_info info = {};
     size_t tensor_offset = 0;
 };
+
+void test_ordinary_opencl_support_gating(ggml_backend_t opencl) {
+    const ggml_init_params params = {
+        /* .mem_size   = */ 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    GGML_ASSERT(ctx != nullptr);
+
+    auto make_attention = [&](ggml_type q_type, ggml_type kv_type, ggml_type mask_type, bool with_lse) {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, q_type, 64, 32, 4, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, kv_type, 64, 32, 4, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, kv_type, 64, 32, 4, 1);
+        ggml_tensor * mask = mask_type == GGML_TYPE_COUNT ? nullptr :
+            ggml_new_tensor_4d(ctx, mask_type, 32, 32, 1, 1);
+        return with_lse ?
+            ggml_flash_attn_ext_with_lse(ctx, q, k, v, mask, 0.125f, 0.0f, 0.0f) :
+            ggml_flash_attn_ext(ctx, q, k, v, mask, 0.125f, 0.0f, 0.0f);
+    };
+
+    ggml_tensor * f32_dense = make_attention(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F16, false);
+    ggml_tensor * mixed_dense = make_attention(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, false);
+    ggml_tensor * maskless = make_attention(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_COUNT, false);
+    GGML_ASSERT(ggml_backend_supports_op(opencl, f32_dense));
+    GGML_ASSERT(ggml_backend_supports_op(opencl, mixed_dense));
+    GGML_ASSERT(ggml_backend_supports_op(opencl, maskless));
+
+    ggml_tensor * i32_matrix = make_attention(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I32, true);
+    ggml_flash_attn_ext_set_block_sparse(
+        i32_matrix, k_block_size, k_block_size, GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX);
+    ggml_tensor * i32_index = make_attention(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I32, true);
+    ggml_flash_attn_ext_set_block_sparse(
+        i32_index, k_block_size, k_block_size, GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
+    GGML_ASSERT(!ggml_backend_supports_op(opencl, i32_matrix));
+    GGML_ASSERT(!ggml_backend_supports_op(opencl, i32_index));
+
+    GGML_ASSERT(!ggml_backend_supports_op(
+        opencl, make_attention(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F16, true)));
+    GGML_ASSERT(!ggml_backend_supports_op(
+        opencl, make_attention(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_COUNT, true)));
+    ggml_tensor f32_mask = *f32_dense->src[3];
+    f32_mask.type = GGML_TYPE_F32;
+    ggml_tensor wrong_mask_type = *f32_dense;
+    wrong_mask_type.src[3] = &f32_mask;
+    GGML_ASSERT(!ggml_backend_supports_op(opencl, &wrong_mask_type));
+
+    ggml_tensor tagged_block_sparse = *mixed_dense;
+    tagged_block_sparse.op_params[4] = k_block_size;
+    tagged_block_sparse.op_params[5] = k_block_size;
+    tagged_block_sparse.op_params[7] = GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX;
+    GGML_ASSERT(!ggml_backend_supports_op(opencl, &tagged_block_sparse));
+
+    ggml_tensor mixed_k = *mixed_dense->src[1];
+    mixed_k.ne[0] = 80;
+    ggml_tensor mixed_dimensions = *mixed_dense;
+    mixed_dimensions.src[1] = &mixed_k;
+    GGML_ASSERT(!ggml_backend_supports_op(opencl, &mixed_dimensions));
+
+    ggml_free(ctx);
+}
 
 size_t q_index(const attention_case & c, int64_t d, int64_t qt, int64_t h, int64_t b) {
     return static_cast<size_t>(d + k_head_dim * (qt + c.lq * (h + c.heads * b)));
@@ -302,20 +366,6 @@ ggml_opencl_htp_import_descriptor make_import_descriptor(const owned_rpcmem_buff
         /* .logical_size    = */ owned.info.logical_size,
         /* .allocation_size = */ owned.info.allocation_size,
     };
-}
-
-void import_buffer(
-    ggml_opencl_htp_graph * graph,
-    const owned_rpcmem_buffer & owned,
-    char * reason,
-    size_t reason_capacity) {
-    const ggml_opencl_htp_import_descriptor descriptor = make_import_descriptor(owned);
-    const ggml_opencl_htp_result result = ggml_backend_opencl_htp_graph_import(
-        graph, &descriptor, reason, reason_capacity);
-    if (result != GGML_OPENCL_HTP_OK) {
-        std::fprintf(stderr, "RPCMEM import failed: %s\n", reason);
-    }
-    GGML_ASSERT(result == GGML_OPENCL_HTP_OK);
 }
 
 template<typename T>
@@ -630,9 +680,196 @@ void run_case(
     const std::vector<uint8_t> output_snapshot = snapshot(buffers[4]);
 
     char reason[1024] = {};
+    ggml_cgraph * cgraph = ggml_new_graph(ctx);
+    ggml_graph_add_node(cgraph, packed);
+    std::vector<ggml_opencl_htp_import_descriptor> descriptors;
+    for (const owned_rpcmem_buffer & buffer : buffers) {
+        descriptors.push_back(make_import_descriptor(buffer));
+    }
+    descriptors.push_back(descriptors.front());
+
+    auto expect_preflight_unsupported = [&] (
+        const char * name,
+        ggml_cgraph * rejected_cgraph,
+        const std::vector<ggml_opencl_htp_import_descriptor> & rejected_descriptors,
+        const char * expected_reason = nullptr) {
+        ggml_opencl_htp_graph * rejected_graph = nullptr;
+        reason[0] = '\0';
+        const ggml_opencl_htp_result result = ggml_backend_opencl_htp_graph_preflight(
+            sidecar, rejected_cgraph,
+            rejected_descriptors.empty() ? nullptr : rejected_descriptors.data(),
+            rejected_descriptors.size(), &rejected_graph, reason, sizeof(reason));
+        if (result != GGML_OPENCL_HTP_UNSUPPORTED || rejected_graph != nullptr || reason[0] == '\0') {
+            std::fprintf(
+                stderr, "%s preflight rejection failed: result=%d graph=%p reason=%s\n",
+                name, result, static_cast<void *>(rejected_graph), reason);
+        }
+        GGML_ASSERT(result == GGML_OPENCL_HTP_UNSUPPORTED);
+        GGML_ASSERT(rejected_graph == nullptr);
+        GGML_ASSERT(reason[0] != '\0');
+        GGML_ASSERT(expected_reason == nullptr || std::strstr(reason, expected_reason) != nullptr);
+        GGML_ASSERT(snapshot(buffers[0]) == q_snapshot);
+        GGML_ASSERT(snapshot(buffers[1]) == k_snapshot);
+        GGML_ASSERT(snapshot(buffers[2]) == v_snapshot);
+        GGML_ASSERT(snapshot(buffers[3]) == mask_snapshot);
+        GGML_ASSERT(snapshot(buffers[4]) == output_snapshot);
+        for (const owned_rpcmem_buffer & buffer : buffers) {
+            GGML_ASSERT(fcntl(buffer.info.fd, F_GETFD) != -1);
+        }
+    };
+
+    if (check_preconditions) {
+        GGML_ASSERT(setenv("SD_HTP_SPARSE_OPENCL", "0", 1) == 0);
+        expect_preflight_unsupported("feature disabled", cgraph, descriptors, "SD_HTP_SPARSE_OPENCL=1");
+        GGML_ASSERT(setenv("SD_HTP_SPARSE_OPENCL", "1", 1) == 0);
+
+        ggml_cgraph * no_candidate_graph = ggml_new_graph(ctx);
+        ggml_graph_add_node(no_candidate_graph, q);
+        expect_preflight_unsupported("no candidate", no_candidate_graph, descriptors, "no eligible");
+
+        ggml_tensor i32_no_lse = *packed;
+        i32_no_lse.op_params[6] = 0;
+        ggml_cgraph * no_lse_graph = ggml_new_graph(ctx);
+        ggml_graph_add_node(no_lse_graph, &i32_no_lse);
+        expect_preflight_unsupported("I32 without LSE", no_lse_graph, descriptors, "no eligible");
+
+        std::vector<ggml_opencl_htp_import_descriptor> missing_descriptor = descriptors;
+        missing_descriptor.erase(missing_descriptor.begin() + 4);
+        expect_preflight_unsupported("missing descriptor", cgraph, missing_descriptor, "missing RPCMEM descriptor");
+
+        std::vector<ggml_opencl_htp_import_descriptor> invalid_descriptor = descriptors;
+        invalid_descriptor[4].fd = -1;
+        expect_preflight_unsupported("invalid descriptor", cgraph, invalid_descriptor, "invalid");
+
+        std::vector<ggml_opencl_htp_import_descriptor> inconsistent_duplicate = descriptors;
+        --inconsistent_duplicate.back().logical_size;
+        expect_preflight_unsupported(
+            "inconsistent duplicate", cgraph, inconsistent_duplicate, "inconsistent");
+
+        std::vector<ggml_opencl_htp_import_descriptor> misaligned_base = descriptors;
+        misaligned_base[4].base = static_cast<uint8_t *>(misaligned_base[4].base) + 1;
+        expect_preflight_unsupported("misaligned base", cgraph, misaligned_base, "not aligned");
+
+        std::vector<ggml_opencl_htp_import_descriptor> zero_logical_size = descriptors;
+        zero_logical_size[4].logical_size = 0;
+        expect_preflight_unsupported("zero logical size", cgraph, zero_logical_size, "nonzero");
+
+        std::vector<ggml_opencl_htp_import_descriptor> short_allocation = descriptors;
+        short_allocation[4].allocation_size = short_allocation[4].logical_size - 1;
+        expect_preflight_unsupported("short allocation", cgraph, short_allocation, "smaller than logical");
+
+        std::vector<ggml_opencl_htp_import_descriptor> short_fd = descriptors;
+        short_fd[4].allocation_size += 4096;
+        expect_preflight_unsupported("short fd", cgraph, short_fd, "fd");
+
+        std::vector<ggml_opencl_htp_import_descriptor> oversized_descriptor = descriptors;
+        oversized_descriptor[4].allocation_size = SIZE_MAX;
+        expect_preflight_unsupported("oversized allocation", cgraph, oversized_descriptor, "OpenCL maximum");
+
+        ggml_tensor invalid_mask = *mask;
+        ++invalid_mask.ne[0];
+        ggml_tensor invalid_shape = *packed;
+        invalid_shape.src[3] = &invalid_mask;
+        ggml_tensor predicate_miss = *packed;
+        predicate_miss.op_params[7] = GGML_FLASH_ATTN_EXT_MASK_DEFAULT;
+        ggml_cgraph * predicate_miss_graph = ggml_new_graph(ctx);
+        ggml_graph_add_node(predicate_miss_graph, packed);
+        ggml_graph_add_node(predicate_miss_graph, &predicate_miss);
+        ggml_opencl_htp_graph * exact_predicate_session = nullptr;
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_preflight(
+            sidecar, predicate_miss_graph, descriptors.data(), descriptors.size(),
+            &exact_predicate_session, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+        GGML_ASSERT(exact_predicate_session != nullptr);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_routed_node_count(exact_predicate_session) == 1);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_routes_node(exact_predicate_session, packed));
+        GGML_ASSERT(!ggml_backend_opencl_htp_graph_routes_node(exact_predicate_session, &predicate_miss));
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_live_alias_count(exact_predicate_session) == 5);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_live_event_count(exact_predicate_session) == 0);
+        ggml_backend_opencl_htp_graph_free(&exact_predicate_session);
+        GGML_ASSERT(snapshot(buffers[4]) == output_snapshot);
+
+        ggml_cgraph * invalid_shape_graph = ggml_new_graph(ctx);
+        ggml_graph_add_node(invalid_shape_graph, packed);
+        ggml_graph_add_node(invalid_shape_graph, &invalid_shape);
+        expect_preflight_unsupported(
+            "eligible node with invalid mask shape", invalid_shape_graph, descriptors, "unsupported");
+
+        ggml_tensor invalid_layout_k = *k;
+        invalid_layout_k.nb[1] += sizeof(ggml_fp16_t);
+        invalid_layout_k.nb[2] = invalid_layout_k.nb[1] * static_cast<size_t>(invalid_layout_k.ne[1]);
+        invalid_layout_k.nb[3] = invalid_layout_k.nb[2] * static_cast<size_t>(invalid_layout_k.ne[2]);
+        ggml_tensor invalid_layout = *packed;
+        invalid_layout.src[1] = &invalid_layout_k;
+        ggml_cgraph * invalid_layout_graph = ggml_new_graph(ctx);
+        ggml_graph_add_node(invalid_layout_graph, &invalid_layout);
+        expect_preflight_unsupported("invalid K layout", invalid_layout_graph, descriptors, "unsupported");
+
+        ggml_tensor invalid_span = *packed;
+        invalid_span.data = static_cast<uint8_t *>(buffers[4].info.base) +
+                            buffers[4].info.logical_size - sizeof(float);
+        ggml_cgraph * invalid_span_graph = ggml_new_graph(ctx);
+        ggml_graph_add_node(invalid_span_graph, &invalid_span);
+        expect_preflight_unsupported("invalid output span", invalid_span_graph, descriptors, "binding preflight");
+
+        ggml_tensor overlapping_q = *q;
+        overlapping_q.buffer = packed->buffer;
+        overlapping_q.data = packed->data;
+        ggml_tensor input_overlap = *packed;
+        input_overlap.src[0] = &overlapping_q;
+        ggml_cgraph * input_overlap_graph = ggml_new_graph(ctx);
+        ggml_graph_add_node(input_overlap_graph, &input_overlap);
+        expect_preflight_unsupported(
+            "output/input overlap", input_overlap_graph, descriptors, "overlaps an input span");
+
+        ggml_tensor overlapping_output = *packed;
+        ggml_cgraph * overlapping_outputs_graph = ggml_new_graph(ctx);
+        ggml_graph_add_node(overlapping_outputs_graph, packed);
+        ggml_graph_add_node(overlapping_outputs_graph, &overlapping_output);
+        expect_preflight_unsupported(
+            "cross-output overlap", overlapping_outputs_graph, descriptors, "output spans overlap");
+
+        ggml_tensor * second_output = ggml_flash_attn_ext_with_lse(
+            ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(second_output, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_block_sparse(
+            second_output, k_block_size, k_block_size, c.format);
+        owned_rpcmem_buffer second_buffer = allocate_tensor_buffer(htp, second_output, 256);
+        const std::vector<uint8_t> second_snapshot = snapshot(second_buffer);
+        std::vector<ggml_opencl_htp_import_descriptor> two_node_descriptors = descriptors;
+        two_node_descriptors.push_back(make_import_descriptor(second_buffer));
+        ggml_cgraph * two_node_graph = ggml_new_graph(ctx);
+        ggml_graph_add_node(two_node_graph, packed);
+        ggml_graph_add_node(two_node_graph, second_output);
+        ggml_opencl_htp_graph * two_node_session = nullptr;
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_preflight(
+            sidecar, two_node_graph, two_node_descriptors.data(), two_node_descriptors.size(),
+            &two_node_session, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+        GGML_ASSERT(two_node_session != nullptr);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_routed_node_count(two_node_session) == 2);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_routes_node(two_node_session, packed));
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_routes_node(two_node_session, second_output));
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_live_alias_count(two_node_session) == 6);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_live_event_count(two_node_session) == 0);
+        GGML_ASSERT(snapshot(buffers[4]) == output_snapshot);
+        GGML_ASSERT(snapshot(second_buffer) == second_snapshot);
+        ggml_backend_opencl_htp_graph_free(&two_node_session);
+        GGML_ASSERT(fcntl(second_buffer.info.fd, F_GETFD) != -1);
+        ggml_backend_buffer_free(second_buffer.buffer);
+    }
+
     ggml_opencl_htp_graph * graph = nullptr;
-    GGML_ASSERT(ggml_backend_opencl_htp_graph_create(
-        sidecar, &graph, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    GGML_ASSERT(ggml_backend_opencl_htp_graph_preflight(
+        sidecar, cgraph, descriptors.data(), descriptors.size(),
+        &graph, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    GGML_ASSERT(graph != nullptr);
+    GGML_ASSERT(ggml_backend_opencl_htp_graph_routed_node_count(graph) == 1);
+    GGML_ASSERT(ggml_backend_opencl_htp_graph_routes_node(graph, packed));
+    GGML_ASSERT(!ggml_backend_opencl_htp_graph_routes_node(graph, q));
+    ggml_tensor equivalent_but_unfrozen = *packed;
+    GGML_ASSERT(!ggml_backend_opencl_htp_graph_routes_node(graph, &equivalent_but_unfrozen));
+    GGML_ASSERT(ggml_backend_opencl_htp_graph_live_alias_count(graph) == 5);
+    GGML_ASSERT(ggml_backend_opencl_htp_graph_live_event_count(graph) == 0);
+    GGML_ASSERT(snapshot(buffers[4]) == output_snapshot);
     auto expect_pre_enqueue_unsupported = [&](
         const char * name,
         const ggml_tensor * node,
@@ -661,12 +898,6 @@ void run_case(
         GGML_ASSERT(ggml_backend_opencl_htp_graph_live_event_count(graph) == 0);
         GGML_ASSERT(output_unchanged);
     };
-    if (check_preconditions) {
-        expect_pre_enqueue_unsupported("missing imports", packed, 0);
-    }
-    for (const owned_rpcmem_buffer & buffer : buffers) {
-        import_buffer(graph, buffer, reason, sizeof(reason));
-    }
     if (check_preconditions) {
         GGML_ASSERT(ggml_backend_opencl_htp_graph_live_alias_count(graph) == 5);
 
@@ -809,9 +1040,12 @@ void run_case(
 
     GGML_ASSERT(ggml_backend_opencl_htp_graph_finish(
         graph, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    GGML_ASSERT(ggml_backend_opencl_htp_graph_routed_node_count(graph) == 0);
+    GGML_ASSERT(!ggml_backend_opencl_htp_graph_routes_node(graph, packed));
     ggml_backend_opencl_htp_graph_free(&graph);
     ggml_free(ctx);
     for (auto it = buffers.rbegin(); it != buffers.rend(); ++it) {
+        GGML_ASSERT(fcntl(it->info.fd, F_GETFD) != -1);
         ggml_backend_buffer_free(it->buffer);
     }
 }
@@ -834,6 +1068,9 @@ int main() {
     }
     ggml_backend_t htp = ggml_backend_htp_init();
     GGML_ASSERT(htp != nullptr && ggml_backend_htp_runtime_available());
+    ggml_backend_t opencl = ggml_backend_opencl_init();
+    GGML_ASSERT(opencl != nullptr);
+    test_ordinary_opencl_support_gating(opencl);
 
     const attention_case cases[] = {
         { "matrix_full_keep", 64, 96, 4, 4, 1,
@@ -868,9 +1105,10 @@ int main() {
           false, false, false, false },
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
-        run_case(sidecar, htp, cases[i], i == 0);
+        run_case(sidecar, htp, cases[i], i == 0 || i == 3);
     }
 
+    ggml_backend_free(opencl);
     ggml_backend_free(htp);
     ggml_backend_opencl_htp_sidecar_free(sidecar);
     return 0;

@@ -13,6 +13,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -34,6 +35,7 @@ struct ggml_opencl_htp_sidecar {
     std::string device_extensions;
     size_t ext_mem_padding = 0;
     size_t page_size = 0;
+    cl_ulong max_mem_alloc_size = 0;
     bool queue_is_in_order = false;
     std::mutex dispatch_mutex;
 
@@ -74,9 +76,11 @@ struct ggml_opencl_htp_graph {
     ggml_opencl_htp_sidecar * sidecar = nullptr;
     std::vector<ggml_opencl_htp_alias> aliases;
     std::vector<cl_event> events;
+    std::vector<const ggml_tensor *> routed_nodes;
     ggml_opencl_htp_graph_state state = ggml_opencl_htp_graph_state::active;
     ggml_opencl_htp_result finish_result = GGML_OPENCL_HTP_OK;
     char finish_reason[256] = {};
+    bool cleanup_failed = false;
     bool test_fail_next_event_cache = false;
 };
 
@@ -333,6 +337,14 @@ ggml_opencl_htp_sidecar * ggml_backend_opencl_htp_sidecar_create(
         return nullptr;
     }
 
+    cl_ulong max_mem_alloc_size = 0;
+    err = clGetDeviceInfo(sidecar->device, CL_DEVICE_MAX_MEM_ALLOC_SIZE,
+                          sizeof(max_mem_alloc_size), &max_mem_alloc_size, nullptr);
+    if (err != CL_SUCCESS || max_mem_alloc_size == 0) {
+        set_reason(reason, reason_capacity, "failed to query OpenCL max allocation size (error %d)", err);
+        return nullptr;
+    }
+
     const cl_context_properties context_properties[] = {
         CL_CONTEXT_PLATFORM,
         reinterpret_cast<cl_context_properties>(sidecar->platform),
@@ -372,6 +384,7 @@ ggml_opencl_htp_sidecar * ggml_backend_opencl_htp_sidecar_create(
 
     sidecar->ext_mem_padding = ext_mem_padding;
     sidecar->page_size = page_size;
+    sidecar->max_mem_alloc_size = max_mem_alloc_size;
     requirements->ext_mem_padding = ext_mem_padding;
     requirements->page_size = page_size;
     set_reason(reason, reason_capacity, "ok");
@@ -587,7 +600,9 @@ ggml_opencl_htp_result finish_graph_state(
         }
     }
     graph->aliases.clear();
+    graph->routed_nodes.clear();
     graph->state = ggml_opencl_htp_graph_state::finished;
+    graph->cleanup_failed = failed_operation != nullptr;
 
     if (requested_result != GGML_OPENCL_HTP_OK) {
         graph->finish_result = GGML_OPENCL_HTP_ERROR;
@@ -952,6 +967,105 @@ bool bindings_overlap(
     return lhs.offset < rhs.offset + rhs.span && rhs.offset < lhs.offset + lhs.span;
 }
 
+struct ggml_opencl_htp_sparse_bindings {
+    ggml_opencl_htp_tensor_binding q;
+    ggml_opencl_htp_tensor_binding k;
+    ggml_opencl_htp_tensor_binding v;
+    ggml_opencl_htp_tensor_binding output;
+    ggml_opencl_htp_tensor_binding mask;
+};
+
+ggml_opencl_htp_result resolve_sparse_bindings(
+    ggml_opencl_htp_graph * graph,
+    const ggml_opencl_htp_sparse_dispatch & dispatch,
+    ggml_opencl_htp_sparse_bindings * bindings,
+    char * reason,
+    size_t reason_capacity) {
+    struct binding_request {
+        const ggml_tensor * tensor;
+        const char * name;
+        ggml_opencl_htp_tensor_binding * binding;
+        size_t scalar_alignment;
+    };
+    const binding_request requests[] = {
+        { dispatch.q, "Q", &bindings->q, sizeof(float) },
+        { dispatch.k, "K", &bindings->k, sizeof(ggml_fp16_t) },
+        { dispatch.v, "V", &bindings->v, sizeof(ggml_fp16_t) },
+        { dispatch.output, "output", &bindings->output, sizeof(float) },
+        { dispatch.mask, "mask", &bindings->mask, sizeof(int32_t) },
+    };
+    for (const binding_request & request : requests) {
+        char binding_reason[256] = {};
+        const ggml_opencl_htp_result binding_result = resolve_tensor_binding(
+            graph, request.tensor, request.binding,
+            binding_reason, sizeof(binding_reason));
+        if (binding_result != GGML_OPENCL_HTP_OK) {
+            return unsupported_sparse_node(
+                reason, reason_capacity,
+                "%s binding is unavailable: %s", request.name, binding_reason);
+        }
+        if (request.binding->offset % request.scalar_alignment != 0) {
+            return unsupported_sparse_node(
+                reason, reason_capacity,
+                "%s binding offset %zu is not aligned to %zu bytes",
+                request.name, request.binding->offset, request.scalar_alignment);
+        }
+    }
+
+    if (bindings_overlap(bindings->output, bindings->q) ||
+        bindings_overlap(bindings->output, bindings->k) ||
+        bindings_overlap(bindings->output, bindings->v) ||
+        bindings_overlap(bindings->output, bindings->mask)) {
+        return unsupported_sparse_node(
+            reason, reason_capacity,
+            "sparse attention output storage overlaps an input span");
+    }
+    return GGML_OPENCL_HTP_OK;
+}
+
+ggml_backend_buffer_t tensor_backing(const ggml_tensor * tensor) {
+    const ggml_tensor * source = tensor;
+    for (size_t depth = 0; source != nullptr && depth < 64; ++depth, source = source->view_src) {
+        if (source->buffer != nullptr) {
+            return source->buffer;
+        }
+    }
+    return nullptr;
+}
+
+bool is_sparse_route_candidate(const ggml_tensor * node) {
+    if (node == nullptr || node->op != GGML_OP_FLASH_ATTN_EXT) {
+        return false;
+    }
+    const ggml_tensor * q = node->src[0];
+    const ggml_tensor * k = node->src[1];
+    const ggml_tensor * v = node->src[2];
+    const ggml_tensor * mask = node->src[3];
+    if (q == nullptr || k == nullptr || v == nullptr || mask == nullptr || node->src[4] != nullptr ||
+        q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 ||
+        v->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_I32 ||
+        node->type != GGML_TYPE_F32 || q->ne[0] != 64 || k->ne[0] != 64 ||
+        v->ne[0] != 64 || node->ne[0] != 65) {
+        return false;
+    }
+    const int32_t mask_format = ggml_get_op_params_i32(node, 7);
+    if (ggml_get_op_params_i32(node, 4) != 32 ||
+        ggml_get_op_params_i32(node, 5) != 32 ||
+        ggml_get_op_params_i32(node, 6) != 1 ||
+        (mask_format != GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX &&
+         mask_format != GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX)) {
+        return false;
+    }
+
+    float scale = 0.0f;
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    std::memcpy(&scale, node->op_params + 0, sizeof(scale));
+    std::memcpy(&max_bias, node->op_params + 1, sizeof(max_bias));
+    std::memcpy(&logit_softcap, node->op_params + 2, sizeof(logit_softcap));
+    return std::isfinite(scale) && max_bias == 0.0f && logit_softcap == 0.0f;
+}
+
 } // namespace
 
 ggml_opencl_htp_result ggml_backend_opencl_htp_graph_create(
@@ -1053,6 +1167,220 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_import(
 
     set_reason(reason, reason_capacity, "ok");
     return GGML_OPENCL_HTP_OK;
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
+    ggml_opencl_htp_sidecar * sidecar,
+    const ggml_cgraph * cgraph,
+    const ggml_opencl_htp_import_descriptor * descriptors,
+    size_t descriptor_count,
+    ggml_opencl_htp_graph ** graph,
+    char * reason,
+    size_t reason_capacity) {
+    if (graph == nullptr) {
+        set_reason(reason, reason_capacity, "graph output must not be null");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    *graph = nullptr;
+    if (sidecar == nullptr || cgraph == nullptr || (descriptor_count != 0 && descriptors == nullptr)) {
+        set_reason(reason, reason_capacity, "sidecar, cgraph, and descriptor array must be valid");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    const char * enabled = std::getenv("SD_HTP_SPARSE_OPENCL");
+    if (enabled == nullptr || std::strcmp(enabled, "1") != 0) {
+        set_reason(reason, reason_capacity, "SD_HTP_SPARSE_OPENCL=1 is required");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+
+    std::vector<ggml_opencl_htp_sparse_dispatch> dispatches;
+    std::vector<const ggml_tensor *> routed_nodes;
+    std::vector<ggml_backend_buffer_t> required_backings;
+    try {
+        const int node_count = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
+        for (int i = 0; i < node_count; ++i) {
+            const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), i);
+            if (!is_sparse_route_candidate(node)) {
+                continue;
+            }
+
+            ggml_opencl_htp_sparse_dispatch dispatch;
+            char validation_reason[256] = {};
+            const ggml_opencl_htp_result validation = validate_block_sparse_node(
+                node, &dispatch, validation_reason, sizeof(validation_reason));
+            if (validation != GGML_OPENCL_HTP_OK) {
+                set_reason(reason, reason_capacity, "eligible sparse node %d is unsupported: %s", i, validation_reason);
+                return validation == GGML_OPENCL_HTP_ERROR ?
+                    GGML_OPENCL_HTP_ERROR : GGML_OPENCL_HTP_UNSUPPORTED;
+            }
+            dispatches.push_back(dispatch);
+            routed_nodes.push_back(node);
+
+            const ggml_tensor * tensors[] = {
+                dispatch.q, dispatch.k, dispatch.v, dispatch.mask, dispatch.output,
+            };
+            for (const ggml_tensor * tensor : tensors) {
+                ggml_backend_buffer_t backing = tensor_backing(tensor);
+                if (backing == nullptr) {
+                    set_reason(reason, reason_capacity, "sparse node %d tensor has no backing buffer", i);
+                    return GGML_OPENCL_HTP_UNSUPPORTED;
+                }
+                if (std::find(required_backings.begin(), required_backings.end(), backing) == required_backings.end()) {
+                    required_backings.push_back(backing);
+                }
+            }
+        }
+    } catch (...) {
+        set_reason(reason, reason_capacity, "failed to allocate preflight routing state");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    if (dispatches.empty()) {
+        set_reason(reason, reason_capacity, "graph has no eligible sparse with-LSE attention nodes");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+
+    ggml_opencl_htp_graph * prepared = nullptr;
+    const ggml_opencl_htp_result create_result = ggml_backend_opencl_htp_graph_create(
+        sidecar, &prepared, reason, reason_capacity);
+    if (create_result != GGML_OPENCL_HTP_OK) {
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+    auto reject_preflight = [&](ggml_opencl_htp_result result, const char * failure_reason) {
+        char cleanup_reason[256] = {};
+        const ggml_opencl_htp_result cleanup_result =
+            ggml_backend_opencl_htp_graph_finish(prepared, cleanup_reason, sizeof(cleanup_reason));
+        ggml_backend_opencl_htp_graph_free(&prepared);
+        if (cleanup_result != GGML_OPENCL_HTP_OK) {
+            set_reason(
+                reason, reason_capacity, "%s; preflight cleanup failed: %s",
+                failure_reason, cleanup_reason);
+            return GGML_OPENCL_HTP_ERROR;
+        }
+        set_reason(reason, reason_capacity, "%s", failure_reason);
+        return result;
+    };
+
+    std::vector<ggml_opencl_htp_import_descriptor> required_descriptors;
+    try {
+        required_descriptors.reserve(required_backings.size());
+        for (ggml_backend_buffer_t backing : required_backings) {
+            const ggml_opencl_htp_import_descriptor * match = nullptr;
+            for (size_t i = 0; i < descriptor_count; ++i) {
+                if (descriptors[i].backing != backing) {
+                    continue;
+                }
+                if (match != nullptr && !descriptors_equal(*match, descriptors[i])) {
+                    char failure_reason[256] = {};
+                    std::snprintf(
+                        failure_reason, sizeof(failure_reason),
+                        "backing %p has inconsistent preflight descriptors",
+                        static_cast<void *>(backing));
+                    return reject_preflight(GGML_OPENCL_HTP_UNSUPPORTED, failure_reason);
+                }
+                match = &descriptors[i];
+            }
+            if (match == nullptr) {
+                char failure_reason[256] = {};
+                std::snprintf(
+                    failure_reason, sizeof(failure_reason),
+                    "missing RPCMEM descriptor for backing %p", static_cast<void *>(backing));
+                return reject_preflight(GGML_OPENCL_HTP_UNSUPPORTED, failure_reason);
+            }
+            required_descriptors.push_back(*match);
+        }
+    } catch (...) {
+        return reject_preflight(GGML_OPENCL_HTP_ERROR, "failed to allocate descriptor preflight state");
+    }
+
+    for (const ggml_opencl_htp_import_descriptor & descriptor : required_descriptors) {
+        if (descriptor.allocation_size > sidecar->max_mem_alloc_size) {
+            char failure_reason[256] = {};
+            std::snprintf(
+                failure_reason, sizeof(failure_reason),
+                "backing %p allocation size %zu exceeds OpenCL maximum %llu",
+                static_cast<void *>(descriptor.backing), descriptor.allocation_size,
+                static_cast<unsigned long long>(sidecar->max_mem_alloc_size));
+            return reject_preflight(GGML_OPENCL_HTP_UNSUPPORTED, failure_reason);
+        }
+        char validation_reason[256] = {};
+        if (validate_import_descriptor(
+                prepared, &descriptor, validation_reason, sizeof(validation_reason)) != GGML_OPENCL_HTP_OK) {
+            char failure_reason[512] = {};
+            std::snprintf(
+                failure_reason, sizeof(failure_reason),
+                "RPCMEM descriptor is invalid: %s", validation_reason);
+            return reject_preflight(GGML_OPENCL_HTP_UNSUPPORTED, failure_reason);
+        }
+    }
+
+    for (const ggml_opencl_htp_import_descriptor & descriptor : required_descriptors) {
+        char import_reason[256] = {};
+        if (ggml_backend_opencl_htp_graph_import(
+                prepared, &descriptor, import_reason, sizeof(import_reason)) != GGML_OPENCL_HTP_OK) {
+            const bool cleanup_failed = prepared->cleanup_failed;
+            ggml_backend_opencl_htp_graph_free(&prepared);
+            set_reason(reason, reason_capacity, "RPCMEM import failed: %s", import_reason);
+            return cleanup_failed ? GGML_OPENCL_HTP_ERROR : GGML_OPENCL_HTP_UNSUPPORTED;
+        }
+    }
+
+    std::vector<ggml_opencl_htp_tensor_binding> output_bindings;
+    try {
+        output_bindings.reserve(dispatches.size());
+        for (const ggml_opencl_htp_sparse_dispatch & dispatch : dispatches) {
+            ggml_opencl_htp_sparse_bindings bindings;
+            char binding_reason[256] = {};
+            if (resolve_sparse_bindings(
+                    prepared, dispatch, &bindings,
+                    binding_reason, sizeof(binding_reason)) != GGML_OPENCL_HTP_OK) {
+                char failure_reason[512] = {};
+                std::snprintf(
+                    failure_reason, sizeof(failure_reason),
+                    "sparse binding preflight failed: %s", binding_reason);
+                return reject_preflight(GGML_OPENCL_HTP_UNSUPPORTED, failure_reason);
+            }
+            for (const ggml_opencl_htp_tensor_binding & prior : output_bindings) {
+                if (bindings_overlap(bindings.output, prior)) {
+                    return reject_preflight(
+                        GGML_OPENCL_HTP_UNSUPPORTED,
+                        "routed sparse attention output spans overlap");
+                }
+            }
+            output_bindings.push_back(bindings.output);
+        }
+        prepared->routed_nodes = std::move(routed_nodes);
+    } catch (...) {
+        return reject_preflight(GGML_OPENCL_HTP_ERROR, "failed to allocate binding preflight state");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(sidecar->dispatch_mutex);
+        char kernel_reason[1024] = {};
+        const ggml_opencl_htp_result kernel_result =
+            ensure_block_sparse_kernel(sidecar, kernel_reason, sizeof(kernel_reason));
+        if (kernel_result != GGML_OPENCL_HTP_OK) {
+            return reject_preflight(GGML_OPENCL_HTP_UNSUPPORTED, kernel_reason);
+        }
+    }
+
+    *graph = prepared;
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
+size_t ggml_backend_opencl_htp_graph_routed_node_count(const ggml_opencl_htp_graph * graph) {
+    return graph != nullptr && graph->state == ggml_opencl_htp_graph_state::active ?
+        graph->routed_nodes.size() : 0;
+}
+
+bool ggml_backend_opencl_htp_graph_routes_node(
+    const ggml_opencl_htp_graph * graph,
+    const ggml_tensor * node) {
+    return graph != nullptr && graph->state == ggml_opencl_htp_graph_state::active &&
+           node != nullptr &&
+           std::find(graph->routed_nodes.begin(), graph->routed_nodes.end(), node) !=
+               graph->routed_nodes.end();
 }
 
 ggml_opencl_htp_result ggml_backend_opencl_htp_graph_fill(
@@ -1176,62 +1504,24 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_s
         return validation;
     }
 
-    ggml_opencl_htp_tensor_binding q_binding;
-    ggml_opencl_htp_tensor_binding k_binding;
-    ggml_opencl_htp_tensor_binding v_binding;
-    ggml_opencl_htp_tensor_binding output_binding;
-    ggml_opencl_htp_tensor_binding mask_binding;
-    struct binding_request {
-        const ggml_tensor * tensor;
-        const char * name;
-        ggml_opencl_htp_tensor_binding * binding;
-        size_t scalar_alignment;
-    };
-    const binding_request requests[] = {
-        { dispatch.q, "Q", &q_binding, sizeof(float) },
-        { dispatch.k, "K", &k_binding, sizeof(ggml_fp16_t) },
-        { dispatch.v, "V", &v_binding, sizeof(ggml_fp16_t) },
-        { dispatch.output, "output", &output_binding, sizeof(float) },
-        { dispatch.mask, "mask", &mask_binding, sizeof(int32_t) },
-    };
-    for (const binding_request & request : requests) {
-        char binding_reason[256] = {};
-        const ggml_opencl_htp_result binding_result = resolve_tensor_binding(
-            graph, request.tensor, request.binding,
-            binding_reason, sizeof(binding_reason));
-        if (binding_result != GGML_OPENCL_HTP_OK) {
-            return unsupported_sparse_node(
-                reason, reason_capacity,
-                "%s binding is unavailable: %s", request.name, binding_reason);
-        }
-        if (request.binding->offset % request.scalar_alignment != 0) {
-            return unsupported_sparse_node(
-                reason, reason_capacity,
-                "%s binding offset %zu is not aligned to %zu bytes",
-                request.name, request.binding->offset, request.scalar_alignment);
-        }
-    }
-
-    if (bindings_overlap(output_binding, q_binding) ||
-        bindings_overlap(output_binding, k_binding) ||
-        bindings_overlap(output_binding, v_binding) ||
-        bindings_overlap(output_binding, mask_binding)) {
-        return unsupported_sparse_node(
-            reason, reason_capacity,
-            "sparse attention output storage overlaps an input span");
+    ggml_opencl_htp_sparse_bindings bindings;
+    const ggml_opencl_htp_result binding_result = resolve_sparse_bindings(
+        graph, dispatch, &bindings, reason, reason_capacity);
+    if (binding_result != GGML_OPENCL_HTP_OK) {
+        return binding_result;
     }
 
     static_assert(sizeof(size_t) <= sizeof(cl_ulong), "OpenCL offsets must hold host size_t values");
-    const cl_mem q_memory = q_binding.memory;
-    const cl_mem k_memory = k_binding.memory;
-    const cl_mem v_memory = v_binding.memory;
-    const cl_mem output_memory = output_binding.memory;
-    const cl_mem mask_memory = mask_binding.memory;
-    const cl_ulong q_offset = static_cast<cl_ulong>(q_binding.offset);
-    const cl_ulong k_offset = static_cast<cl_ulong>(k_binding.offset);
-    const cl_ulong v_offset = static_cast<cl_ulong>(v_binding.offset);
-    const cl_ulong output_offset = static_cast<cl_ulong>(output_binding.offset);
-    const cl_ulong mask_offset = static_cast<cl_ulong>(mask_binding.offset);
+    const cl_mem q_memory = bindings.q.memory;
+    const cl_mem k_memory = bindings.k.memory;
+    const cl_mem v_memory = bindings.v.memory;
+    const cl_mem output_memory = bindings.output.memory;
+    const cl_mem mask_memory = bindings.mask.memory;
+    const cl_ulong q_offset = static_cast<cl_ulong>(bindings.q.offset);
+    const cl_ulong k_offset = static_cast<cl_ulong>(bindings.k.offset);
+    const cl_ulong v_offset = static_cast<cl_ulong>(bindings.v.offset);
+    const cl_ulong output_offset = static_cast<cl_ulong>(bindings.output.offset);
+    const cl_ulong mask_offset = static_cast<cl_ulong>(bindings.mask.offset);
     const cl_float scale = dispatch.scale;
     const cl_int lq = dispatch.lq;
     const cl_int lk = dispatch.lk;
