@@ -2,15 +2,20 @@
 
 #include "ggml-opencl-htp.h"
 #include "ggml-opencl-qcom.h"
+#include "ggml-impl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <climits>
 #include <cctype>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <string>
 #include <vector>
@@ -22,14 +27,23 @@ struct ggml_opencl_htp_sidecar {
     cl_device_id device = nullptr;
     cl_context context = nullptr;
     cl_command_queue queue = nullptr;
+    cl_program block_sparse_program = nullptr;
+    cl_kernel block_sparse_kernel = nullptr;
     std::string platform_vendor;
     std::string device_name;
     std::string device_extensions;
     size_t ext_mem_padding = 0;
     size_t page_size = 0;
     bool queue_is_in_order = false;
+    std::mutex dispatch_mutex;
 
     ~ggml_opencl_htp_sidecar() {
+        if (block_sparse_kernel != nullptr) {
+            clReleaseKernel(block_sparse_kernel);
+        }
+        if (block_sparse_program != nullptr) {
+            clReleaseProgram(block_sparse_program);
+        }
         if (queue != nullptr) {
             clReleaseCommandQueue(queue);
         }
@@ -136,6 +150,77 @@ bool get_device_string(cl_device_id device, cl_device_info param, std::string * 
     }
     *value = storage.data();
     return true;
+}
+
+std::string get_program_build_log(cl_program program, cl_device_id device) {
+    size_t size = 0;
+    cl_int err = clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &size);
+    if (err != CL_SUCCESS || size == 0) {
+        return "build log unavailable";
+    }
+    std::vector<char> storage(size + 1, '\0');
+    err = clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, size, storage.data(), nullptr);
+    if (err != CL_SUCCESS) {
+        return "failed to query build log";
+    }
+    return storage.data();
+}
+
+ggml_opencl_htp_result ensure_block_sparse_kernel(
+    ggml_opencl_htp_sidecar * sidecar,
+    char * reason,
+    size_t reason_capacity) {
+    if (sidecar->block_sparse_kernel != nullptr) {
+        return GGML_OPENCL_HTP_OK;
+    }
+
+#ifdef GGML_OPENCL_EMBED_KERNELS
+    const std::string kernel_source {
+#include "flash_attn_block_sparse_f32_f16.cl.h"
+    };
+#else
+    set_reason(
+        reason, reason_capacity,
+        "block-sparse HTP sidecar requires GGML_OPENCL_EMBED_KERNELS");
+    return GGML_OPENCL_HTP_UNSUPPORTED;
+#endif
+
+#ifdef GGML_OPENCL_EMBED_KERNELS
+    const char * source = kernel_source.c_str();
+    cl_int err = CL_SUCCESS;
+    cl_program program = clCreateProgramWithSource(
+        sidecar->context, 1, &source, nullptr, &err);
+    if (err != CL_SUCCESS || program == nullptr) {
+        set_reason(reason, reason_capacity, "clCreateProgramWithSource failed (error %d)", err);
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    static constexpr const char * build_options = "-cl-std=CL3.0 -cl-mad-enable";
+    err = clBuildProgram(program, 1, &sidecar->device, build_options, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        const std::string build_log = get_program_build_log(program, sidecar->device);
+        const cl_int release_err = clReleaseProgram(program);
+        set_reason(
+            reason, reason_capacity,
+            "clBuildProgram failed (error %d, release error %d): %s",
+            err, release_err, build_log.c_str());
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    cl_kernel kernel = clCreateKernel(program, "flash_attn_block_sparse_f32_f16", &err);
+    if (err != CL_SUCCESS || kernel == nullptr) {
+        const cl_int release_err = clReleaseProgram(program);
+        set_reason(
+            reason, reason_capacity,
+            "clCreateKernel failed (error %d, program release error %d)",
+            err, release_err);
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    sidecar->block_sparse_program = program;
+    sidecar->block_sparse_kernel = kernel;
+    return GGML_OPENCL_HTP_OK;
+#endif
 }
 
 } // namespace
@@ -545,6 +630,21 @@ ggml_opencl_htp_result fail_graph(
         graph, GGML_OPENCL_HTP_ERROR, failure_reason, reason, reason_capacity);
 }
 
+ggml_opencl_htp_result fail_submitted_graph(
+    ggml_opencl_htp_graph * graph,
+    cl_event event,
+    const char * operation,
+    cl_int operation_error,
+    char * reason,
+    size_t reason_capacity) {
+    const cl_int finish_err = clFinish(graph->sidecar->queue);
+    const cl_int release_err = event != nullptr ? clReleaseEvent(event) : CL_SUCCESS;
+    return fail_graph(
+        graph, reason, reason_capacity,
+        "%s failed (error %d, command drain error %d, event release error %d)",
+        operation, operation_error, finish_err, release_err);
+}
+
 ggml_opencl_htp_result validate_import_descriptor(
     const ggml_opencl_htp_graph * graph,
     const ggml_opencl_htp_import_descriptor * descriptor,
@@ -612,6 +712,202 @@ ggml_opencl_htp_result validate_import_descriptor(
     }
 
     return GGML_OPENCL_HTP_OK;
+}
+
+struct ggml_opencl_htp_sparse_dispatch {
+    const ggml_tensor * q = nullptr;
+    const ggml_tensor * k = nullptr;
+    const ggml_tensor * v = nullptr;
+    const ggml_tensor * mask = nullptr;
+    const ggml_tensor * output = nullptr;
+    float scale = 0.0f;
+    cl_int lq = 0;
+    cl_int lk = 0;
+    cl_int heads = 0;
+    cl_int kv_heads = 0;
+    cl_int batch = 0;
+};
+
+ggml_opencl_htp_result unsupported_sparse_node(
+    char * reason,
+    size_t reason_capacity,
+    const char * format,
+    ...) {
+    if (reason != nullptr && reason_capacity > 0) {
+        va_list args;
+        va_start(args, format);
+        std::vsnprintf(reason, reason_capacity, format, args);
+        va_end(args);
+        reason[reason_capacity - 1] = '\0';
+    }
+    return GGML_OPENCL_HTP_UNSUPPORTED;
+}
+
+ggml_opencl_htp_result validate_block_sparse_node(
+    const ggml_tensor * node,
+    ggml_opencl_htp_sparse_dispatch * dispatch,
+    char * reason,
+    size_t reason_capacity) {
+    if (node == nullptr || dispatch == nullptr) {
+        set_reason(reason, reason_capacity, "node and dispatch must not be null");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    if (node->op != GGML_OP_FLASH_ATTN_EXT) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "node op %d is not FLASH_ATTN_EXT", node->op);
+    }
+
+    const ggml_tensor * q = node->src[0];
+    const ggml_tensor * k = node->src[1];
+    const ggml_tensor * v = node->src[2];
+    const ggml_tensor * mask = node->src[3];
+    if (q == nullptr || k == nullptr || v == nullptr || mask == nullptr) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "sparse attention requires Q, K, V, and mask tensors");
+    }
+    if (node->src[4] != nullptr) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "attention sinks are not supported by the sparse sidecar");
+    }
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 ||
+        v->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_I32 ||
+        node->type != GGML_TYPE_F32) {
+        return unsupported_sparse_node(
+            reason, reason_capacity,
+            "required types are Q=F32 K=F16 V=F16 mask=I32 output=F32");
+    }
+
+    const int32_t block_q = ggml_get_op_params_i32(node, 4);
+    const int32_t block_k = ggml_get_op_params_i32(node, 5);
+    const int32_t with_lse = ggml_get_op_params_i32(node, 6);
+    const int32_t mask_format = ggml_get_op_params_i32(node, 7);
+    if (with_lse != 1) {
+        return unsupported_sparse_node(reason, reason_capacity, "with_lse must equal 1");
+    }
+    if (mask_format != GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "mask format must be BLOCK_MATRIX");
+    }
+    if (block_q != 32 || block_k != 32) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "block sizes must be 32x32");
+    }
+
+    float scale = 0.0f;
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    std::memcpy(&scale, node->op_params + 0, sizeof(scale));
+    std::memcpy(&max_bias, node->op_params + 1, sizeof(max_bias));
+    std::memcpy(&logit_softcap, node->op_params + 2, sizeof(logit_softcap));
+    if (!std::isfinite(scale)) {
+        return unsupported_sparse_node(reason, reason_capacity, "scale must be finite");
+    }
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "max_bias and logit_softcap must be zero");
+    }
+
+    auto valid_cl_int_dimension = [](int64_t value) {
+        return value > 0 && value <= INT_MAX;
+    };
+    if (!valid_cl_int_dimension(q->ne[1]) || !valid_cl_int_dimension(k->ne[1]) ||
+        !valid_cl_int_dimension(q->ne[2]) || !valid_cl_int_dimension(k->ne[2]) ||
+        !valid_cl_int_dimension(q->ne[3])) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "attention dimensions must be positive cl_int values");
+    }
+
+    const int64_t lq = q->ne[1];
+    const int64_t lk = k->ne[1];
+    const int64_t heads = q->ne[2];
+    const int64_t kv_heads = k->ne[2];
+    const int64_t batch = q->ne[3];
+    if (q->ne[0] != 64 || k->ne[0] != 64 || v->ne[0] != 64 || node->ne[0] != 65) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "head dimensions must be Q/K/V=64 and output=65");
+    }
+    if (kv_heads > heads || heads % kv_heads != 0) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "query heads must be divisible by KV heads");
+    }
+    if (heads > INT_MAX / batch) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "head and batch product exceeds cl_int range");
+    }
+    if (k->ne[3] != batch || v->ne[1] != lk || v->ne[2] != kv_heads || v->ne[3] != batch) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "K and V shapes or batch dimensions do not match");
+    }
+    if (node->ne[1] != heads || node->ne[2] != lq || node->ne[3] != batch) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "packed output shape must be [65,H,Lq,B]");
+    }
+
+    const int64_t q_blocks_per_head = 1 + (lq - 1) / 32;
+    const int64_t k_blocks_per_head = 1 + (lk - 1) / 32;
+    const int64_t expected_q_blocks = heads * q_blocks_per_head;
+    const int64_t expected_k_blocks = kv_heads * k_blocks_per_head;
+    if (expected_q_blocks > INT_MAX || expected_k_blocks > INT_MAX) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "flattened mask block dimensions exceed cl_int range");
+    }
+    if (mask->ne[0] != expected_k_blocks || mask->ne[1] != expected_q_blocks ||
+        mask->ne[2] != 1 || mask->ne[3] != 1) {
+        return unsupported_sparse_node(
+            reason, reason_capacity,
+            "matrix mask must have shape [Hkv*ceil(Lk/32),H*ceil(Lq/32),1,1]");
+    }
+
+    if (q->nb[0] != sizeof(float) || k->nb[0] != sizeof(ggml_fp16_t) ||
+        v->nb[0] != sizeof(ggml_fp16_t) || node->nb[0] != sizeof(float) ||
+        mask->nb[0] != sizeof(int32_t)) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "tensor dimension-zero strides do not match their types");
+    }
+    if (!ggml_is_contiguous(q) || !ggml_is_contiguous(k) || !ggml_is_contiguous(v) ||
+        !ggml_is_contiguous(mask) || !ggml_is_contiguous(node)) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "Task 6 sparse sidecar tensors must be contiguous");
+    }
+    auto strides_are_aligned = [](const ggml_tensor * tensor, size_t alignment) {
+        for (size_t dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
+            if (tensor->nb[dimension] % alignment != 0) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!strides_are_aligned(q, sizeof(float)) ||
+        !strides_are_aligned(k, sizeof(ggml_fp16_t)) ||
+        !strides_are_aligned(v, sizeof(ggml_fp16_t)) ||
+        !strides_are_aligned(mask, sizeof(int32_t)) ||
+        !strides_are_aligned(node, sizeof(float))) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "tensor strides must preserve scalar alignment");
+    }
+
+    dispatch->q = q;
+    dispatch->k = k;
+    dispatch->v = v;
+    dispatch->mask = mask;
+    dispatch->output = node;
+    dispatch->scale = scale;
+    dispatch->lq = static_cast<cl_int>(lq);
+    dispatch->lk = static_cast<cl_int>(lk);
+    dispatch->heads = static_cast<cl_int>(heads);
+    dispatch->kv_heads = static_cast<cl_int>(kv_heads);
+    dispatch->batch = static_cast<cl_int>(batch);
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
+bool bindings_overlap(
+    const ggml_opencl_htp_tensor_binding & lhs,
+    const ggml_opencl_htp_tensor_binding & rhs) {
+    if (lhs.backing != rhs.backing) {
+        return false;
+    }
+    return lhs.offset < rhs.offset + rhs.span && rhs.offset < lhs.offset + lhs.span;
 }
 
 } // namespace
@@ -815,6 +1111,207 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_fill_tensor(
     return ggml_backend_opencl_htp_graph_fill(
         graph, binding.backing, binding.offset, binding.span,
         pattern, reason, reason_capacity);
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_sync(
+    ggml_opencl_htp_graph * graph,
+    const ggml_tensor * node,
+    char * reason,
+    size_t reason_capacity) {
+    if (graph == nullptr) {
+        set_reason(reason, reason_capacity, "graph must not be null");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    if (graph->state != ggml_opencl_htp_graph_state::active) {
+        set_reason(reason, reason_capacity, "graph is already finished");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    ggml_opencl_htp_sparse_dispatch dispatch;
+    const ggml_opencl_htp_result validation = validate_block_sparse_node(
+        node, &dispatch, reason, reason_capacity);
+    if (validation != GGML_OPENCL_HTP_OK) {
+        return validation;
+    }
+
+    ggml_opencl_htp_tensor_binding q_binding;
+    ggml_opencl_htp_tensor_binding k_binding;
+    ggml_opencl_htp_tensor_binding v_binding;
+    ggml_opencl_htp_tensor_binding output_binding;
+    ggml_opencl_htp_tensor_binding mask_binding;
+    struct binding_request {
+        const ggml_tensor * tensor;
+        const char * name;
+        ggml_opencl_htp_tensor_binding * binding;
+        size_t scalar_alignment;
+    };
+    const binding_request requests[] = {
+        { dispatch.q, "Q", &q_binding, sizeof(float) },
+        { dispatch.k, "K", &k_binding, sizeof(ggml_fp16_t) },
+        { dispatch.v, "V", &v_binding, sizeof(ggml_fp16_t) },
+        { dispatch.output, "output", &output_binding, sizeof(float) },
+        { dispatch.mask, "mask", &mask_binding, sizeof(int32_t) },
+    };
+    for (const binding_request & request : requests) {
+        char binding_reason[256] = {};
+        const ggml_opencl_htp_result binding_result = resolve_tensor_binding(
+            graph, request.tensor, request.binding,
+            binding_reason, sizeof(binding_reason));
+        if (binding_result != GGML_OPENCL_HTP_OK) {
+            return unsupported_sparse_node(
+                reason, reason_capacity,
+                "%s binding is unavailable: %s", request.name, binding_reason);
+        }
+        if (request.binding->offset % request.scalar_alignment != 0) {
+            return unsupported_sparse_node(
+                reason, reason_capacity,
+                "%s binding offset %zu is not aligned to %zu bytes",
+                request.name, request.binding->offset, request.scalar_alignment);
+        }
+    }
+
+    if (bindings_overlap(output_binding, q_binding) ||
+        bindings_overlap(output_binding, k_binding) ||
+        bindings_overlap(output_binding, v_binding) ||
+        bindings_overlap(output_binding, mask_binding)) {
+        return unsupported_sparse_node(
+            reason, reason_capacity,
+            "sparse attention output storage overlaps an input span");
+    }
+
+    static_assert(sizeof(size_t) <= sizeof(cl_ulong), "OpenCL offsets must hold host size_t values");
+    const cl_mem q_memory = q_binding.memory;
+    const cl_mem k_memory = k_binding.memory;
+    const cl_mem v_memory = v_binding.memory;
+    const cl_mem output_memory = output_binding.memory;
+    const cl_mem mask_memory = mask_binding.memory;
+    const cl_ulong q_offset = static_cast<cl_ulong>(q_binding.offset);
+    const cl_ulong k_offset = static_cast<cl_ulong>(k_binding.offset);
+    const cl_ulong v_offset = static_cast<cl_ulong>(v_binding.offset);
+    const cl_ulong output_offset = static_cast<cl_ulong>(output_binding.offset);
+    const cl_ulong mask_offset = static_cast<cl_ulong>(mask_binding.offset);
+    const cl_float scale = dispatch.scale;
+    const cl_int lq = dispatch.lq;
+    const cl_int lk = dispatch.lk;
+    const cl_int heads = dispatch.heads;
+    const cl_int kv_heads = dispatch.kv_heads;
+    const cl_ulong q_nb1 = static_cast<cl_ulong>(dispatch.q->nb[1]);
+    const cl_ulong q_nb2 = static_cast<cl_ulong>(dispatch.q->nb[2]);
+    const cl_ulong q_nb3 = static_cast<cl_ulong>(dispatch.q->nb[3]);
+    const cl_ulong k_nb1 = static_cast<cl_ulong>(dispatch.k->nb[1]);
+    const cl_ulong k_nb2 = static_cast<cl_ulong>(dispatch.k->nb[2]);
+    const cl_ulong k_nb3 = static_cast<cl_ulong>(dispatch.k->nb[3]);
+    const cl_ulong v_nb1 = static_cast<cl_ulong>(dispatch.v->nb[1]);
+    const cl_ulong v_nb2 = static_cast<cl_ulong>(dispatch.v->nb[2]);
+    const cl_ulong v_nb3 = static_cast<cl_ulong>(dispatch.v->nb[3]);
+    const cl_ulong output_nb1 = static_cast<cl_ulong>(dispatch.output->nb[1]);
+    const cl_ulong output_nb2 = static_cast<cl_ulong>(dispatch.output->nb[2]);
+    const cl_ulong output_nb3 = static_cast<cl_ulong>(dispatch.output->nb[3]);
+    const cl_ulong mask_nb0 = static_cast<cl_ulong>(dispatch.mask->nb[0]);
+    const cl_ulong mask_nb1 = static_cast<cl_ulong>(dispatch.mask->nb[1]);
+
+    std::lock_guard<std::mutex> lock(graph->sidecar->dispatch_mutex);
+    char kernel_reason[1024] = {};
+    const ggml_opencl_htp_result kernel_result = ensure_block_sparse_kernel(
+        graph->sidecar, kernel_reason, sizeof(kernel_reason));
+    if (kernel_result == GGML_OPENCL_HTP_UNSUPPORTED) {
+        set_reason(reason, reason_capacity, "%s", kernel_reason);
+        return kernel_result;
+    }
+    if (kernel_result != GGML_OPENCL_HTP_OK) {
+        return fail_graph(
+            graph, reason, reason_capacity,
+            "block-sparse kernel creation failed: %s", kernel_reason);
+    }
+
+    struct kernel_arg {
+        size_t size;
+        const void * value;
+    };
+    const kernel_arg args[] = {
+        { sizeof(q_memory), &q_memory },
+        { sizeof(q_offset), &q_offset },
+        { sizeof(k_memory), &k_memory },
+        { sizeof(k_offset), &k_offset },
+        { sizeof(v_memory), &v_memory },
+        { sizeof(v_offset), &v_offset },
+        { sizeof(output_memory), &output_memory },
+        { sizeof(output_offset), &output_offset },
+        { sizeof(mask_memory), &mask_memory },
+        { sizeof(mask_offset), &mask_offset },
+        { sizeof(scale), &scale },
+        { sizeof(lq), &lq },
+        { sizeof(lk), &lk },
+        { sizeof(heads), &heads },
+        { sizeof(kv_heads), &kv_heads },
+        { sizeof(q_nb1), &q_nb1 },
+        { sizeof(q_nb2), &q_nb2 },
+        { sizeof(q_nb3), &q_nb3 },
+        { sizeof(k_nb1), &k_nb1 },
+        { sizeof(k_nb2), &k_nb2 },
+        { sizeof(k_nb3), &k_nb3 },
+        { sizeof(v_nb1), &v_nb1 },
+        { sizeof(v_nb2), &v_nb2 },
+        { sizeof(v_nb3), &v_nb3 },
+        { sizeof(output_nb1), &output_nb1 },
+        { sizeof(output_nb2), &output_nb2 },
+        { sizeof(output_nb3), &output_nb3 },
+        { sizeof(mask_nb0), &mask_nb0 },
+        { sizeof(mask_nb1), &mask_nb1 },
+    };
+    static_assert(sizeof(args) / sizeof(args[0]) == 29, "block-sparse kernel ABI changed");
+    for (cl_uint index = 0; index < sizeof(args) / sizeof(args[0]); ++index) {
+        const cl_int err = clSetKernelArg(
+            graph->sidecar->block_sparse_kernel, index, args[index].size, args[index].value);
+        if (err != CL_SUCCESS) {
+            return fail_graph(
+                graph, reason, reason_capacity,
+                "clSetKernelArg(%u) failed (error %d)", index, err);
+        }
+    }
+
+    const size_t local_work_size[] = { 32, 1 };
+    const size_t global_work_size[] = {
+        static_cast<size_t>(1 + (dispatch.lq - 1) / 32) * 32,
+        static_cast<size_t>(dispatch.heads) * static_cast<size_t>(dispatch.batch),
+    };
+    cl_event event = nullptr;
+    std::atomic_thread_fence(std::memory_order_release);
+    cl_int err = clEnqueueNDRangeKernel(
+        graph->sidecar->queue, graph->sidecar->block_sparse_kernel,
+        2, nullptr, global_work_size, local_work_size, 0, nullptr, &event);
+    if (err != CL_SUCCESS || event == nullptr) {
+        if (event != nullptr) {
+            return fail_submitted_graph(
+                graph, event, "clEnqueueNDRangeKernel", err, reason, reason_capacity);
+        }
+        return fail_graph(
+            graph, reason, reason_capacity,
+            "clEnqueueNDRangeKernel failed (error %d, no event)", err);
+    }
+
+    err = clFlush(graph->sidecar->queue);
+    if (err != CL_SUCCESS) {
+        return fail_submitted_graph(
+            graph, event, "clFlush", err, reason, reason_capacity);
+    }
+
+    err = clWaitForEvents(1, &event);
+    if (err != CL_SUCCESS) {
+        return fail_submitted_graph(
+            graph, event, "clWaitForEvents", err, reason, reason_capacity);
+    }
+
+    const cl_int release_err = clReleaseEvent(event);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (release_err != CL_SUCCESS) {
+        return fail_graph(
+            graph, reason, reason_capacity,
+            "clReleaseEvent failed (error %d)", release_err);
+    }
+
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
 }
 
 ggml_opencl_htp_result ggml_backend_opencl_htp_graph_finish(
