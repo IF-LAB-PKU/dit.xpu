@@ -4765,9 +4765,19 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 const ggml_tensor * q = op->src[0];
                 const ggml_tensor * k = op->src[1];
                 const ggml_tensor * v = op->src[2];
+                const ggml_tensor * mask = op->src[3];
 
                 const int dk = q->ne[0];
                 const int dv = v->ne[0];
+
+                if (k->ne[0] != dk ||
+                    ggml_get_op_params_i32(op, 4) != 0 ||
+                    ggml_get_op_params_i32(op, 5) != 0 ||
+                    ggml_get_op_params_i32(op, 6) != 0 ||
+                    ggml_get_op_params_i32(op, 7) != GGML_FLASH_ATTN_EXT_MASK_DEFAULT ||
+                    (mask != nullptr && mask->type != GGML_TYPE_F16)) {
+                    return false;
+                }
 
                 const struct { int dk; int dv; } supported_dims[] = {
                     { 40,  40}, { 64,  64}, { 80,  80}, { 96,  96},
