@@ -8,6 +8,7 @@
 
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
@@ -15,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "dsprpc_interface.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
@@ -203,7 +205,14 @@ int g_ctx_ref_count = 0;
 } // namespace
 
 ggml_backend_htp_context::~ggml_backend_htp_context() {
+    std::lock_guard<std::mutex> compute_lock(compute_mutex);
 #ifdef GGML_HTP_OPENCL_SIDECAR
+    if (sparse_opencl_graph != nullptr) {
+        char reason[512] = {};
+        ggml_backend_opencl_htp_graph_finish(sparse_opencl_graph, reason, sizeof(reason));
+        ggml_backend_opencl_htp_graph_free(&sparse_opencl_graph);
+    }
+    sparse_opencl_routed_nodes.clear();
     ggml_backend_opencl_htp_sidecar_free(sparse_opencl_sidecar);
     sparse_opencl_sidecar = nullptr;
 #endif
@@ -561,6 +570,139 @@ static ggml_backend_buffer_t ggml_backend_htp_get_backing_buffer(const ggml_tens
     return nullptr;
 }
 
+#ifdef GGML_HTP_OPENCL_SIDECAR
+static std::vector<ggml_opencl_htp_import_descriptor>
+ggml_backend_htp_collect_opencl_descriptors(const ggml_cgraph * cgraph) {
+    std::vector<ggml_opencl_htp_import_descriptor> descriptors;
+    auto collect_tensor = [&](const ggml_tensor * tensor) {
+        ggml_backend_buffer_t backing = ggml_backend_htp_get_backing_buffer(tensor);
+        if (backing == nullptr ||
+            std::any_of(
+                descriptors.begin(), descriptors.end(),
+                [backing](const ggml_opencl_htp_import_descriptor & descriptor) {
+                    return descriptor.backing == backing;
+                })) {
+            return;
+        }
+
+        ggml_backend_htp_rpcmem_info info = {};
+        if (!ggml_backend_htp_get_rpcmem_info(backing, &info)) {
+            return;
+        }
+        descriptors.push_back({
+            /* .backing         = */ backing,
+            /* .base            = */ info.base,
+            /* .fd              = */ info.fd,
+            /* .logical_size    = */ info.logical_size,
+            /* .allocation_size = */ info.allocation_size,
+        });
+    };
+
+    const int node_count = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
+    for (int i = 0; i < node_count; ++i) {
+        const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), i);
+        collect_tensor(node);
+        if (node == nullptr) {
+            continue;
+        }
+        for (int source = 0; source < GGML_MAX_SRC; ++source) {
+            collect_tensor(node->src[source]);
+        }
+    }
+    return descriptors;
+}
+
+static ggml_opencl_htp_result ggml_backend_htp_opencl_preflight(
+        ggml_backend_htp_context * ctx,
+        const ggml_cgraph * cgraph,
+        char * reason,
+        size_t reason_capacity) {
+    GGML_ASSERT(ctx->sparse_opencl_graph == nullptr);
+    GGML_ASSERT(ctx->sparse_opencl_routed_nodes.empty());
+    if (ctx->sparse_opencl_sidecar == nullptr) {
+        std::snprintf(reason, reason_capacity, "OpenCL sidecar is unavailable");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+
+    std::vector<ggml_opencl_htp_import_descriptor> descriptors;
+    try {
+        descriptors = ggml_backend_htp_collect_opencl_descriptors(cgraph);
+    } catch (...) {
+        std::snprintf(reason, reason_capacity, "failed to collect HTP RPCMEM descriptors");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    ggml_opencl_htp_graph * graph = nullptr;
+    const ggml_opencl_htp_result result = ggml_backend_opencl_htp_graph_preflight(
+        ctx->sparse_opencl_sidecar,
+        cgraph,
+        descriptors.data(),
+        descriptors.size(),
+        &graph,
+        reason,
+        reason_capacity);
+    if (result == GGML_OPENCL_HTP_OK) {
+        GGML_ASSERT(graph != nullptr);
+        std::unordered_set<const ggml_tensor *> routed_nodes;
+        try {
+            const int node_count = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
+            routed_nodes.reserve(ggml_backend_opencl_htp_graph_routed_node_count(graph));
+            for (int i = 0; i < node_count; ++i) {
+                const ggml_tensor * node =
+                    ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), i);
+                if (ggml_backend_opencl_htp_graph_routes_node(graph, node)) {
+                    routed_nodes.insert(node);
+                }
+            }
+        } catch (...) {
+            char cleanup_reason[512] = {};
+            ggml_backend_opencl_htp_graph_finish(graph, cleanup_reason, sizeof(cleanup_reason));
+            ggml_backend_opencl_htp_graph_free(&graph);
+            std::snprintf(
+                reason, reason_capacity,
+                "failed to freeze routed OpenCL tensor set before worker launch");
+            return GGML_OPENCL_HTP_ERROR;
+        }
+        if (routed_nodes.empty()) {
+            char cleanup_reason[512] = {};
+            ggml_backend_opencl_htp_graph_finish(graph, cleanup_reason, sizeof(cleanup_reason));
+            ggml_backend_opencl_htp_graph_free(&graph);
+            std::snprintf(reason, reason_capacity, "OpenCL preflight returned no frozen routed tensors");
+            return GGML_OPENCL_HTP_ERROR;
+        }
+
+        // No worker exists yet. Publish the complete frozen set and active graph as one session.
+        ctx->sparse_opencl_routed_nodes.swap(routed_nodes);
+        ctx->sparse_opencl_graph = graph;
+    } else {
+        GGML_ASSERT(graph == nullptr);
+    }
+    return result;
+}
+
+static bool ggml_backend_htp_opencl_finish(ggml_backend_htp_context * ctx) {
+    if (ctx->sparse_opencl_graph == nullptr) {
+        ctx->sparse_opencl_routed_nodes.clear();
+        return true;
+    }
+
+    ggml_opencl_htp_graph * graph = ctx->sparse_opencl_graph;
+    ctx->sparse_opencl_graph = nullptr;
+    char reason[512] = {};
+    const ggml_opencl_htp_result result =
+        ggml_backend_opencl_htp_graph_finish(graph, reason, sizeof(reason));
+    ggml_backend_opencl_htp_graph_free(&graph);
+    // Hybrid compute has joined every worker before this function is called.
+    ctx->sparse_opencl_routed_nodes.clear();
+    if (result != GGML_OPENCL_HTP_OK) {
+        std::fprintf(
+            stderr, "ggml-htp: OpenCL graph finish failed result=%d reason=%s\n",
+            (int) result, reason[0] != '\0' ? reason : "unknown error");
+        return false;
+    }
+    return true;
+}
+#endif
+
 static bool ggml_backend_htp_node_has_rpcmem_buffers(const ggml_tensor * node) {
     ggml_backend_buffer_t node_buffer = ggml_backend_htp_get_backing_buffer(node);
     if (node == nullptr || node_buffer == nullptr || !ggml_is_contiguous(node)) {
@@ -593,6 +735,7 @@ static bool ggml_backend_htp_node_has_rpcmem_buffers(const ggml_tensor * node) {
 static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
     GGML_ASSERT(ctx != nullptr);
+    std::lock_guard<std::mutex> compute_lock(ctx->compute_mutex);
 
     if (!ctx->runtime_available || !ctx->ops_backend_initialized) {
         std::fprintf(stderr, "ggml-htp: runtime unavailable or ops backend not initialized\n");
@@ -610,7 +753,27 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
             return GGML_STATUS_FAILED;
         }
         cplan.work_data = ctx->work_data;
-        return ggml_graph_compute_htp_hybrid(cgraph, &cplan);
+#ifdef GGML_HTP_OPENCL_SIDECAR
+        char preflight_reason[1024] = {};
+        const ggml_opencl_htp_result preflight = ggml_backend_htp_opencl_preflight(
+            ctx, cgraph, preflight_reason, sizeof(preflight_reason));
+        const char * trace = std::getenv("SD_HTP_SPARSE_OPENCL_TRACE");
+        if (trace != nullptr && trace[0] != '\0' && std::strcmp(trace, "0") != 0) {
+            std::fprintf(
+                stderr,
+                "ggml-htp: OpenCL sidecar preflight result=%d routed_nodes=%zu reason=%s\n",
+                (int) preflight,
+                ctx->sparse_opencl_routed_nodes.size(),
+                preflight_reason[0] != '\0' ? preflight_reason : "unknown");
+        }
+#endif
+        enum ggml_status status = ggml_graph_compute_htp_hybrid(cgraph, &cplan);
+#ifdef GGML_HTP_OPENCL_SIDECAR
+        if (!ggml_backend_htp_opencl_finish(ctx) && status == GGML_STATUS_SUCCESS) {
+            status = GGML_STATUS_FAILED;
+        }
+#endif
+        return status;
     }
 
     ggml_compute_params params = {

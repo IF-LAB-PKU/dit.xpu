@@ -27,6 +27,10 @@
 #include "message.h"
 #include "op_reg.h"
 
+#ifdef GGML_HTP_OPENCL_SIDECAR
+#include "ggml-opencl-htp.h"
+#endif
+
 namespace {
 
 // HTP hybrid 路径里部分张量可能还是 view，这里统一回退到真正持有 buffer 的 backing tensor。
@@ -442,6 +446,58 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
     }
 
     return true;
+}
+
+bool htp_ops_opencl_routes_node(const struct ggml_tensor * dst) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    const auto * ctx = ggml_backend_htp_context::instance();
+    return dst != nullptr && ctx->sparse_opencl_routed_nodes.find(dst) !=
+        ctx->sparse_opencl_routed_nodes.end();
+#else
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
+int htp_ops_opencl_compute_node(struct ggml_tensor * dst) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    auto * ctx = ggml_backend_htp_context::instance();
+    if (ctx->sparse_opencl_graph == nullptr || dst == nullptr ||
+        ctx->sparse_opencl_routed_nodes.find(dst) == ctx->sparse_opencl_routed_nodes.end()) {
+        return -EINVAL;
+    }
+
+    const int64_t begin_ms = ggml_time_ms();
+    char reason[1024] = {};
+    const ggml_opencl_htp_result result =
+        ggml_backend_opencl_htp_graph_compute_block_sparse_attn_sync(
+            ctx->sparse_opencl_graph, dst, reason, sizeof(reason));
+    const char * trace = std::getenv("SD_HTP_SPARSE_OPENCL_TRACE");
+    if (trace != nullptr && trace[0] != '\0' && std::strcmp(trace, "0") != 0) {
+        std::fprintf(
+            stderr,
+            "attention_timing route=opencl mask_type=i32 total=%lldms qo=%lld kv=%lld "
+            "heads=%lld d=%lld with_lse=%d out_d=%lld block_sparse=1 result=%d\n",
+            (long long) (ggml_time_ms() - begin_ms),
+            (long long) dst->src[0]->ne[1],
+            (long long) dst->src[1]->ne[1],
+            (long long) dst->src[0]->ne[2],
+            (long long) dst->src[0]->ne[0],
+            ggml_get_op_params_i32(dst, 6) != 0 ? 1 : 0,
+            (long long) dst->ne[0],
+            (int) result);
+    }
+    if (result != GGML_OPENCL_HTP_OK) {
+        std::fprintf(
+            stderr, "ggml-htp: OpenCL sparse attention failed result=%d reason=%s\n",
+            (int) result, reason[0] != '\0' ? reason : "unknown error");
+        return -EIO;
+    }
+    return 0;
+#else
+    GGML_UNUSED(dst);
+    return -ENOSYS;
+#endif
 }
 
 int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor * dst) {

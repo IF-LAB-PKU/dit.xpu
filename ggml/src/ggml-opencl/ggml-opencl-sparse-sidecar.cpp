@@ -915,13 +915,13 @@ ggml_opencl_htp_result validate_block_sparse_node(
         }
         return true;
     };
-    if (!ggml_is_contiguous(q) ||
+    if (!is_dense_scalar_permutation(q, sizeof(float)) ||
         !is_dense_scalar_permutation(k, sizeof(ggml_fp16_t)) ||
         !is_dense_scalar_permutation(v, sizeof(ggml_fp16_t)) ||
         !ggml_is_contiguous(mask) || !ggml_is_contiguous(node)) {
         return unsupported_sparse_node(
             reason, reason_capacity,
-            "Q, mask, and output must be contiguous; K and V must be dense scalar permutations");
+            "Q, K, and V must be dense scalar permutations; mask and output must be contiguous");
     }
     auto strides_are_aligned = [](const ggml_tensor * tensor, size_t alignment) {
         for (size_t dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
