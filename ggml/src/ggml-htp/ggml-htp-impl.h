@@ -4,8 +4,10 @@
 
 #pragma once
 
+#include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "ggml.h"
 #include "rpcmem_mapper.h"
@@ -14,6 +16,7 @@ static const char * HTP_OPS_DL_PATH = "libhtp_ops.so";
 
 #ifdef GGML_HTP_OPENCL_SIDECAR
 struct ggml_opencl_htp_sidecar;
+struct ggml_opencl_htp_graph;
 #endif
 
 struct ggml_backend_htp_context {
@@ -36,9 +39,13 @@ struct ggml_backend_htp_context {
     bool runtime_available = false;
     std::string runtime_error;
     std::unordered_map<const ggml_tensor *, ggml_tensor *> packed_f16_weights;
+    // The HTP RPC channel, work buffer, and sidecar graph session are process singletons.
+    std::mutex compute_mutex;
 
 #ifdef GGML_HTP_OPENCL_SIDECAR
     ggml_opencl_htp_sidecar * sparse_opencl_sidecar = nullptr;
+    ggml_opencl_htp_graph * sparse_opencl_graph = nullptr;
+    std::unordered_set<const ggml_tensor *> sparse_opencl_routed_nodes;
     size_t sparse_opencl_page_size = 0;
     size_t sparse_opencl_ext_mem_padding = 0;
     std::string sparse_opencl_error;

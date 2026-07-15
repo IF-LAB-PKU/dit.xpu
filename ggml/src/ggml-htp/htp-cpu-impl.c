@@ -2034,9 +2034,22 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                if (htp_ops_opencl_routes_node(tensor)) {
+                    if (params->ith == 0) {
+                        const int err = htp_ops_opencl_compute_node(tensor);
+                        if (err != 0) {
+                            ggml_htp_mark_op_failed(params, tensor, err);
+                        }
+                    }
+                    break;
+                }
+
                 // FLASH_ATTN_EXT 也必须按运行时 RPCMEM 放置结果判断，避免只因 shape 支持就误分发到 HTP。
                 const char * trace_env = getenv("SD_HTP_BLOCK_SPARSE_MASK_TRACE");
-                const bool trace_attn = trace_env != NULL && trace_env[0] != '\0' && strcmp(trace_env, "0") != 0 && params->ith == 0;
+                const char * sidecar_trace_env = getenv("SD_HTP_SPARSE_OPENCL_TRACE");
+                const bool trace_attn = params->ith == 0 &&
+                    ((trace_env != NULL && trace_env[0] != '\0' && strcmp(trace_env, "0") != 0) ||
+                     (sidecar_trace_env != NULL && sidecar_trace_env[0] != '\0' && strcmp(sidecar_trace_env, "0") != 0));
                 const int64_t trace_begin = trace_attn ? ggml_time_ms() : 0;
                 if (htp_ops_support_op_runtime(tensor)) {
                     const int err = htp_ops_compute_op(params, tensor);
