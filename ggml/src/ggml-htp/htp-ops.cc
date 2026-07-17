@@ -459,6 +459,117 @@ bool htp_ops_opencl_routes_node(const struct ggml_tensor * dst) {
 #endif
 }
 
+bool htp_ops_opencl_async_enabled(void) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    const auto * ctx = ggml_backend_htp_context::instance();
+    const char * value = std::getenv("SD_HTP_SPARSE_OPENCL_ASYNC");
+    return ctx->sparse_opencl_graph != nullptr &&
+           value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+#else
+    return false;
+#endif
+}
+
+#ifdef GGML_HTP_OPENCL_SIDECAR
+static bool htp_ops_opencl_is_view_only(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    return tensor->op == GGML_OP_VIEW || tensor->op == GGML_OP_RESHAPE ||
+           tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_TRANSPOSE;
+}
+
+static const ggml_tensor * htp_ops_opencl_routed_producer(
+        const ggml_backend_htp_context * ctx,
+        const ggml_tensor * tensor) {
+    for (size_t depth = 0; tensor != nullptr && depth < 64; ++depth) {
+        if (ctx->sparse_opencl_routed_nodes.find(tensor) !=
+            ctx->sparse_opencl_routed_nodes.end()) {
+            return tensor;
+        }
+        if (!htp_ops_opencl_is_view_only(tensor)) {
+            return nullptr;
+        }
+        tensor = tensor->src[0] != nullptr ? tensor->src[0] : tensor->view_src;
+    }
+    return nullptr;
+}
+
+static size_t htp_ops_opencl_collect_producers(
+        const ggml_tensor * dst,
+        const ggml_tensor ** producers,
+        size_t capacity) {
+    if (dst == nullptr || htp_ops_opencl_is_view_only(dst)) {
+        return 0;
+    }
+    const auto * ctx = ggml_backend_htp_context::instance();
+    size_t count = 0;
+    for (int source = 0; source < GGML_MAX_SRC; ++source) {
+        const ggml_tensor * producer = htp_ops_opencl_routed_producer(ctx, dst->src[source]);
+        if (producer == nullptr) {
+            continue;
+        }
+        bool duplicate = false;
+        for (size_t i = 0; i < count; ++i) {
+            duplicate = duplicate || producers[i] == producer;
+        }
+        if (!duplicate && count < capacity) {
+            producers[count++] = producer;
+        }
+    }
+    return count;
+}
+#endif
+
+bool htp_ops_opencl_node_needs_wait(const struct ggml_tensor * dst) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (!htp_ops_opencl_async_enabled()) {
+        return false;
+    }
+    const ggml_tensor * producers[GGML_MAX_SRC] = {};
+    return htp_ops_opencl_collect_producers(dst, producers, GGML_MAX_SRC) != 0;
+#else
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
+int htp_ops_opencl_wait_node(const struct ggml_tensor * dst) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    auto * ctx = ggml_backend_htp_context::instance();
+    if (!htp_ops_opencl_async_enabled() || dst == nullptr) {
+        return 0;
+    }
+
+    const ggml_tensor * producers[GGML_MAX_SRC] = {};
+    const size_t producer_count =
+        htp_ops_opencl_collect_producers(dst, producers, GGML_MAX_SRC);
+    bool waited_any = false;
+    for (size_t i = 0; i < producer_count; ++i) {
+        bool waited = false;
+        char reason[1024] = {};
+        const ggml_opencl_htp_result result =
+            ggml_backend_opencl_htp_graph_wait_for_tensor(
+                ctx->sparse_opencl_graph, producers[i], &waited,
+                reason, sizeof(reason));
+        if (result != GGML_OPENCL_HTP_OK) {
+            std::fprintf(
+                stderr,
+                "ggml-htp: OpenCL sparse dependency wait failed result=%d reason=%s\n",
+                (int) result, reason[0] != '\0' ? reason : "unknown error");
+            return -EIO;
+        }
+        waited_any = waited_any || waited;
+    }
+
+    GGML_UNUSED(waited_any);
+    return 0;
+#else
+    GGML_UNUSED(dst);
+    return -ENOSYS;
+#endif
+}
+
 int htp_ops_opencl_compute_node(struct ggml_tensor * dst) {
 #ifdef GGML_HTP_OPENCL_SIDECAR
     auto * ctx = ggml_backend_htp_context::instance();
@@ -469,15 +580,18 @@ int htp_ops_opencl_compute_node(struct ggml_tensor * dst) {
 
     const int64_t begin_ms = ggml_time_ms();
     char reason[1024] = {};
-    const ggml_opencl_htp_result result =
-        ggml_backend_opencl_htp_graph_compute_block_sparse_attn_sync(
-            ctx->sparse_opencl_graph, dst, reason, sizeof(reason));
+    const bool async = htp_ops_opencl_async_enabled();
+    const ggml_opencl_htp_result result = async
+        ? ggml_backend_opencl_htp_graph_compute_block_sparse_attn_async(
+              ctx->sparse_opencl_graph, dst, reason, sizeof(reason))
+        : ggml_backend_opencl_htp_graph_compute_block_sparse_attn_sync(
+              ctx->sparse_opencl_graph, dst, reason, sizeof(reason));
     const char * trace = std::getenv("SD_HTP_SPARSE_OPENCL_TRACE");
     if (trace != nullptr && trace[0] != '\0' && std::strcmp(trace, "0") != 0) {
         std::fprintf(
             stderr,
             "attention_timing route=opencl mask_type=i32 total=%lldms qo=%lld kv=%lld "
-            "heads=%lld d=%lld with_lse=%d out_d=%lld block_sparse=1 result=%d\n",
+            "heads=%lld d=%lld with_lse=%d out_d=%lld block_sparse=1 async=%d result=%d\n",
             (long long) (ggml_time_ms() - begin_ms),
             (long long) dst->src[0]->ne[1],
             (long long) dst->src[1]->ne[1],
@@ -485,6 +599,7 @@ int htp_ops_opencl_compute_node(struct ggml_tensor * dst) {
             (long long) dst->src[0]->ne[0],
             ggml_get_op_params_i32(dst, 6) != 0 ? 1 : 0,
             (long long) dst->ne[0],
+            async ? 1 : 0,
             (int) result);
     }
     if (result != GGML_OPENCL_HTP_OK) {

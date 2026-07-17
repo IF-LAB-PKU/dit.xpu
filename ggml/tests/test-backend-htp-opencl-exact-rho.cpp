@@ -298,8 +298,13 @@ std::vector<float> read_f32(const ggml_tensor * tensor) {
     return result;
 }
 
-run_result run_graph(ggml_backend_t backend, graph_fixture & f, bool sidecar_enabled) {
+run_result run_graph(
+        ggml_backend_t backend,
+        graph_fixture & f,
+        bool sidecar_enabled,
+        bool async_enabled) {
     env_guard sidecar("SD_HTP_SPARSE_OPENCL", sidecar_enabled ? "1" : "0");
+    env_guard async_sidecar("SD_HTP_SPARSE_OPENCL_ASYNC", async_enabled ? "1" : "0");
     run_result result;
     result.trace = capture_graph_compute(backend, f.graph, &result.status);
     if (result.status == GGML_STATUS_SUCCESS) {
@@ -310,6 +315,62 @@ run_result run_graph(ggml_backend_t backend, graph_fixture & f, bool sidecar_ena
         result.recovered = read_f32(f.recovered);
     }
     return result;
+}
+
+void require_async_event_order(const std::string & trace) {
+    const char * expected[] = {
+        "gpu_sparse_enqueue",
+        "gpu_sparse_flush",
+        "htp_dense_begin",
+        "htp_dense_end",
+        "gpu_sparse_wait_begin",
+        "gpu_sparse_wait_end",
+        "rho_consumer_begin",
+    };
+    struct event_record {
+        const char * name;
+        int64_t ts_us;
+    } records[sizeof(expected) / sizeof(expected[0])] = {};
+    size_t position = 0;
+    size_t record_count = 0;
+    for (const char * event : expected) {
+        const size_t found = trace.find(event, position);
+        if (found == std::string::npos) {
+            std::fprintf(
+                stderr,
+                "[FAIL] missing or out-of-order async event '%s' after offset %zu\n--- trace ---\n%s",
+                event, position, trace.c_str());
+            GGML_ASSERT(false && "OpenCL sparse/HTP dense overlap event order mismatch");
+        }
+        const size_t line_begin = trace.rfind('\n', found);
+        const size_t line_end = trace.find('\n', found);
+        const size_t line_start = line_begin == std::string::npos ? 0 : line_begin + 1;
+        const size_t line_length = line_end == std::string::npos ?
+            std::string::npos : line_end - line_start;
+        const std::string line = trace.substr(line_start, line_length);
+        const std::string timestamp_prefix = "ts_us=";
+        const size_t timestamp_begin = line.find(timestamp_prefix);
+        GGML_ASSERT(timestamp_begin != std::string::npos);
+        const size_t timestamp_value_begin = timestamp_begin + timestamp_prefix.size();
+        const size_t timestamp_end = line.find_first_not_of("0123456789", timestamp_value_begin);
+        const std::string timestamp = line.substr(
+            timestamp_value_begin,
+            timestamp_end == std::string::npos ? std::string::npos : timestamp_end - timestamp_value_begin);
+        GGML_ASSERT(!timestamp.empty());
+        records[record_count++] = { event, std::strtoll(timestamp.c_str(), nullptr, 10) };
+        std::printf(
+            "[ASYNC_ORDER] %s\n",
+            line.c_str());
+        position = found + std::strlen(event);
+    }
+    for (size_t i = 1; i < record_count; ++i) {
+        GGML_ASSERT(records[i - 1].ts_us <= records[i].ts_us);
+    }
+    GGML_ASSERT(records[0].ts_us < records[2].ts_us);
+    GGML_ASSERT(records[2].ts_us < records[4].ts_us);
+    GGML_ASSERT(records[3].ts_us <= records[4].ts_us);
+    GGML_ASSERT(records[4].ts_us <= records[5].ts_us);
+    GGML_ASSERT(records[5].ts_us <= records[6].ts_us);
 }
 
 int count_attention_trace(const std::string & trace, const char * route, int block_sparse) {
@@ -461,6 +522,14 @@ void require_numerics(
         max_abs_diff(off.recovered, on.recovered));
 }
 
+void require_async_parity(const run_result & sync, const run_result & async) {
+    GGML_ASSERT(max_abs_diff(sync.dense_packed, async.dense_packed) <= 1.0e-6f);
+    GGML_ASSERT(max_abs_diff(sync.sparse_packed, async.sparse_packed) <= 2.0e-5f);
+    GGML_ASSERT(max_abs_diff(sync.rho, async.rho) <= 2.0e-5f);
+    GGML_ASSERT(max_abs_diff(sync.residual, async.residual) <= 2.0e-5f);
+    GGML_ASSERT(max_abs_diff(sync.recovered, async.recovered) <= 2.0e-5f);
+}
+
 } // namespace
 
 int main() {
@@ -469,7 +538,6 @@ int main() {
     env_guard htp_ops("SD_HTP_OPS", "1");
     env_guard htp_compute("SD_HTP_COMPUTE", "1");
     env_guard htp_attention("SD_HTP_ATTENTION", "1");
-    env_guard async_sidecar("SD_HTP_SPARSE_OPENCL_ASYNC", "0");
 
     ggml_backend_t backend = ggml_backend_htp_init();
     GGML_ASSERT(backend != nullptr);
@@ -527,12 +595,18 @@ int main() {
 
     const std::vector<float> dense_ref = reference_attention(q, k, v, false);
     const std::vector<float> sparse_ref = reference_attention(q, k, v, true);
-    const run_result off = run_graph(backend, fixture, false);
-    const run_result on = run_graph(backend, fixture, true);
+    const run_result off = run_graph(backend, fixture, false, false);
+    const run_result sync = run_graph(backend, fixture, true, false);
+    const run_result async = run_graph(backend, fixture, true, true);
     GGML_ASSERT(off.status == GGML_STATUS_SUCCESS);
-    GGML_ASSERT(on.status == GGML_STATUS_SUCCESS);
-    require_routes(off, on);
-    require_numerics(off, on, dense_ref, sparse_ref);
+    GGML_ASSERT(sync.status == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(async.status == GGML_STATUS_SUCCESS);
+    require_routes(off, sync);
+    require_routes(off, async);
+    require_numerics(off, sync, dense_ref, sparse_ref);
+    require_numerics(off, async, dense_ref, sparse_ref);
+    require_async_parity(sync, async);
+    require_async_event_order(async.trace);
 
     ggml_backend_buffer_free(fixture.buffer);
     ggml_free(fixture.ctx);
