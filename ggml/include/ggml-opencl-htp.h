@@ -143,8 +143,17 @@ GGML_BACKEND_API size_t ggml_backend_opencl_htp_graph_live_alias_count(
 GGML_BACKEND_API size_t ggml_backend_opencl_htp_graph_live_event_count(
     const ggml_opencl_htp_graph * graph);
 
+GGML_BACKEND_API size_t ggml_backend_opencl_htp_graph_pending_sparse_event_count(
+    const ggml_opencl_htp_graph * graph);
+
 // Diagnostic fault injection used by the shared-memory lifecycle test.
 GGML_BACKEND_API void ggml_backend_opencl_htp_graph_test_fail_next_event_cache(
+    ggml_opencl_htp_graph * graph);
+
+GGML_BACKEND_API void ggml_backend_opencl_htp_graph_test_fail_next_sparse_enqueue(
+    ggml_opencl_htp_graph * graph);
+
+GGML_BACKEND_API void ggml_backend_opencl_htp_graph_test_fail_next_sparse_wait(
     ggml_opencl_htp_graph * graph);
 
 #ifdef __cplusplus
