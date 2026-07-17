@@ -108,6 +108,21 @@ GGML_BACKEND_API enum ggml_opencl_htp_result ggml_backend_opencl_htp_graph_fill_
     size_t reason_capacity);
 
 GGML_BACKEND_API enum ggml_opencl_htp_result
+ggml_backend_opencl_htp_graph_compute_block_sparse_attn_async(
+    ggml_opencl_htp_graph * graph,
+    const struct ggml_tensor * node,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API enum ggml_opencl_htp_result
+ggml_backend_opencl_htp_graph_wait_for_tensor(
+    ggml_opencl_htp_graph * graph,
+    const struct ggml_tensor * producer,
+    bool * waited,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API enum ggml_opencl_htp_result
 ggml_backend_opencl_htp_graph_compute_block_sparse_attn_sync(
     ggml_opencl_htp_graph * graph,
     const struct ggml_tensor * node,

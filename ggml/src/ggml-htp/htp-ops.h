@@ -18,6 +18,9 @@ bool htp_ops_support_op(const struct ggml_tensor * dst);
 bool htp_ops_support_op_runtime(const struct ggml_tensor * dst);
 int  htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor * dst);
 bool htp_ops_opencl_routes_node(const struct ggml_tensor * dst);
+bool htp_ops_opencl_async_enabled(void);
+bool htp_ops_opencl_node_needs_wait(const struct ggml_tensor * dst);
+int  htp_ops_opencl_wait_node(const struct ggml_tensor * dst);
 int  htp_ops_opencl_compute_node(struct ggml_tensor * dst);
 
 #ifdef __cplusplus
