@@ -68,7 +68,7 @@ struct graph_fixture {
     ggml_tensor * rho = nullptr;
     ggml_tensor * residual = nullptr;
     ggml_tensor * recovered = nullptr;
-    ggml_backend_buffer_t buffer = nullptr;
+    ggml_gallocr_t allocator = nullptr;
 };
 
 struct run_result {
@@ -214,6 +214,11 @@ graph_fixture make_graph(ggml_backend_t backend) {
     ggml_set_name(f.v, "exact_rho_v");
     ggml_set_name(f.dense_mask, "exact_rho_dense_mask");
     ggml_set_name(f.sparse_mask, "exact_rho_sparse_index");
+    ggml_set_input(f.q_storage);
+    ggml_set_input(f.k_storage);
+    ggml_set_input(f.v_storage);
+    ggml_set_input(f.dense_mask);
+    ggml_set_input(f.sparse_mask);
 
     f.dense_packed = ggml_flash_attn_ext_with_lse(
         f.ctx, f.q, f.k, f.v, f.dense_mask, k_scale, 0.0f, 0.0f);
@@ -254,14 +259,64 @@ graph_fixture make_graph(ggml_backend_t backend) {
     ggml_set_name(f.residual, "exact_rho_residual");
     f.recovered = ggml_add(f.ctx, ggml_mul(f.ctx, sparse_o, f.rho), f.residual);
     ggml_set_name(f.recovered, "exact_rho_recovered");
+    ggml_set_output(f.dense_packed);
+    ggml_set_output(f.sparse_packed);
+    ggml_set_output(f.rho);
+    ggml_set_output(f.residual);
+    ggml_set_output(f.recovered);
 
     f.graph = ggml_new_graph(f.ctx);
     GGML_ASSERT(f.graph != nullptr);
     ggml_build_forward_expand(f.graph, f.recovered);
-    f.buffer = ggml_backend_alloc_ctx_tensors_from_buft(
-        f.ctx, ggml_backend_get_default_buffer_type(backend));
-    GGML_ASSERT(f.buffer != nullptr);
+    f.allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    GGML_ASSERT(f.allocator != nullptr);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(f.allocator, f.graph));
     return f;
+}
+
+void initialize_graph_inputs(graph_fixture & fixture) {
+    const std::vector<float> q = make_q();
+    std::vector<float> q_physical(q.size());
+    for (int64_t h = 0; h < k_heads; ++h) {
+        for (int64_t qt = 0; qt < k_q_tokens; ++qt) {
+            for (int64_t d = 0; d < k_head_dim; ++d) {
+                const size_t physical = static_cast<size_t>(
+                    d + k_head_dim * (h + k_heads * qt));
+                q_physical[physical] = q[q_index(d, qt, h)];
+            }
+        }
+    }
+
+    std::vector<ggml_fp16_t> k;
+    std::vector<ggml_fp16_t> v;
+    make_kv(k, v);
+    std::vector<ggml_fp16_t> k_physical(k.size());
+    std::vector<ggml_fp16_t> v_physical(v.size());
+    for (int64_t h = 0; h < k_kv_heads; ++h) {
+        for (int64_t kt = 0; kt < k_kv_tokens; ++kt) {
+            for (int64_t d = 0; d < k_head_dim; ++d) {
+                const size_t logical = kv_index(d, kt, h);
+                const size_t physical = static_cast<size_t>(
+                    d + k_head_dim * (h + k_kv_heads * kt));
+                k_physical[physical] = k[logical];
+                v_physical[physical] = v[logical];
+            }
+        }
+    }
+
+    const std::vector<ggml_fp16_t> dense_mask(
+        static_cast<size_t>(k_kv_tokens * k_q_tokens), ggml_fp32_to_fp16(0.0f));
+    const std::vector<int32_t> sparse_mask = { 0, 2 };
+    ggml_backend_tensor_set(
+        fixture.q_storage, q_physical.data(), 0, q_physical.size() * sizeof(float));
+    ggml_backend_tensor_set(
+        fixture.k_storage, k_physical.data(), 0, k_physical.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(
+        fixture.v_storage, v_physical.data(), 0, v_physical.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(
+        fixture.dense_mask, dense_mask.data(), 0, dense_mask.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(
+        fixture.sparse_mask, sparse_mask.data(), 0, sparse_mask.size() * sizeof(int32_t));
 }
 
 std::string capture_graph_compute(
@@ -305,6 +360,7 @@ run_result run_graph(
         bool async_enabled) {
     env_guard sidecar("SD_HTP_SPARSE_OPENCL", sidecar_enabled ? "1" : "0");
     env_guard async_sidecar("SD_HTP_SPARSE_OPENCL_ASYNC", async_enabled ? "1" : "0");
+    initialize_graph_inputs(f);
     run_result result;
     result.trace = capture_graph_compute(backend, f.graph, &result.status);
     if (result.status == GGML_STATUS_SUCCESS) {
@@ -409,7 +465,8 @@ struct packed_error {
 
 packed_error packed_max_abs_diff(
         const std::vector<float> & actual,
-        const std::vector<float> & reference) {
+        const std::vector<float> & reference,
+        const char * label) {
     GGML_ASSERT(actual.size() == reference.size());
     packed_error result;
     for (int64_t qt = 0; qt < k_q_tokens; ++qt) {
@@ -422,6 +479,16 @@ packed_error packed_max_abs_diff(
                     result.o,
                     std::fabs(actual[row + static_cast<size_t>(d)] -
                               reference[row + static_cast<size_t>(d)]));
+            }
+            if (!std::isfinite(actual[row + k_head_dim])) {
+                std::fprintf(
+                    stderr,
+                    "%s has non-finite LSE at qt=%lld head=%lld index=%zu value=%g\n",
+                    label,
+                    (long long) qt,
+                    (long long) h,
+                    row + k_head_dim,
+                    actual[row + k_head_dim]);
             }
             GGML_ASSERT(std::isfinite(actual[row + k_head_dim]));
             GGML_ASSERT(std::isfinite(reference[row + k_head_dim]));
@@ -461,10 +528,10 @@ void require_numerics(
         const std::vector<float> & dense_ref,
         const std::vector<float> & sparse_ref) {
     constexpr float opencl_tolerance = 2.0e-4f;
-    const packed_error off_dense_error = packed_max_abs_diff(off.dense_packed, dense_ref);
-    const packed_error off_sparse_error = packed_max_abs_diff(off.sparse_packed, sparse_ref);
-    const packed_error on_dense_error = packed_max_abs_diff(on.dense_packed, dense_ref);
-    const packed_error on_sparse_error = packed_max_abs_diff(on.sparse_packed, sparse_ref);
+    const packed_error off_dense_error = packed_max_abs_diff(off.dense_packed, dense_ref, "off dense");
+    const packed_error off_sparse_error = packed_max_abs_diff(off.sparse_packed, sparse_ref, "off sparse");
+    const packed_error on_dense_error = packed_max_abs_diff(on.dense_packed, dense_ref, "on dense");
+    const packed_error on_sparse_error = packed_max_abs_diff(on.sparse_packed, sparse_ref, "on sparse");
     std::fprintf(
         stderr,
         "exact-rho packed errors off[dense_o=%.9g dense_lse=%.9g sparse_o=%.9g sparse_lse=%.9g] "
@@ -530,6 +597,110 @@ void require_async_parity(const run_result & sync, const run_result & async) {
     GGML_ASSERT(max_abs_diff(sync.recovered, async.recovered) <= 2.0e-5f);
 }
 
+void require_task11_failure_modes(
+        ggml_backend_t backend,
+        graph_fixture & fixture,
+        const run_result & sync_reference) {
+    auto checkpoint = [](const char * name) {
+        std::printf("Task 11 failure mode: %s ts_us=%lld\n", name, (long long) ggml_time_us());
+        std::fflush(stdout);
+    };
+    checkpoint("preflight fallback begin");
+    {
+        env_guard reject_preflight("SD_HTP_SPARSE_OPENCL_TEST_REJECT_PREFLIGHT", "1");
+        env_guard strict("SD_HTP_SPARSE_OPENCL_STRICT", "0");
+        const run_result fallback = run_graph(backend, fixture, true, true);
+        GGML_ASSERT(fallback.status == GGML_STATUS_SUCCESS);
+        GGML_ASSERT(count_attention_trace(fallback.trace, "opencl", 1) == 0);
+        GGML_ASSERT(count_attention_trace(fallback.trace, "htp", 1) == 1);
+        GGML_ASSERT(count_attention_trace(fallback.trace, "htp", 0) == 1);
+    }
+    checkpoint("preflight fallback end; strict begin");
+    {
+        env_guard reject_preflight("SD_HTP_SPARSE_OPENCL_TEST_REJECT_PREFLIGHT", "1");
+        env_guard strict("SD_HTP_SPARSE_OPENCL_STRICT", "1");
+        const run_result strict_failure = run_graph(backend, fixture, true, true);
+        GGML_ASSERT(strict_failure.status == GGML_STATUS_FAILED);
+        GGML_ASSERT(count_attention_trace(strict_failure.trace, "opencl", 1) == 0);
+        GGML_ASSERT(count_attention_trace(strict_failure.trace, "htp", 1) == 0);
+    }
+    checkpoint("strict end; enqueue failure begin");
+    {
+        env_guard fail_enqueue("SD_HTP_SPARSE_OPENCL_TEST_FAIL_ENQUEUE", "1");
+        const run_result enqueue_failure = run_graph(backend, fixture, true, true);
+        GGML_ASSERT(enqueue_failure.status == GGML_STATUS_FAILED);
+        GGML_ASSERT(count_attention_trace(enqueue_failure.trace, "opencl", 1) == 1);
+        GGML_ASSERT(count_attention_trace(enqueue_failure.trace, "htp", 1) == 0);
+    }
+    checkpoint("enqueue failure end; wait failure begin");
+    {
+        env_guard fail_wait("SD_HTP_SPARSE_OPENCL_TEST_FAIL_WAIT", "1");
+        const run_result wait_failure = run_graph(backend, fixture, true, true);
+        GGML_ASSERT(wait_failure.status == GGML_STATUS_FAILED);
+        GGML_ASSERT(count_attention_trace(wait_failure.trace, "opencl", 1) == 1);
+        GGML_ASSERT(count_attention_trace(wait_failure.trace, "htp", 1) == 0);
+        GGML_ASSERT(count_attention_trace(wait_failure.trace, "htp", 0) == 1);
+    }
+    checkpoint("wait failure end; abort after enqueue begin");
+    {
+        env_guard abort_after_enqueue("SD_HTP_SPARSE_OPENCL_TEST_ABORT_AFTER_ENQUEUE", "1");
+        const run_result aborted = run_graph(backend, fixture, true, true);
+        GGML_ASSERT(aborted.status == GGML_STATUS_ABORTED);
+        GGML_ASSERT(count_attention_trace(aborted.trace, "opencl", 1) == 1);
+        GGML_ASSERT(count_attention_trace(aborted.trace, "htp", 1) == 0);
+    }
+    checkpoint("abort after enqueue end; stress begin");
+
+    {
+        env_guard stress_trace("SD_HTP_SPARSE_OPENCL_TRACE", "0");
+        constexpr int stress_iterations = 100;
+        std::printf("Task 11 abort/rebuild recovery stress: begin %d iterations\n", stress_iterations);
+        std::fflush(stdout);
+        int64_t checkpoint_begin_us = ggml_time_us();
+        double checkpoint_abort_ms = 0.0;
+        double checkpoint_recovery_ms = 0.0;
+        for (int iteration = 0; iteration < stress_iterations; ++iteration) {
+            const int64_t iteration_begin_us = ggml_time_us();
+            graph_fixture rebuilt = make_graph(backend);
+            {
+                env_guard abort_after_enqueue(
+                    "SD_HTP_SPARSE_OPENCL_TEST_ABORT_AFTER_ENQUEUE", "1");
+                const run_result aborted = run_graph(backend, rebuilt, true, true);
+                GGML_ASSERT(aborted.status == GGML_STATUS_ABORTED);
+            }
+            const int64_t abort_end_us = ggml_time_us();
+            const bool verify_recovery =
+                (iteration + 1) % 10 == 0 || iteration + 1 == stress_iterations;
+            if (verify_recovery) {
+                const run_result recovered = run_graph(backend, rebuilt, true, true);
+                GGML_ASSERT(recovered.status == GGML_STATUS_SUCCESS);
+                GGML_ASSERT(max_abs_diff(
+                    recovered.recovered, sync_reference.recovered) <= 2.0e-5f);
+            }
+            ggml_gallocr_free(rebuilt.allocator);
+            ggml_free(rebuilt.ctx);
+            const int64_t iteration_end_us = ggml_time_us();
+            checkpoint_abort_ms += (abort_end_us - iteration_begin_us) / 1000.0;
+            checkpoint_recovery_ms +=
+                verify_recovery ? (iteration_end_us - abort_end_us) / 1000.0 : 0.0;
+            if ((iteration + 1) % 10 == 0 || iteration + 1 == stress_iterations) {
+                std::printf(
+                    "Task 11 abort/rebuild recovery stress: %d/%d "
+                    "wall_ms=%.3f abort_ms=%.3f recovery_ms=%.3f\n",
+                    iteration + 1,
+                    stress_iterations,
+                    (iteration_end_us - checkpoint_begin_us) / 1000.0,
+                    checkpoint_abort_ms,
+                    checkpoint_recovery_ms);
+                std::fflush(stdout);
+                checkpoint_begin_us = iteration_end_us;
+                checkpoint_abort_ms = 0.0;
+                checkpoint_recovery_ms = 0.0;
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -553,45 +724,9 @@ int main() {
 
     graph_fixture fixture = make_graph(backend);
     const std::vector<float> q = make_q();
-    std::vector<float> q_physical(q.size());
-    for (int64_t h = 0; h < k_heads; ++h) {
-        for (int64_t qt = 0; qt < k_q_tokens; ++qt) {
-            for (int64_t d = 0; d < k_head_dim; ++d) {
-                const size_t physical = static_cast<size_t>(
-                    d + k_head_dim * (h + k_heads * qt));
-                q_physical[physical] = q[q_index(d, qt, h)];
-            }
-        }
-    }
     std::vector<ggml_fp16_t> k;
     std::vector<ggml_fp16_t> v;
     make_kv(k, v);
-    std::vector<ggml_fp16_t> k_physical(k.size());
-    std::vector<ggml_fp16_t> v_physical(v.size());
-    for (int64_t h = 0; h < k_kv_heads; ++h) {
-        for (int64_t kt = 0; kt < k_kv_tokens; ++kt) {
-            for (int64_t d = 0; d < k_head_dim; ++d) {
-                const size_t logical = kv_index(d, kt, h);
-                const size_t physical = static_cast<size_t>(
-                    d + k_head_dim * (h + k_kv_heads * kt));
-                k_physical[physical] = k[logical];
-                v_physical[physical] = v[logical];
-            }
-        }
-    }
-    std::vector<ggml_fp16_t> dense_mask(
-        static_cast<size_t>(k_kv_tokens * k_q_tokens), ggml_fp32_to_fp16(0.0f));
-    std::vector<int32_t> sparse_mask = { 0, 2 };
-    ggml_backend_tensor_set(
-        fixture.q_storage, q_physical.data(), 0, q_physical.size() * sizeof(float));
-    ggml_backend_tensor_set(
-        fixture.k_storage, k_physical.data(), 0, k_physical.size() * sizeof(ggml_fp16_t));
-    ggml_backend_tensor_set(
-        fixture.v_storage, v_physical.data(), 0, v_physical.size() * sizeof(ggml_fp16_t));
-    ggml_backend_tensor_set(
-        fixture.dense_mask, dense_mask.data(), 0, dense_mask.size() * sizeof(ggml_fp16_t));
-    ggml_backend_tensor_set(
-        fixture.sparse_mask, sparse_mask.data(), 0, sparse_mask.size() * sizeof(int32_t));
 
     const std::vector<float> dense_ref = reference_attention(q, k, v, false);
     const std::vector<float> sparse_ref = reference_attention(q, k, v, true);
@@ -607,8 +742,9 @@ int main() {
     require_numerics(off, async, dense_ref, sparse_ref);
     require_async_parity(sync, async);
     require_async_event_order(async.trace);
+    require_task11_failure_modes(backend, fixture, sync);
 
-    ggml_backend_buffer_free(fixture.buffer);
+    ggml_gallocr_free(fixture.allocator);
     ggml_free(fixture.ctx);
     ggml_backend_free(backend);
     ggml_backend_htp_set_hybrid_enabled(false);

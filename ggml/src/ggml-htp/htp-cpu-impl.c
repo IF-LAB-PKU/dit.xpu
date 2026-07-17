@@ -3285,8 +3285,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
     // 如果某个 HTP op 已经失败，当前节点同步完成后立刻停止后续节点，避免错误 dst 继续污染整张图。
     for (int node_n = 0; node_n < cgraph->n_nodes &&
-            atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n &&
-            tp->ec == GGML_STATUS_SUCCESS; node_n++) {
+            atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
         if (ggml_op_is_empty(node->op)) {
@@ -3346,6 +3345,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_barrier(state->threadpool);
         } else if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+        }
+        if (node_n + 1 < cgraph->n_nodes && tp->ec != GGML_STATUS_SUCCESS) {
+            break;
         }
     }
 

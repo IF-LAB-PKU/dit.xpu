@@ -88,6 +88,8 @@ struct ggml_opencl_htp_graph {
     char finish_reason[256] = {};
     bool cleanup_failed = false;
     bool test_fail_next_event_cache = false;
+    bool test_fail_next_sparse_enqueue = false;
+    bool test_fail_next_sparse_wait = false;
 };
 
 namespace {
@@ -1668,6 +1670,13 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_a
             "clEnqueueNDRangeKernel failed (error %d, no event)", err);
     }
 
+    if (graph->test_fail_next_sparse_enqueue) {
+        graph->test_fail_next_sparse_enqueue = false;
+        return fail_submitted_graph(
+            graph, event, "injected sparse enqueue failure",
+            CL_INVALID_OPERATION, reason, reason_capacity);
+    }
+
     try {
         graph->pending_events.push_back({ node, event });
     } catch (...) {
@@ -1716,6 +1725,13 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_wait_for_tensor(
     if (pending == graph->pending_events.end()) {
         set_reason(reason, reason_capacity, "ok");
         return GGML_OPENCL_HTP_OK;
+    }
+
+    if (graph->test_fail_next_sparse_wait) {
+        graph->test_fail_next_sparse_wait = false;
+        return fail_graph(
+            graph, reason, reason_capacity,
+            "injected sparse wait failure after submission");
     }
 
     trace_sidecar_event("gpu_sparse_wait_begin", producer);
@@ -1792,8 +1808,27 @@ size_t ggml_backend_opencl_htp_graph_live_event_count(const ggml_opencl_htp_grap
     return graph != nullptr ? graph->events.size() + graph->pending_events.size() : 0;
 }
 
+size_t ggml_backend_opencl_htp_graph_pending_sparse_event_count(
+        const ggml_opencl_htp_graph * graph) {
+    return graph != nullptr ? graph->pending_events.size() : 0;
+}
+
 void ggml_backend_opencl_htp_graph_test_fail_next_event_cache(ggml_opencl_htp_graph * graph) {
     if (graph != nullptr && graph->state == ggml_opencl_htp_graph_state::active) {
         graph->test_fail_next_event_cache = true;
+    }
+}
+
+void ggml_backend_opencl_htp_graph_test_fail_next_sparse_enqueue(
+        ggml_opencl_htp_graph * graph) {
+    if (graph != nullptr && graph->state == ggml_opencl_htp_graph_state::active) {
+        graph->test_fail_next_sparse_enqueue = true;
+    }
+}
+
+void ggml_backend_opencl_htp_graph_test_fail_next_sparse_wait(
+        ggml_opencl_htp_graph * graph) {
+    if (graph != nullptr && graph->state == ggml_opencl_htp_graph_state::active) {
+        graph->test_fail_next_sparse_wait = true;
     }
 }

@@ -623,6 +623,10 @@ static ggml_opencl_htp_result ggml_backend_htp_opencl_preflight(
         std::snprintf(reason, reason_capacity, "OpenCL sidecar is unavailable");
         return GGML_OPENCL_HTP_UNSUPPORTED;
     }
+    if (ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_TEST_REJECT_PREFLIGHT")) {
+        std::snprintf(reason, reason_capacity, "injected OpenCL preflight rejection");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
 
     std::vector<ggml_opencl_htp_import_descriptor> descriptors;
     try {
@@ -671,6 +675,12 @@ static ggml_opencl_htp_result ggml_backend_htp_opencl_preflight(
         }
 
         // No worker exists yet. Publish the complete frozen set and active graph as one session.
+        if (ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_TEST_FAIL_ENQUEUE")) {
+            ggml_backend_opencl_htp_graph_test_fail_next_sparse_enqueue(graph);
+        }
+        if (ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_TEST_FAIL_WAIT")) {
+            ggml_backend_opencl_htp_graph_test_fail_next_sparse_wait(graph);
+        }
         ctx->sparse_opencl_routed_nodes.swap(routed_nodes);
         ctx->sparse_opencl_graph = graph;
     } else {
@@ -700,6 +710,12 @@ static bool ggml_backend_htp_opencl_finish(ggml_backend_htp_context * ctx) {
         return false;
     }
     return true;
+}
+
+static bool ggml_backend_htp_test_abort_after_sparse_enqueue(void * data) {
+    auto * ctx = static_cast<ggml_backend_htp_context *>(data);
+    return ctx != nullptr && ctx->sparse_opencl_graph != nullptr &&
+        ggml_backend_opencl_htp_graph_pending_sparse_event_count(ctx->sparse_opencl_graph) > 0;
 }
 #endif
 
@@ -765,6 +781,21 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
                 (int) preflight,
                 ctx->sparse_opencl_routed_nodes.size(),
                 preflight_reason[0] != '\0' ? preflight_reason : "unknown");
+        }
+        if (preflight == GGML_OPENCL_HTP_ERROR ||
+            (preflight != GGML_OPENCL_HTP_OK &&
+             ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_STRICT"))) {
+            std::fprintf(
+                stderr,
+                "ggml-htp: OpenCL sidecar preflight rejected in %s mode: %s\n",
+                preflight == GGML_OPENCL_HTP_ERROR ? "error" : "strict",
+                preflight_reason[0] != '\0' ? preflight_reason : "unknown error");
+            return GGML_STATUS_FAILED;
+        }
+        if (preflight == GGML_OPENCL_HTP_OK &&
+            ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_TEST_ABORT_AFTER_ENQUEUE")) {
+            cplan.abort_callback = ggml_backend_htp_test_abort_after_sparse_enqueue;
+            cplan.abort_callback_data = ctx;
         }
 #endif
         enum ggml_status status = ggml_graph_compute_htp_hybrid(cgraph, &cplan);
