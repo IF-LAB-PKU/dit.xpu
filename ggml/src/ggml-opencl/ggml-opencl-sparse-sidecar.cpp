@@ -775,6 +775,7 @@ struct ggml_opencl_htp_sparse_dispatch {
     cl_int batch = 0;
     cl_int mask_format = 0;
     cl_int max_kept_blocks = 0;
+    int graph_index = -1;
 };
 
 ggml_opencl_htp_result unsupported_sparse_node(
@@ -1098,6 +1099,56 @@ bool is_sparse_route_candidate(const ggml_tensor * node) {
     return std::isfinite(scale) && max_bias == 0.0f && logit_softcap == 0.0f;
 }
 
+bool is_view_only_node(const ggml_tensor * tensor) {
+    return tensor != nullptr &&
+        (tensor->op == GGML_OP_VIEW || tensor->op == GGML_OP_RESHAPE ||
+         tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_TRANSPOSE);
+}
+
+bool reaches_producer_through_views(
+    const ggml_tensor * tensor,
+    const ggml_tensor * producer) {
+    for (size_t depth = 0; tensor != nullptr && depth < 64; ++depth) {
+        if (tensor == producer) {
+            return true;
+        }
+        if (!is_view_only_node(tensor)) {
+            return false;
+        }
+        tensor = tensor->src[0] != nullptr ? tensor->src[0] : tensor->view_src;
+    }
+    return false;
+}
+
+bool output_lifetime_ends_before(
+    const ggml_cgraph * cgraph,
+    const ggml_tensor * producer,
+    int producer_index,
+    int reuse_index) {
+    bool has_real_consumer = false;
+    const int node_count = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
+    for (int i = producer_index + 1; i < node_count; ++i) {
+        const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), i);
+        if (node == nullptr || ggml_op_is_empty(node->op) ||
+            (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        bool consumes_producer = false;
+        for (int source = 0; source < GGML_MAX_SRC; ++source) {
+            consumes_producer = consumes_producer ||
+                reaches_producer_through_views(node->src[source], producer);
+        }
+        if (!consumes_producer) {
+            continue;
+        }
+        has_real_consumer = true;
+        if (i >= reuse_index) {
+            return false;
+        }
+    }
+    return has_real_consumer;
+}
+
 } // namespace
 
 ggml_opencl_htp_result ggml_backend_opencl_htp_graph_create(
@@ -1245,6 +1296,7 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
                 return validation == GGML_OPENCL_HTP_ERROR ?
                     GGML_OPENCL_HTP_ERROR : GGML_OPENCL_HTP_UNSUPPORTED;
             }
+            dispatch.graph_index = i;
             dispatches.push_back(dispatch);
             routed_nodes.push_back(node);
 
@@ -1357,7 +1409,12 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
         }
     }
 
-    std::vector<ggml_opencl_htp_tensor_binding> output_bindings;
+    struct routed_output_binding {
+        ggml_opencl_htp_tensor_binding binding;
+        const ggml_tensor * producer = nullptr;
+        int graph_index = -1;
+    };
+    std::vector<routed_output_binding> output_bindings;
     try {
         output_bindings.reserve(dispatches.size());
         for (const ggml_opencl_htp_sparse_dispatch & dispatch : dispatches) {
@@ -1372,14 +1429,16 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
                     "sparse binding preflight failed: %s", binding_reason);
                 return reject_preflight(GGML_OPENCL_HTP_UNSUPPORTED, failure_reason);
             }
-            for (const ggml_opencl_htp_tensor_binding & prior : output_bindings) {
-                if (bindings_overlap(bindings.output, prior)) {
+            for (const routed_output_binding & prior : output_bindings) {
+                if (bindings_overlap(bindings.output, prior.binding) &&
+                    !output_lifetime_ends_before(
+                        cgraph, prior.producer, prior.graph_index, dispatch.graph_index)) {
                     return reject_preflight(
                         GGML_OPENCL_HTP_UNSUPPORTED,
                         "routed sparse attention output spans overlap");
                 }
             }
-            output_bindings.push_back(bindings.output);
+            output_bindings.push_back({ bindings.output, dispatch.output, dispatch.graph_index });
         }
         prepared->routed_nodes = std::move(routed_nodes);
     } catch (...) {
