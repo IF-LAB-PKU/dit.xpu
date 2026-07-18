@@ -828,6 +828,41 @@ void run_case(
         expect_preflight_unsupported(
             "cross-output overlap", overlapping_outputs_graph, descriptors, "output spans overlap");
 
+        ggml_tensor consumed_output = *q;
+        consumed_output.op = GGML_OP_DUP;
+        consumed_output.flags |= GGML_TENSOR_FLAG_COMPUTE;
+        ggml_tensor packed_view = *packed;
+        packed_view.op = GGML_OP_VIEW;
+        packed_view.src[0] = packed;
+        packed_view.view_src = packed;
+        consumed_output.src[0] = &packed_view;
+        for (int source = 1; source < GGML_MAX_SRC; ++source) {
+            consumed_output.src[source] = nullptr;
+        }
+        ggml_tensor reused_output = *packed;
+        ggml_cgraph * lifetime_safe_overlap_graph = ggml_new_graph(ctx);
+        ggml_graph_add_node(lifetime_safe_overlap_graph, packed);
+        ggml_graph_add_node(lifetime_safe_overlap_graph, &packed_view);
+        ggml_graph_add_node(lifetime_safe_overlap_graph, &consumed_output);
+        ggml_graph_add_node(lifetime_safe_overlap_graph, &reused_output);
+        ggml_opencl_htp_graph * lifetime_safe_overlap_session = nullptr;
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_preflight(
+            sidecar, lifetime_safe_overlap_graph, descriptors.data(), descriptors.size(),
+            &lifetime_safe_overlap_session, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+        GGML_ASSERT(lifetime_safe_overlap_session != nullptr);
+        GGML_ASSERT(
+            ggml_backend_opencl_htp_graph_routed_node_count(lifetime_safe_overlap_session) == 2);
+        ggml_backend_opencl_htp_graph_free(&lifetime_safe_overlap_session);
+
+        ggml_cgraph * lifetime_unsafe_overlap_graph = ggml_new_graph(ctx);
+        ggml_graph_add_node(lifetime_unsafe_overlap_graph, packed);
+        ggml_graph_add_node(lifetime_unsafe_overlap_graph, &reused_output);
+        ggml_graph_add_node(lifetime_unsafe_overlap_graph, &packed_view);
+        ggml_graph_add_node(lifetime_unsafe_overlap_graph, &consumed_output);
+        expect_preflight_unsupported(
+            "overlap before last consumer", lifetime_unsafe_overlap_graph, descriptors,
+            "output spans overlap");
+
         ggml_tensor * second_output = ggml_flash_attn_ext_with_lse(
             ctx, q, k, v, mask, scale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(second_output, GGML_PREC_F32);
