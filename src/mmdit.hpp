@@ -267,7 +267,9 @@ __STATIC_INLINE__ ggml_tensor* mmdit_residual_attention(GGMLRunnerContext* ctx,
                                   cached_residual,
                                   rho_cache_name.empty() ? nullptr : rho_cache_name.c_str(),
                                   cached_rho,
-                                  &ctx->cache_tensor);
+                                  &ctx->cache_tensor,
+                                  ctx->block_sparse_token_h,
+                                  ctx->block_sparse_token_w);
 }
 
 __STATIC_INLINE__ ggml_tensor* modulate(ggml_context* ctx,
@@ -900,11 +902,17 @@ public:
             sd::ggml_graph_cut::mark_graph_cut(context, "mmdit.prelude", "context");
         }
 
+        const int previous_block_sparse_token_h = ctx->block_sparse_token_h;
+        const int previous_block_sparse_token_w = ctx->block_sparse_token_w;
+        ctx->block_sparse_token_h = static_cast<int>(token_h);
+        ctx->block_sparse_token_w = static_cast<int>(token_w);
         x = forward_core_with_concat(ctx,
                                      x,
                                      c,
                                      context,
                                      skip_layers);  // (N, H*W, patch_size ** 2 * out_channels)
+        ctx->block_sparse_token_h = previous_block_sparse_token_h;
+        ctx->block_sparse_token_w = previous_block_sparse_token_w;
         x = sd_patch_major_reorder_node(ctx->ggml_ctx,
                                         x,
                                         static_cast<int>(token_h),

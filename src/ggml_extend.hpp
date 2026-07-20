@@ -108,6 +108,10 @@ __STATIC_INLINE__ bool sd_htp_block_sparse_score_enabled() {
     return sd_htp_block_sparse_score_enabled(sd_htp_block_sparse_keep_ratio());
 }
 
+__STATIC_INLINE__ bool sd_htp_block_sparse_direct_halo_enabled(float keep_ratio, bool patch_halo) {
+    return keep_ratio == 0.0f && patch_halo;
+}
+
 __STATIC_INLINE__ int sd_htp_block_sparse_step_shift(bool enabled, int sparse_step_index) {
     if (!enabled || sparse_step_index <= 0) {
         return 0;
@@ -463,6 +467,129 @@ __STATIC_INLINE__ void ggml_ext_block_sparse_promote_16_mask_to_32_index(const i
             }
             GGML_ASSERT(kept < max_kept32);
             row[kept++] = kb32;
+        }
+    }
+}
+
+__STATIC_INLINE__ bool ggml_ext_block_sparse_fill_direct_halo_index_32(int32_t* index32,
+                                                                        int max_kept32,
+                                                                        int qo_len,
+                                                                        int kv_len,
+                                                                        int protected_start,
+                                                                        int protected_len,
+                                                                        int token_h,
+                                                                        int token_w,
+                                                                        int n_heads,
+                                                                        int n_kv_heads,
+                                                                        bool center_sink) {
+    if (index32 == nullptr || max_kept32 <= 0 || qo_len <= 0 || kv_len <= 0 ||
+        token_h <= 0 || token_w <= 0 || token_h % 4 != 0 || token_w % 8 != 0 ||
+        n_heads <= 0 || n_kv_heads <= 0 || n_heads % n_kv_heads != 0) {
+        return false;
+    }
+
+    protected_start = std::max(0, protected_start);
+    protected_len = std::max(0, protected_len);
+    const int image_tokens = token_h * token_w;
+    const int protected_end = protected_start + protected_len;
+    const int covered_tokens = protected_len > 0 ? protected_end : image_tokens;
+    if ((protected_len > 0 && protected_start != image_tokens) ||
+        (protected_len == 0 && protected_start != 0) ||
+        qo_len != covered_tokens || kv_len != covered_tokens ||
+        image_tokens % SD_HTP_BLOCK_SPARSE_MASK_BLOCK != 0) {
+        return false;
+    }
+
+    const int grid_h = token_h / 4;
+    const int grid_w = token_w / 8;
+    const int image_blocks = grid_h * grid_w;
+    const int q_blocks_per_head = (qo_len + SD_HTP_BLOCK_SPARSE_MASK_BLOCK - 1) /
+                                  SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    const int k_blocks_per_head = (kv_len + SD_HTP_BLOCK_SPARSE_MASK_BLOCK - 1) /
+                                  SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    if (image_blocks > q_blocks_per_head || image_blocks > k_blocks_per_head ||
+        max_kept32 < k_blocks_per_head) {
+        return false;
+    }
+
+    const int n_q_blocks = n_heads * q_blocks_per_head;
+    std::fill(index32, index32 + size_t(n_q_blocks) * size_t(max_kept32), -1);
+    const int gqa = n_heads / n_kv_heads;
+    const int protected_first_block = protected_start / SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    const int protected_end_block = (protected_end + SD_HTP_BLOCK_SPARSE_MASK_BLOCK - 1) /
+                                    SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    const int center_y0 = (grid_h - 1) / 2;
+    const int center_y1 = grid_h / 2;
+    const int center_x0 = (grid_w - 1) / 2;
+    const int center_x1 = grid_w / 2;
+    std::vector<uint8_t> keep(size_t(k_blocks_per_head), 0);
+    for (int qb = 0; qb < n_q_blocks; ++qb) {
+        const int q_head = qb / q_blocks_per_head;
+        const int q_block_in_head = qb % q_blocks_per_head;
+        const int kv_head = q_head / gqa;
+        int32_t* row = index32 + size_t(qb) * size_t(max_kept32);
+        int kept = 0;
+        if (protected_len > 0 &&
+            q_block_in_head >= protected_first_block && q_block_in_head < protected_end_block) {
+            for (int kb = 0; kb < k_blocks_per_head; ++kb) {
+                row[kept++] = kv_head * k_blocks_per_head + kb;
+            }
+            continue;
+        }
+        if (q_block_in_head >= image_blocks) {
+            continue;
+        }
+
+        const int qy = q_block_in_head / grid_w;
+        const int qx = q_block_in_head % grid_w;
+        std::fill(keep.begin(), keep.end(), 0);
+        for (int ky = std::max(0, qy - 1); ky <= std::min(grid_h - 1, qy + 1); ++ky) {
+            for (int kx = std::max(0, qx - 1); kx <= std::min(grid_w - 1, qx + 1); ++kx) {
+                keep[size_t(ky * grid_w + kx)] = 1;
+            }
+        }
+        if (center_sink) {
+            for (int ky = center_y0; ky <= center_y1; ++ky) {
+                for (int kx = center_x0; kx <= center_x1; ++kx) {
+                    keep[size_t(ky * grid_w + kx)] = 1;
+                }
+            }
+        }
+        for (int kb = protected_first_block; protected_len > 0 && kb < protected_end_block; ++kb) {
+            keep[size_t(kb)] = 1;
+        }
+        for (int kb = 0; kb < k_blocks_per_head; ++kb) {
+            if (keep[size_t(kb)] != 0) {
+                row[kept++] = kv_head * k_blocks_per_head + kb;
+            }
+        }
+    }
+    return true;
+}
+
+__STATIC_INLINE__ void ggml_ext_block_sparse_fill_full_index_32(int32_t* index32,
+                                                                 int max_kept32,
+                                                                 int qo_len,
+                                                                 int kv_len,
+                                                                 int n_heads,
+                                                                 int n_kv_heads) {
+    GGML_ASSERT(index32 != nullptr && max_kept32 > 0);
+    GGML_ASSERT(qo_len > 0 && kv_len > 0);
+    GGML_ASSERT(n_heads > 0 && n_kv_heads > 0 && n_heads % n_kv_heads == 0);
+    const int q_blocks_per_head = (qo_len + SD_HTP_BLOCK_SPARSE_MASK_BLOCK - 1) /
+                                  SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    const int k_blocks_per_head = (kv_len + SD_HTP_BLOCK_SPARSE_MASK_BLOCK - 1) /
+                                  SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    GGML_ASSERT(max_kept32 >= k_blocks_per_head);
+    const int n_q_blocks = n_heads * q_blocks_per_head;
+    const int gqa = n_heads / n_kv_heads;
+    std::fill(index32, index32 + size_t(n_q_blocks) * size_t(max_kept32), -1);
+    for (int qb = 0; qb < n_q_blocks; ++qb) {
+        const int q_head = qb / q_blocks_per_head;
+        const int kv_head = q_head / gqa;
+        int32_t* row = index32 + size_t(qb) * size_t(max_kept32);
+        for (int kb = 0; kb < k_blocks_per_head; ++kb) {
+            row[kb] = kv_head * k_blocks_per_head + kb;
         }
     }
 }
@@ -1928,6 +2055,16 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_structural_index_32_node(gg
                                                                               int n_kv_heads,
                                                                               bool patch_halo,
                                                                               bool center_sink);
+__STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_direct_halo_index_32_node(ggml_context* ctx,
+                                                                                int qo_len,
+                                                                                int kv_len,
+                                                                                int protected_start,
+                                                                                int protected_len,
+                                                                                int token_h,
+                                                                                int token_w,
+                                                                                int n_heads,
+                                                                                int n_kv_heads,
+                                                                                bool center_sink);
 __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_lse_node(ggml_context* ctx,
                                                            ggml_tensor* q,
                                                            ggml_tensor* k,
@@ -1963,7 +2100,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                       ggml_tensor* block_sparse_cached_residual = nullptr,
                                                       const char* block_sparse_residual_rho_cache_name = nullptr,
                                                       ggml_tensor* block_sparse_cached_rho = nullptr,
-                                                      const std::function<void(const std::string&, ggml_tensor*)>* block_sparse_cache_tensor = nullptr) {  // avoid overflow
+                                                      const std::function<void(const std::string&, ggml_tensor*)>* block_sparse_cache_tensor = nullptr,
+                                                      int block_sparse_token_h = 0,
+                                                      int block_sparse_token_w = 0) {  // avoid overflow
     int64_t L_q;
     int64_t L_k;
     int64_t C;
@@ -2199,8 +2338,21 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             if (block_sparse_force_full_keep || block_sparse_keep_ratio == 1.0f) {
                 block_mask = ggml_ext_block_sparse_full_keep_mask_node(ctx, n_q_blocks, n_k_blocks);
                 block_mask_format = GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX;
+            } else if (sd_htp_block_sparse_direct_halo_enabled(block_sparse_keep_ratio,
+                                                                block_sparse_patch_halo)) {
+                block_mask = ggml_ext_block_sparse_direct_halo_index_32_node(ctx,
+                                                                             static_cast<int>(L_q),
+                                                                             static_cast<int>(L_k),
+                                                                             protected_start,
+                                                                             protected_len,
+                                                                             block_sparse_token_h,
+                                                                             block_sparse_token_w,
+                                                                             static_cast<int>(n_head),
+                                                                             static_cast<int>(n_kv_head),
+                                                                             block_sparse_center_sink);
+                block_mask_format = GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX;
             } else if (!sd_htp_block_sparse_score_enabled(block_sparse_keep_ratio)) {
-                if (block_sparse_patch_halo || block_sparse_center_sink) {
+                if (block_sparse_center_sink) {
                     block_mask = ggml_ext_block_sparse_structural_index_32_node(ctx,
                                                                                 static_cast<int>(L_q),
                                                                                 static_cast<int>(L_k),
@@ -2208,7 +2360,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                                                 protected_len,
                                                                                 static_cast<int>(n_head),
                                                                                 static_cast<int>(n_kv_head),
-                                                                                block_sparse_patch_halo,
+                                                                                false,
                                                                                 block_sparse_center_sink);
                     block_mask_format = GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX;
                 } else {
@@ -3475,6 +3627,18 @@ struct ggml_ext_block_sparse_structural_index_32_params {
     int center_sink;
 };
 
+struct ggml_ext_block_sparse_direct_halo_index_32_params {
+    int qo_len;
+    int kv_len;
+    int protected_start;
+    int protected_len;
+    int token_h;
+    int token_w;
+    int n_heads;
+    int n_kv_heads;
+    int center_sink;
+};
+
 __STATIC_INLINE__ void ggml_ext_block_sparse_full_keep_mask_custom(ggml_tensor* dst, int ith, int nth, void* userdata) {
     SD_UNUSED(nth);
     SD_UNUSED(userdata);
@@ -3644,6 +3808,94 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_structural_index_32_node(gg
                                          nullptr,
                                          0,
                                          ggml_ext_block_sparse_structural_index_32_custom,
+                                         1,
+                                         params);
+    ggml_set_name(result, "block_sparse_index");
+    return result;
+}
+
+__STATIC_INLINE__ void ggml_ext_block_sparse_direct_halo_index_32_custom(ggml_tensor* dst,
+                                                                          int ith,
+                                                                          int nth,
+                                                                          void* userdata) {
+    SD_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+
+    const auto* params = static_cast<const ggml_ext_block_sparse_direct_halo_index_32_params*>(userdata);
+    GGML_ASSERT(params != nullptr);
+    GGML_ASSERT(dst != nullptr && dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->src[0] == nullptr);
+    const bool direct = ggml_ext_block_sparse_fill_direct_halo_index_32(
+        static_cast<int32_t*>(dst->data),
+        static_cast<int>(dst->ne[0]),
+        params->qo_len,
+        params->kv_len,
+        params->protected_start,
+        params->protected_len,
+        params->token_h,
+        params->token_w,
+        params->n_heads,
+        params->n_kv_heads,
+        params->center_sink != 0);
+    if (!direct) {
+        ggml_ext_block_sparse_fill_full_index_32(static_cast<int32_t*>(dst->data),
+                                                  static_cast<int>(dst->ne[0]),
+                                                  params->qo_len,
+                                                  params->kv_len,
+                                                  params->n_heads,
+                                                  params->n_kv_heads);
+        if (sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
+            std::fprintf(stderr,
+                         "block_sparse_direct_halo fallback=full token_h=%d token_w=%d qo_len=%d kv_len=%d\n",
+                         params->token_h,
+                         params->token_w,
+                         params->qo_len,
+                         params->kv_len);
+        }
+    }
+}
+
+__STATIC_INLINE__ ggml_tensor* ggml_ext_block_sparse_direct_halo_index_32_node(ggml_context* ctx,
+                                                                                int qo_len,
+                                                                                int kv_len,
+                                                                                int protected_start,
+                                                                                int protected_len,
+                                                                                int token_h,
+                                                                                int token_w,
+                                                                                int n_heads,
+                                                                                int n_kv_heads,
+                                                                                bool center_sink) {
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(qo_len > 0 && kv_len > 0);
+    GGML_ASSERT(n_heads > 0 && n_kv_heads > 0);
+
+    const int q_blocks_per_head = (qo_len + SD_HTP_BLOCK_SPARSE_MASK_BLOCK - 1) /
+                                  SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    const int k_blocks_per_head = (kv_len + SD_HTP_BLOCK_SPARSE_MASK_BLOCK - 1) /
+                                  SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    auto* params = static_cast<ggml_ext_block_sparse_direct_halo_index_32_params*>(
+        ggml_new_buffer(ctx, sizeof(ggml_ext_block_sparse_direct_halo_index_32_params)));
+    params->qo_len = qo_len;
+    params->kv_len = kv_len;
+    params->protected_start = std::max(0, protected_start);
+    params->protected_len = std::max(0, protected_len);
+    params->token_h = token_h;
+    params->token_w = token_w;
+    params->n_heads = n_heads;
+    params->n_kv_heads = n_kv_heads;
+    params->center_sink = center_sink ? 1 : 0;
+
+    ggml_tensor* result = ggml_custom_4d(ctx,
+                                         GGML_TYPE_I32,
+                                         k_blocks_per_head,
+                                         n_heads * q_blocks_per_head,
+                                         1,
+                                         1,
+                                         nullptr,
+                                         0,
+                                         ggml_ext_block_sparse_direct_halo_index_32_custom,
                                          1,
                                          params);
     ggml_set_name(result, "block_sparse_index");
@@ -4228,6 +4480,8 @@ struct GGMLRunnerContext {
     bool block_sparse_residual_exact_rho                             = false;
     int block_sparse_residual_branch_index                           = 0;
     int block_sparse_residual_attention_index                        = 0;
+    int block_sparse_token_h                                         = 0;
+    int block_sparse_token_w                                         = 0;
     std::shared_ptr<WeightAdapter> weight_adapter                    = nullptr;
     std::vector<std::pair<ggml_tensor*, std::string>>* debug_tensors = nullptr;
     std::function<ggml_tensor*(const std::string&)> get_cache_tensor;
