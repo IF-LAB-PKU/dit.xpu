@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <numeric>
 #include <vector>
 
 static ggml_context * make_ctx(size_t tensor_count, size_t extra = 256 * 1024) {
@@ -170,6 +171,17 @@ static std::vector<int32_t> read_i32_tensor(const ggml_tensor * t) {
     std::vector<int32_t> data(size_t(ggml_nelements(t)));
     ggml_backend_tensor_get(t, data.data(), 0, data.size() * sizeof(int32_t));
     return data;
+}
+
+static std::vector<int32_t> read_index_row(const std::vector<int32_t> & index,
+                                           int max_kept,
+                                           int row) {
+    std::vector<int32_t> result;
+    const int32_t * row_data = index.data() + size_t(row) * size_t(max_kept);
+    for (int i = 0; i < max_kept && row_data[i] >= 0; ++i) {
+        result.push_back(row_data[i]);
+    }
+    return result;
 }
 
 static std::vector<float> read_f32_tensor(const ggml_tensor * t) {
@@ -381,6 +393,15 @@ static void test_block_sparse_step_shift_policy() {
     std::printf("[PASS] block sparse step shift policy\n");
 }
 
+static void test_direct_32_token_halo_policy() {
+    GGML_ASSERT(sd_htp_block_sparse_direct_halo_enabled(0.0f, true));
+    GGML_ASSERT(!sd_htp_block_sparse_direct_halo_enabled(0.0f, false));
+    GGML_ASSERT(!sd_htp_block_sparse_direct_halo_enabled(0.5f, true));
+    GGML_ASSERT(!sd_htp_block_sparse_direct_halo_enabled(1.0f, true));
+
+    std::printf("[PASS] direct 32-token halo policy\n");
+}
+
 static void test_block_sparse_dense_interval_policy() {
     GGML_ASSERT(sd_htp_block_sparse_scheduled_step_index(0, 0) == 0);
     GGML_ASSERT(sd_htp_block_sparse_scheduled_step_index(1, 0) == 1);
@@ -531,6 +552,200 @@ static void test_patch_score_mask_2d_halo_keeps_surrounding_blocks() {
     GGML_ASSERT(actual_kept == expected_kept);
 
     std::printf("[PASS] patch score mask 2d halo keeps surrounding blocks\n");
+}
+
+static void test_direct_32_token_halo_keeps_center_neighborhood() {
+    constexpr int token_h = 16;
+    constexpr int token_w = 32;
+    constexpr int seq_len = token_h * token_w;
+    constexpr int max_kept = seq_len / SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+
+    std::vector<int32_t> index(size_t(max_kept) * size_t(max_kept), -1);
+    GGML_ASSERT(ggml_ext_block_sparse_fill_direct_halo_index_32(index.data(),
+                                                                max_kept,
+                                                                seq_len,
+                                                                seq_len,
+                                                                0,
+                                                                0,
+                                                                token_h,
+                                                                token_w,
+                                                                1,
+                                                                1,
+                                                                false));
+
+    const std::vector<int32_t> expected = {
+        0, 1, 2,
+        4, 5, 6,
+        8, 9, 10,
+    };
+    GGML_ASSERT(read_index_row(index, max_kept, 5) == expected);
+
+    std::printf("[PASS] direct 32-token halo keeps center neighborhood\n");
+}
+
+static void test_direct_32_token_halo_clips_corner_neighborhood() {
+    constexpr int token_h = 16;
+    constexpr int token_w = 32;
+    constexpr int seq_len = token_h * token_w;
+    constexpr int max_kept = seq_len / SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+
+    std::vector<int32_t> index(size_t(max_kept) * size_t(max_kept), -1);
+    GGML_ASSERT(ggml_ext_block_sparse_fill_direct_halo_index_32(index.data(),
+                                                                max_kept,
+                                                                seq_len,
+                                                                seq_len,
+                                                                0,
+                                                                0,
+                                                                token_h,
+                                                                token_w,
+                                                                1,
+                                                                1,
+                                                                false));
+
+    const std::vector<int32_t> expected = {0, 1, 4, 5};
+    GGML_ASSERT(read_index_row(index, max_kept, 0) == expected);
+
+    std::printf("[PASS] direct 32-token halo clips corner neighborhood\n");
+}
+
+static void test_direct_32_token_halo_keeps_text_keys_for_image_queries() {
+    constexpr int token_h = 16;
+    constexpr int token_w = 32;
+    constexpr int image_len = token_h * token_w;
+    constexpr int text_len = 64;
+    constexpr int seq_len = image_len + text_len;
+    constexpr int max_kept = seq_len / SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+
+    std::vector<int32_t> index(size_t(max_kept) * size_t(max_kept), -1);
+    GGML_ASSERT(ggml_ext_block_sparse_fill_direct_halo_index_32(index.data(),
+                                                                max_kept,
+                                                                seq_len,
+                                                                seq_len,
+                                                                image_len,
+                                                                text_len,
+                                                                token_h,
+                                                                token_w,
+                                                                1,
+                                                                1,
+                                                                false));
+
+    const std::vector<int32_t> expected = {
+        0, 1, 2,
+        4, 5, 6,
+        8, 9, 10,
+        16, 17,
+    };
+    GGML_ASSERT(read_index_row(index, max_kept, 5) == expected);
+
+    std::printf("[PASS] direct 32-token halo keeps text keys for image queries\n");
+}
+
+static void test_direct_32_token_halo_keeps_full_rows_for_text_queries() {
+    constexpr int token_h = 16;
+    constexpr int token_w = 32;
+    constexpr int image_len = token_h * token_w;
+    constexpr int text_len = 64;
+    constexpr int seq_len = image_len + text_len;
+    constexpr int max_kept = seq_len / SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+
+    std::vector<int32_t> index(size_t(max_kept) * size_t(max_kept), -1);
+    GGML_ASSERT(ggml_ext_block_sparse_fill_direct_halo_index_32(index.data(),
+                                                                max_kept,
+                                                                seq_len,
+                                                                seq_len,
+                                                                image_len,
+                                                                text_len,
+                                                                token_h,
+                                                                token_w,
+                                                                1,
+                                                                1,
+                                                                false));
+
+    std::vector<int32_t> expected(max_kept);
+    std::iota(expected.begin(), expected.end(), 0);
+    GGML_ASSERT(read_index_row(index, max_kept, 16) == expected);
+
+    std::printf("[PASS] direct 32-token halo keeps full rows for text queries\n");
+}
+
+static void test_direct_32_token_halo_maps_gqa_heads() {
+    constexpr int token_h = 16;
+    constexpr int token_w = 32;
+    constexpr int seq_len = token_h * token_w;
+    constexpr int blocks_per_head = seq_len / SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    constexpr int n_heads = 4;
+    constexpr int n_kv_heads = 2;
+
+    std::vector<int32_t> index(size_t(n_heads * blocks_per_head) * size_t(blocks_per_head), -1);
+    GGML_ASSERT(ggml_ext_block_sparse_fill_direct_halo_index_32(index.data(),
+                                                                blocks_per_head,
+                                                                seq_len,
+                                                                seq_len,
+                                                                0,
+                                                                0,
+                                                                token_h,
+                                                                token_w,
+                                                                n_heads,
+                                                                n_kv_heads,
+                                                                false));
+
+    const std::vector<int32_t> expected = {
+        16, 17, 18,
+        20, 21, 22,
+        24, 25, 26,
+    };
+    const int query_row = 3 * blocks_per_head + 5;
+    GGML_ASSERT(read_index_row(index, blocks_per_head, query_row) == expected);
+
+    std::printf("[PASS] direct 32-token halo maps GQA heads\n");
+}
+
+static void test_direct_32_token_halo_unions_center_sink() {
+    constexpr int token_h = 16;
+    constexpr int token_w = 32;
+    constexpr int seq_len = token_h * token_w;
+    constexpr int max_kept = seq_len / SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+
+    std::vector<int32_t> index(size_t(max_kept) * size_t(max_kept), -1);
+    GGML_ASSERT(ggml_ext_block_sparse_fill_direct_halo_index_32(index.data(),
+                                                                max_kept,
+                                                                seq_len,
+                                                                seq_len,
+                                                                0,
+                                                                0,
+                                                                token_h,
+                                                                token_w,
+                                                                1,
+                                                                1,
+                                                                true));
+
+    const std::vector<int32_t> expected = {0, 1, 4, 5, 6, 9, 10};
+    GGML_ASSERT(read_index_row(index, max_kept, 0) == expected);
+
+    std::printf("[PASS] direct 32-token halo unions center sink\n");
+}
+
+static void test_direct_32_token_halo_rejects_uncovered_suffix() {
+    constexpr int token_h = 16;
+    constexpr int token_w = 32;
+    constexpr int image_len = token_h * token_w;
+    constexpr int seq_len = image_len + SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    constexpr int max_kept = seq_len / SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+
+    std::vector<int32_t> index(size_t(max_kept) * size_t(max_kept), -1);
+    GGML_ASSERT(!ggml_ext_block_sparse_fill_direct_halo_index_32(index.data(),
+                                                                 max_kept,
+                                                                 seq_len,
+                                                                 seq_len,
+                                                                 0,
+                                                                 0,
+                                                                 token_h,
+                                                                 token_w,
+                                                                 1,
+                                                                 1,
+                                                                 false));
+
+    std::printf("[PASS] direct 32-token halo rejects uncovered suffix\n");
 }
 
 static void test_patch_score_mask_center_sink_keeps_center_blocks() {
@@ -703,6 +918,63 @@ static void test_structural_index_node_without_score(bool patch_halo, bool cente
     std::printf("[PASS] structural index without score patch_halo=%d center_sink=%d\n",
                 patch_halo ? 1 : 0,
                 center_sink ? 1 : 0);
+}
+
+static void test_direct_32_token_halo_index_node_without_score() {
+    constexpr int token_h = 16;
+    constexpr int token_w = 32;
+    constexpr int image_len = token_h * token_w;
+    constexpr int text_len = 64;
+    constexpr int seq_len = image_len + text_len;
+    constexpr int n_heads = 1;
+    constexpr int n_kv_heads = 1;
+    constexpr int max_kept = seq_len / SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+
+    ggml_context * ctx = make_ctx(4);
+    ggml_tensor * index_t = ggml_ext_block_sparse_direct_halo_index_32_node(ctx,
+                                                                            seq_len,
+                                                                            seq_len,
+                                                                            image_len,
+                                                                            text_len,
+                                                                            token_h,
+                                                                            token_w,
+                                                                            n_heads,
+                                                                            n_kv_heads,
+                                                                            false);
+    GGML_ASSERT(index_t != nullptr);
+    GGML_ASSERT(index_t->src[0] == nullptr);
+    GGML_ASSERT(std::strcmp(index_t->name, "block_sparse_index") == 0);
+
+    ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);
+    GGML_ASSERT(cpu != nullptr);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(cpu));
+    GGML_ASSERT(buffer != nullptr);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, index_t);
+    GGML_ASSERT(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(cpu);
+    const std::vector<int32_t> actual = read_i32_tensor(index_t);
+
+    std::vector<int32_t> expected(size_t(max_kept) * size_t(max_kept), -1);
+    GGML_ASSERT(ggml_ext_block_sparse_fill_direct_halo_index_32(expected.data(),
+                                                                max_kept,
+                                                                seq_len,
+                                                                seq_len,
+                                                                image_len,
+                                                                text_len,
+                                                                token_h,
+                                                                token_w,
+                                                                n_heads,
+                                                                n_kv_heads,
+                                                                false));
+    GGML_ASSERT(actual == expected);
+
+    ggml_backend_buffer_free(buffer);
+    ggml_backend_free(cpu);
+    ggml_free(ctx);
+
+    std::printf("[PASS] direct 32-token halo index node without score\n");
 }
 
 static std::vector<int32_t> run_mask_node_cpu(int n_q_blocks,
@@ -1261,6 +1533,7 @@ int main() {
     test_patch_major_shifted_reorder_tensor_roundtrip();
     test_patch_major_shifted_to_shifted_reorder_tensor_roundtrip();
     test_block_sparse_step_shift_policy();
+    test_direct_32_token_halo_policy();
     test_block_sparse_dense_interval_policy();
     test_block_sparse_residual_mode_policy();
     test_block_sparse_residual_warmup_anchor_policy();
@@ -1270,12 +1543,20 @@ int main() {
     test_block_sparse_residual_rho_policy();
     test_patch_score_mask_promotes_to_dsp_index();
     test_patch_score_mask_2d_halo_keeps_surrounding_blocks();
+    test_direct_32_token_halo_keeps_center_neighborhood();
+    test_direct_32_token_halo_clips_corner_neighborhood();
+    test_direct_32_token_halo_keeps_text_keys_for_image_queries();
+    test_direct_32_token_halo_keeps_full_rows_for_text_queries();
+    test_direct_32_token_halo_maps_gqa_heads();
+    test_direct_32_token_halo_unions_center_sink();
+    test_direct_32_token_halo_rejects_uncovered_suffix();
     test_patch_score_mask_center_sink_keeps_center_blocks();
     test_patch_score_node_promotes_to_dsp_index();
     test_full_mask_node_masks_all_blocks();
     test_structural_index_node_without_score(true, false);
     test_structural_index_node_without_score(false, true);
     test_structural_index_node_without_score(true, true);
+    test_direct_32_token_halo_index_node_without_score();
     test_score_to_mask_reference(24, 24, 0.95f, 0);
     test_score_to_mask_reference(192, 192, 0.95f, 0);
     test_score_to_mask_reference(312, 312, 0.95f, 154);
