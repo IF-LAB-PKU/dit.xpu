@@ -17,7 +17,9 @@
 
 #include <atomic>
 #include <cstring>
+#include <memory>
 #include <tuple>
+#include <unordered_set>
 #include <vector>
 
 #include "ggml-backend-impl.h"
@@ -471,6 +473,26 @@ bool htp_ops_opencl_async_enabled(void) {
 }
 
 #ifdef GGML_HTP_OPENCL_SIDECAR
+struct htp_ops_opencl_early_submit_candidate {
+    const ggml_tensor * node = nullptr;
+    std::vector<const ggml_tensor *> producer_roots;
+    std::unordered_set<const ggml_tensor *> completed_roots;
+    bool submitted = false;
+};
+
+struct htp_ops_opencl_early_submit_state {
+    std::vector<htp_ops_opencl_early_submit_candidate> candidates;
+    std::unordered_set<const ggml_tensor *> prerequisites;
+};
+
+static std::unique_ptr<htp_ops_opencl_early_submit_state> g_opencl_early_submit;
+
+static bool htp_ops_opencl_early_submit_enabled(void) {
+    const char * value = std::getenv("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT");
+    return htp_ops_opencl_async_enabled() && value != nullptr && value[0] != '\0' &&
+           std::strcmp(value, "0") != 0;
+}
+
 static bool htp_ops_opencl_is_view_only(const ggml_tensor * tensor) {
     if (tensor == nullptr) {
         return false;
@@ -478,6 +500,220 @@ static bool htp_ops_opencl_is_view_only(const ggml_tensor * tensor) {
     return tensor->op == GGML_OP_VIEW || tensor->op == GGML_OP_RESHAPE ||
            tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_TRANSPOSE;
 }
+
+static const ggml_tensor * htp_ops_opencl_early_submit_input_root(const ggml_tensor * tensor) {
+    for (size_t depth = 0; tensor != nullptr && depth < 64; ++depth) {
+        if (!htp_ops_opencl_is_view_only(tensor)) {
+            return tensor;
+        }
+        tensor = tensor->src[0] != nullptr ? tensor->src[0] : tensor->view_src;
+    }
+    return nullptr;
+}
+
+static bool htp_ops_opencl_early_submit_candidate_ready(
+        const htp_ops_opencl_early_submit_candidate & candidate) {
+    return candidate.completed_roots.size() == candidate.producer_roots.size();
+}
+
+static bool htp_ops_opencl_early_submit_is_inputless_single_task_custom(
+        const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->op != GGML_OP_CUSTOM) {
+        return false;
+    }
+    for (int source = 0; source < GGML_MAX_SRC; ++source) {
+        if (tensor->src[source] != nullptr) {
+            return false;
+        }
+    }
+    ggml_custom_op_params params = {};
+    std::memcpy(&params, tensor->op_params, sizeof(params));
+    return params.n_tasks == 1;
+}
+
+static void htp_ops_opencl_trace_early_submit(
+        const ggml_tensor * node,
+        const ggml_tensor * completed_node) {
+    const char * trace = std::getenv("SD_HTP_SPARSE_OPENCL_TRACE");
+    if (trace == nullptr || trace[0] == '\0' || std::strcmp(trace, "0") == 0) {
+        return;
+    }
+    std::fprintf(
+        stderr,
+        "htp_opencl_event name=gpu_sparse_early_enqueue ts_us=%lld producer=%s ready_after=%s\n",
+        (long long) ggml_time_us(),
+        node != nullptr && node->name[0] != '\0' ? node->name : "<unnamed>",
+        completed_node != nullptr && completed_node->name[0] != '\0'
+            ? completed_node->name : "<graph-input>");
+}
+
+static int htp_ops_opencl_early_submit_ready_candidates(const ggml_tensor * completed_node) {
+    GGML_ASSERT(g_opencl_early_submit != nullptr);
+    for (htp_ops_opencl_early_submit_candidate & candidate : g_opencl_early_submit->candidates) {
+        if (candidate.submitted || !htp_ops_opencl_early_submit_candidate_ready(candidate)) {
+            continue;
+        }
+        htp_ops_opencl_trace_early_submit(candidate.node, completed_node);
+        const int err = htp_ops_opencl_compute_node(const_cast<ggml_tensor *>(candidate.node));
+        if (err != 0) {
+            return err;
+        }
+        candidate.submitted = true;
+    }
+    return 0;
+}
+#endif
+
+int htp_ops_opencl_early_submit_begin(const struct ggml_cgraph * graph) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (!htp_ops_opencl_early_submit_enabled()) {
+        return 0;
+    }
+    if (graph == nullptr || g_opencl_early_submit != nullptr) {
+        return -EINVAL;
+    }
+
+    auto state = std::make_unique<htp_ops_opencl_early_submit_state>();
+    const auto * ctx = ggml_backend_htp_context::instance();
+    state->candidates.reserve(ctx->sparse_opencl_routed_nodes.size());
+    for (int node_index = 0; node_index < graph->n_nodes; ++node_index) {
+        const ggml_tensor * node = graph->nodes[node_index];
+        if (node == nullptr || ctx->sparse_opencl_routed_nodes.find(node) ==
+                                   ctx->sparse_opencl_routed_nodes.end()) {
+            continue;
+        }
+
+        htp_ops_opencl_early_submit_candidate candidate = {};
+        candidate.node = node;
+        for (int source = 0; source < GGML_MAX_SRC; ++source) {
+            const ggml_tensor * root =
+                htp_ops_opencl_early_submit_input_root(node->src[source]);
+            if (root == nullptr || root->op == GGML_OP_NONE) {
+                continue;
+            }
+            bool duplicate = false;
+            for (const ggml_tensor * existing : candidate.producer_roots) {
+                duplicate = duplicate || existing == root;
+            }
+            if (!duplicate) {
+                candidate.producer_roots.push_back(root);
+                if (htp_ops_opencl_early_submit_is_inputless_single_task_custom(root)) {
+                    state->prerequisites.insert(root);
+                }
+            }
+        }
+        state->candidates.push_back(std::move(candidate));
+    }
+
+    g_opencl_early_submit = std::move(state);
+    const int err = htp_ops_opencl_early_submit_ready_candidates(nullptr);
+    if (err != 0) {
+        g_opencl_early_submit.reset();
+    }
+    return err;
+#else
+    GGML_UNUSED(graph);
+    return 0;
+#endif
+}
+
+void htp_ops_opencl_early_submit_end(void) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    g_opencl_early_submit.reset();
+#endif
+}
+
+bool htp_ops_opencl_early_submit_tracks_node(const struct ggml_tensor * node) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (g_opencl_early_submit == nullptr || node == nullptr) {
+        return false;
+    }
+    for (const htp_ops_opencl_early_submit_candidate & candidate :
+             g_opencl_early_submit->candidates) {
+        if (candidate.submitted) {
+            continue;
+        }
+        for (const ggml_tensor * root : candidate.producer_roots) {
+            if (root == node) {
+                return true;
+            }
+        }
+    }
+#else
+    GGML_UNUSED(node);
+#endif
+    return false;
+}
+
+bool htp_ops_opencl_early_submit_is_prerequisite(const struct ggml_tensor * node) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    return g_opencl_early_submit != nullptr && node != nullptr &&
+           g_opencl_early_submit->prerequisites.find(node) !=
+               g_opencl_early_submit->prerequisites.end();
+#else
+    GGML_UNUSED(node);
+    return false;
+#endif
+}
+
+int htp_ops_opencl_early_submit_node_completed(const struct ggml_tensor * node) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (g_opencl_early_submit == nullptr || node == nullptr) {
+        return 0;
+    }
+    for (htp_ops_opencl_early_submit_candidate & candidate :
+             g_opencl_early_submit->candidates) {
+        if (candidate.submitted) {
+            continue;
+        }
+        for (const ggml_tensor * root : candidate.producer_roots) {
+            if (root == node) {
+                candidate.completed_roots.insert(root);
+            }
+        }
+    }
+    return htp_ops_opencl_early_submit_ready_candidates(node);
+#else
+    GGML_UNUSED(node);
+    return 0;
+#endif
+}
+
+bool htp_ops_opencl_early_submit_was_submitted(const struct ggml_tensor * node) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (g_opencl_early_submit == nullptr || node == nullptr) {
+        return false;
+    }
+    for (const htp_ops_opencl_early_submit_candidate & candidate :
+             g_opencl_early_submit->candidates) {
+        if (candidate.node == node) {
+            return candidate.submitted;
+        }
+    }
+#else
+    GGML_UNUSED(node);
+#endif
+    return false;
+}
+
+void htp_ops_opencl_early_submit_mark_submitted(const struct ggml_tensor * node) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (g_opencl_early_submit == nullptr || node == nullptr) {
+        return;
+    }
+    for (htp_ops_opencl_early_submit_candidate & candidate :
+             g_opencl_early_submit->candidates) {
+        if (candidate.node == node) {
+            candidate.submitted = true;
+            return;
+        }
+    }
+#else
+    GGML_UNUSED(node);
+#endif
+}
+
+#ifdef GGML_HTP_OPENCL_SIDECAR
 
 static const ggml_tensor * htp_ops_opencl_routed_producer(
         const ggml_backend_htp_context * ctx,

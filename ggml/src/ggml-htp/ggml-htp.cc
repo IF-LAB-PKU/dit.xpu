@@ -798,7 +798,15 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
             cplan.abort_callback_data = ctx;
         }
 #endif
-        enum ggml_status status = ggml_graph_compute_htp_hybrid(cgraph, &cplan);
+        enum ggml_status status = GGML_STATUS_SUCCESS;
+        const int early_submit_err = htp_ops_opencl_early_submit_begin(cgraph);
+        if (early_submit_err != 0) {
+            std::fprintf(stderr, "ggml-htp: OpenCL early sparse submit setup failed: %d\n", early_submit_err);
+            status = GGML_STATUS_FAILED;
+        } else {
+            status = ggml_graph_compute_htp_hybrid(cgraph, &cplan);
+        }
+        htp_ops_opencl_early_submit_end();
 #ifdef GGML_HTP_OPENCL_SIDECAR
         if (!ggml_backend_htp_opencl_finish(ctx) && status == GGML_STATUS_SUCCESS) {
             status = GGML_STATUS_FAILED;

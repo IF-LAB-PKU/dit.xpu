@@ -176,6 +176,19 @@ std::vector<float> reference_attention(
     return packed;
 }
 
+void fill_sparse_index(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    GGML_UNUSED(userdata);
+    if (ith != 0) {
+        return;
+    }
+    GGML_ASSERT(dst != nullptr && dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nelements(dst) == k_heads);
+    auto * values = static_cast<int32_t *>(dst->data);
+    values[0] = 0;
+    values[1] = 2;
+}
+
 graph_fixture make_graph(ggml_backend_t backend) {
     const ggml_init_params params = {
         /* .mem_size   = */ 4 * 1024 * 1024,
@@ -205,7 +218,11 @@ graph_fixture make_graph(ggml_backend_t backend) {
     f.v->op = GGML_OP_NONE;
     f.q->op = GGML_OP_NONE;
     f.dense_mask = ggml_new_tensor_4d(f.ctx, GGML_TYPE_F16, k_kv_tokens, k_q_tokens, 1, 1);
-    f.sparse_mask = ggml_new_tensor_4d(f.ctx, GGML_TYPE_I32, 1, k_heads, 1, 1);
+    // Production halo masks are input-less GGML_OP_CUSTOM side branches. They
+    // must be prepared before their sparse attention can be submitted early.
+    f.sparse_mask = ggml_custom_4d(
+        f.ctx, GGML_TYPE_I32, 1, k_heads, 1, 1,
+        nullptr, 0, fill_sparse_index, 1, nullptr);
     ggml_set_name(f.q_storage, "exact_rho_q_storage");
     ggml_set_name(f.q, "exact_rho_q");
     ggml_set_name(f.k_storage, "exact_rho_k_storage");
@@ -267,6 +284,10 @@ graph_fixture make_graph(ggml_backend_t backend) {
 
     f.graph = ggml_new_graph(f.ctx);
     GGML_ASSERT(f.graph != nullptr);
+    // Match the production anchor graph: the dense model result is expanded
+    // first, while the exact-rho residual is a cache-only side branch added
+    // afterward. Early OpenCL dispatch must not depend on cache-root order.
+    ggml_build_forward_expand(f.graph, dense_o);
     ggml_build_forward_expand(f.graph, f.recovered);
     f.allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     GGML_ASSERT(f.allocator != nullptr);
@@ -306,7 +327,6 @@ void initialize_graph_inputs(graph_fixture & fixture) {
 
     const std::vector<ggml_fp16_t> dense_mask(
         static_cast<size_t>(k_kv_tokens * k_q_tokens), ggml_fp32_to_fp16(0.0f));
-    const std::vector<int32_t> sparse_mask = { 0, 2 };
     ggml_backend_tensor_set(
         fixture.q_storage, q_physical.data(), 0, q_physical.size() * sizeof(float));
     ggml_backend_tensor_set(
@@ -315,8 +335,6 @@ void initialize_graph_inputs(graph_fixture & fixture) {
         fixture.v_storage, v_physical.data(), 0, v_physical.size() * sizeof(ggml_fp16_t));
     ggml_backend_tensor_set(
         fixture.dense_mask, dense_mask.data(), 0, dense_mask.size() * sizeof(ggml_fp16_t));
-    ggml_backend_tensor_set(
-        fixture.sparse_mask, sparse_mask.data(), 0, sparse_mask.size() * sizeof(int32_t));
 }
 
 std::string capture_graph_compute(
@@ -373,8 +391,11 @@ run_result run_graph(
     return result;
 }
 
+int count_attention_trace(const std::string & trace, const char * route, int block_sparse);
+
 void require_async_event_order(const std::string & trace) {
     const char * expected[] = {
+        "gpu_sparse_early_enqueue",
         "gpu_sparse_enqueue",
         "gpu_sparse_flush",
         "htp_dense_begin",
@@ -422,11 +443,13 @@ void require_async_event_order(const std::string & trace) {
     for (size_t i = 1; i < record_count; ++i) {
         GGML_ASSERT(records[i - 1].ts_us <= records[i].ts_us);
     }
-    GGML_ASSERT(records[0].ts_us < records[2].ts_us);
-    GGML_ASSERT(records[2].ts_us < records[4].ts_us);
-    GGML_ASSERT(records[3].ts_us <= records[4].ts_us);
+    GGML_ASSERT(records[0].ts_us <= records[1].ts_us);
+    GGML_ASSERT(records[1].ts_us < records[3].ts_us);
+    GGML_ASSERT(records[3].ts_us < records[5].ts_us);
     GGML_ASSERT(records[4].ts_us <= records[5].ts_us);
     GGML_ASSERT(records[5].ts_us <= records[6].ts_us);
+    GGML_ASSERT(records[6].ts_us <= records[7].ts_us);
+    GGML_ASSERT(count_attention_trace(trace, "opencl", 1) == 1);
 }
 
 int count_attention_trace(const std::string & trace, const char * route, int block_sparse) {
@@ -706,6 +729,7 @@ void require_task11_failure_modes(
 int main() {
     env_guard initial_sidecar("SD_HTP_SPARSE_OPENCL", "1");
     env_guard sidecar_trace("SD_HTP_SPARSE_OPENCL_TRACE", "1");
+    env_guard early_submit("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT", "1");
     env_guard htp_ops("SD_HTP_OPS", "1");
     env_guard htp_compute("SD_HTP_COMPUTE", "1");
     env_guard htp_attention("SD_HTP_ATTENTION", "1");

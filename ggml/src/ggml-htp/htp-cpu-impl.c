@@ -2035,10 +2035,15 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 if (htp_ops_opencl_routes_node(tensor)) {
+                    if (htp_ops_opencl_early_submit_was_submitted(tensor)) {
+                        break;
+                    }
                     if (params->ith == 0) {
                         const int err = htp_ops_opencl_compute_node(tensor);
                         if (err != 0) {
                             ggml_htp_mark_op_failed(params, tensor, err);
+                        } else {
+                            htp_ops_opencl_early_submit_mark_submitted(tensor);
                         }
                     }
                     break;
@@ -3283,6 +3288,30 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    // Halo masks are input-less, single-task custom nodes. They otherwise live
+    // in the cache side branch and would defer every GPU sparse submit until
+    // after the dense main graph. Compute only these self-contained masks now.
+    for (int node_n = 0; node_n < cgraph->n_nodes; ++node_n) {
+        struct ggml_tensor * node = cgraph->nodes[node_n];
+        if (!htp_ops_opencl_early_submit_is_prerequisite(node)) {
+            continue;
+        }
+        if (state->ith == 0) {
+            ggml_compute_forward(&params, node);
+        }
+        ggml_barrier(state->threadpool);
+        if (state->ith == 0) {
+            const int err = htp_ops_opencl_early_submit_node_completed(node);
+            if (err != 0) {
+                ggml_htp_mark_op_failed(&params, node, err);
+            }
+        }
+        ggml_barrier(state->threadpool);
+        if (tp->ec != GGML_STATUS_SUCCESS) {
+            break;
+        }
+    }
+
     // 如果某个 HTP op 已经失败，当前节点同步完成后立刻停止后续节点，避免错误 dst 继续污染整张图。
     for (int node_n = 0; node_n < cgraph->n_nodes &&
             atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
@@ -3294,6 +3323,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        if (htp_ops_opencl_early_submit_is_prerequisite(node)) {
             continue;
         }
 
@@ -3324,11 +3357,41 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
+        const int first_completed_node_n = node_n;
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
+        }
+
+        bool completes_opencl_producer = false;
+        for (int completed_node_n = first_completed_node_n;
+                completed_node_n <= node_n; ++completed_node_n) {
+            completes_opencl_producer = completes_opencl_producer ||
+                htp_ops_opencl_early_submit_tracks_node(cgraph->nodes[completed_node_n]);
+        }
+        if (completes_opencl_producer) {
+            // The current node can be a multi-worker CPU/HTP producer. Publish its
+            // writes before worker zero hands the shared RPCMEM inputs to OpenCL.
+            ggml_barrier(state->threadpool);
+            if (state->ith == 0) {
+                for (int completed_node_n = first_completed_node_n;
+                        completed_node_n <= node_n; ++completed_node_n) {
+                    const int err = htp_ops_opencl_early_submit_node_completed(
+                        cgraph->nodes[completed_node_n]);
+                    if (err != 0) {
+                        ggml_htp_mark_op_failed(&params, cgraph->nodes[completed_node_n], err);
+                        break;
+                    }
+                }
+            }
+            // Keep all workers behind the enqueue so a direct consumer cannot race
+            // ahead of the event registration.
+            ggml_barrier(state->threadpool);
+            if (tp->ec != GGML_STATUS_SUCCESS) {
+                break;
+            }
         }
 
         if (state->ith == 0 && cplan->abort_callback &&

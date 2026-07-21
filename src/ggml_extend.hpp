@@ -2411,10 +2411,41 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                 block_sparse_cache_tensor != nullptr &&
                 *block_sparse_cache_tensor;
             const bool sparse_with_lse = anchor_can_cache_residual && can_cache_exact_rho;
-            ggml_tensor* candidate  = build_htp_kqv(block_mask, sparse_with_lse);
-            const bool candidate_is_htp_layout = candidate != nullptr;
-            if (candidate == nullptr) {
-                candidate = build_kqv(q, k, v, block_mask, sparse_with_lse);
+            ggml_tensor* dense_candidate = nullptr;
+            ggml_tensor* dense_lse = nullptr;
+            bool candidate_is_htp_layout = false;
+
+            // An exact-rho anchor needs two attention operators with identical
+            // Q/K/V. Reusing the dense operator's prepared inputs keeps those
+            // copies on the main graph path, so the sparse sidecar can launch
+            // while HTP computes the dense operator instead of after cache-tail
+            // Q/K/V preparation has completed.
+            if (anchor_can_cache_residual && can_cache_exact_rho) {
+                dense_candidate = build_htp_kqv(nullptr, true);
+                candidate_is_htp_layout = dense_candidate != nullptr;
+                if (dense_candidate == nullptr) {
+                    dense_candidate = build_kqv(q, k, v, nullptr, true);
+                }
+            }
+
+            ggml_tensor* candidate = nullptr;
+            if (dense_candidate != nullptr && candidate_is_htp_layout) {
+                candidate = ggml_flash_attn_ext_with_lse(
+                    ctx,
+                    dense_candidate->src[0],
+                    dense_candidate->src[1],
+                    dense_candidate->src[2],
+                    block_mask,
+                    scale / kv_scale,
+                    0,
+                    0);
+                ggml_flash_attn_ext_set_prec(candidate, GGML_PREC_F32);
+            } else {
+                candidate = build_htp_kqv(block_mask, sparse_with_lse);
+                candidate_is_htp_layout = candidate != nullptr;
+                if (candidate == nullptr) {
+                    candidate = build_kqv(q, k, v, block_mask, sparse_with_lse);
+                }
             }
             GGML_ASSERT(block_mask_format != GGML_FLASH_ATTN_EXT_MASK_DEFAULT);
             ggml_flash_attn_ext_set_block_sparse(candidate, block_q, block_k, block_mask_format);
@@ -2435,14 +2466,12 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                     sparse_reshape_out = ggml_ext_scale(ctx, sparse_reshape_out, block_sparse_residual_rho);
                 }
                 if (anchor_can_cache_residual) {
-                    ggml_tensor* dense_candidate = nullptr;
-                    ggml_tensor* dense_lse = nullptr;
-                    if (can_cache_exact_rho) {
+                    if (dense_candidate == nullptr && can_cache_exact_rho) {
                         dense_candidate = build_htp_kqv(nullptr, true);
                         if (dense_candidate == nullptr) {
                             dense_candidate = build_kqv(q, k, v, nullptr, true);
                         }
-                    } else {
+                    } else if (dense_candidate == nullptr) {
                         dense_candidate = build_htp_kqv(nullptr);
                         if (dense_candidate == nullptr) {
                             dense_candidate = build_kqv(q, k, v, nullptr);

@@ -22,6 +22,13 @@ bool htp_ops_opencl_async_enabled(void);
 bool htp_ops_opencl_node_needs_wait(const struct ggml_tensor * dst);
 int  htp_ops_opencl_wait_node(const struct ggml_tensor * dst);
 int  htp_ops_opencl_compute_node(struct ggml_tensor * dst);
+int  htp_ops_opencl_early_submit_begin(const struct ggml_cgraph * graph);
+void htp_ops_opencl_early_submit_end(void);
+bool htp_ops_opencl_early_submit_tracks_node(const struct ggml_tensor * node);
+bool htp_ops_opencl_early_submit_is_prerequisite(const struct ggml_tensor * node);
+int  htp_ops_opencl_early_submit_node_completed(const struct ggml_tensor * node);
+bool htp_ops_opencl_early_submit_was_submitted(const struct ggml_tensor * node);
+void htp_ops_opencl_early_submit_mark_submitted(const struct ggml_tensor * node);
 
 #ifdef __cplusplus
 }
