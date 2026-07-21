@@ -797,6 +797,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                         .mask_format = is_index ? 1 : 0,
                         .max_kept_blocks = is_index ? (int32_t) mask->ne[0] : 0,
                         .with_lse = with_lse ? 1 : 0,
+                        .elapsed_us = 0,
                     };
                     *reinterpret_cast<BlockSparseAttnParams *>(param_buf) = op_params;
 
@@ -819,6 +820,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                         .head_dim   = (int32_t) q->ne[0],
                         .impl       = htp_attention_impl_is_normal() ? 1 : 0,
                         .with_lse   = with_lse ? 1 : 0,
+                        .elapsed_us = 0,
                     };
                     *reinterpret_cast<FlashAttnParams *>(param_buf) = op_params;
 
@@ -986,7 +988,26 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     }
 
     std::atomic_thread_fence(std::memory_order_acquire);
-    const int ret = message_header_get_request_ptr(msg_hdr, 0)->state;
+    auto * completed_request = message_header_get_request_ptr(msg_hdr, 0);
+    const int ret = completed_request->state;
+    const char * internal_trace = std::getenv("SD_HTP_ATTN_INTERNAL_TRACE");
+    if (internal_trace != nullptr && internal_trace[0] != '\0' && std::strcmp(internal_trace, "0") != 0 &&
+        (op_index == HTP_OPS_FLASH_ATTN_QO_F32_KV_F16 ||
+         op_index == HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16)) {
+        auto * compute_request = reinterpret_cast<OpComputeRequest *>(completed_request->data);
+        const int32_t elapsed_us = op_index == HTP_OPS_FLASH_ATTN_QO_F32_KV_F16
+            ? reinterpret_cast<const FlashAttnParams *>(compute_request->payload)->elapsed_us
+            : reinterpret_cast<const BlockSparseAttnParams *>(compute_request->payload)->elapsed_us;
+        std::fprintf(
+            stderr,
+            "htp_attention_internal kind=%s elapsed_us=%d qo=%d kv=%d heads=%d with_lse=%d\n",
+            op_index == HTP_OPS_FLASH_ATTN_QO_F32_KV_F16 ? "dense" : "block_sparse",
+            elapsed_us,
+            dispatch_m,
+            dispatch_k,
+            dispatch_n,
+            ggml_get_op_params_i32(dst, 6) != 0 ? 1 : 0);
+    }
     if (debug_hash_index >= 0) {
         const uint64_t output_hash = htp_hash_tensor_bytes(dst);
         std::fprintf(stderr,
