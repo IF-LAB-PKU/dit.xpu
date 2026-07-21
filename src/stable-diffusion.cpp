@@ -2266,7 +2266,20 @@ public:
                     return std::move(cached_output);
                 }
 
+                const bool trace_denoise_step = sd_env_flag_enabled("SD_HTP_DENOISE_STEP_TRACE");
+                const int64_t compute_begin_us = trace_denoise_step ? ggml_time_us() : 0;
                 auto output_opt = work_diffusion_model->compute(n_threads, diffusion_params);
+                if (trace_denoise_step) {
+                    LOG_INFO(
+                        "htp_denoise_step_timing step=%d/%zu branch=%d sparse_step=%d residual_mode=%d exact_rho=%d compute=%.3fms",
+                        step,
+                        steps,
+                        block_sparse_residual_branch_index,
+                        htp_block_sparse_step_index,
+                        htp_block_sparse_residual_mode,
+                        htp_block_sparse_residual_exact_rho ? 1 : 0,
+                        double(ggml_time_us() - compute_begin_us) / 1000.0);
+                }
                 if (output_opt.empty()) {
                     LOG_ERROR("diffusion model compute failed");
                     return sd::Tensor<float>();
