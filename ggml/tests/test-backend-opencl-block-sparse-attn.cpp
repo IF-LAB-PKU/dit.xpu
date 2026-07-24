@@ -3,12 +3,14 @@
 #include "ggml-opencl.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
@@ -788,6 +790,22 @@ void run_case(
         ggml_backend_opencl_htp_graph_free(&exact_predicate_session);
         GGML_ASSERT(snapshot(buffers[4]) == output_snapshot);
 
+        ggml_opencl_htp_graph * mutated_metadata_session = nullptr;
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_preflight(
+            sidecar, cgraph, descriptors.data(), descriptors.size(),
+            &mutated_metadata_session, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+        const int32_t saved_q_block = packed->op_params[4];
+        const int32_t mutated_q_block = saved_q_block + 1;
+        packed->op_params[4] = mutated_q_block;
+        const ggml_opencl_htp_result mutated_metadata_result =
+            ggml_backend_opencl_htp_graph_compute_block_sparse_attn_async(
+                mutated_metadata_session, packed, reason, sizeof(reason));
+        packed->op_params[4] = saved_q_block;
+        ggml_backend_opencl_htp_graph_free(&mutated_metadata_session);
+        GGML_ASSERT(mutated_metadata_result == GGML_OPENCL_HTP_ERROR);
+        GGML_ASSERT(std::strstr(reason, "metadata changed") != nullptr);
+        std::memcpy(buffers[4].info.base, output_snapshot.data(), output_snapshot.size());
+
         ggml_cgraph * invalid_shape_graph = ggml_new_graph(ctx);
         ggml_graph_add_node(invalid_shape_graph, packed);
         ggml_graph_add_node(invalid_shape_graph, &invalid_shape);
@@ -887,7 +905,73 @@ void run_case(
         GGML_ASSERT(ggml_backend_opencl_htp_graph_live_event_count(two_node_session) == 0);
         GGML_ASSERT(snapshot(buffers[4]) == output_snapshot);
         GGML_ASSERT(snapshot(second_buffer) == second_snapshot);
+
+        GGML_ASSERT(setenv("SD_HTP_SPARSE_OPENCL_TEST_SUBMIT_DELAY_US", "50000", 1) == 0);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_start_submission_thread(
+            two_node_session, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_queue_block_sparse_attn(
+            two_node_session, packed, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_queue_block_sparse_attn(
+            two_node_session, second_output, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+        bool first_published = false;
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_wait_for_tensor(
+            two_node_session, packed, &first_published,
+            reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+        bool second_published = false;
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_wait_for_tensor(
+            two_node_session, second_output, &second_published,
+            reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+        GGML_ASSERT(first_published);
+        GGML_ASSERT(second_published);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_finish(
+            two_node_session, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+        GGML_ASSERT(snapshot(buffers[4]) != output_snapshot);
+        GGML_ASSERT(snapshot(second_buffer) != second_snapshot);
+        GGML_ASSERT(unsetenv("SD_HTP_SPARSE_OPENCL_TEST_SUBMIT_DELAY_US") == 0);
         ggml_backend_opencl_htp_graph_free(&two_node_session);
+
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_preflight(
+            sidecar, two_node_graph, two_node_descriptors.data(), two_node_descriptors.size(),
+            &two_node_session, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+        GGML_ASSERT(setenv("SD_HTP_SPARSE_OPENCL_TEST_WAIT_DELAY_US", "50000", 1) == 0);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_start_submission_thread(
+            two_node_session, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_queue_block_sparse_attn(
+            two_node_session, packed, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_queue_block_sparse_attn(
+            two_node_session, packed, reason, sizeof(reason)) == GGML_OPENCL_HTP_ERROR);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_queue_block_sparse_attn(
+            two_node_session, second_output, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+
+        ggml_opencl_htp_result first_wait_result = GGML_OPENCL_HTP_ERROR;
+        std::thread first_consumer([&]() {
+            bool waited = false;
+            char wait_reason[256] = {};
+            first_wait_result = ggml_backend_opencl_htp_graph_wait_for_tensor(
+                two_node_session, packed, &waited, wait_reason, sizeof(wait_reason));
+        });
+        bool both_events_published = false;
+        for (int attempt = 0; attempt < 20; ++attempt) {
+            if (ggml_backend_opencl_htp_graph_pending_sparse_submission_count(
+                    two_node_session) == 0) {
+                both_events_published = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        first_consumer.join();
+        GGML_ASSERT(unsetenv("SD_HTP_SPARSE_OPENCL_TEST_WAIT_DELAY_US") == 0);
+        GGML_ASSERT(first_wait_result == GGML_OPENCL_HTP_OK);
+        GGML_ASSERT(both_events_published);
+        bool second_waited = false;
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_wait_for_tensor(
+            two_node_session, second_output, &second_waited,
+            reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_finish(
+            two_node_session, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+        ggml_backend_opencl_htp_graph_free(&two_node_session);
+        std::memcpy(buffers[4].info.base, output_snapshot.data(), output_snapshot.size());
+        std::memcpy(second_buffer.info.base, second_snapshot.data(), second_snapshot.size());
         GGML_ASSERT(fcntl(second_buffer.info.fd, F_GETFD) != -1);
         ggml_backend_buffer_free(second_buffer.buffer);
     }

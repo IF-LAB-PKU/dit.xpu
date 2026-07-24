@@ -45,6 +45,7 @@ struct ggml_backend_htp_context {
 #ifdef GGML_HTP_OPENCL_SIDECAR
     ggml_opencl_htp_sidecar * sparse_opencl_sidecar = nullptr;
     ggml_opencl_htp_graph * sparse_opencl_graph = nullptr;
+    bool sparse_opencl_submission_thread_active = false;
     std::unordered_set<const ggml_tensor *> sparse_opencl_routed_nodes;
     size_t sparse_opencl_page_size = 0;
     size_t sparse_opencl_ext_mem_padding = 0;

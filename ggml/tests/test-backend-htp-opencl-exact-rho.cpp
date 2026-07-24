@@ -26,6 +26,7 @@ constexpr int64_t k_batch = 1;
 constexpr int32_t k_block_size = 32;
 constexpr int64_t k_packed_dim = k_head_dim + 1;
 constexpr float k_scale = 0.125f;
+constexpr float k_live_alias_sentinel = 17.25f;
 
 class env_guard {
 public:
@@ -63,11 +64,14 @@ struct graph_fixture {
     ggml_tensor * v = nullptr;
     ggml_tensor * dense_mask = nullptr;
     ggml_tensor * sparse_mask = nullptr;
+    ggml_tensor * sparse_mask_clobber = nullptr;
     ggml_tensor * dense_packed = nullptr;
     ggml_tensor * sparse_packed = nullptr;
     ggml_tensor * rho = nullptr;
     ggml_tensor * residual = nullptr;
     ggml_tensor * recovered = nullptr;
+    ggml_tensor * live_alias = nullptr;
+    ggml_tensor * live_probe = nullptr;
     ggml_gallocr_t allocator = nullptr;
 };
 
@@ -79,6 +83,7 @@ struct run_result {
     std::vector<float> rho;
     std::vector<float> residual;
     std::vector<float> recovered;
+    std::vector<float> live_probe;
 };
 
 size_t q_index(int64_t d, int64_t qt, int64_t h, int64_t b = 0) {
@@ -189,6 +194,45 @@ void fill_sparse_index(ggml_tensor * dst, int ith, int nth, void * userdata) {
     values[1] = 2;
 }
 
+void clobber_sparse_index(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    GGML_UNUSED(userdata);
+    if (ith != 0) {
+        return;
+    }
+    const char * enabled = std::getenv("SD_HTP_SPARSE_OPENCL_TEST_CLOBBER_MASK");
+    if (enabled == nullptr || enabled[0] == '\0' || std::strcmp(enabled, "0") == 0) {
+        return;
+    }
+    std::fill_n(
+        static_cast<int32_t *>(dst->data),
+        static_cast<size_t>(ggml_nelements(dst)),
+        -1);
+}
+
+void capture_live_alias(
+        ggml_tensor * dst,
+        const ggml_tensor * src,
+        int ith,
+        int nth,
+        void * userdata) {
+    GGML_UNUSED(nth);
+    GGML_UNUSED(userdata);
+    if (ith != 0) {
+        return;
+    }
+    const char * delay_value = std::getenv("SD_HTP_SPARSE_OPENCL_TEST_LIVE_ALIAS_DELAY_US");
+    if (delay_value != nullptr && delay_value[0] != '\0') {
+        char * end = nullptr;
+        const long delay_us = std::strtol(delay_value, &end, 10);
+        if (end != delay_value && *end == '\0' && delay_us > 0 && delay_us <= 1000000) {
+            usleep(static_cast<useconds_t>(delay_us));
+        }
+    }
+    GGML_ASSERT(ggml_nbytes(dst) == ggml_nbytes(src));
+    std::memcpy(dst->data, src->data, ggml_nbytes(dst));
+}
+
 graph_fixture make_graph(ggml_backend_t backend) {
     const ggml_init_params params = {
         /* .mem_size   = */ 4 * 1024 * 1024,
@@ -223,6 +267,9 @@ graph_fixture make_graph(ggml_backend_t backend) {
     f.sparse_mask = ggml_custom_4d(
         f.ctx, GGML_TYPE_I32, 1, k_heads, 1, 1,
         nullptr, 0, fill_sparse_index, 1, nullptr);
+    f.sparse_mask_clobber = ggml_custom_4d(
+        f.ctx, GGML_TYPE_I32, 1, k_heads, 1, 1,
+        nullptr, 0, clobber_sparse_index, 1, nullptr);
     ggml_set_name(f.q_storage, "exact_rho_q_storage");
     ggml_set_name(f.q, "exact_rho_q");
     ggml_set_name(f.k_storage, "exact_rho_k_storage");
@@ -231,6 +278,7 @@ graph_fixture make_graph(ggml_backend_t backend) {
     ggml_set_name(f.v, "exact_rho_v");
     ggml_set_name(f.dense_mask, "exact_rho_dense_mask");
     ggml_set_name(f.sparse_mask, "exact_rho_sparse_index");
+    ggml_set_name(f.sparse_mask_clobber, "exact_rho_sparse_index_clobber");
     ggml_set_input(f.q_storage);
     ggml_set_input(f.k_storage);
     ggml_set_input(f.v_storage);
@@ -276,6 +324,13 @@ graph_fixture make_graph(ggml_backend_t backend) {
     ggml_set_name(f.residual, "exact_rho_residual");
     f.recovered = ggml_add(f.ctx, ggml_mul(f.ctx, sparse_o, f.rho), f.residual);
     ggml_set_name(f.recovered, "exact_rho_recovered");
+    f.live_alias = ggml_new_tensor_4d(
+        f.ctx, GGML_TYPE_F32, k_packed_dim, k_heads, k_q_tokens, k_batch);
+    ggml_set_name(f.live_alias, "exact_rho_live_alias");
+    ggml_set_input(f.live_alias);
+    f.live_probe = ggml_map_custom1(f.ctx, f.live_alias, capture_live_alias, 1, nullptr);
+    ggml_set_name(f.live_probe, "exact_rho_live_probe");
+    ggml_set_output(f.live_probe);
     ggml_set_output(f.dense_packed);
     ggml_set_output(f.sparse_packed);
     ggml_set_output(f.rho);
@@ -287,11 +342,19 @@ graph_fixture make_graph(ggml_backend_t backend) {
     // Match the production anchor graph: the dense model result is expanded
     // first, while the exact-rho residual is a cache-only side branch added
     // afterward. Early OpenCL dispatch must not depend on cache-root order.
+    ggml_build_forward_expand(f.graph, f.sparse_mask_clobber);
     ggml_build_forward_expand(f.graph, dense_o);
+    ggml_build_forward_expand(f.graph, f.live_probe);
     ggml_build_forward_expand(f.graph, f.recovered);
     f.allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     GGML_ASSERT(f.allocator != nullptr);
     GGML_ASSERT(ggml_gallocr_alloc_graph(f.allocator, f.graph));
+    // Model the production allocator reuse that makes the future sparse output
+    // share storage with a still-live main-graph intermediate.
+    f.live_alias->buffer = f.sparse_packed->buffer;
+    f.live_alias->data = f.sparse_packed->data;
+    f.sparse_mask_clobber->buffer = f.sparse_mask->buffer;
+    f.sparse_mask_clobber->data = f.sparse_mask->data;
     return f;
 }
 
@@ -335,6 +398,10 @@ void initialize_graph_inputs(graph_fixture & fixture) {
         fixture.v_storage, v_physical.data(), 0, v_physical.size() * sizeof(ggml_fp16_t));
     ggml_backend_tensor_set(
         fixture.dense_mask, dense_mask.data(), 0, dense_mask.size() * sizeof(ggml_fp16_t));
+    const std::vector<float> live_alias(
+        static_cast<size_t>(ggml_nelements(fixture.live_alias)), k_live_alias_sentinel);
+    ggml_backend_tensor_set(
+        fixture.live_alias, live_alias.data(), 0, live_alias.size() * sizeof(float));
 }
 
 std::string capture_graph_compute(
@@ -387,68 +454,75 @@ run_result run_graph(
         result.rho = read_f32(f.rho);
         result.residual = read_f32(f.residual);
         result.recovered = read_f32(f.recovered);
+        result.live_probe = read_f32(f.live_probe);
     }
     return result;
 }
 
 int count_attention_trace(const std::string & trace, const char * route, int block_sparse);
 
+int64_t require_event_timestamp(const std::string & trace, const char * event) {
+    const size_t found = trace.find(event);
+    if (found == std::string::npos) {
+        std::fprintf(stderr, "[FAIL] missing async event '%s'\n--- trace ---\n%s",
+                     event, trace.c_str());
+        GGML_ASSERT(false && "OpenCL sparse/HTP dense event missing");
+    }
+    const size_t line_begin = trace.rfind('\n', found);
+    const size_t line_end = trace.find('\n', found);
+    const size_t line_start = line_begin == std::string::npos ? 0 : line_begin + 1;
+    const size_t line_length = line_end == std::string::npos ?
+        std::string::npos : line_end - line_start;
+    const std::string line = trace.substr(line_start, line_length);
+    const std::string timestamp_prefix = "ts_us=";
+    const size_t timestamp_begin = line.find(timestamp_prefix);
+    GGML_ASSERT(timestamp_begin != std::string::npos);
+    const size_t timestamp_value_begin = timestamp_begin + timestamp_prefix.size();
+    const size_t timestamp_end = line.find_first_not_of("0123456789", timestamp_value_begin);
+    const std::string timestamp = line.substr(
+        timestamp_value_begin,
+        timestamp_end == std::string::npos ? std::string::npos : timestamp_end - timestamp_value_begin);
+    GGML_ASSERT(!timestamp.empty());
+    std::printf("[ASYNC_ORDER] %s\n", line.c_str());
+    return std::strtoll(timestamp.c_str(), nullptr, 10);
+}
+
 void require_async_event_order(const std::string & trace) {
-    const char * expected[] = {
-        "gpu_sparse_early_enqueue",
-        "gpu_sparse_enqueue",
-        "gpu_sparse_flush",
-        "htp_dense_begin",
-        "htp_dense_end",
-        "gpu_sparse_wait_begin",
-        "gpu_sparse_wait_end",
-        "rho_consumer_begin",
-    };
-    struct event_record {
-        const char * name;
-        int64_t ts_us;
-    } records[sizeof(expected) / sizeof(expected[0])] = {};
-    size_t position = 0;
-    size_t record_count = 0;
-    for (const char * event : expected) {
-        const size_t found = trace.find(event, position);
-        if (found == std::string::npos) {
-            std::fprintf(
-                stderr,
-                "[FAIL] missing or out-of-order async event '%s' after offset %zu\n--- trace ---\n%s",
-                event, position, trace.c_str());
-            GGML_ASSERT(false && "OpenCL sparse/HTP dense overlap event order mismatch");
-        }
-        const size_t line_begin = trace.rfind('\n', found);
-        const size_t line_end = trace.find('\n', found);
-        const size_t line_start = line_begin == std::string::npos ? 0 : line_begin + 1;
-        const size_t line_length = line_end == std::string::npos ?
-            std::string::npos : line_end - line_start;
-        const std::string line = trace.substr(line_start, line_length);
-        const std::string timestamp_prefix = "ts_us=";
-        const size_t timestamp_begin = line.find(timestamp_prefix);
-        GGML_ASSERT(timestamp_begin != std::string::npos);
-        const size_t timestamp_value_begin = timestamp_begin + timestamp_prefix.size();
-        const size_t timestamp_end = line.find_first_not_of("0123456789", timestamp_value_begin);
-        const std::string timestamp = line.substr(
-            timestamp_value_begin,
-            timestamp_end == std::string::npos ? std::string::npos : timestamp_end - timestamp_value_begin);
-        GGML_ASSERT(!timestamp.empty());
-        records[record_count++] = { event, std::strtoll(timestamp.c_str(), nullptr, 10) };
-        std::printf(
-            "[ASYNC_ORDER] %s\n",
-            line.c_str());
-        position = found + std::strlen(event);
+    GGML_ASSERT(trace.find("htp_opencl_submit_timing") != std::string::npos);
+    GGML_ASSERT(trace.find("cached=1") != std::string::npos);
+    const int64_t early = require_event_timestamp(trace, "gpu_sparse_early_enqueue");
+    const int64_t job = require_event_timestamp(trace, "gpu_sparse_submit_job");
+    const int64_t dense_begin = require_event_timestamp(trace, "htp_dense_begin");
+    const int64_t dense_end = require_event_timestamp(trace, "htp_dense_end");
+    const int64_t enqueue = require_event_timestamp(trace, "gpu_sparse_enqueue");
+    const int64_t flush = require_event_timestamp(trace, "gpu_sparse_flush");
+    const int64_t wait_begin = require_event_timestamp(trace, "gpu_sparse_wait_begin");
+    const int64_t wait_end = require_event_timestamp(trace, "gpu_sparse_wait_end");
+    const int64_t static_wait_begin =
+        require_event_timestamp(trace, "gpu_sparse_static_wait_begin");
+    const int64_t static_wait_end =
+        require_event_timestamp(trace, "gpu_sparse_static_wait_end");
+    const int64_t consumer = require_event_timestamp(trace, "rho_consumer_begin");
+    GGML_ASSERT(early <= job);
+    GGML_ASSERT(job < dense_begin);
+    GGML_ASSERT(dense_begin < dense_end);
+    GGML_ASSERT(enqueue <= flush);
+    const bool waited_for_publication =
+        trace.find("gpu_sparse_publication_wait_begin") != std::string::npos;
+    if (waited_for_publication) {
+        const int64_t publication_wait_begin =
+            require_event_timestamp(trace, "gpu_sparse_publication_wait_begin");
+        const int64_t publication_wait_end =
+            require_event_timestamp(trace, "gpu_sparse_publication_wait_end");
+        GGML_ASSERT(publication_wait_begin <= enqueue);
+        GGML_ASSERT(flush <= publication_wait_end);
+        GGML_ASSERT(publication_wait_end <= wait_begin);
     }
-    for (size_t i = 1; i < record_count; ++i) {
-        GGML_ASSERT(records[i - 1].ts_us <= records[i].ts_us);
-    }
-    GGML_ASSERT(records[0].ts_us <= records[1].ts_us);
-    GGML_ASSERT(records[1].ts_us < records[3].ts_us);
-    GGML_ASSERT(records[3].ts_us < records[5].ts_us);
-    GGML_ASSERT(records[4].ts_us <= records[5].ts_us);
-    GGML_ASSERT(records[5].ts_us <= records[6].ts_us);
-    GGML_ASSERT(records[6].ts_us <= records[7].ts_us);
+    GGML_ASSERT(flush <= wait_begin);
+    GGML_ASSERT(static_wait_begin <= wait_begin);
+    GGML_ASSERT(wait_begin <= wait_end);
+    GGML_ASSERT(wait_end <= static_wait_end);
+    GGML_ASSERT(wait_end <= consumer);
     GGML_ASSERT(count_attention_trace(trace, "opencl", 1) == 1);
 }
 
@@ -620,6 +694,36 @@ void require_async_parity(const run_result & sync, const run_result & async) {
     GGML_ASSERT(max_abs_diff(sync.recovered, async.recovered) <= 2.0e-5f);
 }
 
+void require_early_output_lifetime(ggml_backend_t backend, graph_fixture & fixture) {
+    auto require_sentinel = [](const run_result & result) {
+        GGML_ASSERT(result.status == GGML_STATUS_SUCCESS);
+        for (float value : result.live_probe) {
+            GGML_ASSERT(value == k_live_alias_sentinel);
+        }
+    };
+    {
+        env_guard delayed_probe("SD_HTP_SPARSE_OPENCL_TEST_LIVE_ALIAS_DELAY_US", "50000");
+        env_guard inline_submission("SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD", "0");
+        require_sentinel(run_graph(backend, fixture, true, true));
+    }
+    {
+        env_guard delayed_probe("SD_HTP_SPARSE_OPENCL_TEST_LIVE_ALIAS_DELAY_US", "100000");
+        env_guard delayed_submission("SD_HTP_SPARSE_OPENCL_TEST_SUBMIT_DELAY_US", "20000");
+        require_sentinel(run_graph(backend, fixture, true, true));
+    }
+}
+
+void require_early_mask_lifetime(
+        ggml_backend_t backend,
+        graph_fixture & fixture,
+        const run_result & sync_reference) {
+    env_guard clobber_mask("SD_HTP_SPARSE_OPENCL_TEST_CLOBBER_MASK", "1");
+    env_guard delayed_submission("SD_HTP_SPARSE_OPENCL_TEST_SUBMIT_DELAY_US", "50000");
+    const run_result result = run_graph(backend, fixture, true, true);
+    GGML_ASSERT(result.status == GGML_STATUS_SUCCESS);
+    require_async_parity(sync_reference, result);
+}
+
 void require_task11_failure_modes(
         ggml_backend_t backend,
         graph_fixture & fixture,
@@ -647,7 +751,19 @@ void require_task11_failure_modes(
         GGML_ASSERT(count_attention_trace(strict_failure.trace, "opencl", 1) == 0);
         GGML_ASSERT(count_attention_trace(strict_failure.trace, "htp", 1) == 0);
     }
-    checkpoint("strict end; enqueue failure begin");
+    checkpoint("strict end; submit thread fallback begin");
+    {
+        env_guard fail_start("SD_HTP_SPARSE_OPENCL_TEST_FAIL_SUBMIT_THREAD_START", "1");
+        const run_result fallback = run_graph(backend, fixture, true, true);
+        GGML_ASSERT(fallback.status == GGML_STATUS_SUCCESS);
+        GGML_ASSERT(fallback.trace.find("submission thread start failed") != std::string::npos);
+        GGML_ASSERT(fallback.trace.find("falling back to inline submission") != std::string::npos);
+        GGML_ASSERT(fallback.trace.find("gpu_sparse_submit_job") == std::string::npos);
+        GGML_ASSERT(count_attention_trace(fallback.trace, "opencl", 1) == 1);
+        GGML_ASSERT(count_attention_trace(fallback.trace, "htp", 1) == 0);
+        require_async_parity(sync_reference, fallback);
+    }
+    checkpoint("submit thread fallback end; enqueue failure begin");
     {
         env_guard fail_enqueue("SD_HTP_SPARSE_OPENCL_TEST_FAIL_ENQUEUE", "1");
         const run_result enqueue_failure = run_graph(backend, fixture, true, true);
@@ -665,6 +781,15 @@ void require_task11_failure_modes(
         GGML_ASSERT(count_attention_trace(wait_failure.trace, "htp", 0) == 1);
     }
     checkpoint("wait failure end; abort after enqueue begin");
+    {
+        env_guard abort_after_queue("SD_HTP_SPARSE_OPENCL_TEST_ABORT_AFTER_QUEUE", "1");
+        env_guard delayed_submission("SD_HTP_SPARSE_OPENCL_TEST_SUBMIT_DELAY_US", "50000");
+        const run_result aborted = run_graph(backend, fixture, true, true);
+        GGML_ASSERT(aborted.status == GGML_STATUS_ABORTED);
+        GGML_ASSERT(aborted.trace.find("gpu_sparse_submit_job") != std::string::npos);
+        GGML_ASSERT(aborted.trace.find("gpu_sparse_enqueue") == std::string::npos);
+    }
+    checkpoint("abort after queue end; abort after enqueue begin");
     {
         env_guard abort_after_enqueue("SD_HTP_SPARSE_OPENCL_TEST_ABORT_AFTER_ENQUEUE", "1");
         const run_result aborted = run_graph(backend, fixture, true, true);
@@ -730,6 +855,7 @@ int main() {
     env_guard initial_sidecar("SD_HTP_SPARSE_OPENCL", "1");
     env_guard sidecar_trace("SD_HTP_SPARSE_OPENCL_TRACE", "1");
     env_guard early_submit("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT", "1");
+    env_guard submit_thread("SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD", "1");
     env_guard htp_ops("SD_HTP_OPS", "1");
     env_guard htp_compute("SD_HTP_COMPUTE", "1");
     env_guard htp_attention("SD_HTP_ATTENTION", "1");
@@ -756,16 +882,31 @@ int main() {
     const std::vector<float> sparse_ref = reference_attention(q, k, v, true);
     const run_result off = run_graph(backend, fixture, false, false);
     const run_result sync = run_graph(backend, fixture, true, false);
-    const run_result async = run_graph(backend, fixture, true, true);
+    run_result inline_async;
+    {
+        env_guard inline_submission("SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD", "0");
+        inline_async = run_graph(backend, fixture, true, true);
+    }
+    run_result async;
+    {
+        env_guard delayed_submission("SD_HTP_SPARSE_OPENCL_TEST_SUBMIT_DELAY_US", "50000");
+        async = run_graph(backend, fixture, true, true);
+    }
     GGML_ASSERT(off.status == GGML_STATUS_SUCCESS);
     GGML_ASSERT(sync.status == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(inline_async.status == GGML_STATUS_SUCCESS);
     GGML_ASSERT(async.status == GGML_STATUS_SUCCESS);
     require_routes(off, sync);
+    require_routes(off, inline_async);
     require_routes(off, async);
     require_numerics(off, sync, dense_ref, sparse_ref);
+    require_numerics(off, inline_async, dense_ref, sparse_ref);
     require_numerics(off, async, dense_ref, sparse_ref);
+    require_async_parity(sync, inline_async);
     require_async_parity(sync, async);
     require_async_event_order(async.trace);
+    require_early_output_lifetime(backend, fixture);
+    require_early_mask_lifetime(backend, fixture, sync);
     require_task11_failure_modes(backend, fixture, sync);
 
     ggml_gallocr_free(fixture.allocator);
