@@ -2036,6 +2036,29 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 if (htp_ops_opencl_routes_node(tensor)) {
                     if (htp_ops_opencl_early_submit_was_submitted(tensor)) {
+                        if (params->ith == 0) {
+                            const char * trace = getenv("SD_HTP_SPARSE_OPENCL_TRACE");
+                            const bool trace_enabled =
+                                trace != NULL && trace[0] != '\0' && strcmp(trace, "0") != 0;
+                            if (trace_enabled) {
+                                fprintf(stderr,
+                                        "htp_opencl_event name=gpu_sparse_static_wait_begin "
+                                        "ts_us=%lld producer=%s\n",
+                                        (long long) ggml_time_us(),
+                                        tensor->name[0] != '\0' ? tensor->name : "<unnamed>");
+                            }
+                            const int err = htp_ops_opencl_wait_producer(tensor);
+                            if (err != 0) {
+                                ggml_htp_mark_op_failed(params, tensor, err);
+                            }
+                            if (trace_enabled) {
+                                fprintf(stderr,
+                                        "htp_opencl_event name=gpu_sparse_static_wait_end "
+                                        "ts_us=%lld producer=%s\n",
+                                        (long long) ggml_time_us(),
+                                        tensor->name[0] != '\0' ? tensor->name : "<unnamed>");
+                            }
+                        }
                         break;
                     }
                     if (params->ith == 0) {

@@ -21,6 +21,7 @@ bool htp_ops_opencl_routes_node(const struct ggml_tensor * dst);
 bool htp_ops_opencl_async_enabled(void);
 bool htp_ops_opencl_node_needs_wait(const struct ggml_tensor * dst);
 int  htp_ops_opencl_wait_node(const struct ggml_tensor * dst);
+int  htp_ops_opencl_wait_producer(const struct ggml_tensor * producer);
 int  htp_ops_opencl_compute_node(struct ggml_tensor * dst);
 int  htp_ops_opencl_early_submit_begin(const struct ggml_cgraph * graph);
 void htp_ops_opencl_early_submit_end(void);

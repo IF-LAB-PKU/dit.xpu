@@ -9,16 +9,20 @@
 #include <cerrno>
 #include <climits>
 #include <cctype>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <sys/stat.h>
@@ -67,9 +71,67 @@ struct ggml_opencl_htp_tensor_binding {
     size_t span = 0;
 };
 
+struct ggml_opencl_htp_sparse_dispatch {
+    const ggml_tensor * q = nullptr;
+    const ggml_tensor * k = nullptr;
+    const ggml_tensor * v = nullptr;
+    const ggml_tensor * mask = nullptr;
+    const ggml_tensor * output = nullptr;
+    float scale = 0.0f;
+    cl_int lq = 0;
+    cl_int lk = 0;
+    cl_int heads = 0;
+    cl_int kv_heads = 0;
+    cl_int batch = 0;
+    cl_int mask_format = 0;
+    cl_int max_kept_blocks = 0;
+    int graph_index = -1;
+};
+
+struct ggml_opencl_htp_sparse_bindings {
+    ggml_opencl_htp_tensor_binding q;
+    ggml_opencl_htp_tensor_binding k;
+    ggml_opencl_htp_tensor_binding v;
+    ggml_opencl_htp_tensor_binding output;
+    ggml_opencl_htp_tensor_binding mask;
+};
+
+struct ggml_opencl_htp_tensor_metadata {
+    ggml_type type = GGML_TYPE_COUNT;
+    ggml_op op = GGML_OP_COUNT;
+    int64_t ne[GGML_MAX_DIMS] = {};
+    size_t nb[GGML_MAX_DIMS] = {};
+    const void * data = nullptr;
+    ggml_backend_buffer_t backing = nullptr;
+};
+
+struct ggml_opencl_htp_prepared_sparse_dispatch {
+    ggml_opencl_htp_sparse_dispatch dispatch;
+    ggml_opencl_htp_sparse_bindings bindings;
+    ggml_opencl_htp_tensor_metadata tensor_metadata[5];
+    int32_t output_op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)] = {};
+    cl_mem staged_mask = nullptr;
+};
+
 struct ggml_opencl_htp_pending_event {
     const ggml_tensor * producer = nullptr;
     cl_event event = nullptr;
+    cl_mem staged_output = nullptr;
+    ggml_opencl_htp_tensor_binding destination;
+};
+
+enum class ggml_opencl_htp_submission_state {
+    queued,
+    submitting,
+    submitted,
+    failed,
+};
+
+struct ggml_opencl_htp_submission_record {
+    const ggml_tensor * producer = nullptr;
+    ggml_opencl_htp_submission_state state = ggml_opencl_htp_submission_state::queued;
+    ggml_opencl_htp_result result = GGML_OPENCL_HTP_OK;
+    char reason[256] = {};
 };
 
 enum class ggml_opencl_htp_graph_state {
@@ -83,6 +145,17 @@ struct ggml_opencl_htp_graph {
     std::vector<cl_event> events;
     std::vector<ggml_opencl_htp_pending_event> pending_events;
     std::vector<const ggml_tensor *> routed_nodes;
+    std::vector<ggml_opencl_htp_prepared_sparse_dispatch> prepared_sparse_dispatches;
+    mutable std::mutex submission_mutex;
+    std::condition_variable submission_cv;
+    std::deque<const ggml_tensor *> submission_jobs;
+    std::vector<ggml_opencl_htp_submission_record> submission_records;
+    std::thread submission_thread;
+    bool submission_worker_active = false;
+    bool submission_stop_requested = false;
+    bool submission_cancel_requested = false;
+    ggml_opencl_htp_result async_failure_result = GGML_OPENCL_HTP_OK;
+    char async_failure_reason[256] = {};
     ggml_opencl_htp_graph_state state = ggml_opencl_htp_graph_state::active;
     ggml_opencl_htp_result finish_result = GGML_OPENCL_HTP_OK;
     char finish_reason[256] = {};
@@ -597,6 +670,8 @@ ggml_opencl_htp_result finish_graph_state(
     const char * requested_reason,
     char * reason,
     size_t reason_capacity) {
+    std::lock_guard<std::mutex> submission_lock(graph->submission_mutex);
+    GGML_ASSERT(!graph->submission_worker_active);
     if (graph->state == ggml_opencl_htp_graph_state::finished) {
         set_reason(reason, reason_capacity, "%s", graph->finish_reason);
         return graph->finish_result;
@@ -623,6 +698,10 @@ ggml_opencl_htp_result finish_graph_state(
             record_error("clReleaseEvent", clReleaseEvent(pending.event));
             pending.event = nullptr;
         }
+        if (pending.staged_output != nullptr) {
+            record_error("clReleaseMemObject", clReleaseMemObject(pending.staged_output));
+            pending.staged_output = nullptr;
+        }
     }
     graph->pending_events.clear();
     for (ggml_opencl_htp_alias & alias : graph->aliases) {
@@ -633,6 +712,14 @@ ggml_opencl_htp_result finish_graph_state(
     }
     graph->aliases.clear();
     graph->routed_nodes.clear();
+    for (ggml_opencl_htp_prepared_sparse_dispatch & prepared :
+            graph->prepared_sparse_dispatches) {
+        if (prepared.staged_mask != nullptr) {
+            record_error("clReleaseMemObject", clReleaseMemObject(prepared.staged_mask));
+            prepared.staged_mask = nullptr;
+        }
+    }
+    graph->prepared_sparse_dispatches.clear();
     graph->state = ggml_opencl_htp_graph_state::finished;
     graph->cleanup_failed = failed_operation != nullptr;
 
@@ -677,6 +764,51 @@ ggml_opencl_htp_result fail_graph(
         graph, GGML_OPENCL_HTP_ERROR, failure_reason, reason, reason_capacity);
 }
 
+ggml_opencl_htp_result fail_runtime_graph(
+    ggml_opencl_htp_graph * graph,
+    char * reason,
+    size_t reason_capacity,
+    const char * format,
+    ...) {
+    char failure_reason[256] = {};
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(failure_reason, sizeof(failure_reason), format, args);
+    va_end(args);
+    failure_reason[sizeof(failure_reason) - 1] = '\0';
+
+    {
+        std::lock_guard<std::mutex> lock(graph->submission_mutex);
+        if (graph->submission_worker_active) {
+            if (graph->async_failure_result == GGML_OPENCL_HTP_OK) {
+                graph->async_failure_result = GGML_OPENCL_HTP_ERROR;
+                std::snprintf(
+                    graph->async_failure_reason, sizeof(graph->async_failure_reason),
+                    "%s", failure_reason);
+            }
+            graph->submission_stop_requested = true;
+            graph->submission_cancel_requested = true;
+            for (ggml_opencl_htp_submission_record & queued : graph->submission_records) {
+                if (queued.state != ggml_opencl_htp_submission_state::queued) {
+                    continue;
+                }
+                queued.result = GGML_OPENCL_HTP_ERROR;
+                queued.state = ggml_opencl_htp_submission_state::failed;
+                std::snprintf(
+                    queued.reason, sizeof(queued.reason),
+                    "submission cancelled after graph failure: %s", failure_reason);
+            }
+            graph->submission_jobs.clear();
+            set_reason(reason, reason_capacity, "%s", failure_reason);
+            graph->submission_cv.notify_all();
+            return GGML_OPENCL_HTP_ERROR;
+        }
+    }
+
+    return finish_graph_state(
+        graph, GGML_OPENCL_HTP_ERROR, failure_reason, reason, reason_capacity);
+}
+
 ggml_opencl_htp_result fail_submitted_graph(
     ggml_opencl_htp_graph * graph,
     cl_event event,
@@ -686,7 +818,7 @@ ggml_opencl_htp_result fail_submitted_graph(
     size_t reason_capacity) {
     const cl_int finish_err = clFinish(graph->sidecar->queue);
     const cl_int release_err = event != nullptr ? clReleaseEvent(event) : CL_SUCCESS;
-    return fail_graph(
+    return fail_runtime_graph(
         graph, reason, reason_capacity,
         "%s failed (error %d, command drain error %d, event release error %d)",
         operation, operation_error, finish_err, release_err);
@@ -760,23 +892,6 @@ ggml_opencl_htp_result validate_import_descriptor(
 
     return GGML_OPENCL_HTP_OK;
 }
-
-struct ggml_opencl_htp_sparse_dispatch {
-    const ggml_tensor * q = nullptr;
-    const ggml_tensor * k = nullptr;
-    const ggml_tensor * v = nullptr;
-    const ggml_tensor * mask = nullptr;
-    const ggml_tensor * output = nullptr;
-    float scale = 0.0f;
-    cl_int lq = 0;
-    cl_int lk = 0;
-    cl_int heads = 0;
-    cl_int kv_heads = 0;
-    cl_int batch = 0;
-    cl_int mask_format = 0;
-    cl_int max_kept_blocks = 0;
-    int graph_index = -1;
-};
 
 ggml_opencl_htp_result unsupported_sparse_node(
     char * reason,
@@ -1000,14 +1115,6 @@ bool bindings_overlap(
     return lhs.offset < rhs.offset + rhs.span && rhs.offset < lhs.offset + lhs.span;
 }
 
-struct ggml_opencl_htp_sparse_bindings {
-    ggml_opencl_htp_tensor_binding q;
-    ggml_opencl_htp_tensor_binding k;
-    ggml_opencl_htp_tensor_binding v;
-    ggml_opencl_htp_tensor_binding output;
-    ggml_opencl_htp_tensor_binding mask;
-};
-
 ggml_opencl_htp_result resolve_sparse_bindings(
     ggml_opencl_htp_graph * graph,
     const ggml_opencl_htp_sparse_dispatch & dispatch,
@@ -1064,6 +1171,63 @@ ggml_backend_buffer_t tensor_backing(const ggml_tensor * tensor) {
         }
     }
     return nullptr;
+}
+
+ggml_opencl_htp_tensor_metadata capture_tensor_metadata(const ggml_tensor * tensor) {
+    ggml_opencl_htp_tensor_metadata metadata;
+    metadata.type = tensor->type;
+    metadata.op = tensor->op;
+    std::memcpy(metadata.ne, tensor->ne, sizeof(metadata.ne));
+    std::memcpy(metadata.nb, tensor->nb, sizeof(metadata.nb));
+    metadata.data = tensor->data;
+    metadata.backing = tensor_backing(tensor);
+    return metadata;
+}
+
+bool tensor_metadata_matches(
+        const ggml_tensor * tensor,
+        const ggml_opencl_htp_tensor_metadata & metadata) {
+    return tensor != nullptr &&
+           tensor->type == metadata.type &&
+           tensor->op == metadata.op &&
+           std::memcmp(tensor->ne, metadata.ne, sizeof(metadata.ne)) == 0 &&
+           std::memcmp(tensor->nb, metadata.nb, sizeof(metadata.nb)) == 0 &&
+           tensor->data == metadata.data &&
+           tensor_backing(tensor) == metadata.backing;
+}
+
+ggml_opencl_htp_prepared_sparse_dispatch make_prepared_sparse_dispatch(
+        const ggml_opencl_htp_sparse_dispatch & dispatch,
+        const ggml_opencl_htp_sparse_bindings & bindings) {
+    ggml_opencl_htp_prepared_sparse_dispatch prepared;
+    prepared.dispatch = dispatch;
+    prepared.bindings = bindings;
+    const ggml_tensor * tensors[] = {
+        dispatch.q, dispatch.k, dispatch.v, dispatch.mask, dispatch.output,
+    };
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(tensors[0]); ++i) {
+        prepared.tensor_metadata[i] = capture_tensor_metadata(tensors[i]);
+    }
+    std::memcpy(
+        prepared.output_op_params, dispatch.output->op_params,
+        sizeof(prepared.output_op_params));
+    return prepared;
+}
+
+bool prepared_sparse_metadata_matches(
+        const ggml_opencl_htp_prepared_sparse_dispatch & prepared,
+        const ggml_tensor * output) {
+    const ggml_tensor * tensors[] = {
+        output->src[0], output->src[1], output->src[2], output->src[3], output,
+    };
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(tensors[0]); ++i) {
+        if (!tensor_metadata_matches(tensors[i], prepared.tensor_metadata[i])) {
+            return false;
+        }
+    }
+    return std::memcmp(
+        output->op_params, prepared.output_op_params,
+        sizeof(prepared.output_op_params)) == 0;
 }
 
 bool is_sparse_route_candidate(const ggml_tensor * node) {
@@ -1417,6 +1581,7 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
     std::vector<routed_output_binding> output_bindings;
     try {
         output_bindings.reserve(dispatches.size());
+        prepared->prepared_sparse_dispatches.reserve(dispatches.size());
         for (const ggml_opencl_htp_sparse_dispatch & dispatch : dispatches) {
             ggml_opencl_htp_sparse_bindings bindings;
             char binding_reason[256] = {};
@@ -1439,6 +1604,8 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
                 }
             }
             output_bindings.push_back({ bindings.output, dispatch.output, dispatch.graph_index });
+            prepared->prepared_sparse_dispatches.push_back(
+                make_prepared_sparse_dispatch(dispatch, bindings));
         }
         prepared->routed_nodes = std::move(routed_nodes);
     } catch (...) {
@@ -1574,9 +1741,93 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_fill_tensor(
         pattern, reason, reason_capacity);
 }
 
-ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_async(
+ggml_opencl_htp_result ggml_backend_opencl_htp_graph_stage_block_sparse_attn_mask(
     ggml_opencl_htp_graph * graph,
     const ggml_tensor * node,
+    char * reason,
+    size_t reason_capacity) {
+    if (graph == nullptr || node == nullptr) {
+        set_reason(reason, reason_capacity, "graph and node must not be null");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    if (graph->state != ggml_opencl_htp_graph_state::active) {
+        set_reason(reason, reason_capacity, "graph is already finished");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    std::lock_guard<std::mutex> lock(graph->sidecar->dispatch_mutex);
+    const auto prepared = std::find_if(
+        graph->prepared_sparse_dispatches.begin(), graph->prepared_sparse_dispatches.end(),
+        [node](const ggml_opencl_htp_prepared_sparse_dispatch & item) {
+            return item.dispatch.output == node;
+        });
+    if (prepared == graph->prepared_sparse_dispatches.end()) {
+        set_reason(reason, reason_capacity, "sparse attention node was not prepared");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+    if (prepared->staged_mask != nullptr) {
+        set_reason(reason, reason_capacity, "ok");
+        return GGML_OPENCL_HTP_OK;
+    }
+
+    cl_int err = CL_SUCCESS;
+    cl_mem staged_mask = clCreateBuffer(
+        graph->sidecar->context, CL_MEM_READ_ONLY,
+        prepared->bindings.mask.span, nullptr, &err);
+    if (err != CL_SUCCESS || staged_mask == nullptr) {
+        if (staged_mask != nullptr) {
+            clReleaseMemObject(staged_mask);
+        }
+        return fail_runtime_graph(
+            graph, reason, reason_capacity,
+            "clCreateBuffer failed for early sparse mask staging (span %zu, error %d)",
+            prepared->bindings.mask.span, err);
+    }
+
+    trace_sidecar_event("gpu_sparse_mask_stage_begin", node);
+    cl_event copy_event = nullptr;
+    err = clEnqueueCopyBuffer(
+        graph->sidecar->queue,
+        prepared->bindings.mask.memory,
+        staged_mask,
+        prepared->bindings.mask.offset,
+        0,
+        prepared->bindings.mask.span,
+        0,
+        nullptr,
+        &copy_event);
+    if (err == CL_SUCCESS && copy_event == nullptr) {
+        err = CL_INVALID_EVENT;
+    }
+    if (err == CL_SUCCESS) {
+        err = clFlush(graph->sidecar->queue);
+    }
+    if (err == CL_SUCCESS) {
+        err = clWaitForEvents(1, &copy_event);
+    }
+    const cl_int event_release_err = copy_event != nullptr
+        ? clReleaseEvent(copy_event) : CL_SUCCESS;
+    if (err != CL_SUCCESS || event_release_err != CL_SUCCESS) {
+        const cl_int memory_release_err = clReleaseMemObject(staged_mask);
+        return fail_runtime_graph(
+            graph, reason, reason_capacity,
+            "failed to stage early sparse mask for producer %p "
+            "(error %d, event release error %d, memory release error %d)",
+            static_cast<const void *>(node), err,
+            event_release_err, memory_release_err);
+    }
+
+    std::atomic_thread_fence(std::memory_order_acquire);
+    prepared->staged_mask = staged_mask;
+    trace_sidecar_event("gpu_sparse_mask_stage_end", node);
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
+static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
+    ggml_opencl_htp_graph * graph,
+    const ggml_tensor * node,
+    bool stage_output,
     char * reason,
     size_t reason_capacity) {
     if (graph == nullptr) {
@@ -1588,31 +1839,92 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_a
         return GGML_OPENCL_HTP_ERROR;
     }
 
+    const bool trace_timing = sidecar_trace_enabled();
+    const int64_t timing_begin_us = trace_timing ? ggml_time_us() : 0;
+    bool cached_dispatch = false;
+    cl_mem staged_mask = nullptr;
     ggml_opencl_htp_sparse_dispatch dispatch;
-    const ggml_opencl_htp_result validation = validate_block_sparse_node(
-        node, &dispatch, reason, reason_capacity);
-    if (validation != GGML_OPENCL_HTP_OK) {
-        return validation;
-    }
-
     ggml_opencl_htp_sparse_bindings bindings;
-    const ggml_opencl_htp_result binding_result = resolve_sparse_bindings(
-        graph, dispatch, &bindings, reason, reason_capacity);
-    if (binding_result != GGML_OPENCL_HTP_OK) {
-        return binding_result;
+    const auto prepared = std::find_if(
+        graph->prepared_sparse_dispatches.begin(), graph->prepared_sparse_dispatches.end(),
+        [node](const ggml_opencl_htp_prepared_sparse_dispatch & item) {
+            return item.dispatch.output == node;
+        });
+    if (prepared != graph->prepared_sparse_dispatches.end()) {
+        dispatch = prepared->dispatch;
+        bindings = prepared->bindings;
+        staged_mask = prepared->staged_mask;
+        cached_dispatch = true;
+        if (node->src[0] != dispatch.q || node->src[1] != dispatch.k ||
+            node->src[2] != dispatch.v || node->src[3] != dispatch.mask ||
+            !prepared_sparse_metadata_matches(*prepared, node)) {
+            return fail_runtime_graph(
+                graph, reason, reason_capacity,
+                "preflight sparse dispatch tensor or metadata changed");
+        }
+    } else {
+        const ggml_opencl_htp_result validation = validate_block_sparse_node(
+            node, &dispatch, reason, reason_capacity);
+        if (validation != GGML_OPENCL_HTP_OK) {
+            return validation;
+        }
     }
+    const int64_t validation_end_us = trace_timing ? ggml_time_us() : 0;
+
+    if (!cached_dispatch) {
+        const ggml_opencl_htp_result binding_result = resolve_sparse_bindings(
+            graph, dispatch, &bindings, reason, reason_capacity);
+        if (binding_result != GGML_OPENCL_HTP_OK) {
+            return binding_result;
+        }
+    }
+    const int64_t binding_end_us = trace_timing ? ggml_time_us() : 0;
 
     static_assert(sizeof(size_t) <= sizeof(cl_ulong), "OpenCL offsets must hold host size_t values");
     const cl_mem q_memory = bindings.q.memory;
     const cl_mem k_memory = bindings.k.memory;
     const cl_mem v_memory = bindings.v.memory;
-    const cl_mem output_memory = bindings.output.memory;
-    const cl_mem mask_memory = bindings.mask.memory;
+    cl_int staging_error = CL_SUCCESS;
+    cl_mem staged_output = nullptr;
+    if (stage_output) {
+        staged_output = clCreateBuffer(
+            graph->sidecar->context, CL_MEM_READ_WRITE,
+            bindings.output.span, nullptr, &staging_error);
+        if (staging_error != CL_SUCCESS || staged_output == nullptr) {
+            if (staged_output != nullptr) {
+                clReleaseMemObject(staged_output);
+            }
+            return fail_runtime_graph(
+                graph, reason, reason_capacity,
+                "clCreateBuffer failed for early sparse output staging "
+                "(span %zu, error %d)",
+                bindings.output.span, staging_error);
+        }
+    }
+    struct staged_output_guard {
+        cl_mem memory = nullptr;
+        ~staged_output_guard() {
+            if (memory != nullptr) {
+                clReleaseMemObject(memory);
+            }
+        }
+        cl_mem release() {
+            cl_mem result = memory;
+            memory = nullptr;
+            return result;
+        }
+    } staging_guard = { staged_output };
+
+    const cl_mem output_memory = stage_output ? staged_output : bindings.output.memory;
+    const cl_mem mask_memory = stage_output && staged_mask != nullptr
+        ? staged_mask : bindings.mask.memory;
     const cl_ulong q_offset = static_cast<cl_ulong>(bindings.q.offset);
     const cl_ulong k_offset = static_cast<cl_ulong>(bindings.k.offset);
     const cl_ulong v_offset = static_cast<cl_ulong>(bindings.v.offset);
-    const cl_ulong output_offset = static_cast<cl_ulong>(bindings.output.offset);
-    const cl_ulong mask_offset = static_cast<cl_ulong>(bindings.mask.offset);
+    const cl_ulong output_offset = stage_output
+        ? 0 : static_cast<cl_ulong>(bindings.output.offset);
+    const cl_ulong mask_offset = stage_output && staged_mask != nullptr
+        ? 0 : static_cast<cl_ulong>(bindings.mask.offset);
     const cl_float scale = dispatch.scale;
     const cl_int lq = dispatch.lq;
     const cl_int lk = dispatch.lk;
@@ -1642,7 +1954,7 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_a
             return item.producer == node;
         });
     if (pending != graph->pending_events.end()) {
-        return fail_graph(
+        return fail_runtime_graph(
             graph, reason, reason_capacity,
             "sparse attention producer %p already has a pending event",
             static_cast<const void *>(node));
@@ -1656,7 +1968,7 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_a
         return kernel_result;
     }
     if (kernel_result != GGML_OPENCL_HTP_OK) {
-        return fail_graph(
+        return fail_runtime_graph(
             graph, reason, reason_capacity,
             "block-sparse kernel creation failed: %s", kernel_reason);
     }
@@ -1703,11 +2015,12 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_a
         const cl_int err = clSetKernelArg(
             graph->sidecar->block_sparse_kernel, index, args[index].size, args[index].value);
         if (err != CL_SUCCESS) {
-            return fail_graph(
+            return fail_runtime_graph(
                 graph, reason, reason_capacity,
                 "clSetKernelArg(%u) failed (error %d)", index, err);
         }
     }
+    const int64_t kernel_args_end_us = trace_timing ? ggml_time_us() : 0;
 
     const size_t local_work_size[] = { 32, 1 };
     const size_t global_work_size[] = {
@@ -1724,10 +2037,11 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_a
             return fail_submitted_graph(
                 graph, event, "clEnqueueNDRangeKernel", err, reason, reason_capacity);
         }
-        return fail_graph(
+        return fail_runtime_graph(
             graph, reason, reason_capacity,
             "clEnqueueNDRangeKernel failed (error %d, no event)", err);
     }
+    const int64_t enqueue_end_us = trace_timing ? ggml_time_us() : 0;
 
     if (graph->test_fail_next_sparse_enqueue) {
         graph->test_fail_next_sparse_enqueue = false;
@@ -1737,7 +2051,13 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_a
     }
 
     try {
-        graph->pending_events.push_back({ node, event });
+        ggml_opencl_htp_pending_event pending_event;
+        pending_event.producer = node;
+        pending_event.event = event;
+        pending_event.staged_output = staging_guard.memory;
+        pending_event.destination = bindings.output;
+        graph->pending_events.push_back(pending_event);
+        staging_guard.release();
     } catch (...) {
         return fail_submitted_graph(
             graph, event, "cache sparse producer event", CL_OUT_OF_HOST_MEMORY,
@@ -1747,12 +2067,332 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_a
 
     err = clFlush(graph->sidecar->queue);
     if (err != CL_SUCCESS) {
-        return fail_graph(
+        return fail_runtime_graph(
             graph, reason, reason_capacity,
             "clFlush failed after sparse enqueue (error %d)", err);
     }
     trace_sidecar_event("gpu_sparse_flush", node);
+    if (trace_timing) {
+        const int64_t flush_end_us = ggml_time_us();
+        std::fprintf(
+            stderr,
+            "htp_opencl_submit_timing producer=%s cached=%d validation_us=%lld "
+            "binding_us=%lld kernel_args_us=%lld enqueue_us=%lld flush_us=%lld total_us=%lld\n",
+            node->name[0] != '\0' ? node->name : "<unnamed>",
+            cached_dispatch ? 1 : 0,
+            (long long) (validation_end_us - timing_begin_us),
+            (long long) (binding_end_us - validation_end_us),
+            (long long) (kernel_args_end_us - binding_end_us),
+            (long long) (enqueue_end_us - kernel_args_end_us),
+            (long long) (flush_end_us - enqueue_end_us),
+            (long long) (flush_end_us - timing_begin_us));
+    }
 
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_async(
+    ggml_opencl_htp_graph * graph,
+    const ggml_tensor * node,
+    char * reason,
+    size_t reason_capacity) {
+    return compute_block_sparse_attn_async_impl(
+        graph, node, false, reason, reason_capacity);
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_early_async(
+    ggml_opencl_htp_graph * graph,
+    const ggml_tensor * node,
+    char * reason,
+    size_t reason_capacity) {
+    return compute_block_sparse_attn_async_impl(
+        graph, node, true, reason, reason_capacity);
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_graph_start_submission_thread(
+    ggml_opencl_htp_graph * graph,
+    char * reason,
+    size_t reason_capacity) {
+    if (graph == nullptr) {
+        set_reason(reason, reason_capacity, "graph must not be null");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    std::lock_guard<std::mutex> lock(graph->submission_mutex);
+    if (graph->state != ggml_opencl_htp_graph_state::active) {
+        set_reason(reason, reason_capacity, "graph is already finished");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    if (graph->submission_thread.joinable()) {
+        set_reason(reason, reason_capacity, "submission thread is already running");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    if (graph->routed_nodes.empty()) {
+        set_reason(reason, reason_capacity, "graph has no routed sparse nodes");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+    if (const char * fail_start =
+            std::getenv("SD_HTP_SPARSE_OPENCL_TEST_FAIL_SUBMIT_THREAD_START");
+        fail_start != nullptr && fail_start[0] != '\0' && std::strcmp(fail_start, "0") != 0) {
+        set_reason(reason, reason_capacity, "injected OpenCL submission thread start failure");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    graph->submission_stop_requested = false;
+    graph->submission_cancel_requested = false;
+    graph->async_failure_result = GGML_OPENCL_HTP_OK;
+    graph->async_failure_reason[0] = '\0';
+    graph->submission_jobs.clear();
+    graph->submission_records.clear();
+    try {
+        graph->submission_records.reserve(graph->routed_nodes.size());
+        graph->submission_thread = std::thread([graph]() {
+            for (;;) {
+                const ggml_tensor * node = nullptr;
+                {
+                    std::unique_lock<std::mutex> lock(graph->submission_mutex);
+                    graph->submission_cv.wait(lock, [graph]() {
+                        return graph->submission_stop_requested || !graph->submission_jobs.empty();
+                    });
+                    if (graph->submission_jobs.empty()) {
+                        if (graph->submission_stop_requested) {
+                            return;
+                        }
+                        continue;
+                    }
+                    node = graph->submission_jobs.front();
+                    graph->submission_jobs.pop_front();
+                    const auto record = std::find_if(
+                        graph->submission_records.begin(), graph->submission_records.end(),
+                        [node](const ggml_opencl_htp_submission_record & item) {
+                            return item.producer == node;
+                        });
+                    if (record != graph->submission_records.end()) {
+                        record->state = ggml_opencl_htp_submission_state::submitting;
+                    }
+                }
+
+                char submit_reason[256] = {};
+                ggml_opencl_htp_result result = GGML_OPENCL_HTP_ERROR;
+                try {
+                    const char * delay_value =
+                        std::getenv("SD_HTP_SPARSE_OPENCL_TEST_SUBMIT_DELAY_US");
+                    if (delay_value != nullptr && delay_value[0] != '\0') {
+                        char * end = nullptr;
+                        const long long delay_us = std::strtoll(delay_value, &end, 10);
+                        if (end != delay_value && *end == '\0' && delay_us > 0 && delay_us <= 1000000) {
+                            std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+                        }
+                    }
+                    bool cancelled = false;
+                    {
+                        std::lock_guard<std::mutex> lock(graph->submission_mutex);
+                        cancelled = graph->submission_cancel_requested;
+                    }
+                    if (cancelled) {
+                        std::snprintf(
+                            submit_reason, sizeof(submit_reason),
+                            "OpenCL submission cancelled before enqueue");
+                    } else {
+                        result = ggml_backend_opencl_htp_graph_compute_block_sparse_attn_early_async(
+                            graph, node, submit_reason, sizeof(submit_reason));
+                    }
+                } catch (...) {
+                    std::snprintf(
+                        submit_reason, sizeof(submit_reason),
+                        "unexpected exception in OpenCL submission thread");
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(graph->submission_mutex);
+                    const auto record = std::find_if(
+                        graph->submission_records.begin(), graph->submission_records.end(),
+                        [node](const ggml_opencl_htp_submission_record & item) {
+                            return item.producer == node;
+                        });
+                    if (record != graph->submission_records.end()) {
+                        record->result = result;
+                        record->state = result == GGML_OPENCL_HTP_OK
+                            ? ggml_opencl_htp_submission_state::submitted
+                            : ggml_opencl_htp_submission_state::failed;
+                        std::snprintf(
+                            record->reason, sizeof(record->reason), "%s",
+                            submit_reason[0] != '\0' ? submit_reason : "OpenCL submission failed");
+                    }
+                    if (result != GGML_OPENCL_HTP_OK) {
+                        graph->submission_stop_requested = true;
+                        graph->submission_cancel_requested = true;
+                        for (ggml_opencl_htp_submission_record & queued : graph->submission_records) {
+                            if (queued.state != ggml_opencl_htp_submission_state::queued) {
+                                continue;
+                            }
+                            queued.result = result;
+                            queued.state = ggml_opencl_htp_submission_state::failed;
+                            std::snprintf(
+                                queued.reason, sizeof(queued.reason),
+                                "submission thread stopped after producer failure: %s",
+                                submit_reason[0] != '\0' ? submit_reason : "unknown error");
+                        }
+                        graph->submission_jobs.clear();
+                    }
+                }
+                graph->submission_cv.notify_all();
+            }
+        });
+        graph->submission_worker_active = true;
+    } catch (...) {
+        graph->submission_worker_active = false;
+        graph->submission_stop_requested = true;
+        set_reason(reason, reason_capacity, "failed to start OpenCL submission thread");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_graph_queue_block_sparse_attn(
+    ggml_opencl_htp_graph * graph,
+    const ggml_tensor * node,
+    char * reason,
+    size_t reason_capacity) {
+    if (graph == nullptr || node == nullptr) {
+        set_reason(reason, reason_capacity, "graph and node must not be null");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    std::lock_guard<std::mutex> lock(graph->submission_mutex);
+    if (graph->state != ggml_opencl_htp_graph_state::active) {
+        set_reason(reason, reason_capacity, "graph is already finished");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    if (!graph->submission_thread.joinable() || graph->submission_stop_requested) {
+        set_reason(reason, reason_capacity, "submission thread is not accepting work");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    if (std::find(graph->routed_nodes.begin(), graph->routed_nodes.end(), node) ==
+        graph->routed_nodes.end()) {
+        set_reason(reason, reason_capacity, "node is not routed to the OpenCL sidecar");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+    const auto existing = std::find_if(
+        graph->submission_records.begin(), graph->submission_records.end(),
+        [node](const ggml_opencl_htp_submission_record & item) {
+            return item.producer == node;
+        });
+    if (existing != graph->submission_records.end()) {
+        set_reason(reason, reason_capacity, "sparse attention producer was already queued");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    if (graph->submission_records.size() >= graph->routed_nodes.size()) {
+        set_reason(reason, reason_capacity, "OpenCL submission queue capacity exceeded");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    try {
+        ggml_opencl_htp_submission_record record;
+        record.producer = node;
+        std::snprintf(record.reason, sizeof(record.reason), "queued");
+        graph->submission_records.push_back(record);
+        graph->submission_jobs.push_back(node);
+    } catch (...) {
+        const auto record = std::find_if(
+            graph->submission_records.begin(), graph->submission_records.end(),
+            [node](const ggml_opencl_htp_submission_record & item) {
+                return item.producer == node;
+            });
+        if (record != graph->submission_records.end()) {
+            graph->submission_records.erase(record);
+        }
+        set_reason(reason, reason_capacity, "failed to publish OpenCL submission job");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    trace_sidecar_event("gpu_sparse_submit_job", node);
+    graph->submission_cv.notify_one();
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_graph_stop_submission_thread(
+    ggml_opencl_htp_graph * graph,
+    char * reason,
+    size_t reason_capacity) {
+    if (graph == nullptr) {
+        set_reason(reason, reason_capacity, "graph must not be null");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    std::thread worker;
+    {
+        std::lock_guard<std::mutex> lock(graph->submission_mutex);
+        if (!graph->submission_worker_active) {
+            GGML_ASSERT(!graph->submission_thread.joinable());
+            set_reason(reason, reason_capacity, "ok");
+            return GGML_OPENCL_HTP_OK;
+        }
+        GGML_ASSERT(graph->submission_thread.joinable());
+        if (graph->submission_thread.get_id() == std::this_thread::get_id()) {
+            set_reason(reason, reason_capacity, "submission thread cannot join itself");
+            return GGML_OPENCL_HTP_ERROR;
+        }
+        graph->submission_stop_requested = true;
+        worker = std::move(graph->submission_thread);
+    }
+    graph->submission_cv.notify_all();
+    worker.join();
+
+    std::lock_guard<std::mutex> lock(graph->submission_mutex);
+    graph->submission_worker_active = false;
+    if (graph->async_failure_result != GGML_OPENCL_HTP_OK) {
+        set_reason(reason, reason_capacity, "%s", graph->async_failure_reason);
+        return graph->async_failure_result;
+    }
+    const auto failed = std::find_if(
+        graph->submission_records.begin(), graph->submission_records.end(),
+        [](const ggml_opencl_htp_submission_record & item) {
+            return item.state == ggml_opencl_htp_submission_state::failed;
+        });
+    if (failed != graph->submission_records.end()) {
+        set_reason(reason, reason_capacity, "%s", failed->reason);
+        return failed->result == GGML_OPENCL_HTP_OK
+            ? GGML_OPENCL_HTP_ERROR : failed->result;
+    }
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_graph_cancel_submission_thread(
+    ggml_opencl_htp_graph * graph,
+    char * reason,
+    size_t reason_capacity) {
+    if (graph == nullptr) {
+        set_reason(reason, reason_capacity, "graph must not be null");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(graph->submission_mutex);
+        if (!graph->submission_worker_active) {
+            set_reason(reason, reason_capacity, "ok");
+            return GGML_OPENCL_HTP_OK;
+        }
+        graph->submission_cancel_requested = true;
+        graph->submission_stop_requested = true;
+        for (ggml_opencl_htp_submission_record & queued : graph->submission_records) {
+            if (queued.state != ggml_opencl_htp_submission_state::queued) {
+                continue;
+            }
+            queued.result = GGML_OPENCL_HTP_ERROR;
+            queued.state = ggml_opencl_htp_submission_state::failed;
+            std::snprintf(
+                queued.reason, sizeof(queued.reason),
+                "OpenCL submission cancelled before enqueue");
+        }
+        graph->submission_jobs.clear();
+    }
+    graph->submission_cv.notify_all();
     set_reason(reason, reason_capacity, "ok");
     return GGML_OPENCL_HTP_OK;
 }
@@ -1770,47 +2410,173 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_wait_for_tensor(
         set_reason(reason, reason_capacity, "graph and producer must not be null");
         return GGML_OPENCL_HTP_ERROR;
     }
-    if (graph->state != ggml_opencl_htp_graph_state::active) {
-        set_reason(reason, reason_capacity, "graph is already finished");
-        return GGML_OPENCL_HTP_ERROR;
+    {
+        std::unique_lock<std::mutex> lock(graph->submission_mutex);
+        auto find_submission = [graph, producer]() {
+            return std::find_if(
+                graph->submission_records.begin(), graph->submission_records.end(),
+                [producer](const ggml_opencl_htp_submission_record & item) {
+                    return item.producer == producer;
+                });
+        };
+        auto submission = find_submission();
+        if (submission != graph->submission_records.end()) {
+            const bool waits_for_publication =
+                submission->state == ggml_opencl_htp_submission_state::queued ||
+                submission->state == ggml_opencl_htp_submission_state::submitting;
+            if (waits_for_publication) {
+                trace_sidecar_event("gpu_sparse_publication_wait_begin", producer);
+            }
+            graph->submission_cv.wait(lock, [&find_submission, graph]() {
+                const auto current = find_submission();
+                GGML_ASSERT(current != graph->submission_records.end());
+                return current->state == ggml_opencl_htp_submission_state::submitted ||
+                       current->state == ggml_opencl_htp_submission_state::failed;
+            });
+            submission = find_submission();
+            if (waits_for_publication) {
+                trace_sidecar_event("gpu_sparse_publication_wait_end", producer);
+            }
+            if (submission->state == ggml_opencl_htp_submission_state::failed) {
+                set_reason(reason, reason_capacity, "%s", submission->reason);
+                return submission->result == GGML_OPENCL_HTP_OK
+                    ? GGML_OPENCL_HTP_ERROR : submission->result;
+            }
+        }
+        if (graph->state != ggml_opencl_htp_graph_state::active) {
+            set_reason(reason, reason_capacity, "graph is already finished");
+            return GGML_OPENCL_HTP_ERROR;
+        }
     }
 
-    std::lock_guard<std::mutex> lock(graph->sidecar->dispatch_mutex);
-    const auto pending = std::find_if(
-        graph->pending_events.begin(), graph->pending_events.end(),
-        [producer](const ggml_opencl_htp_pending_event & item) {
-            return item.producer == producer;
-        });
-    if (pending == graph->pending_events.end()) {
-        set_reason(reason, reason_capacity, "ok");
-        return GGML_OPENCL_HTP_OK;
-    }
-
-    if (graph->test_fail_next_sparse_wait) {
+    cl_event pending_event = nullptr;
+    cl_mem staged_output = nullptr;
+    ggml_opencl_htp_tensor_binding destination;
+    cl_int retain_err = CL_SUCCESS;
+    bool inject_wait_failure = false;
+    {
+        std::lock_guard<std::mutex> lock(graph->sidecar->dispatch_mutex);
+        const auto pending = std::find_if(
+            graph->pending_events.begin(), graph->pending_events.end(),
+            [producer](const ggml_opencl_htp_pending_event & item) {
+                return item.producer == producer;
+            });
+        if (pending == graph->pending_events.end()) {
+            set_reason(reason, reason_capacity, "ok");
+            return GGML_OPENCL_HTP_OK;
+        }
+        pending_event = pending->event;
+        staged_output = pending->staged_output;
+        destination = pending->destination;
+        inject_wait_failure = graph->test_fail_next_sparse_wait;
         graph->test_fail_next_sparse_wait = false;
-        return fail_graph(
+        if (!inject_wait_failure) {
+            retain_err = clRetainEvent(pending_event);
+        }
+    }
+
+    if (inject_wait_failure) {
+        return fail_runtime_graph(
             graph, reason, reason_capacity,
             "injected sparse wait failure after submission");
     }
-
-    trace_sidecar_event("gpu_sparse_wait_begin", producer);
-    const cl_int wait_err = clWaitForEvents(1, &pending->event);
-    if (wait_err != CL_SUCCESS) {
-        return fail_graph(
+    if (retain_err != CL_SUCCESS) {
+        return fail_runtime_graph(
             graph, reason, reason_capacity,
-            "clWaitForEvents failed for sparse producer %p (error %d)",
-            static_cast<const void *>(producer), wait_err);
+            "clRetainEvent failed for sparse producer %p (error %d)",
+            static_cast<const void *>(producer), retain_err);
     }
 
-    const cl_event completed_event = pending->event;
-    graph->pending_events.erase(pending);
-    const cl_int release_err = clReleaseEvent(completed_event);
-    std::atomic_thread_fence(std::memory_order_acquire);
-    if (release_err != CL_SUCCESS) {
-        return fail_graph(
+    if (const char * wait_delay =
+            std::getenv("SD_HTP_SPARSE_OPENCL_TEST_WAIT_DELAY_US");
+        wait_delay != nullptr && wait_delay[0] != '\0') {
+        char * end = nullptr;
+        const long long delay_us = std::strtoll(wait_delay, &end, 10);
+        if (end != wait_delay && *end == '\0' && delay_us > 0 && delay_us <= 1000000) {
+            std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+        }
+    }
+
+    trace_sidecar_event("gpu_sparse_wait_begin", producer);
+    const cl_int wait_err = clWaitForEvents(1, &pending_event);
+    if (wait_err != CL_SUCCESS) {
+        const cl_int release_err = clReleaseEvent(pending_event);
+        return fail_runtime_graph(
             graph, reason, reason_capacity,
-            "clReleaseEvent failed for sparse producer %p (error %d)",
-            static_cast<const void *>(producer), release_err);
+            "clWaitForEvents failed for sparse producer %p "
+            "(error %d, retained event release error %d)",
+            static_cast<const void *>(producer), wait_err, release_err);
+    }
+
+    cl_event publish_event = nullptr;
+    if (staged_output != nullptr) {
+        trace_sidecar_event("gpu_sparse_publish_begin", producer);
+        cl_int publish_err = clEnqueueCopyBuffer(
+            graph->sidecar->queue,
+            staged_output,
+            destination.memory,
+            0,
+            destination.offset,
+            destination.span,
+            0,
+            nullptr,
+            &publish_event);
+        if (publish_err == CL_SUCCESS && publish_event == nullptr) {
+            publish_err = CL_INVALID_EVENT;
+        }
+        if (publish_err == CL_SUCCESS) {
+            publish_err = clFlush(graph->sidecar->queue);
+        }
+        if (publish_err == CL_SUCCESS) {
+            publish_err = clWaitForEvents(1, &publish_event);
+        }
+        if (publish_err != CL_SUCCESS) {
+            const cl_int publish_release_err = publish_event != nullptr
+                ? clReleaseEvent(publish_event) : CL_SUCCESS;
+            const cl_int retained_release_err = clReleaseEvent(pending_event);
+            return fail_runtime_graph(
+                graph, reason, reason_capacity,
+                "failed to publish staged sparse output for producer %p "
+                "(error %d, publish event release error %d, "
+                "retained event release error %d)",
+                static_cast<const void *>(producer), publish_err,
+                publish_release_err, retained_release_err);
+        }
+        trace_sidecar_event("gpu_sparse_publish_end", producer);
+    }
+
+    bool removed_pending_event = false;
+    {
+        std::lock_guard<std::mutex> lock(graph->sidecar->dispatch_mutex);
+        const auto pending = std::find_if(
+            graph->pending_events.begin(), graph->pending_events.end(),
+            [producer, pending_event](const ggml_opencl_htp_pending_event & item) {
+                return item.producer == producer && item.event == pending_event;
+            });
+        if (pending != graph->pending_events.end()) {
+            graph->pending_events.erase(pending);
+            removed_pending_event = true;
+        }
+    }
+    const cl_int owner_release_err =
+        removed_pending_event ? clReleaseEvent(pending_event) : CL_SUCCESS;
+    const cl_int retained_release_err = clReleaseEvent(pending_event);
+    const cl_int publish_release_err = publish_event != nullptr
+        ? clReleaseEvent(publish_event) : CL_SUCCESS;
+    const cl_int staging_release_err = removed_pending_event && staged_output != nullptr
+        ? clReleaseMemObject(staged_output) : CL_SUCCESS;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (!removed_pending_event || owner_release_err != CL_SUCCESS ||
+        retained_release_err != CL_SUCCESS || publish_release_err != CL_SUCCESS ||
+        staging_release_err != CL_SUCCESS) {
+        return fail_runtime_graph(
+            graph, reason, reason_capacity,
+            "sparse producer %p event completion cleanup failed "
+            "(pending=%d, owner release error %d, retained release error %d, "
+            "publish release error %d, staging release error %d)",
+            static_cast<const void *>(producer), removed_pending_event ? 1 : 0,
+            owner_release_err, retained_release_err,
+            publish_release_err, staging_release_err);
     }
     if (waited != nullptr) {
         *waited = true;
@@ -1845,8 +2611,15 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_finish(
         set_reason(reason, reason_capacity, "graph must not be null");
         return GGML_OPENCL_HTP_ERROR;
     }
+    char stop_reason[256] = {};
+    const ggml_opencl_htp_result stop_result =
+        ggml_backend_opencl_htp_graph_stop_submission_thread(
+            graph, stop_reason, sizeof(stop_reason));
     return finish_graph_state(
-        graph, GGML_OPENCL_HTP_OK, "ok", reason, reason_capacity);
+        graph,
+        stop_result == GGML_OPENCL_HTP_OK ? GGML_OPENCL_HTP_OK : GGML_OPENCL_HTP_ERROR,
+        stop_result == GGML_OPENCL_HTP_OK ? "ok" : stop_reason,
+        reason, reason_capacity);
 }
 
 void ggml_backend_opencl_htp_graph_free(ggml_opencl_htp_graph ** graph) {
@@ -1869,7 +2642,25 @@ size_t ggml_backend_opencl_htp_graph_live_event_count(const ggml_opencl_htp_grap
 
 size_t ggml_backend_opencl_htp_graph_pending_sparse_event_count(
         const ggml_opencl_htp_graph * graph) {
-    return graph != nullptr ? graph->pending_events.size() : 0;
+    if (graph == nullptr) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(graph->sidecar->dispatch_mutex);
+    return graph->pending_events.size();
+}
+
+size_t ggml_backend_opencl_htp_graph_pending_sparse_submission_count(
+        const ggml_opencl_htp_graph * graph) {
+    if (graph == nullptr) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(graph->submission_mutex);
+    return static_cast<size_t>(std::count_if(
+        graph->submission_records.begin(), graph->submission_records.end(),
+        [](const ggml_opencl_htp_submission_record & item) {
+            return item.state == ggml_opencl_htp_submission_state::queued ||
+                   item.state == ggml_opencl_htp_submission_state::submitting;
+        }));
 }
 
 void ggml_backend_opencl_htp_graph_test_fail_next_event_cache(ggml_opencl_htp_graph * graph) {

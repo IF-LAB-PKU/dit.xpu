@@ -115,6 +115,45 @@ ggml_backend_opencl_htp_graph_compute_block_sparse_attn_async(
     size_t reason_capacity);
 
 GGML_BACKEND_API enum ggml_opencl_htp_result
+ggml_backend_opencl_htp_graph_compute_block_sparse_attn_early_async(
+    ggml_opencl_htp_graph * graph,
+    const struct ggml_tensor * node,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API enum ggml_opencl_htp_result
+ggml_backend_opencl_htp_graph_stage_block_sparse_attn_mask(
+    ggml_opencl_htp_graph * graph,
+    const struct ggml_tensor * node,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API enum ggml_opencl_htp_result
+ggml_backend_opencl_htp_graph_start_submission_thread(
+    ggml_opencl_htp_graph * graph,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API enum ggml_opencl_htp_result
+ggml_backend_opencl_htp_graph_queue_block_sparse_attn(
+    ggml_opencl_htp_graph * graph,
+    const struct ggml_tensor * node,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API enum ggml_opencl_htp_result
+ggml_backend_opencl_htp_graph_stop_submission_thread(
+    ggml_opencl_htp_graph * graph,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API enum ggml_opencl_htp_result
+ggml_backend_opencl_htp_graph_cancel_submission_thread(
+    ggml_opencl_htp_graph * graph,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API enum ggml_opencl_htp_result
 ggml_backend_opencl_htp_graph_wait_for_tensor(
     ggml_opencl_htp_graph * graph,
     const struct ggml_tensor * producer,
@@ -144,6 +183,9 @@ GGML_BACKEND_API size_t ggml_backend_opencl_htp_graph_live_event_count(
     const ggml_opencl_htp_graph * graph);
 
 GGML_BACKEND_API size_t ggml_backend_opencl_htp_graph_pending_sparse_event_count(
+    const ggml_opencl_htp_graph * graph);
+
+GGML_BACKEND_API size_t ggml_backend_opencl_htp_graph_pending_sparse_submission_count(
     const ggml_opencl_htp_graph * graph);
 
 // Diagnostic fault injection used by the shared-memory lifecycle test.

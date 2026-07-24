@@ -212,6 +212,7 @@ ggml_backend_htp_context::~ggml_backend_htp_context() {
         ggml_backend_opencl_htp_graph_finish(sparse_opencl_graph, reason, sizeof(reason));
         ggml_backend_opencl_htp_graph_free(&sparse_opencl_graph);
     }
+    sparse_opencl_submission_thread_active = false;
     sparse_opencl_routed_nodes.clear();
     ggml_backend_opencl_htp_sidecar_free(sparse_opencl_sidecar);
     sparse_opencl_sidecar = nullptr;
@@ -618,6 +619,7 @@ static ggml_opencl_htp_result ggml_backend_htp_opencl_preflight(
         char * reason,
         size_t reason_capacity) {
     GGML_ASSERT(ctx->sparse_opencl_graph == nullptr);
+    GGML_ASSERT(!ctx->sparse_opencl_submission_thread_active);
     GGML_ASSERT(ctx->sparse_opencl_routed_nodes.empty());
     if (ctx->sparse_opencl_sidecar == nullptr) {
         std::snprintf(reason, reason_capacity, "OpenCL sidecar is unavailable");
@@ -691,12 +693,14 @@ static ggml_opencl_htp_result ggml_backend_htp_opencl_preflight(
 
 static bool ggml_backend_htp_opencl_finish(ggml_backend_htp_context * ctx) {
     if (ctx->sparse_opencl_graph == nullptr) {
+        ctx->sparse_opencl_submission_thread_active = false;
         ctx->sparse_opencl_routed_nodes.clear();
         return true;
     }
 
     ggml_opencl_htp_graph * graph = ctx->sparse_opencl_graph;
     ctx->sparse_opencl_graph = nullptr;
+    ctx->sparse_opencl_submission_thread_active = false;
     char reason[512] = {};
     const ggml_opencl_htp_result result =
         ggml_backend_opencl_htp_graph_finish(graph, reason, sizeof(reason));
@@ -716,6 +720,13 @@ static bool ggml_backend_htp_test_abort_after_sparse_enqueue(void * data) {
     auto * ctx = static_cast<ggml_backend_htp_context *>(data);
     return ctx != nullptr && ctx->sparse_opencl_graph != nullptr &&
         ggml_backend_opencl_htp_graph_pending_sparse_event_count(ctx->sparse_opencl_graph) > 0;
+}
+
+static bool ggml_backend_htp_test_abort_after_sparse_queue(void * data) {
+    auto * ctx = static_cast<ggml_backend_htp_context *>(data);
+    return ctx != nullptr && ctx->sparse_opencl_graph != nullptr &&
+        ggml_backend_opencl_htp_graph_pending_sparse_submission_count(
+            ctx->sparse_opencl_graph) > 0;
 }
 #endif
 
@@ -793,6 +804,30 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
             return GGML_STATUS_FAILED;
         }
         if (preflight == GGML_OPENCL_HTP_OK &&
+            ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_ASYNC") &&
+            ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT") &&
+            ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD")) {
+            char start_reason[512] = {};
+            const ggml_opencl_htp_result start_result =
+                ggml_backend_opencl_htp_graph_start_submission_thread(
+                    ctx->sparse_opencl_graph, start_reason, sizeof(start_reason));
+            if (start_result != GGML_OPENCL_HTP_OK) {
+                std::fprintf(
+                    stderr,
+                    "ggml-htp: OpenCL submission thread start failed result=%d reason=%s; "
+                    "falling back to inline submission\n",
+                    (int) start_result,
+                    start_reason[0] != '\0' ? start_reason : "unknown error");
+            } else {
+                ctx->sparse_opencl_submission_thread_active = true;
+            }
+        }
+        if (preflight == GGML_OPENCL_HTP_OK &&
+            ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_TEST_ABORT_AFTER_QUEUE")) {
+            cplan.abort_callback = ggml_backend_htp_test_abort_after_sparse_queue;
+            cplan.abort_callback_data = ctx;
+        }
+        if (preflight == GGML_OPENCL_HTP_OK &&
             ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_TEST_ABORT_AFTER_ENQUEUE")) {
             cplan.abort_callback = ggml_backend_htp_test_abort_after_sparse_enqueue;
             cplan.abort_callback_data = ctx;
@@ -808,6 +843,19 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
         }
         htp_ops_opencl_early_submit_end();
 #ifdef GGML_HTP_OPENCL_SIDECAR
+        if (status != GGML_STATUS_SUCCESS && ctx->sparse_opencl_graph != nullptr) {
+            char cancel_reason[512] = {};
+            const ggml_opencl_htp_result cancel_result =
+                ggml_backend_opencl_htp_graph_cancel_submission_thread(
+                    ctx->sparse_opencl_graph, cancel_reason, sizeof(cancel_reason));
+            if (cancel_result != GGML_OPENCL_HTP_OK) {
+                std::fprintf(
+                    stderr,
+                    "ggml-htp: OpenCL submission cancellation failed result=%d reason=%s\n",
+                    (int) cancel_result,
+                    cancel_reason[0] != '\0' ? cancel_reason : "unknown error");
+            }
+        }
         if (!ggml_backend_htp_opencl_finish(ctx) && status == GGML_STATUS_SUCCESS) {
             status = GGML_STATUS_FAILED;
         }
