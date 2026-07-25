@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -2074,6 +2075,57 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_lse_node(ggml_context* ctx,
                                                            ggml_flash_attn_ext_mask_format mask_format =
                                                                GGML_FLASH_ATTN_EXT_MASK_DEFAULT);
 
+__STATIC_INLINE__ void sd_htp_exact_rho_cache_cpu(
+        ggml_tensor* dst, int ith, int nth, void* userdata) {
+    SD_UNUSED(userdata);
+    const ggml_tensor* dense = dst->src[0];
+    const ggml_tensor* sparse = dst->src[1];
+    GGML_ASSERT(dense != nullptr && sparse != nullptr);
+    GGML_ASSERT(dense->type == GGML_TYPE_F32 && sparse->type == GGML_TYPE_F32);
+    const int64_t head_dim = dense->ne[0] - 1;
+    const int64_t rows = dense->ne[1] * dense->ne[2] * dense->ne[3];
+    for (int64_t row = ith; row < rows; row += nth) {
+        static_cast<float*>(dst->data)[row] = std::exp(
+            static_cast<const float*>(sparse->data)[row * sparse->ne[0] + head_dim] -
+            static_cast<const float*>(dense->data)[row * dense->ne[0] + head_dim]);
+    }
+}
+
+__STATIC_INLINE__ void sd_htp_exact_residual_cache_cpu(
+        ggml_tensor* dst, int ith, int nth, void* userdata) {
+    SD_UNUSED(userdata);
+    const ggml_tensor* dense = dst->src[0];
+    const ggml_tensor* sparse = dst->src[1];
+    const ggml_tensor* rho = dst->src[2];
+    GGML_ASSERT(dense != nullptr && sparse != nullptr && rho != nullptr);
+    GGML_ASSERT(dense->type == GGML_TYPE_F32 && sparse->type == GGML_TYPE_F32 &&
+                rho->type == GGML_TYPE_F32);
+    const int64_t head_dim = dense->ne[0] - 1;
+    const int64_t rows = dense->ne[1] * dense->ne[2] * dense->ne[3];
+    for (int64_t row = ith; row < rows; row += nth) {
+        const float scale = static_cast<const float*>(rho->data)[row];
+        for (int64_t d = 0; d < head_dim; ++d) {
+            static_cast<float*>(dst->data)[row * head_dim + d] =
+                static_cast<const float*>(dense->data)[row * dense->ne[0] + d] -
+                static_cast<const float*>(sparse->data)[row * sparse->ne[0] + d] * scale;
+        }
+    }
+}
+
+__STATIC_INLINE__ bool sd_htp_opencl_residual_route_prerequisites() {
+    return sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL") &&
+           sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_ASYNC") &&
+           sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT") &&
+           sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE") &&
+           sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO");
+}
+
+__STATIC_INLINE__ bool sd_htp_opencl_deferred_residual_enabled() {
+    return sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL") &&
+           sd_env_flag_enabled_default(
+               "SD_HTP_SPARSE_OPENCL_DEFER_RESIDUAL", true);
+}
+
 // q: [N, L_q, C(n_head*d_head)] or [N*n_head, L_q, d_head]
 // k: [N, L_k, n_kv_head*d_head] or [N*n_kv_head, L_k, d_head]
 // v: [N, L_k, n_kv_head*d_head] or [N, L_k, n_kv_head, d_head]
@@ -2482,14 +2534,53 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                         dense_lse = flash_attn_lse_view(dense_candidate);
                     }
                     ggml_tensor* rho = nullptr;
+                    ggml_tensor* residual = nullptr;
                     if (can_cache_exact_rho) {
                         GGML_ASSERT(dense_lse != nullptr && sparse_lse != nullptr);
-                        rho = ggml_exp(ctx, ggml_sub(ctx, sparse_lse, dense_lse));
+                        const bool residual_route_requested =
+                            sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL");
+                        const bool residual_route_enabled =
+                            residual_route_requested &&
+                            sd_htp_opencl_residual_route_prerequisites();
+                        if (residual_route_requested && !residual_route_enabled &&
+                            sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_STRICT")) {
+                            GGML_ABORT(
+                                "SD_HTP_SPARSE_OPENCL_RESIDUAL requires OpenCL sparse, "
+                                "async, early-submit, residual cache, and exact-rho");
+                        }
+                        if (residual_route_enabled) {
+                            ggml_tensor* rho_args[] = { dense_candidate, candidate };
+                            rho = ggml_custom_4d(
+                                ctx, GGML_TYPE_F32, 1, n_head, L_q, N,
+                                rho_args, 2, sd_htp_exact_rho_cache_cpu,
+                                GGML_N_TASKS_MAX, nullptr);
+                        } else {
+                            ggml_tensor* rho_sub = ggml_sub(
+                                ctx, sparse_lse, dense_lse);
+                            ggml_set_name(
+                                rho_sub, "htp_cpu_residual_rho_sub");
+                            rho = ggml_exp(ctx, rho_sub);
+                        }
                         ggml_set_name(rho, block_sparse_residual_rho_cache_name);
                         (*block_sparse_cache_tensor)(block_sparse_residual_rho_cache_name, rho);
-                        sparse_reshape_out = ggml_mul(ctx, sparse_out, rho);
+                        if (residual_route_enabled) {
+                            ggml_tensor* residual_args[] = {
+                                dense_candidate, candidate, rho,
+                            };
+                            residual = ggml_custom_4d(
+                                ctx, GGML_TYPE_F32, d_head, n_head, L_q, N,
+                                residual_args, 3, sd_htp_exact_residual_cache_cpu,
+                                GGML_N_TASKS_MAX, nullptr);
+                        } else {
+                            sparse_reshape_out = ggml_mul(ctx, sparse_out, rho);
+                            ggml_set_name(
+                                sparse_reshape_out,
+                                "htp_cpu_residual_scale_mul");
+                        }
                     }
-                    ggml_tensor* residual = ggml_sub(ctx, dense_out, sparse_reshape_out);
+                    if (residual == nullptr) {
+                        residual = ggml_sub(ctx, dense_out, sparse_reshape_out);
+                    }
                     ggml_set_name(residual, block_sparse_residual_cache_name);
                     (*block_sparse_cache_tensor)(block_sparse_residual_cache_name, residual);
                     if (sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
@@ -4582,8 +4673,28 @@ protected:
     ggml_context* cache_ctx            = nullptr;
     ggml_backend_buffer_t cache_buffer = nullptr;
 
+    struct AsyncResidualCacheGeneration {
+        uint64_t generation = 0;
+        ggml_backend_htp_async_cache_slot* slot = nullptr;
+        size_t consumer_count = 0;
+        bool producer_pending = false;
+    };
+    std::unordered_map<std::string, std::deque<AsyncResidualCacheGeneration>>
+        async_residual_cache_slots_;
+    std::map<ggml_tensor*, uint64_t> cache_backed_tensor_generation_map_;
+    std::vector<std::pair<std::string, uint64_t>> active_async_cache_consumers_;
+    uint64_t next_async_residual_cache_generation_ = 1;
+
     ggml_context* compute_ctx    = nullptr;
     ggml_gallocr* compute_allocr = nullptr;
+    struct RetiredComputeArenaGeneration {
+        uint64_t generation = 0;
+        ggml_gallocr* allocator = nullptr;
+        size_t bytes = 0;
+    };
+    std::deque<RetiredComputeArenaGeneration> retired_compute_arenas_;
+    uint64_t next_compute_arena_generation_ = 1;
+    uint64_t active_compute_arena_generation_ = 0;
 
     ggml_context* partial_offload_ctx                   = nullptr;
     ggml_backend_buffer_t partial_runtime_params_buffer = nullptr;
@@ -4698,6 +4809,114 @@ protected:
         }
     }
 
+    void free_async_residual_cache_slots() {
+        for (auto& keyed_slots : async_residual_cache_slots_) {
+            for (AsyncResidualCacheGeneration& generation : keyed_slots.second) {
+                ggml_backend_htp_async_cache_slot_free(generation.slot);
+                generation.slot = nullptr;
+            }
+        }
+        async_residual_cache_slots_.clear();
+    }
+
+    AsyncResidualCacheGeneration* find_async_residual_cache_slot(
+            const std::string& key,
+            uint64_t generation) {
+        auto found = async_residual_cache_slots_.find(key);
+        if (found == async_residual_cache_slots_.end()) {
+            return nullptr;
+        }
+        for (AsyncResidualCacheGeneration& slot : found->second) {
+            if (slot.generation == generation) {
+                return &slot;
+            }
+        }
+        return nullptr;
+    }
+
+    AsyncResidualCacheGeneration* latest_async_residual_cache_slot(
+            const std::string& key) {
+        auto found = async_residual_cache_slots_.find(key);
+        if (found == async_residual_cache_slots_.end() || found->second.empty()) {
+            return nullptr;
+        }
+        return &found->second.back();
+    }
+
+    bool async_residual_cache_backed(const std::string& key) const {
+        const auto found = async_residual_cache_slots_.find(key);
+        return found != async_residual_cache_slots_.end() &&
+               !found->second.empty() && found->second.back().slot != nullptr;
+    }
+
+    void release_active_async_cache_consumers() {
+        for (const auto& binding : active_async_cache_consumers_) {
+            AsyncResidualCacheGeneration* generation =
+                find_async_residual_cache_slot(binding.first, binding.second);
+            if (generation == nullptr) {
+                continue;
+            }
+            GGML_ASSERT(generation->consumer_count > 0);
+            --generation->consumer_count;
+            bool ready = false;
+            char reason[512] = {};
+            if (htp_backend != nullptr &&
+                ggml_backend_htp_opencl_cache_query(
+                    htp_backend, binding.first.c_str(), binding.second,
+                    &ready, reason, sizeof(reason)) && ready) {
+                generation->producer_pending = false;
+            }
+        }
+        active_async_cache_consumers_.clear();
+    }
+
+    AsyncResidualCacheGeneration* allocate_async_residual_cache_slot(
+            const std::string& key,
+            const ggml_tensor* metadata,
+            uint64_t generation) {
+        if (htp_backend == nullptr || metadata == nullptr || key.empty()) {
+            return nullptr;
+        }
+        if (AsyncResidualCacheGeneration* existing =
+                find_async_residual_cache_slot(key, generation)) {
+            return existing;
+        }
+        std::deque<AsyncResidualCacheGeneration>& generations =
+            async_residual_cache_slots_[key];
+        if (generations.size() >= 2) {
+            AsyncResidualCacheGeneration& oldest = generations.front();
+            if (oldest.producer_pending || oldest.consumer_count != 0) {
+                LOG_DEBUG(
+                    "gpu_residual_cache_pressure_wait key=%s generation=%" PRIu64,
+                    key.c_str(), oldest.generation);
+                return nullptr;
+            }
+            ggml_backend_htp_async_cache_slot_free(oldest.slot);
+            generations.pop_front();
+        }
+
+        char reason[512] = {};
+        ggml_backend_htp_async_cache_slot* slot =
+            ggml_backend_htp_async_cache_slot_create(
+                htp_backend,
+                key.c_str(),
+                generation,
+                metadata->type,
+                metadata->ne,
+                reason,
+                sizeof(reason));
+        if (slot == nullptr) {
+            LOG_ERROR("allocate async residual cache slot %s failed: %s",
+                      key.c_str(), reason[0] != '\0' ? reason : "unknown error");
+            if (generations.empty()) {
+                async_residual_cache_slots_.erase(key);
+            }
+            return nullptr;
+        }
+        generations.push_back({ generation, slot, 0, false });
+        return &generations.back();
+    }
+
     void alloc_compute_ctx() {
         ggml_init_params params;
         params.mem_size   = static_cast<size_t>(ggml_tensor_overhead() * MAX_GRAPH_SIZE + ggml_graph_overhead());
@@ -4708,6 +4927,80 @@ protected:
         GGML_ASSERT(compute_ctx != nullptr);
     }
 
+    bool reap_retired_compute_arenas(bool wait_all) {
+        if (htp_backend == nullptr) {
+            return retired_compute_arenas_.empty();
+        }
+        for (auto it = retired_compute_arenas_.begin();
+             it != retired_compute_arenas_.end();) {
+            bool released = false;
+            char reason[512] = {};
+            if (!ggml_backend_htp_opencl_release_arena_generation(
+                    htp_backend, it->generation, wait_all, &released,
+                    reason, sizeof(reason))) {
+                LOG_ERROR(
+                    "%s release deferred compute arena generation=%" PRIu64 " failed: %s",
+                    get_desc().c_str(), it->generation,
+                    reason[0] != '\0' ? reason : "unknown error");
+                return false;
+            }
+            if (!released) {
+                ++it;
+                continue;
+            }
+            ggml_gallocr_free(it->allocator);
+            it = retired_compute_arenas_.erase(it);
+        }
+        return true;
+    }
+
+    bool retire_current_compute_arena(uint64_t generation) {
+        if (compute_allocr == nullptr || generation == 0) {
+            return true;
+        }
+        if (!reap_retired_compute_arenas(false)) {
+            return false;
+        }
+        while (retired_compute_arenas_.size() >= 2) {
+            RetiredComputeArenaGeneration& oldest = retired_compute_arenas_.front();
+            const int64_t wait_begin = ggml_time_us();
+            std::fprintf(
+                stderr,
+                "htp_opencl_event name=gpu_residual_arena_pressure_wait_begin "
+                "ts_us=%lld generation=%" PRIu64 " bytes=%zu\n",
+                (long long) wait_begin, oldest.generation, oldest.bytes);
+            bool released = false;
+            char reason[512] = {};
+            if (!ggml_backend_htp_opencl_release_arena_generation(
+                    htp_backend, oldest.generation, true, &released,
+                    reason, sizeof(reason)) || !released) {
+                LOG_ERROR(
+                    "%s pressure wait for compute arena generation=%" PRIu64
+                    " failed: %s",
+                    get_desc().c_str(), oldest.generation,
+                    reason[0] != '\0' ? reason : "unknown error");
+                return false;
+            }
+            std::fprintf(
+                stderr,
+                "htp_opencl_event name=gpu_residual_arena_pressure_wait_end "
+                "ts_us=%lld generation=%" PRIu64 "\n",
+                (long long) ggml_time_us(), oldest.generation);
+            ggml_gallocr_free(oldest.allocator);
+            retired_compute_arenas_.pop_front();
+        }
+
+        size_t bytes = ggml_gallocr_get_buffer_size(compute_allocr, 0);
+        if (!compute_node_buffer_ids_.empty()) {
+            bytes += ggml_gallocr_get_buffer_size(compute_allocr, 1);
+        }
+        retired_compute_arenas_.push_back({ generation, compute_allocr, bytes });
+        compute_allocr = nullptr;
+        compute_node_buffer_ids_.clear();
+        compute_leaf_buffer_ids_.clear();
+        return true;
+    }
+
     void free_compute_ctx() {
         debug_tensors.clear();
         if (compute_ctx != nullptr) {
@@ -4716,6 +5009,7 @@ protected:
         }
         backend_tensor_data_map.clear();
         cache_backed_tensor_name_map.clear();
+        cache_backed_tensor_generation_map_.clear();
     }
 
     void rebuild_params_tensor_set() {
@@ -4768,6 +5062,9 @@ protected:
                 ggml_build_forward_expand(gf, entry.second);
             }
         }
+        if (htp_backend != nullptr) {
+            ggml_backend_htp_opencl_retain_deferred_residual_inputs(gf);
+        }
         prepare_build_in_tensor_after(gf);
         return gf;
     }
@@ -4788,6 +5085,9 @@ protected:
     }
 
     bool alloc_compute_buffer(ggml_cgraph* gf) {
+        if (!reap_retired_compute_arenas(false)) {
+            return false;
+        }
         ggml_backend_buffer_type_t runtime_buft = ggml_backend_get_default_buffer_type(runtime_backend);
         ggml_backend_buffer_type_t htp_buft     = htp_backend != nullptr ? ggml_backend_get_default_buffer_type(htp_backend) : nullptr;
         compute_node_buffer_ids_.clear();
@@ -5374,11 +5674,17 @@ protected:
                 if (cache_keep_names != nullptr && cache_keep_names->find(tensor->name) == cache_keep_names->end()) {
                     continue;
                 }
+                if (async_residual_cache_backed(tensor->name)) {
+                    continue;
+                }
                 merged_cache_sources[tensor->name] = tensor;
             }
         }
         for (const auto& kv : cache_tensor_map) {
             if (cache_keep_names != nullptr && cache_keep_names->find(kv.first) == cache_keep_names->end()) {
+                continue;
+            }
+            if (async_residual_cache_backed(kv.first)) {
                 continue;
             }
             merged_cache_sources[kv.first] = kv.second;
@@ -5542,9 +5848,24 @@ protected:
     }
 
     bool bind_cache_backed_tensors() {
+        GGML_ASSERT(active_async_cache_consumers_.empty());
         for (const auto& kv : cache_backed_tensor_name_map) {
             ggml_tensor* graph_tensor = kv.first;
-            ggml_tensor* cache_tensor = get_cache_tensor_by_name(kv.second);
+            ggml_tensor* cache_tensor = nullptr;
+            uint64_t async_generation = 0;
+            const auto generation_it =
+                cache_backed_tensor_generation_map_.find(graph_tensor);
+            if (generation_it != cache_backed_tensor_generation_map_.end()) {
+                async_generation = generation_it->second;
+                AsyncResidualCacheGeneration* cached =
+                    find_async_residual_cache_slot(kv.second, async_generation);
+                if (cached != nullptr && cached->slot != nullptr) {
+                    cache_tensor =
+                        ggml_backend_htp_async_cache_slot_tensor(cached->slot);
+                }
+            } else {
+                cache_tensor = get_cache_tensor_by_name(kv.second);
+            }
             if (graph_tensor == nullptr || cache_tensor == nullptr) {
                 LOG_WARN("%s block sparse residual cache miss while binding: %s",
                          get_desc().c_str(),
@@ -5567,6 +5888,27 @@ protected:
                     return false;
                 }
             }
+            if (async_generation != 0) {
+                char reason[512] = {};
+                if (htp_backend == nullptr ||
+                    !ggml_backend_htp_opencl_bind_cache_input(
+                        htp_backend, graph_tensor, kv.second.c_str(),
+                        async_generation, reason, sizeof(reason))) {
+                    LOG_ERROR(
+                        "%s bind async residual cache input failed: key=%s "
+                        "generation=%" PRIu64 " reason=%s",
+                        get_desc().c_str(), kv.second.c_str(), async_generation,
+                        reason[0] != '\0' ? reason : "unknown error");
+                    release_active_async_cache_consumers();
+                    return false;
+                }
+                AsyncResidualCacheGeneration* cached =
+                    find_async_residual_cache_slot(kv.second, async_generation);
+                GGML_ASSERT(cached != nullptr);
+                ++cached->consumer_count;
+                active_async_cache_consumers_.push_back(
+                    { kv.second, async_generation });
+            }
             graph_tensor->buffer = cache_tensor->buffer;
             graph_tensor->data   = cache_tensor->data;
             graph_tensor->extra  = cache_tensor->extra;
@@ -5574,6 +5916,45 @@ protected:
                 graph_tensor->src[src_idx] = nullptr;
             }
             graph_tensor->op = GGML_OP_NONE;
+        }
+        return true;
+    }
+
+    bool bind_async_residual_cache_outputs() {
+        if (!sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL")) {
+            return true;
+        }
+        std::vector<std::pair<std::string, ggml_tensor*>> outputs;
+        for (const auto& entry : cache_tensor_map) {
+            ggml_tensor* tensor = entry.second;
+            if (tensor == nullptr || tensor->op != GGML_OP_CUSTOM ||
+                entry.first.rfind("htp_block_sparse_residual_", 0) != 0) {
+                continue;
+            }
+            outputs.push_back(entry);
+        }
+        if (outputs.empty()) {
+            return true;
+        }
+
+        const uint64_t generation = next_async_residual_cache_generation_++;
+        for (const auto& output : outputs) {
+            AsyncResidualCacheGeneration* cached =
+                allocate_async_residual_cache_slot(
+                    output.first, output.second, generation);
+            if (cached == nullptr || cached->slot == nullptr) {
+                if (sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_STRICT")) {
+                    return false;
+                }
+                continue;
+            }
+            ggml_tensor* slot_tensor =
+                ggml_backend_htp_async_cache_slot_tensor(cached->slot);
+            GGML_ASSERT(slot_tensor != nullptr);
+            output.second->buffer = slot_tensor->buffer;
+            output.second->data = slot_tensor->data;
+            output.second->extra = slot_tensor->extra;
+            cached->producer_pending = true;
         }
         return true;
     }
@@ -5952,6 +6333,15 @@ protected:
         int64_t t_alloc_end = ggml_time_ms();
 
         int64_t t_copy_begin = ggml_time_ms();
+        if (!bind_async_residual_cache_outputs()) {
+            LOG_ERROR("%s bind async residual cache outputs failed", get_desc().c_str());
+            if (free_compute_buffer_immediately) {
+                free_compute_buffer();
+            } else if (use_partial_param_offload) {
+                restore_partial_params();
+            }
+            return std::nullopt;
+        }
         if (!bind_cache_backed_tensors()) {
             if (free_compute_buffer_immediately) {
                 free_compute_buffer();
@@ -5972,10 +6362,26 @@ protected:
             sd_backend_htp_set_n_threads(htp_backend, n_threads);
             sd_backend_htp_set_hybrid_enabled(true);
         }
+        uint64_t arena_generation = 0;
+        if (use_htp_compute && sd_htp_opencl_deferred_residual_enabled()) {
+            arena_generation = next_compute_arena_generation_++;
+            active_compute_arena_generation_ = arena_generation;
+            ggml_backend_htp_opencl_set_compute_arena_generation(
+                htp_backend, arena_generation);
+        }
         ggml_status status      = ggml_backend_graph_compute(use_htp_compute ? htp_backend : runtime_backend, gf);
+        release_active_async_cache_consumers();
         if (use_htp_compute) {
             sd_backend_htp_set_hybrid_enabled(false);
         }
+        if (arena_generation != 0 &&
+            ggml_backend_htp_opencl_arena_generation_pending(
+                htp_backend, arena_generation)) {
+            if (!retire_current_compute_arena(arena_generation)) {
+                status = GGML_STATUS_FAILED;
+            }
+        }
+        active_compute_arena_generation_ = 0;
         int64_t t_compute_end   = ggml_time_ms();
         if (status != GGML_STATUS_SUCCESS) {
             LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
@@ -6024,6 +6430,21 @@ protected:
             print_sd_tensor(debug_tensor, false, entry.second.c_str());
         }
 
+        bool trace_residual_cache_copy = false;
+        if (sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_TRACE")) {
+            for (const auto& entry : cache_tensor_map) {
+                if (entry.first.rfind("htp_block_sparse_residual_", 0) == 0 &&
+                    !async_residual_cache_backed(entry.first)) {
+                    trace_residual_cache_copy = true;
+                    break;
+                }
+            }
+        }
+        if (trace_residual_cache_copy) {
+            std::fprintf(stderr,
+                         "htp_residual_cache_copy_begin ts_us=%lld\n",
+                         (long long) ggml_time_us());
+        }
         int64_t t_cache_begin = ggml_time_ms();
         if (!copy_cache_tensors_to_cache_buffer(cache_keep_names)) {
             if (free_compute_buffer_immediately) {
@@ -6032,6 +6453,11 @@ protected:
                 restore_partial_params();
             }
             return std::nullopt;
+        }
+        if (trace_residual_cache_copy) {
+            std::fprintf(stderr,
+                         "htp_residual_cache_copy_end ts_us=%lld\n",
+                         (long long) ggml_time_us());
         }
         int64_t t_cache_end = ggml_time_ms();
         auto result         = ggml_get_tensor(compute_ctx, final_result_name.c_str());
@@ -6148,10 +6574,12 @@ public:
 
     virtual ~GGMLRunner() {
         free_compute_buffer();
+        reap_retired_compute_arenas(true);
         free_params_buffer();
         free_params_ctx();
         free_compute_ctx();
         free_cache_ctx_and_buffer();
+        free_async_residual_cache_slots();
     }
 
     virtual GGMLRunnerContext get_context() {
@@ -6175,6 +6603,14 @@ public:
         runner_ctx.bind_cache_tensor = [this](const std::string& name, ggml_tensor* tensor) {
             if (tensor != nullptr) {
                 this->cache_backed_tensor_name_map[tensor] = name;
+                if (sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL")) {
+                    AsyncResidualCacheGeneration* generation =
+                        this->latest_async_residual_cache_slot(name);
+                    if (generation != nullptr) {
+                        this->cache_backed_tensor_generation_map_[tensor] =
+                            generation->generation;
+                    }
+                }
             }
         };
         return runner_ctx;
@@ -6254,6 +6690,7 @@ public:
     }
 
     void free_compute_buffer() {
+        reap_retired_compute_arenas(false);
         if (compute_allocr != nullptr) {
             ggml_gallocr_free(compute_allocr);
             compute_allocr = nullptr;
@@ -6317,6 +6754,13 @@ public:
     }
 
     ggml_tensor* get_cache_tensor_by_name(const std::string& name) {
+        if (sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL")) {
+            AsyncResidualCacheGeneration* generation =
+                latest_async_residual_cache_slot(name);
+            if (generation != nullptr && generation->slot != nullptr) {
+                return ggml_backend_htp_async_cache_slot_tensor(generation->slot);
+            }
+        }
         if (cache_ctx == nullptr) {
             return nullptr;
         }

@@ -8,6 +8,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "ggml.h"
 #include "rpcmem_mapper.h"
@@ -43,10 +44,22 @@ struct ggml_backend_htp_context {
     std::mutex compute_mutex;
 
 #ifdef GGML_HTP_OPENCL_SIDECAR
+    struct cache_input_binding {
+        std::string cache_key;
+        uint64_t generation = 0;
+    };
+    struct deferred_opencl_graph {
+        uint64_t arena_generation = 0;
+        ggml_opencl_htp_graph * graph = nullptr;
+    };
     ggml_opencl_htp_sidecar * sparse_opencl_sidecar = nullptr;
     ggml_opencl_htp_graph * sparse_opencl_graph = nullptr;
+    std::vector<deferred_opencl_graph> deferred_opencl_graphs;
+    uint64_t active_compute_arena_generation = 0;
     bool sparse_opencl_submission_thread_active = false;
     std::unordered_set<const ggml_tensor *> sparse_opencl_routed_nodes;
+    std::unordered_map<const ggml_tensor *, cache_input_binding>
+        sparse_opencl_cache_input_bindings;
     size_t sparse_opencl_page_size = 0;
     size_t sparse_opencl_ext_mem_padding = 0;
     std::string sparse_opencl_error;

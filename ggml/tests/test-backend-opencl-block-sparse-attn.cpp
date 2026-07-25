@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -368,6 +369,279 @@ ggml_opencl_htp_import_descriptor make_import_descriptor(const owned_rpcmem_buff
         /* .logical_size    = */ owned.info.logical_size,
         /* .allocation_size = */ owned.info.allocation_size,
     };
+}
+
+template<typename T>
+void write_scalar(
+    ggml_tensor * tensor,
+    int64_t i0,
+    int64_t i1,
+    int64_t i2,
+    int64_t i3,
+    T value);
+
+std::vector<uint8_t> snapshot(const owned_rpcmem_buffer & owned);
+
+void test_residual_descriptor_contract(
+        ggml_opencl_htp_sidecar * sidecar,
+        ggml_backend_t htp) {
+    const ggml_init_params params = {
+        /* .mem_size   = */ 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    GGML_ASSERT(ctx != nullptr);
+    ggml_tensor * dense = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 65, 2, 3, 1);
+    ggml_tensor * sparse = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 65, 2, 3, 1);
+    ggml_tensor * residual = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, 2, 3, 1);
+    ggml_tensor * rho = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 2, 3, 1);
+    std::vector<owned_rpcmem_buffer> buffers;
+    buffers.push_back(allocate_tensor_buffer(htp, dense, 64));
+    buffers.push_back(allocate_tensor_buffer(htp, sparse, 96));
+    buffers.push_back(allocate_tensor_buffer(htp, residual, 128));
+    buffers.push_back(allocate_tensor_buffer(htp, rho, 160));
+
+    char reason[1024] = {};
+    ggml_opencl_htp_graph * graph = nullptr;
+    GGML_ASSERT(ggml_backend_opencl_htp_graph_create(
+        sidecar, &graph, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    for (const owned_rpcmem_buffer & buffer : buffers) {
+        const ggml_opencl_htp_import_descriptor descriptor = make_import_descriptor(buffer);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_import(
+            graph, &descriptor, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    }
+
+    const ggml_opencl_htp_residual_dispatch valid = {
+        /* .dense_packed            = */ dense,
+        /* .sparse_packed_producer  = */ sparse,
+        /* .residual_destination    = */ residual,
+        /* .rho_destination         = */ rho,
+        /* .residual_cache_key      = */ "descriptor_residual",
+        /* .rho_cache_key           = */ "descriptor_rho",
+        /* .generation              = */ 7,
+    };
+    auto expect_unsupported = [&](const ggml_opencl_htp_residual_dispatch & dispatch,
+                                  const char * expected_reason) {
+        reason[0] = '\0';
+        const ggml_opencl_htp_result result =
+            ggml_backend_opencl_htp_graph_prepare_exact_rho_residual(
+                graph, &dispatch, reason, sizeof(reason));
+        GGML_ASSERT(result == GGML_OPENCL_HTP_UNSUPPORTED);
+        GGML_ASSERT(reason[0] != '\0');
+        GGML_ASSERT(std::strstr(reason, expected_reason) != nullptr);
+    };
+
+    reason[0] = '\0';
+    GGML_ASSERT(ggml_backend_opencl_htp_graph_prepare_exact_rho_residual(
+        graph, nullptr, reason, sizeof(reason)) == GGML_OPENCL_HTP_ERROR);
+    GGML_ASSERT(std::strstr(reason, "must not be null") != nullptr);
+
+    ggml_opencl_htp_residual_dispatch null_tensor = valid;
+    null_tensor.dense_packed = nullptr;
+    expect_unsupported(null_tensor, "dense_packed");
+
+    ggml_tensor wrong_sparse_shape = *sparse;
+    ++wrong_sparse_shape.ne[2];
+    ggml_opencl_htp_residual_dispatch mismatched_shape = valid;
+    mismatched_shape.sparse_packed_producer = &wrong_sparse_shape;
+    expect_unsupported(mismatched_shape, "packed shape");
+
+    ggml_tensor wrong_dense_type = *dense;
+    wrong_dense_type.type = GGML_TYPE_F16;
+    ggml_opencl_htp_residual_dispatch non_f32 = valid;
+    non_f32.dense_packed = &wrong_dense_type;
+    expect_unsupported(non_f32, "F32");
+
+    ggml_tensor overflowing_residual = *residual;
+    overflowing_residual.data = static_cast<uint8_t *>(buffers[2].info.base) +
+                                buffers[2].info.logical_size - sizeof(float);
+    ggml_opencl_htp_residual_dispatch overflow = valid;
+    overflow.residual_destination = &overflowing_residual;
+    expect_unsupported(overflow, "destination");
+
+    GGML_ASSERT(ggml_backend_opencl_htp_graph_prepare_exact_rho_residual(
+        graph, &valid, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    ggml_opencl_htp_cache_state state = GGML_OPENCL_HTP_CACHE_EMPTY;
+    GGML_ASSERT(ggml_backend_opencl_htp_cache_query(
+        sidecar, valid.residual_cache_key, valid.generation,
+        &state, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    GGML_ASSERT(state == GGML_OPENCL_HTP_CACHE_ALLOCATED);
+    GGML_ASSERT(ggml_backend_opencl_htp_cache_query(
+        sidecar, valid.rho_cache_key, valid.generation,
+        &state, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    GGML_ASSERT(state == GGML_OPENCL_HTP_CACHE_ALLOCATED);
+
+    expect_unsupported(valid, "duplicate generation");
+    GGML_ASSERT(ggml_backend_opencl_htp_graph_queue_exact_rho_residual(
+        graph, valid.residual_cache_key, valid.generation,
+        reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    GGML_ASSERT(ggml_backend_opencl_htp_cache_query(
+        sidecar, valid.residual_cache_key, valid.generation,
+        &state, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    GGML_ASSERT(state == GGML_OPENCL_HTP_CACHE_SUBMITTED ||
+                state == GGML_OPENCL_HTP_CACHE_READY);
+    bool waited = false;
+    GGML_ASSERT(ggml_backend_opencl_htp_cache_wait(
+        sidecar, valid.residual_cache_key, valid.generation,
+        &waited, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    GGML_ASSERT(ggml_backend_opencl_htp_cache_query(
+        sidecar, valid.rho_cache_key, valid.generation,
+        &state, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    GGML_ASSERT(state == GGML_OPENCL_HTP_CACHE_READY);
+
+    GGML_ASSERT(ggml_backend_opencl_htp_graph_finish(
+        graph, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    ggml_backend_opencl_htp_graph_free(&graph);
+    for (auto it = buffers.rbegin(); it != buffers.rend(); ++it) {
+        ggml_backend_buffer_free(it->buffer);
+    }
+    ggml_free(ctx);
+    std::printf("[PASS] OpenCL residual descriptor contract\n");
+}
+
+struct residual_kernel_case {
+    const char * name;
+    int64_t query_tokens;
+    int64_t heads;
+    int64_t batch;
+    bool empty_sparse_rows;
+};
+
+void assert_tensor_guards_unchanged(
+        const owned_rpcmem_buffer & buffer,
+        const ggml_tensor * tensor) {
+    const size_t tensor_begin = static_cast<const uint8_t *>(tensor->data) -
+                                static_cast<const uint8_t *>(buffer.info.base);
+    const size_t tensor_end = tensor_begin + ggml_nbytes(tensor);
+    const uint8_t * bytes = static_cast<const uint8_t *>(buffer.info.base);
+    for (size_t i = 0; i < buffer.info.logical_size; ++i) {
+        if (i < tensor_begin || i >= tensor_end) {
+            GGML_ASSERT(bytes[i] == k_guard);
+        }
+    }
+}
+
+void run_residual_kernel_case(
+        ggml_opencl_htp_sidecar * sidecar,
+        ggml_backend_t htp,
+        const residual_kernel_case & c,
+        uint64_t generation) {
+    const ggml_init_params params = {
+        /* .mem_size   = */ 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    GGML_ASSERT(ctx != nullptr);
+    ggml_tensor * dense = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, k_head_dim + 1, c.heads, c.query_tokens, c.batch);
+    ggml_tensor * sparse = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, k_head_dim + 1, c.heads, c.query_tokens, c.batch);
+    ggml_tensor * residual = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, k_head_dim, c.heads, c.query_tokens, c.batch);
+    ggml_tensor * rho = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, 1, c.heads, c.query_tokens, c.batch);
+    std::vector<owned_rpcmem_buffer> buffers;
+    buffers.push_back(allocate_tensor_buffer(htp, dense, 64));
+    buffers.push_back(allocate_tensor_buffer(htp, sparse, 96));
+    buffers.push_back(allocate_tensor_buffer(htp, residual, 128));
+    buffers.push_back(allocate_tensor_buffer(htp, rho, 160));
+
+    std::vector<float> expected_residual(static_cast<size_t>(ggml_nelements(residual)));
+    std::vector<float> expected_rho(static_cast<size_t>(ggml_nelements(rho)));
+    for (int64_t b = 0; b < c.batch; ++b) {
+        for (int64_t q = 0; q < c.query_tokens; ++q) {
+            for (int64_t h = 0; h < c.heads; ++h) {
+                const bool empty = c.empty_sparse_rows && ((q + 3 * h + 5 * b) % 11 == 0);
+                const float dense_lse = 1.25f + 0.003f * float(q) + 0.07f * float(h) + 0.11f * float(b);
+                const float sparse_lse = empty ?
+                    -std::numeric_limits<float>::infinity() :
+                    dense_lse - 0.15f - 0.01f * float((q + h) % 5);
+                const float row_rho = empty ? 0.0f : std::exp(sparse_lse - dense_lse);
+                write_scalar(dense, k_head_dim, h, q, b, dense_lse);
+                write_scalar(sparse, k_head_dim, h, q, b, sparse_lse);
+                write_scalar(rho, 0, h, q, b, -777.0f);
+                expected_rho[static_cast<size_t>(h + c.heads * (q + c.query_tokens * b))] = row_rho;
+                for (int64_t d = 0; d < k_head_dim; ++d) {
+                    const float dense_o = 0.02f * float(d) + 0.001f * float(q) +
+                                          0.03f * float(h) + 0.05f * float(b);
+                    const float sparse_o = empty ? 0.0f :
+                        -0.01f * float(d) + 0.0005f * float(q) + 0.02f * float(h);
+                    write_scalar(dense, d, h, q, b, dense_o);
+                    write_scalar(sparse, d, h, q, b, sparse_o);
+                    write_scalar(residual, d, h, q, b, -999.0f);
+                    const size_t index = static_cast<size_t>(
+                        d + k_head_dim * (h + c.heads * (q + c.query_tokens * b)));
+                    expected_residual[index] = dense_o - sparse_o * row_rho;
+                }
+            }
+        }
+    }
+    const std::vector<uint8_t> dense_snapshot = snapshot(buffers[0]);
+    const std::vector<uint8_t> sparse_snapshot = snapshot(buffers[1]);
+
+    char reason[1024] = {};
+    ggml_opencl_htp_graph * graph = nullptr;
+    GGML_ASSERT(ggml_backend_opencl_htp_graph_create(
+        sidecar, &graph, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    for (const owned_rpcmem_buffer & buffer : buffers) {
+        const ggml_opencl_htp_import_descriptor descriptor = make_import_descriptor(buffer);
+        GGML_ASSERT(ggml_backend_opencl_htp_graph_import(
+            graph, &descriptor, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    }
+    const std::string residual_key = std::string("kernel_residual_") + c.name;
+    const std::string rho_key = std::string("kernel_rho_") + c.name;
+    const ggml_opencl_htp_residual_dispatch dispatch = {
+        dense,
+        sparse,
+        residual,
+        rho,
+        residual_key.c_str(),
+        rho_key.c_str(),
+        generation,
+    };
+    GGML_ASSERT(ggml_backend_opencl_htp_graph_prepare_exact_rho_residual(
+        graph, &dispatch, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    GGML_ASSERT(ggml_backend_opencl_htp_graph_queue_exact_rho_residual(
+        graph, dispatch.residual_cache_key, dispatch.generation,
+        reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    bool waited = false;
+    GGML_ASSERT(ggml_backend_opencl_htp_cache_wait(
+        sidecar, dispatch.residual_cache_key, dispatch.generation,
+        &waited, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    ggml_opencl_htp_cache_state state = GGML_OPENCL_HTP_CACHE_EMPTY;
+    GGML_ASSERT(ggml_backend_opencl_htp_cache_query(
+        sidecar, dispatch.rho_cache_key, dispatch.generation,
+        &state, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    GGML_ASSERT(state == GGML_OPENCL_HTP_CACHE_READY);
+
+    float rho_max_abs = 0.0f;
+    for (size_t i = 0; i < expected_rho.size(); ++i) {
+        rho_max_abs = std::max(rho_max_abs, std::fabs(
+            static_cast<const float *>(rho->data)[i] - expected_rho[i]));
+    }
+    float residual_max_abs = 0.0f;
+    for (size_t i = 0; i < expected_residual.size(); ++i) {
+        residual_max_abs = std::max(residual_max_abs, std::fabs(
+            static_cast<const float *>(residual->data)[i] - expected_residual[i]));
+    }
+    GGML_ASSERT(rho_max_abs <= 2.0e-5f);
+    GGML_ASSERT(residual_max_abs <= 2.0e-5f);
+    GGML_ASSERT(snapshot(buffers[0]) == dense_snapshot);
+    GGML_ASSERT(snapshot(buffers[1]) == sparse_snapshot);
+    assert_tensor_guards_unchanged(buffers[2], residual);
+    assert_tensor_guards_unchanged(buffers[3], rho);
+    GGML_ASSERT(ggml_backend_opencl_htp_graph_finish(
+        graph, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK);
+    ggml_backend_opencl_htp_graph_free(&graph);
+    for (auto it = buffers.rbegin(); it != buffers.rend(); ++it) {
+        ggml_backend_buffer_free(it->buffer);
+    }
+    ggml_free(ctx);
+    std::printf(
+        "[OPENCL_RESIDUAL] case=%s rho=%.9g residual=%.9g guards=yes\n",
+        c.name, rho_max_abs, residual_max_abs);
 }
 
 template<typename T>
@@ -1187,6 +1461,20 @@ int main() {
     }
     ggml_backend_t htp = ggml_backend_htp_init();
     GGML_ASSERT(htp != nullptr && ggml_backend_htp_runtime_available());
+    test_residual_descriptor_contract(sidecar, htp);
+    const residual_kernel_case residual_cases[] = {
+        { "256_joint", 410, 24, 1, false },
+        { "256_self", 256, 24, 1, false },
+        { "512_joint", 1178, 24, 1, false },
+        { "512_self", 1024, 24, 1, false },
+        { "tail_67", 67, 3, 1, false },
+        { "gqa_4_heads", 65, 4, 1, false },
+        { "batch2", 65, 4, 2, false },
+        { "empty_sparse_rows", 65, 4, 1, true },
+    };
+    for (size_t i = 0; i < sizeof(residual_cases) / sizeof(residual_cases[0]); ++i) {
+        run_residual_kernel_case(sidecar, htp, residual_cases[i], 100 + i);
+    }
     ggml_backend_t opencl = ggml_backend_opencl_init();
     GGML_ASSERT(opencl != nullptr);
     test_ordinary_opencl_support_gating(opencl);

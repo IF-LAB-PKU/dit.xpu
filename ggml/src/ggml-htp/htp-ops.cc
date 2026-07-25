@@ -226,6 +226,7 @@ uint64_t htp_hash_tensor_bytes(const ggml_tensor * tensor) {
 }
 
 std::atomic<int> htp_debug_hash_counter{0};
+std::atomic<bool> htp_opencl_residual_job_just_queued{false};
 
 bool is_block_sparse_score_custom(const ggml_tensor * dst) {
     if (dst == nullptr || dst->op != GGML_OP_CUSTOM || std::strcmp(dst->name, "block_sparse_score") != 0) {
@@ -620,7 +621,8 @@ int htp_ops_opencl_early_submit_begin(const struct ggml_cgraph * graph) {
     for (int node_index = 0; node_index < graph->n_nodes; ++node_index) {
         const ggml_tensor * node = graph->nodes[node_index];
         if (node == nullptr || ctx->sparse_opencl_routed_nodes.find(node) ==
-                                   ctx->sparse_opencl_routed_nodes.end()) {
+                                   ctx->sparse_opencl_routed_nodes.end() ||
+            node->op != GGML_OP_FLASH_ATTN_EXT) {
             continue;
         }
 
@@ -819,11 +821,115 @@ static size_t htp_ops_opencl_collect_producers(
     }
     return count;
 }
+
+static const ggml_tensor * htp_ops_opencl_bound_cache_input(
+        const ggml_backend_htp_context * ctx,
+        const ggml_tensor * tensor) {
+    for (size_t depth = 0; tensor != nullptr && depth < 64; ++depth) {
+        if (ctx->sparse_opencl_cache_input_bindings.find(tensor) !=
+            ctx->sparse_opencl_cache_input_bindings.end()) {
+            return tensor;
+        }
+        if (!htp_ops_opencl_is_view_only(tensor)) {
+            return nullptr;
+        }
+        tensor = tensor->src[0] != nullptr ? tensor->src[0] : tensor->view_src;
+    }
+    return nullptr;
+}
+
+static size_t htp_ops_opencl_collect_cache_inputs(
+        const ggml_tensor * dst,
+        const ggml_tensor ** inputs,
+        size_t capacity) {
+    if (dst == nullptr || htp_ops_opencl_is_view_only(dst)) {
+        return 0;
+    }
+    const auto * ctx = ggml_backend_htp_context::instance();
+    size_t count = 0;
+    for (int source = 0; source < GGML_MAX_SRC; ++source) {
+        const ggml_tensor * input =
+            htp_ops_opencl_bound_cache_input(ctx, dst->src[source]);
+        if (input == nullptr) {
+            continue;
+        }
+        bool duplicate = false;
+        for (size_t i = 0; i < count; ++i) {
+            duplicate = duplicate || inputs[i] == input;
+        }
+        if (!duplicate && count < capacity) {
+            inputs[count++] = input;
+        }
+    }
+    return count;
+}
+
+static int htp_ops_opencl_wait_cache_inputs(const ggml_tensor * dst) {
+    auto * ctx = ggml_backend_htp_context::instance();
+    const ggml_tensor * inputs[GGML_MAX_SRC] = {};
+    const size_t input_count =
+        htp_ops_opencl_collect_cache_inputs(dst, inputs, GGML_MAX_SRC);
+    for (size_t i = 0; i < input_count; ++i) {
+        auto found = ctx->sparse_opencl_cache_input_bindings.find(inputs[i]);
+        if (found == ctx->sparse_opencl_cache_input_bindings.end()) {
+            continue;
+        }
+        const ggml_backend_htp_context::cache_input_binding binding = found->second;
+        char reason[1024] = {};
+        ggml_opencl_htp_cache_state state = GGML_OPENCL_HTP_CACHE_EMPTY;
+        ggml_opencl_htp_result result = ggml_backend_opencl_htp_cache_query(
+            ctx->sparse_opencl_sidecar,
+            binding.cache_key.c_str(), binding.generation,
+            &state, reason, sizeof(reason));
+        if (result != GGML_OPENCL_HTP_OK) {
+            std::fprintf(
+                stderr,
+                "ggml-htp: OpenCL residual cache query failed result=%d reason=%s\n",
+                (int) result, reason[0] != '\0' ? reason : "unknown error");
+            return -EIO;
+        }
+        if (state != GGML_OPENCL_HTP_CACHE_READY) {
+            std::fprintf(
+                stderr,
+                "htp_opencl_event name=gpu_residual_cache_wait_begin "
+                "ts_us=%lld key=%s generation=%" PRIu64 "\n",
+                (long long) ggml_time_us(), binding.cache_key.c_str(),
+                binding.generation);
+            bool waited = false;
+            result = ggml_backend_opencl_htp_cache_wait(
+                ctx->sparse_opencl_sidecar,
+                binding.cache_key.c_str(), binding.generation,
+                &waited, reason, sizeof(reason));
+            std::fprintf(
+                stderr,
+                "htp_opencl_event name=gpu_residual_cache_wait_end "
+                "ts_us=%lld key=%s generation=%" PRIu64 " waited=%d\n",
+                (long long) ggml_time_us(), binding.cache_key.c_str(),
+                binding.generation, waited ? 1 : 0);
+            if (result != GGML_OPENCL_HTP_OK) {
+                std::fprintf(
+                    stderr,
+                    "ggml-htp: OpenCL residual cache wait failed result=%d reason=%s\n",
+                    (int) result, reason[0] != '\0' ? reason : "unknown error");
+                return -EIO;
+            }
+        }
+    }
+    return 0;
+}
 #endif
 
 bool htp_ops_opencl_node_needs_wait(const struct ggml_tensor * dst) {
 #ifdef GGML_HTP_OPENCL_SIDECAR
+    const ggml_tensor * cache_inputs[GGML_MAX_SRC] = {};
+    if (htp_ops_opencl_collect_cache_inputs(dst, cache_inputs, GGML_MAX_SRC) != 0) {
+        return true;
+    }
     if (!htp_ops_opencl_async_enabled()) {
+        return false;
+    }
+    if (dst != nullptr && dst->op == GGML_OP_CUSTOM &&
+        std::strncmp(dst->name, "htp_block_sparse_residual_", 26) == 0) {
         return false;
     }
     const ggml_tensor * producers[GGML_MAX_SRC] = {};
@@ -837,7 +943,15 @@ bool htp_ops_opencl_node_needs_wait(const struct ggml_tensor * dst) {
 int htp_ops_opencl_wait_node(const struct ggml_tensor * dst) {
 #ifdef GGML_HTP_OPENCL_SIDECAR
     auto * ctx = ggml_backend_htp_context::instance();
-    if (!htp_ops_opencl_async_enabled() || dst == nullptr) {
+    if (dst == nullptr) {
+        return 0;
+    }
+    const int cache_wait_err = htp_ops_opencl_wait_cache_inputs(dst);
+    if (cache_wait_err != 0 || !htp_ops_opencl_async_enabled()) {
+        return cache_wait_err;
+    }
+    if (dst->op == GGML_OP_CUSTOM &&
+        std::strncmp(dst->name, "htp_block_sparse_residual_", 26) == 0) {
         return 0;
     }
 
@@ -870,6 +984,20 @@ int htp_ops_opencl_wait_node(const struct ggml_tensor * dst) {
 #endif
 }
 
+void htp_ops_opencl_wait_node_completed(const struct ggml_tensor * dst) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    auto * ctx = ggml_backend_htp_context::instance();
+    const ggml_tensor * inputs[GGML_MAX_SRC] = {};
+    const size_t input_count =
+        htp_ops_opencl_collect_cache_inputs(dst, inputs, GGML_MAX_SRC);
+    for (size_t i = 0; i < input_count; ++i) {
+        ctx->sparse_opencl_cache_input_bindings.erase(inputs[i]);
+    }
+#else
+    GGML_UNUSED(dst);
+#endif
+}
+
 int htp_ops_opencl_wait_producer(const struct ggml_tensor * producer) {
 #ifdef GGML_HTP_OPENCL_SIDECAR
     auto * ctx = ggml_backend_htp_context::instance();
@@ -889,6 +1017,46 @@ int htp_ops_opencl_wait_producer(const struct ggml_tensor * producer) {
         std::fprintf(
             stderr,
             "ggml-htp: OpenCL sparse producer wait failed result=%d reason=%s\n",
+            (int) result, reason[0] != '\0' ? reason : "unknown error");
+        return -EIO;
+    }
+    return 0;
+#else
+    GGML_UNUSED(producer);
+    return -ENOSYS;
+#endif
+}
+
+bool htp_ops_opencl_sparse_is_residual_owned(
+        const struct ggml_tensor * producer) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    const auto * ctx = ggml_backend_htp_context::instance();
+    return ctx->sparse_opencl_graph != nullptr &&
+        ggml_backend_opencl_htp_graph_sparse_output_is_residual_owned(
+            ctx->sparse_opencl_graph, producer);
+#else
+    GGML_UNUSED(producer);
+    return false;
+#endif
+}
+
+int htp_ops_opencl_wait_sparse_input_lifetime(
+        const struct ggml_tensor * producer) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    auto * ctx = ggml_backend_htp_context::instance();
+    if (ctx->sparse_opencl_graph == nullptr || producer == nullptr) {
+        return -EINVAL;
+    }
+    bool waited = false;
+    char reason[1024] = {};
+    const ggml_opencl_htp_result result =
+        ggml_backend_opencl_htp_graph_wait_for_sparse_input_lifetime(
+            ctx->sparse_opencl_graph, producer, &waited,
+            reason, sizeof(reason));
+    if (result != GGML_OPENCL_HTP_OK) {
+        std::fprintf(
+            stderr,
+            "ggml-htp: OpenCL sparse input lifetime wait failed result=%d reason=%s\n",
             (int) result, reason[0] != '\0' ? reason : "unknown error");
         return -EIO;
     }
@@ -950,6 +1118,85 @@ static int htp_ops_opencl_compute_node_impl(struct ggml_tensor * dst, bool early
 
 int htp_ops_opencl_compute_node(struct ggml_tensor * dst) {
     return htp_ops_opencl_compute_node_impl(dst, false);
+}
+
+int htp_ops_opencl_compute_residual_node(struct ggml_tensor * dst) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    auto * ctx = ggml_backend_htp_context::instance();
+    if (ctx->sparse_opencl_graph == nullptr || dst == nullptr ||
+        ctx->sparse_opencl_routed_nodes.find(dst) ==
+            ctx->sparse_opencl_routed_nodes.end()) {
+        return -EINVAL;
+    }
+    char reason[1024] = {};
+    ggml_opencl_htp_result result = GGML_OPENCL_HTP_ERROR;
+    if (ctx->sparse_opencl_submission_thread_active) {
+        // The submission thread already owns this cache-only residual job.
+        // Its completion is synchronized once at graph finish, after ordinary
+        // graph nodes have been allowed to continue.
+        return 0;
+    } else {
+        result = ggml_backend_opencl_htp_graph_compute_exact_rho_residual_sync(
+            ctx->sparse_opencl_graph, dst, reason, sizeof(reason));
+    }
+    if (result != GGML_OPENCL_HTP_OK) {
+        std::fprintf(stderr,
+                     "ggml-htp: OpenCL exact-rho residual failed result=%d reason=%s\n",
+                     (int) result, reason[0] != '\0' ? reason : "unknown error");
+        return -EIO;
+    }
+    return 0;
+#else
+    GGML_UNUSED(dst);
+    return -ENOSYS;
+#endif
+}
+
+int htp_ops_opencl_queue_residual_after_dense(struct ggml_tensor * dense) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    auto * ctx = ggml_backend_htp_context::instance();
+    if (ctx->sparse_opencl_graph == nullptr || dense == nullptr ||
+        !ctx->sparse_opencl_submission_thread_active) {
+        return 0;
+    }
+    char reason[1024] = {};
+    const ggml_opencl_htp_result result =
+        ggml_backend_opencl_htp_graph_queue_exact_rho_residual_after_dense(
+            ctx->sparse_opencl_graph, dense, reason, sizeof(reason));
+    if (result == GGML_OPENCL_HTP_UNSUPPORTED) {
+        return 0;
+    }
+    if (result != GGML_OPENCL_HTP_OK) {
+        std::fprintf(stderr,
+                     "ggml-htp: queue OpenCL residual after dense failed result=%d reason=%s\n",
+                     (int) result, reason[0] != '\0' ? reason : "unknown error");
+        return -EIO;
+    }
+    htp_opencl_residual_job_just_queued.store(true, std::memory_order_release);
+    return 0;
+#else
+    GGML_UNUSED(dense);
+    return 0;
+#endif
+}
+
+void htp_ops_opencl_trace_next_node_begin(const struct ggml_tensor * node) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (!htp_opencl_residual_job_just_queued.exchange(
+            false, std::memory_order_acq_rel)) {
+        return;
+    }
+    const char * trace = std::getenv("SD_HTP_SPARSE_OPENCL_TRACE");
+    if (trace != nullptr && trace[0] != '\0' && std::strcmp(trace, "0") != 0) {
+        std::fprintf(
+            stderr,
+            "htp_opencl_event name=next_htp_node_begin ts_us=%lld producer=%s\n",
+            (long long) ggml_time_us(),
+            node != nullptr && node->name[0] != '\0' ? node->name : "<unnamed>");
+    }
+#else
+    GGML_UNUSED(node);
+#endif
 }
 
 int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor * dst) {

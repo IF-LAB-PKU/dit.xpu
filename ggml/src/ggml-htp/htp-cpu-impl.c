@@ -2047,7 +2047,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                                         (long long) ggml_time_us(),
                                         tensor->name[0] != '\0' ? tensor->name : "<unnamed>");
                             }
-                            const int err = htp_ops_opencl_wait_producer(tensor);
+                            const int err =
+                                htp_ops_opencl_sparse_is_residual_owned(tensor)
+                                    ? htp_ops_opencl_wait_sparse_input_lifetime(tensor)
+                                    : htp_ops_opencl_wait_producer(tensor);
                             if (err != 0) {
                                 ggml_htp_mark_op_failed(params, tensor, err);
                             }
@@ -2078,9 +2081,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 const bool trace_attn = params->ith == 0 &&
                     ((trace_env != NULL && trace_env[0] != '\0' && strcmp(trace_env, "0") != 0) ||
                      (sidecar_trace_env != NULL && sidecar_trace_env[0] != '\0' && strcmp(sidecar_trace_env, "0") != 0));
-                const bool trace_async_dense = trace_attn &&
+                const bool is_async_dense =
                     htp_ops_opencl_async_enabled() && tensor->src[3] != NULL &&
                     tensor->src[3]->type == GGML_TYPE_F16;
+                const bool trace_async_dense = trace_attn && is_async_dense;
                 const int64_t trace_begin = trace_attn ? ggml_time_ms() : 0;
                 if (htp_ops_support_op_runtime(tensor)) {
                     if (trace_async_dense) {
@@ -2098,6 +2102,13 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                     }
                     if (err != 0) {
                         ggml_htp_mark_op_failed(params, tensor, err);
+                    }
+                    if (err == 0 && params->ith == 0 && is_async_dense) {
+                        const int residual_err =
+                            htp_ops_opencl_queue_residual_after_dense(tensor);
+                        if (residual_err != 0) {
+                            ggml_htp_mark_op_failed(params, tensor, residual_err);
+                        }
                     }
                     if (trace_attn) {
                         const struct ggml_tensor * q = tensor->src[0];
@@ -2237,6 +2248,17 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             break;
         case GGML_OP_CUSTOM:
             {
+                if (htp_ops_opencl_routes_node(tensor)) {
+                    if (params->ith == 0 &&
+                        strncmp(tensor->name,
+                                "htp_block_sparse_residual_rho_b", 31) == 0) {
+                        const int err = htp_ops_opencl_compute_residual_node(tensor);
+                        if (err != 0) {
+                            ggml_htp_mark_op_failed(params, tensor, err);
+                        }
+                    }
+                    break;
+                }
                 if (htp_ops_support_op_runtime(tensor)) {
                     const int err = htp_ops_compute_op(params, tensor);
                     if (err != 0) {
@@ -3249,6 +3271,30 @@ static void ggml_htp_cpu_init(void);
 
 static bool ggml_htp_cpu_disable_fusion = false;  // initialized once in ggml_htp_cpu_init(), read-only afterwards
 
+static const char * ggml_htp_cpu_residual_profile_stage(
+        const struct ggml_tensor * node) {
+    if (strcmp(node->name, "htp_cpu_residual_rho_sub") == 0) {
+        return "rho_sub";
+    }
+    if (strcmp(node->name, "htp_cpu_residual_scale_mul") == 0) {
+        return "scale_mul";
+    }
+    if (node->op == GGML_OP_UNARY &&
+        ggml_get_unary_op(node) == GGML_UNARY_OP_EXP &&
+        strncmp(
+            node->name, "htp_block_sparse_residual_rho_",
+            strlen("htp_block_sparse_residual_rho_")) == 0) {
+        return "rho_exp";
+    }
+    if (node->op == GGML_OP_SUB &&
+        strncmp(
+            node->name, "htp_block_sparse_residual_",
+            strlen("htp_block_sparse_residual_")) == 0) {
+        return "residual_sub";
+    }
+    return NULL;
+}
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -3349,9 +3395,23 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        if (state->ith == 0) {
+            htp_ops_opencl_trace_next_node_begin(node);
+        }
+
         if (htp_ops_opencl_early_submit_is_prerequisite(node)) {
             continue;
         }
+
+        const char * residual_profile = getenv("SD_HTP_RESIDUAL_PROFILE");
+        const bool residual_profile_enabled =
+            residual_profile != NULL && residual_profile[0] != '\0' &&
+            strcmp(residual_profile, "0") != 0;
+        const char * residual_profile_stage = residual_profile_enabled ?
+            ggml_htp_cpu_residual_profile_stage(node) : NULL;
+        const int64_t residual_profile_begin_us =
+            residual_profile_stage != NULL && state->ith == 0 ?
+                ggml_time_us() : 0;
 
         const bool waits_for_opencl = htp_ops_opencl_node_needs_wait(node);
         if (waits_for_opencl) {
@@ -3362,6 +3422,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 }
             }
             // No worker may execute the consumer until worker zero has acquired GPU writes.
+            ggml_barrier(state->threadpool);
+            if (state->ith == 0) {
+                htp_ops_opencl_wait_node_completed(node);
+            }
+            // Keep cache-binding removal ordered before any worker inspects the next node.
             ggml_barrier(state->threadpool);
             if (tp->ec != GGML_STATUS_SUCCESS) {
                 break;
@@ -3423,14 +3488,31 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
+        bool end_of_node_barrier_completed = false;
         if (ggml_htp_debug_node_hash_enabled()) {
             ggml_barrier(state->threadpool);
+            end_of_node_barrier_completed = true;
             if (state->ith == 0) {
                 ggml_htp_debug_log_node_hash(node);
             }
             ggml_barrier(state->threadpool);
         } else if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+            end_of_node_barrier_completed = true;
+        }
+        if (residual_profile_stage != NULL &&
+            !end_of_node_barrier_completed) {
+            ggml_barrier(state->threadpool);
+        }
+        if (residual_profile_stage != NULL && state->ith == 0) {
+            const int64_t residual_profile_end_us = ggml_time_us();
+            fprintf(
+                stderr,
+                "htp_cpu_residual_timing stage=%s total_us=%lld tensor=%s\n",
+                residual_profile_stage,
+                (long long) (residual_profile_end_us -
+                             residual_profile_begin_us),
+                node->name[0] != '\0' ? node->name : "<unnamed>");
         }
         if (node_n + 1 < cgraph->n_nodes && tp->ec != GGML_STATUS_SUCCESS) {
             break;

@@ -11,7 +11,11 @@
 #include <cstdlib>
 #include <cstdint>
 #include <numeric>
+#include <set>
+#include <string>
 #include <vector>
+
+#include <unistd.h>
 
 static ggml_context * make_ctx(size_t tensor_count, size_t extra = 256 * 1024) {
     ggml_init_params params = {
@@ -188,6 +192,238 @@ static std::vector<float> read_f32_tensor(const ggml_tensor * t) {
     std::vector<float> data(size_t(ggml_nelements(t)));
     ggml_backend_tensor_get(t, data.data(), 0, data.size() * sizeof(float));
     return data;
+}
+
+struct residual_cache_contract_runner : GGMLRunner {
+    static constexpr const char * residual_key = "htp_block_sparse_residual_b0_self_s0";
+    static constexpr const char * rho_key = "htp_block_sparse_residual_rho_b0_self_s0";
+
+    explicit residual_cache_contract_runner(ggml_backend_t backend)
+        : GGMLRunner(backend, backend) {
+    }
+
+    std::string get_desc() override {
+        return "residual-cache-contract";
+    }
+
+    std::pair<std::optional<sd::Tensor<float>>, std::string> run_anchor() {
+        const sd::Tensor<float> dense_o({2, 2}, {2.0f, 4.0f, 6.0f, 8.0f});
+        const sd::Tensor<float> sparse_o({2, 2}, {1.0f, 3.0f, 5.0f, 7.0f});
+        const sd::Tensor<float> dense_lse({1, 2}, {1.0f, 2.0f});
+        const sd::Tensor<float> sparse_lse({1, 2}, {0.5f, 1.75f});
+        auto get_graph = [&]() -> ggml_cgraph * {
+            GGMLRunnerContext runner_ctx = get_context();
+            ggml_tensor * dense = make_input(dense_o);
+            ggml_tensor * sparse = make_input(sparse_o);
+            ggml_tensor * dense_logsumexp = make_input(dense_lse);
+            ggml_tensor * sparse_logsumexp = make_input(sparse_lse);
+            ggml_tensor * rho = ggml_exp(
+                runner_ctx.ggml_ctx,
+                ggml_sub(runner_ctx.ggml_ctx, sparse_logsumexp, dense_logsumexp));
+            ggml_tensor * residual = ggml_sub(
+                runner_ctx.ggml_ctx,
+                dense,
+                ggml_mul(runner_ctx.ggml_ctx, sparse, rho));
+            ggml_set_name(rho, rho_key);
+            ggml_set_name(residual, residual_key);
+            runner_ctx.persist_cache_tensor(rho_key, rho);
+            runner_ctx.persist_cache_tensor(residual_key, residual);
+
+            ggml_tensor * anchor_output = ggml_scale(runner_ctx.ggml_ctx, dense, 1.0f);
+            ggml_cgraph * graph = ggml_new_graph(runner_ctx.ggml_ctx);
+            ggml_build_forward_expand(graph, anchor_output);
+            return graph;
+        };
+        return capture_compute(get_graph);
+    }
+
+    std::pair<std::optional<sd::Tensor<float>>, std::string> run_apply() {
+        const sd::Tensor<float> sparse_o({2, 2}, {1.0f, 3.0f, 5.0f, 7.0f});
+        apply_bound_keys.clear();
+        apply_anchor_node_count = -1;
+        auto get_graph = [&]() -> ggml_cgraph * {
+            GGMLRunnerContext runner_ctx = get_context();
+            runner_ctx.bind_cache_tensor = [&](const std::string & key, ggml_tensor * tensor) {
+                apply_bound_keys.insert(key);
+                cache_backed_tensor_name_map[tensor] = key;
+            };
+            ggml_tensor * residual = runner_ctx.cache_tensor_as_graph_input(residual_key);
+            ggml_tensor * rho = runner_ctx.cache_tensor_as_graph_input(rho_key);
+            GGML_ASSERT(residual != nullptr && rho != nullptr);
+            ggml_tensor * sparse = make_input(sparse_o);
+            ggml_tensor * recovered = ggml_add(
+                runner_ctx.ggml_ctx,
+                ggml_mul(runner_ctx.ggml_ctx, sparse, rho),
+                residual);
+            ggml_cgraph * graph = ggml_new_graph(runner_ctx.ggml_ctx);
+            ggml_build_forward_expand(graph, recovered);
+            apply_anchor_node_count = 0;
+            for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+                const enum ggml_op op = ggml_graph_node(graph, i)->op;
+                const bool is_exp = op == GGML_OP_UNARY &&
+                    ggml_get_unary_op(ggml_graph_node(graph, i)) == GGML_UNARY_OP_EXP;
+                if (is_exp || op == GGML_OP_SUB) {
+                    ++apply_anchor_node_count;
+                }
+            }
+            return graph;
+        };
+        return capture_compute(get_graph);
+    }
+
+    std::vector<float> cache_snapshot(const char * key) {
+        ggml_tensor * tensor = get_cache_tensor_by_name(key);
+        GGML_ASSERT(tensor != nullptr);
+        return read_f32_tensor(tensor);
+    }
+
+    bool install_async_residual_slots(ggml_backend_t htp_backend) {
+        set_htp_backend(htp_backend);
+        reset_compute_ctx();
+        ggml_tensor * residual = ggml_new_tensor_2d(
+            compute_ctx, GGML_TYPE_F32, 2, 2);
+        ggml_tensor * rho = ggml_new_tensor_2d(
+            compute_ctx, GGML_TYPE_F32, 1, 2);
+        constexpr uint64_t generation = 701;
+        auto install = [&](const char * key, const ggml_tensor * metadata) {
+            char reason[512] = {};
+            ggml_backend_htp_async_cache_slot * slot =
+                ggml_backend_htp_async_cache_slot_create(
+                    htp_backend, key, generation, metadata->type,
+                    metadata->ne, reason, sizeof(reason));
+            if (slot == nullptr) {
+                std::fprintf(stderr, "async cache test slot %s failed: %s\n",
+                             key, reason[0] != '\0' ? reason : "unknown error");
+                return false;
+            }
+            async_residual_cache_slots_[key].push_back(
+                { generation, slot, 0, false });
+            return true;
+        };
+        return install(residual_key, residual) && install(rho_key, rho);
+    }
+
+    std::set<std::string> apply_bound_keys;
+    int apply_anchor_node_count = -1;
+
+private:
+    std::pair<std::optional<sd::Tensor<float>>, std::string> capture_compute(
+            const get_graph_cb_t & get_graph) {
+        FILE * capture = std::tmpfile();
+        GGML_ASSERT(capture != nullptr);
+        const int saved_stderr = dup(STDERR_FILENO);
+        GGML_ASSERT(saved_stderr >= 0);
+        GGML_ASSERT(std::fflush(stderr) == 0);
+        GGML_ASSERT(dup2(fileno(capture), STDERR_FILENO) >= 0);
+        const char * old_trace = std::getenv("SD_HTP_SPARSE_OPENCL_TRACE");
+        const std::string old_trace_value = old_trace != nullptr ? old_trace : "";
+        GGML_ASSERT(setenv("SD_HTP_SPARSE_OPENCL_TRACE", "1", 1) == 0);
+
+        std::optional<sd::Tensor<float>> result = GGMLRunner::compute<float>(get_graph, 1, true);
+
+        if (old_trace != nullptr) {
+            GGML_ASSERT(setenv("SD_HTP_SPARSE_OPENCL_TRACE", old_trace_value.c_str(), 1) == 0);
+        } else {
+            GGML_ASSERT(unsetenv("SD_HTP_SPARSE_OPENCL_TRACE") == 0);
+        }
+        GGML_ASSERT(std::fflush(stderr) == 0);
+        GGML_ASSERT(dup2(saved_stderr, STDERR_FILENO) >= 0);
+        close(saved_stderr);
+        GGML_ASSERT(std::fseek(capture, 0, SEEK_END) == 0);
+        const long length = std::ftell(capture);
+        GGML_ASSERT(length >= 0);
+        GGML_ASSERT(std::fseek(capture, 0, SEEK_SET) == 0);
+        std::string trace(static_cast<size_t>(length), '\0');
+        if (length > 0) {
+            GGML_ASSERT(std::fread(trace.data(), 1, trace.size(), capture) == trace.size());
+        }
+        std::fclose(capture);
+        return {std::move(result), std::move(trace)};
+    }
+};
+
+static void test_residual_cache_lifecycle_contract() {
+    ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);
+    GGML_ASSERT(cpu != nullptr);
+    residual_cache_contract_runner runner(cpu);
+
+    const auto anchor = runner.run_anchor();
+    GGML_ASSERT(anchor.first.has_value());
+    GGML_ASSERT(anchor.second.find("htp_residual_cache_copy_begin") != std::string::npos);
+    GGML_ASSERT(anchor.second.find("htp_residual_cache_copy_end") != std::string::npos);
+    const std::vector<float> residual_snapshot =
+        runner.cache_snapshot(residual_cache_contract_runner::residual_key);
+    const std::vector<float> rho_snapshot =
+        runner.cache_snapshot(residual_cache_contract_runner::rho_key);
+
+    const auto apply = runner.run_apply();
+    GGML_ASSERT(apply.first.has_value());
+    GGML_ASSERT(runner.apply_bound_keys == std::set<std::string>({
+        residual_cache_contract_runner::residual_key,
+        residual_cache_contract_runner::rho_key,
+    }));
+    GGML_ASSERT(runner.apply_anchor_node_count == 0);
+    const std::vector<float> expected = {2.0f, 4.0f, 6.0f, 8.0f};
+    GGML_ASSERT(apply.first->values().size() == expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        GGML_ASSERT(std::fabs(apply.first->values()[i] - expected[i]) <= 1.0e-6f);
+    }
+    GGML_ASSERT(runner.cache_snapshot(residual_cache_contract_runner::residual_key) == residual_snapshot);
+    GGML_ASSERT(runner.cache_snapshot(residual_cache_contract_runner::rho_key) == rho_snapshot);
+    std::printf("[PASS] residual cache lifecycle contract\n");
+}
+
+static void test_gpu_residual_cache_skips_generic_copy() {
+    const char * previous_sidecar = std::getenv("SD_HTP_SPARSE_OPENCL");
+    const bool had_previous_sidecar = previous_sidecar != nullptr;
+    const std::string previous_sidecar_value =
+        had_previous_sidecar ? previous_sidecar : "";
+    const char * previous = std::getenv("SD_HTP_SPARSE_OPENCL_RESIDUAL");
+    const bool had_previous = previous != nullptr;
+    const std::string previous_value = had_previous ? previous : "";
+    const auto restore_environment = [&]() {
+        if (had_previous) {
+            GGML_ASSERT(setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL",
+                               previous_value.c_str(), 1) == 0);
+        } else {
+            GGML_ASSERT(unsetenv("SD_HTP_SPARSE_OPENCL_RESIDUAL") == 0);
+        }
+        if (had_previous_sidecar) {
+            GGML_ASSERT(setenv("SD_HTP_SPARSE_OPENCL",
+                               previous_sidecar_value.c_str(), 1) == 0);
+        } else {
+            GGML_ASSERT(unsetenv("SD_HTP_SPARSE_OPENCL") == 0);
+        }
+    };
+    GGML_ASSERT(setenv("SD_HTP_SPARSE_OPENCL", "1", 1) == 0);
+    GGML_ASSERT(setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "1", 1) == 0);
+
+    ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);
+    GGML_ASSERT(cpu != nullptr);
+    ggml_backend_t htp = ggml_backend_htp_init();
+    GGML_ASSERT(htp != nullptr);
+    if (!ggml_backend_htp_runtime_available()) {
+        std::printf("[SKIP] GPU residual generic cache copy test: %s\n",
+                    ggml_backend_htp_runtime_error());
+        ggml_backend_free(htp);
+        ggml_backend_free(cpu);
+        restore_environment();
+        return;
+    }
+    {
+        residual_cache_contract_runner runner(cpu);
+        GGML_ASSERT(runner.install_async_residual_slots(htp));
+        const auto anchor = runner.run_anchor();
+        GGML_ASSERT(anchor.first.has_value());
+        GGML_ASSERT(anchor.second.find("htp_residual_cache_copy_begin") ==
+                    std::string::npos);
+        GGML_ASSERT(anchor.second.find("htp_residual_cache_copy_end") ==
+                    std::string::npos);
+    }
+    restore_environment();
+    ggml_backend_free(htp);
+    ggml_backend_free(cpu);
+    std::printf("[PASS] GPU residual cache skips generic copy\n");
 }
 
 static void test_patch_major_mapping_roundtrip() {
@@ -487,6 +723,21 @@ static void test_block_sparse_residual_rho_policy() {
     GGML_ASSERT(sd_htp_block_sparse_residual_rho_value(1.5f) == 1.0f);
 
     std::printf("[PASS] block sparse residual rho policy\n");
+}
+
+static void test_opencl_deferred_residual_policy() {
+    GGML_ASSERT(setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "1", 1) == 0);
+    GGML_ASSERT(unsetenv("SD_HTP_SPARSE_OPENCL_DEFER_RESIDUAL") == 0);
+    GGML_ASSERT(sd_htp_opencl_deferred_residual_enabled());
+    GGML_ASSERT(setenv("SD_HTP_SPARSE_OPENCL_DEFER_RESIDUAL", "0", 1) == 0);
+    GGML_ASSERT(!sd_htp_opencl_deferred_residual_enabled());
+    GGML_ASSERT(setenv("SD_HTP_SPARSE_OPENCL_DEFER_RESIDUAL", "1", 1) == 0);
+    GGML_ASSERT(sd_htp_opencl_deferred_residual_enabled());
+    GGML_ASSERT(setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "0", 1) == 0);
+    GGML_ASSERT(!sd_htp_opencl_deferred_residual_enabled());
+    GGML_ASSERT(unsetenv("SD_HTP_SPARSE_OPENCL_RESIDUAL") == 0);
+    GGML_ASSERT(unsetenv("SD_HTP_SPARSE_OPENCL_DEFER_RESIDUAL") == 0);
+    std::printf("[PASS] OpenCL deferred residual policy\n");
 }
 
 static void test_patch_score_mask_promotes_to_dsp_index() {
@@ -1527,6 +1778,8 @@ static void test_score_shape(int qo_len, int kv_len, int n_heads, int n_kv_heads
 }
 
 int main() {
+    test_gpu_residual_cache_skips_generic_copy();
+    test_residual_cache_lifecycle_contract();
     test_patch_major_mapping_roundtrip();
     test_patch_major_shift_mapping_roundtrip();
     test_patch_major_reorder_tensor_roundtrip();
@@ -1541,6 +1794,7 @@ int main() {
     test_block_sparse_residual_cache_key_policy();
     test_block_sparse_residual_rho_cache_key_policy();
     test_block_sparse_residual_rho_policy();
+    test_opencl_deferred_residual_policy();
     test_patch_score_mask_promotes_to_dsp_index();
     test_patch_score_mask_2d_halo_keeps_surrounding_blocks();
     test_direct_32_token_halo_keeps_center_neighborhood();
