@@ -44,6 +44,16 @@ struct ggml_backend_htp_buffer_context {
     ggml_backend_htp_context * owner;
 };
 
+struct ggml_backend_htp_async_cache_slot {
+    ggml_context * metadata_ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_tensor * tensor = nullptr;
+    ggml_backend_htp_context * owner = nullptr;
+    std::string cache_key;
+    uint64_t generation = 0;
+    uint64_t opencl_import_identity = 0;
+};
+
 static bool ggml_backend_htp_env_enabled(const char * name) {
     const char * value = std::getenv(name);
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
@@ -79,6 +89,27 @@ void ggml_backend_htp_set_hybrid_enabled(bool enabled) {
 
 bool ggml_backend_htp_get_hybrid_enabled(void) {
     return g_htp_hybrid_enabled.load(std::memory_order_relaxed);
+}
+
+size_t ggml_backend_htp_opencl_retain_deferred_residual_inputs(
+        struct ggml_cgraph * graph) {
+    if (graph == nullptr) {
+        return 0;
+    }
+    static constexpr char rho_prefix[] =
+        "htp_block_sparse_residual_rho_b";
+    size_t retained = 0;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+        if (node == nullptr || node->op != GGML_OP_CUSTOM ||
+            std::strncmp(node->name, rho_prefix, sizeof(rho_prefix) - 1) != 0 ||
+            node->src[0] == nullptr || node->src[1] == nullptr) {
+            continue;
+        }
+        ggml_set_output(node->src[0]);
+        ++retained;
+    }
+    return retained;
 }
 
 static bool ggml_backend_htp_use_hybrid_graph_compute() {
@@ -212,6 +243,19 @@ ggml_backend_htp_context::~ggml_backend_htp_context() {
         ggml_backend_opencl_htp_graph_finish(sparse_opencl_graph, reason, sizeof(reason));
         ggml_backend_opencl_htp_graph_free(&sparse_opencl_graph);
     }
+    for (deferred_opencl_graph & deferred : deferred_opencl_graphs) {
+        if (deferred.graph == nullptr) {
+            continue;
+        }
+        char reason[512] = {};
+        ggml_backend_opencl_htp_graph_wait_deferred(
+            deferred.graph, reason, sizeof(reason));
+        ggml_backend_opencl_htp_graph_finish(
+            deferred.graph, reason, sizeof(reason));
+        ggml_backend_opencl_htp_graph_free(&deferred.graph);
+    }
+    deferred_opencl_graphs.clear();
+    active_compute_arena_generation = 0;
     sparse_opencl_submission_thread_active = false;
     sparse_opencl_routed_nodes.clear();
     ggml_backend_opencl_htp_sidecar_free(sparse_opencl_sidecar);
@@ -494,6 +538,169 @@ bool ggml_backend_htp_get_rpcmem_info(
     return true;
 }
 
+ggml_backend_htp_async_cache_slot * ggml_backend_htp_async_cache_slot_create(
+        ggml_backend_t backend,
+        const char * cache_key,
+        uint64_t generation,
+        enum ggml_type type,
+        const int64_t ne[GGML_MAX_DIMS],
+        char * reason,
+        size_t reason_capacity) {
+    auto set_slot_reason = [reason, reason_capacity](const char * message) {
+        if (reason != nullptr && reason_capacity > 0) {
+            std::snprintf(reason, reason_capacity, "%s", message);
+            reason[reason_capacity - 1] = '\0';
+        }
+    };
+    if (backend == nullptr || !ggml_backend_is_htp(backend) || cache_key == nullptr ||
+        cache_key[0] == '\0' || ne == nullptr || type < 0 || type >= GGML_TYPE_COUNT) {
+        set_slot_reason("backend, cache key, type, and shape must be valid");
+        return nullptr;
+    }
+    for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (ne[i] <= 0) {
+            set_slot_reason("cache slot dimensions must be positive");
+            return nullptr;
+        }
+    }
+    if (ggml_backend_htp_env_enabled(
+            "SD_HTP_SPARSE_OPENCL_TEST_FAIL_CACHE_ALLOC")) {
+        set_slot_reason("injected cache allocation failure");
+        return nullptr;
+    }
+
+    std::unique_ptr<ggml_backend_htp_async_cache_slot> slot(
+        new (std::nothrow) ggml_backend_htp_async_cache_slot());
+    if (!slot) {
+        set_slot_reason("failed to allocate async cache slot state");
+        return nullptr;
+    }
+    const ggml_init_params params = {
+        /* .mem_size   = */ 16 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    slot->metadata_ctx = ggml_init(params);
+    if (slot->metadata_ctx == nullptr) {
+        set_slot_reason("failed to allocate async cache metadata context");
+        return nullptr;
+    }
+    slot->tensor = ggml_new_tensor_4d(
+        slot->metadata_ctx, type, ne[0], ne[1], ne[2], ne[3]);
+    ggml_set_name(slot->tensor, cache_key);
+    slot->buffer = ggml_backend_alloc_ctx_tensors(slot->metadata_ctx, backend);
+    if (slot->buffer == nullptr) {
+        ggml_free(slot->metadata_ctx);
+        slot->metadata_ctx = nullptr;
+        set_slot_reason("failed to allocate RPCMEM async cache backing");
+        return nullptr;
+    }
+
+    slot->owner = ggml_backend_htp_context::instance();
+    slot->cache_key = cache_key;
+    slot->generation = generation;
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (slot->owner->sparse_opencl_sidecar == nullptr) {
+        ggml_backend_buffer_free(slot->buffer);
+        ggml_free(slot->metadata_ctx);
+        slot->buffer = nullptr;
+        slot->metadata_ctx = nullptr;
+        set_slot_reason("OpenCL sidecar is unavailable for async cache import");
+        return nullptr;
+    }
+    ggml_backend_htp_rpcmem_info info = {};
+    GGML_ASSERT(ggml_backend_htp_get_rpcmem_info(slot->buffer, &info));
+    const ggml_opencl_htp_import_descriptor descriptor = {
+        slot->buffer,
+        info.base,
+        info.fd,
+        info.logical_size,
+        info.allocation_size,
+    };
+    if (ggml_backend_htp_env_enabled(
+            "SD_HTP_SPARSE_OPENCL_TEST_FAIL_CACHE_IMPORT")) {
+        ggml_backend_buffer_free(slot->buffer);
+        ggml_free(slot->metadata_ctx);
+        slot->buffer = nullptr;
+        slot->metadata_ctx = nullptr;
+        set_slot_reason("injected cache import failure");
+        return nullptr;
+    }
+    const ggml_opencl_htp_result import_result =
+        ggml_backend_opencl_htp_persistent_import_acquire(
+            slot->owner->sparse_opencl_sidecar,
+            &descriptor,
+            cache_key,
+            generation,
+            &slot->opencl_import_identity,
+            reason,
+            reason_capacity);
+    if (import_result != GGML_OPENCL_HTP_OK) {
+        ggml_backend_buffer_free(slot->buffer);
+        ggml_free(slot->metadata_ctx);
+        slot->buffer = nullptr;
+        slot->metadata_ctx = nullptr;
+        return nullptr;
+    }
+#else
+    ggml_backend_buffer_free(slot->buffer);
+    ggml_free(slot->metadata_ctx);
+    slot->buffer = nullptr;
+    slot->metadata_ctx = nullptr;
+    set_slot_reason("HTP OpenCL sidecar support is not compiled in");
+    return nullptr;
+#endif
+    set_slot_reason("ok");
+    return slot.release();
+}
+
+ggml_tensor * ggml_backend_htp_async_cache_slot_tensor(
+        ggml_backend_htp_async_cache_slot * slot) {
+    return slot != nullptr ? slot->tensor : nullptr;
+}
+
+bool ggml_backend_htp_async_cache_slot_rpcmem_info(
+        const ggml_backend_htp_async_cache_slot * slot,
+        ggml_backend_htp_rpcmem_info * info) {
+    return slot != nullptr && ggml_backend_htp_get_rpcmem_info(slot->buffer, info);
+}
+
+uint64_t ggml_backend_htp_async_cache_slot_opencl_import_identity(
+        const ggml_backend_htp_async_cache_slot * slot) {
+    return slot != nullptr ? slot->opencl_import_identity : 0;
+}
+
+void ggml_backend_htp_async_cache_slot_free(ggml_backend_htp_async_cache_slot * slot) {
+    if (slot == nullptr) {
+        return;
+    }
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (slot->opencl_import_identity != 0 && slot->owner != nullptr &&
+        slot->owner->sparse_opencl_sidecar != nullptr) {
+        char reason[256] = {};
+        const ggml_opencl_htp_result release_result =
+            ggml_backend_opencl_htp_persistent_import_release(
+                slot->owner->sparse_opencl_sidecar,
+                slot->cache_key.c_str(),
+                slot->generation,
+                reason,
+                sizeof(reason));
+        if (release_result != GGML_OPENCL_HTP_OK) {
+            std::fprintf(stderr,
+                         "ggml-htp: persistent cache import release failed: %s\n",
+                         reason[0] != '\0' ? reason : "unknown error");
+        }
+    }
+#endif
+    if (slot->buffer != nullptr) {
+        ggml_backend_buffer_free(slot->buffer);
+    }
+    if (slot->metadata_ctx != nullptr) {
+        ggml_free(slot->metadata_ctx);
+    }
+    delete slot;
+}
+
 void ggml_backend_htp_pack_f16_weight(ggml_fp16_t * dst, const ggml_fp16_t * src, int64_t k, int64_t n) {
     GGML_ASSERT(dst != nullptr);
     GGML_ASSERT(src != nullptr);
@@ -683,6 +890,18 @@ static ggml_opencl_htp_result ggml_backend_htp_opencl_preflight(
         if (ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_TEST_FAIL_WAIT")) {
             ggml_backend_opencl_htp_graph_test_fail_next_sparse_wait(graph);
         }
+        if (ggml_backend_htp_env_enabled(
+                "SD_HTP_SPARSE_OPENCL_TEST_FAIL_RHO_ENQUEUE")) {
+            ggml_backend_opencl_htp_graph_test_fail_next_rho_enqueue(graph);
+        }
+        if (ggml_backend_htp_env_enabled(
+                "SD_HTP_SPARSE_OPENCL_TEST_FAIL_RESIDUAL_ENQUEUE")) {
+            ggml_backend_opencl_htp_graph_test_fail_next_residual_enqueue(graph);
+        }
+        if (ggml_backend_htp_env_enabled(
+                "SD_HTP_SPARSE_OPENCL_TEST_FAIL_RESIDUAL_WAIT")) {
+            ggml_backend_opencl_htp_graph_test_fail_next_residual_wait(graph);
+        }
         ctx->sparse_opencl_routed_nodes.swap(routed_nodes);
         ctx->sparse_opencl_graph = graph;
     } else {
@@ -695,6 +914,8 @@ static bool ggml_backend_htp_opencl_finish(ggml_backend_htp_context * ctx) {
     if (ctx->sparse_opencl_graph == nullptr) {
         ctx->sparse_opencl_submission_thread_active = false;
         ctx->sparse_opencl_routed_nodes.clear();
+        ctx->sparse_opencl_cache_input_bindings.clear();
+        ctx->active_compute_arena_generation = 0;
         return true;
     }
 
@@ -702,11 +923,38 @@ static bool ggml_backend_htp_opencl_finish(ggml_backend_htp_context * ctx) {
     ctx->sparse_opencl_graph = nullptr;
     ctx->sparse_opencl_submission_thread_active = false;
     char reason[512] = {};
-    const ggml_opencl_htp_result result =
-        ggml_backend_opencl_htp_graph_finish(graph, reason, sizeof(reason));
+    ggml_opencl_htp_result result = GGML_OPENCL_HTP_OK;
+    bool deferred = false;
+    if (ctx->active_compute_arena_generation != 0) {
+        bool pending = false;
+        result = ggml_backend_opencl_htp_graph_defer(
+            graph, &pending, reason, sizeof(reason));
+        if (result == GGML_OPENCL_HTP_OK && pending) {
+            try {
+                ctx->deferred_opencl_graphs.push_back({
+                    ctx->active_compute_arena_generation, graph,
+                });
+                deferred = true;
+                graph = nullptr;
+            } catch (...) {
+                result = GGML_OPENCL_HTP_ERROR;
+                std::snprintf(reason, sizeof(reason),
+                              "failed to retain deferred OpenCL graph");
+            }
+        }
+    }
+    ctx->active_compute_arena_generation = 0;
+    if (!deferred) {
+        const ggml_opencl_htp_result finish =
+            ggml_backend_opencl_htp_graph_finish(graph, reason, sizeof(reason));
+        if (result == GGML_OPENCL_HTP_OK) {
+            result = finish;
+        }
+    }
     ggml_backend_opencl_htp_graph_free(&graph);
     // Hybrid compute has joined every worker before this function is called.
     ctx->sparse_opencl_routed_nodes.clear();
+    ctx->sparse_opencl_cache_input_bindings.clear();
     if (result != GGML_OPENCL_HTP_OK) {
         std::fprintf(
             stderr, "ggml-htp: OpenCL graph finish failed result=%d reason=%s\n",
@@ -719,13 +967,30 @@ static bool ggml_backend_htp_opencl_finish(ggml_backend_htp_context * ctx) {
 static bool ggml_backend_htp_test_abort_after_sparse_enqueue(void * data) {
     auto * ctx = static_cast<ggml_backend_htp_context *>(data);
     return ctx != nullptr && ctx->sparse_opencl_graph != nullptr &&
-        ggml_backend_opencl_htp_graph_pending_sparse_event_count(ctx->sparse_opencl_graph) > 0;
+        (ggml_backend_opencl_htp_graph_pending_sparse_event_count(
+             ctx->sparse_opencl_graph) > 0 ||
+         ggml_backend_opencl_htp_graph_submitted_sparse_count(
+             ctx->sparse_opencl_graph) > 0);
 }
 
 static bool ggml_backend_htp_test_abort_after_sparse_queue(void * data) {
     auto * ctx = static_cast<ggml_backend_htp_context *>(data);
     return ctx != nullptr && ctx->sparse_opencl_graph != nullptr &&
         ggml_backend_opencl_htp_graph_pending_sparse_submission_count(
+            ctx->sparse_opencl_graph) > 0;
+}
+
+static bool ggml_backend_htp_test_abort_after_residual_queue(void * data) {
+    auto * ctx = static_cast<ggml_backend_htp_context *>(data);
+    return ctx != nullptr && ctx->sparse_opencl_graph != nullptr &&
+        ggml_backend_opencl_htp_graph_pending_residual_submission_count(
+            ctx->sparse_opencl_graph) > 0;
+}
+
+static bool ggml_backend_htp_test_abort_after_residual_enqueue(void * data) {
+    auto * ctx = static_cast<ggml_backend_htp_context *>(data);
+    return ctx != nullptr && ctx->sparse_opencl_graph != nullptr &&
+        ggml_backend_opencl_htp_graph_pending_residual_event_count(
             ctx->sparse_opencl_graph) > 0;
 }
 #endif
@@ -795,6 +1060,7 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
         }
         if (preflight == GGML_OPENCL_HTP_ERROR ||
             (preflight != GGML_OPENCL_HTP_OK &&
+             preflight != GGML_OPENCL_HTP_NO_WORK &&
              ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_STRICT"))) {
             std::fprintf(
                 stderr,
@@ -830,6 +1096,18 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
         if (preflight == GGML_OPENCL_HTP_OK &&
             ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_TEST_ABORT_AFTER_ENQUEUE")) {
             cplan.abort_callback = ggml_backend_htp_test_abort_after_sparse_enqueue;
+            cplan.abort_callback_data = ctx;
+        }
+        if (preflight == GGML_OPENCL_HTP_OK &&
+            ggml_backend_htp_env_enabled(
+                "SD_HTP_SPARSE_OPENCL_TEST_ABORT_AFTER_RESIDUAL_QUEUE")) {
+            cplan.abort_callback = ggml_backend_htp_test_abort_after_residual_queue;
+            cplan.abort_callback_data = ctx;
+        }
+        if (preflight == GGML_OPENCL_HTP_OK &&
+            ggml_backend_htp_env_enabled(
+                "SD_HTP_SPARSE_OPENCL_TEST_ABORT_AFTER_RESIDUAL_ENQUEUE")) {
+            cplan.abort_callback = ggml_backend_htp_test_abort_after_residual_enqueue;
             cplan.abort_callback_data = ctx;
         }
 #endif
@@ -939,6 +1217,315 @@ ggml_backend_t ggml_backend_htp_init(void) {
 
 bool ggml_backend_is_htp(ggml_backend_t backend) {
     return backend != nullptr && ggml_guid_matches(backend->guid, ggml_backend_htp_guid());
+}
+
+void ggml_backend_htp_opencl_set_compute_arena_generation(
+        ggml_backend_t backend,
+        uint64_t generation) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (!ggml_backend_is_htp(backend)) {
+        return;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    ctx->active_compute_arena_generation = generation;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(generation);
+#endif
+}
+
+bool ggml_backend_htp_opencl_arena_generation_pending(
+        ggml_backend_t backend,
+        uint64_t generation) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (!ggml_backend_is_htp(backend) || generation == 0) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    return std::find_if(
+        ctx->deferred_opencl_graphs.begin(),
+        ctx->deferred_opencl_graphs.end(),
+        [generation](const ggml_backend_htp_context::deferred_opencl_graph & item) {
+            return item.arena_generation == generation;
+        }) != ctx->deferred_opencl_graphs.end();
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(generation);
+    return false;
+#endif
+}
+
+bool ggml_backend_htp_opencl_bind_cache_input(
+        ggml_backend_t backend,
+        const struct ggml_tensor * input,
+        const char * cache_key,
+        uint64_t generation,
+        char * reason,
+        size_t reason_capacity) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (!ggml_backend_is_htp(backend) || input == nullptr || cache_key == nullptr ||
+        cache_key[0] == '\0' || generation == 0) {
+        std::snprintf(reason, reason_capacity, "invalid cache input binding");
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    if (ctx->sparse_opencl_sidecar == nullptr) {
+        std::snprintf(reason, reason_capacity, "OpenCL sidecar is unavailable");
+        return false;
+    }
+    ggml_opencl_htp_cache_state state = GGML_OPENCL_HTP_CACHE_EMPTY;
+    const ggml_opencl_htp_result result = ggml_backend_opencl_htp_cache_query(
+        ctx->sparse_opencl_sidecar, cache_key, generation, &state,
+        reason, reason_capacity);
+    if (result != GGML_OPENCL_HTP_OK) {
+        return false;
+    }
+    try {
+        ctx->sparse_opencl_cache_input_bindings[input] = { cache_key, generation };
+    } catch (...) {
+        std::snprintf(reason, reason_capacity, "failed to retain cache input binding");
+        return false;
+    }
+    std::snprintf(reason, reason_capacity, "ok");
+    return true;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(input);
+    GGML_UNUSED(cache_key);
+    GGML_UNUSED(generation);
+    std::snprintf(reason, reason_capacity, "OpenCL sidecar support is unavailable");
+    return false;
+#endif
+}
+
+bool ggml_backend_htp_opencl_cache_query(
+        ggml_backend_t backend,
+        const char * cache_key,
+        uint64_t generation,
+        bool * ready,
+        char * reason,
+        size_t reason_capacity) {
+    if (ready != nullptr) {
+        *ready = false;
+    }
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (!ggml_backend_is_htp(backend) || cache_key == nullptr ||
+        cache_key[0] == '\0' || generation == 0 || ready == nullptr) {
+        std::snprintf(reason, reason_capacity, "invalid cache query");
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    if (ctx->sparse_opencl_sidecar == nullptr) {
+        std::snprintf(reason, reason_capacity, "OpenCL sidecar is unavailable");
+        return false;
+    }
+    ggml_opencl_htp_cache_state state = GGML_OPENCL_HTP_CACHE_EMPTY;
+    const ggml_opencl_htp_result result = ggml_backend_opencl_htp_cache_query(
+        ctx->sparse_opencl_sidecar, cache_key, generation, &state,
+        reason, reason_capacity);
+    if (result != GGML_OPENCL_HTP_OK) {
+        return false;
+    }
+    *ready = state == GGML_OPENCL_HTP_CACHE_READY;
+    return true;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(cache_key);
+    GGML_UNUSED(generation);
+    GGML_UNUSED(ready);
+    std::snprintf(reason, reason_capacity, "OpenCL sidecar support is unavailable");
+    return false;
+#endif
+}
+
+bool ggml_backend_htp_opencl_cache_wait(
+        ggml_backend_t backend,
+        const char * cache_key,
+        uint64_t generation,
+        bool * waited,
+        char * reason,
+        size_t reason_capacity) {
+    if (waited != nullptr) {
+        *waited = false;
+    }
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (!ggml_backend_is_htp(backend) || cache_key == nullptr ||
+        cache_key[0] == '\0' || generation == 0) {
+        std::snprintf(reason, reason_capacity, "invalid cache wait");
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    if (ctx->sparse_opencl_sidecar == nullptr) {
+        std::snprintf(reason, reason_capacity, "OpenCL sidecar is unavailable");
+        return false;
+    }
+    return ggml_backend_opencl_htp_cache_wait(
+               ctx->sparse_opencl_sidecar, cache_key, generation, waited,
+               reason, reason_capacity) == GGML_OPENCL_HTP_OK;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(cache_key);
+    GGML_UNUSED(generation);
+    GGML_UNUSED(waited);
+    std::snprintf(reason, reason_capacity, "OpenCL sidecar support is unavailable");
+    return false;
+#endif
+}
+
+void ggml_backend_htp_opencl_test_fail_next_cache_wait(
+        ggml_backend_t backend) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (!ggml_backend_is_htp(backend)) {
+        return;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    ggml_backend_opencl_htp_sidecar_test_fail_next_residual_wait(
+        ctx->sparse_opencl_sidecar);
+#else
+    GGML_UNUSED(backend);
+#endif
+}
+
+size_t ggml_backend_htp_opencl_cache_input_binding_count(
+        ggml_backend_t backend) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (!ggml_backend_is_htp(backend)) {
+        return 0;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    return ctx->sparse_opencl_cache_input_bindings.size();
+#else
+    GGML_UNUSED(backend);
+    return 0;
+#endif
+}
+
+size_t ggml_backend_htp_opencl_live_cache_import_count(
+        ggml_backend_t backend) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (!ggml_backend_is_htp(backend)) {
+        return 0;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    return ggml_backend_opencl_htp_sidecar_live_persistent_import_count(
+        ctx->sparse_opencl_sidecar);
+#else
+    GGML_UNUSED(backend);
+    return 0;
+#endif
+}
+
+size_t ggml_backend_htp_opencl_live_cache_event_count(
+        ggml_backend_t backend) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (!ggml_backend_is_htp(backend)) {
+        return 0;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    return ggml_backend_opencl_htp_sidecar_live_cache_event_count(
+        ctx->sparse_opencl_sidecar);
+#else
+    GGML_UNUSED(backend);
+    return 0;
+#endif
+}
+
+bool ggml_backend_htp_opencl_release_arena_generation(
+        ggml_backend_t backend,
+        uint64_t generation,
+        bool wait,
+        bool * released,
+        char * reason,
+        size_t reason_capacity) {
+    if (released != nullptr) {
+        *released = false;
+    }
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (!ggml_backend_is_htp(backend) || generation == 0) {
+        std::snprintf(reason, reason_capacity, "invalid HTP backend or arena generation");
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    const auto found = std::find_if(
+        ctx->deferred_opencl_graphs.begin(),
+        ctx->deferred_opencl_graphs.end(),
+        [generation](const ggml_backend_htp_context::deferred_opencl_graph & item) {
+            return item.arena_generation == generation;
+        });
+    if (found == ctx->deferred_opencl_graphs.end()) {
+        if (released != nullptr) {
+            *released = true;
+        }
+        std::snprintf(reason, reason_capacity, "ok");
+        return true;
+    }
+
+    ggml_opencl_htp_result result = GGML_OPENCL_HTP_OK;
+    bool ready = false;
+    if (wait) {
+        result = ggml_backend_opencl_htp_graph_wait_deferred(
+            found->graph, reason, reason_capacity);
+        ready = result == GGML_OPENCL_HTP_OK;
+    } else {
+        result = ggml_backend_opencl_htp_graph_deferred_ready(
+            found->graph, &ready, reason, reason_capacity);
+    }
+    if (result != GGML_OPENCL_HTP_OK) {
+        return false;
+    }
+    if (!ready) {
+        std::snprintf(reason, reason_capacity, "deferred arena is still pending");
+        return true;
+    }
+    result = ggml_backend_opencl_htp_graph_reap_deferred(
+        found->graph, reason, reason_capacity);
+    if (result != GGML_OPENCL_HTP_OK) {
+        return false;
+    }
+    ggml_opencl_htp_graph * graph = found->graph;
+    ctx->deferred_opencl_graphs.erase(found);
+    ggml_backend_opencl_htp_graph_free(&graph);
+    if (released != nullptr) {
+        *released = true;
+    }
+    std::snprintf(reason, reason_capacity, "ok");
+    return true;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(generation);
+    GGML_UNUSED(wait);
+    if (released != nullptr) {
+        *released = true;
+    }
+    if (reason != nullptr && reason_capacity > 0) {
+        std::snprintf(reason, reason_capacity, "ok");
+    }
+    return true;
+#endif
+}
+
+size_t ggml_backend_htp_opencl_deferred_arena_count(ggml_backend_t backend) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (!ggml_backend_is_htp(backend)) {
+        return 0;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    return ctx->deferred_opencl_graphs.size();
+#else
+    GGML_UNUSED(backend);
+    return 0;
+#endif
 }
 
 void ggml_backend_htp_set_n_threads(ggml_backend_t backend, int n_threads) {

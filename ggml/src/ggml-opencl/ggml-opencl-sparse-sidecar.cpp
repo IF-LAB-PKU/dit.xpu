@@ -27,31 +27,85 @@
 
 #include <sys/stat.h>
 
+struct ggml_opencl_htp_cache_record {
+    std::string key;
+    uint64_t generation = 0;
+    ggml_opencl_htp_cache_state state = GGML_OPENCL_HTP_CACHE_EMPTY;
+    std::string failure_reason;
+    std::string peer_key;
+    cl_event producer_event = nullptr;
+    cl_event profiling_dependency_event = nullptr;
+    bool profiling_owner = false;
+};
+
+struct ggml_opencl_htp_persistent_import {
+    std::string key;
+    uint64_t generation = 0;
+    ggml_opencl_htp_import_descriptor descriptor = {};
+    cl_mem memory = nullptr;
+};
+
 struct ggml_opencl_htp_sidecar {
     cl_platform_id platform = nullptr;
     cl_device_id device = nullptr;
     cl_context context = nullptr;
-    cl_command_queue queue = nullptr;
+    cl_command_queue sparse_queue = nullptr;
+    cl_command_queue residual_queue = nullptr;
     cl_program block_sparse_program = nullptr;
     cl_kernel block_sparse_kernel = nullptr;
+    cl_program residual_program = nullptr;
+    cl_kernel rho_residual_kernel = nullptr;
     std::string platform_vendor;
     std::string device_name;
     std::string device_extensions;
     size_t ext_mem_padding = 0;
     size_t page_size = 0;
     cl_ulong max_mem_alloc_size = 0;
-    bool queue_is_in_order = false;
+    bool sparse_queue_is_in_order = false;
+    bool residual_queue_is_in_order = false;
+    bool profiling_enabled = false;
+    std::mutex queue_mutex;
+    bool residual_queue_fallback_logged = false;
     std::mutex dispatch_mutex;
+    mutable std::mutex cache_mutex;
+    std::vector<ggml_opencl_htp_cache_record> cache_records;
+    std::vector<ggml_opencl_htp_persistent_import> persistent_imports;
+    bool test_fail_next_residual_wait = false;
 
     ~ggml_opencl_htp_sidecar() {
+        for (ggml_opencl_htp_cache_record & record : cache_records) {
+            if (record.producer_event != nullptr) {
+                clReleaseEvent(record.producer_event);
+                record.producer_event = nullptr;
+            }
+            if (record.profiling_dependency_event != nullptr) {
+                clReleaseEvent(record.profiling_dependency_event);
+                record.profiling_dependency_event = nullptr;
+            }
+        }
+        for (ggml_opencl_htp_persistent_import & imported : persistent_imports) {
+            if (imported.memory != nullptr) {
+                clReleaseMemObject(imported.memory);
+                imported.memory = nullptr;
+            }
+        }
+        if (rho_residual_kernel != nullptr) {
+            clReleaseKernel(rho_residual_kernel);
+        }
+        if (residual_program != nullptr) {
+            clReleaseProgram(residual_program);
+        }
         if (block_sparse_kernel != nullptr) {
             clReleaseKernel(block_sparse_kernel);
         }
         if (block_sparse_program != nullptr) {
             clReleaseProgram(block_sparse_program);
         }
-        if (queue != nullptr) {
-            clReleaseCommandQueue(queue);
+        if (residual_queue != nullptr) {
+            clReleaseCommandQueue(residual_queue);
+        }
+        if (sparse_queue != nullptr) {
+            clReleaseCommandQueue(sparse_queue);
         }
         if (context != nullptr) {
             clReleaseContext(context);
@@ -113,6 +167,17 @@ struct ggml_opencl_htp_prepared_sparse_dispatch {
     cl_mem staged_mask = nullptr;
 };
 
+struct ggml_opencl_htp_prepared_residual_dispatch {
+    ggml_opencl_htp_residual_dispatch dispatch = {};
+    ggml_opencl_htp_tensor_binding dense;
+    ggml_opencl_htp_tensor_binding sparse;
+    ggml_opencl_htp_tensor_binding residual;
+    ggml_opencl_htp_tensor_binding rho;
+    ggml_opencl_htp_tensor_metadata tensor_metadata[4];
+    std::string residual_cache_key;
+    std::string rho_cache_key;
+};
+
 struct ggml_opencl_htp_pending_event {
     const ggml_tensor * producer = nullptr;
     cl_event event = nullptr;
@@ -127,7 +192,21 @@ enum class ggml_opencl_htp_submission_state {
     failed,
 };
 
+enum class ggml_opencl_htp_submission_job_kind {
+    sparse_attention,
+    exact_rho_residual,
+};
+
+struct ggml_opencl_htp_submission_job {
+    ggml_opencl_htp_submission_job_kind kind =
+        ggml_opencl_htp_submission_job_kind::sparse_attention;
+    const ggml_tensor * producer = nullptr;
+    int64_t published_us = 0;
+};
+
 struct ggml_opencl_htp_submission_record {
+    ggml_opencl_htp_submission_job_kind kind =
+        ggml_opencl_htp_submission_job_kind::sparse_attention;
     const ggml_tensor * producer = nullptr;
     ggml_opencl_htp_submission_state state = ggml_opencl_htp_submission_state::queued;
     ggml_opencl_htp_result result = GGML_OPENCL_HTP_OK;
@@ -145,10 +224,13 @@ struct ggml_opencl_htp_graph {
     std::vector<cl_event> events;
     std::vector<ggml_opencl_htp_pending_event> pending_events;
     std::vector<const ggml_tensor *> routed_nodes;
+    std::vector<const ggml_tensor *> residual_owned_sparse_producers;
     std::vector<ggml_opencl_htp_prepared_sparse_dispatch> prepared_sparse_dispatches;
+    std::vector<ggml_opencl_htp_prepared_residual_dispatch> prepared_residual_dispatches;
     mutable std::mutex submission_mutex;
     std::condition_variable submission_cv;
-    std::deque<const ggml_tensor *> submission_jobs;
+    std::deque<ggml_opencl_htp_submission_job> sparse_submission_jobs;
+    std::deque<ggml_opencl_htp_submission_job> residual_submission_jobs;
     std::vector<ggml_opencl_htp_submission_record> submission_records;
     std::thread submission_thread;
     bool submission_worker_active = false;
@@ -163,6 +245,9 @@ struct ggml_opencl_htp_graph {
     bool test_fail_next_event_cache = false;
     bool test_fail_next_sparse_enqueue = false;
     bool test_fail_next_sparse_wait = false;
+    bool test_fail_next_rho_enqueue = false;
+    bool test_fail_next_residual_enqueue = false;
+    bool use_residual_queue = false;
 };
 
 namespace {
@@ -194,6 +279,40 @@ void trace_sidecar_event(const char * event, const ggml_tensor * producer) {
         event,
         (long long) ggml_time_us(),
         producer != nullptr && producer->name[0] != '\0' ? producer->name : "<unnamed>");
+}
+
+void trace_sidecar_queue_event(
+        const char * event,
+        const char * queue,
+        const ggml_tensor * producer) {
+    if (!sidecar_trace_enabled()) {
+        return;
+    }
+    std::fprintf(
+        stderr,
+        "htp_opencl_event name=%s queue=%s ts_us=%lld producer=%s\n",
+        event,
+        queue,
+        (long long) ggml_time_us(),
+        producer != nullptr && producer->name[0] != '\0' ?
+            producer->name : "<unnamed>");
+}
+
+void trace_submission_scheduler_timing(
+        const ggml_opencl_htp_submission_job & job,
+        int64_t selected_us) {
+    if (!sidecar_trace_enabled()) {
+        return;
+    }
+    std::fprintf(
+        stderr,
+        "htp_opencl_submission_scheduler_timing kind=%s "
+        "publication_to_selection_us=%lld producer=%s\n",
+        job.kind == ggml_opencl_htp_submission_job_kind::sparse_attention ?
+            "sparse" : "residual",
+        (long long) std::max<int64_t>(0, selected_us - job.published_us),
+        job.producer != nullptr && job.producer->name[0] != '\0' ?
+            job.producer->name : "<unnamed>");
 }
 
 bool contains_case_insensitive(const std::string & text, const char * needle) {
@@ -325,6 +444,151 @@ ggml_opencl_htp_result ensure_block_sparse_kernel(
 #endif
 }
 
+ggml_opencl_htp_result ensure_residual_kernel(
+        ggml_opencl_htp_sidecar * sidecar,
+        char * reason,
+        size_t reason_capacity) {
+    if (sidecar->rho_residual_kernel != nullptr) {
+        return GGML_OPENCL_HTP_OK;
+    }
+
+    static constexpr const char * kernel_source = R"CLC(
+__kernel void exact_rho_residual_f32(
+        __global const float * dense,
+        ulong dense_offset_bytes,
+        __global const float * sparse,
+        ulong sparse_offset_bytes,
+        __global float * rho,
+        ulong rho_offset_bytes,
+        __global float * residual,
+        ulong residual_offset_bytes,
+        ulong head_dim,
+        ulong row_count) {
+    const ulong row = (ulong) get_group_id(0);
+    const ulong lane = (ulong) get_local_id(0);
+    if (row >= row_count) {
+        return;
+    }
+    const ulong packed_dim = head_dim + 1;
+    const ulong dense_base = dense_offset_bytes / sizeof(float);
+    const ulong sparse_base = sparse_offset_bytes / sizeof(float);
+    const ulong rho_base = rho_offset_bytes / sizeof(float);
+    const ulong residual_base = residual_offset_bytes / sizeof(float);
+    __local float row_rho[1];
+    if (lane == 0) {
+        const float value = exp(
+            sparse[sparse_base + row * packed_dim + head_dim] -
+            dense[dense_base + row * packed_dim + head_dim]);
+        row_rho[0] = value;
+        rho[rho_base + row] = value;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (ulong d = lane; d < head_dim; d += (ulong) get_local_size(0)) {
+        residual[residual_base + row * head_dim + d] =
+            dense[dense_base + row * packed_dim + d] -
+            sparse[sparse_base + row * packed_dim + d] * row_rho[0];
+    }
+}
+)CLC";
+
+    const char * source = kernel_source;
+    cl_int err = CL_SUCCESS;
+    cl_program program = clCreateProgramWithSource(
+        sidecar->context, 1, &source, nullptr, &err);
+    if (err != CL_SUCCESS || program == nullptr) {
+        set_reason(reason, reason_capacity, "clCreateProgramWithSource for residual failed (error %d)", err);
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    static constexpr const char * build_options = "-cl-std=CL3.0 -cl-mad-enable";
+    err = clBuildProgram(program, 1, &sidecar->device, build_options, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        const std::string build_log = get_program_build_log(program, sidecar->device);
+        const cl_int release_err = clReleaseProgram(program);
+        set_reason(
+            reason, reason_capacity,
+            "residual clBuildProgram failed (error %d, release error %d): %s",
+            err, release_err, build_log.c_str());
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    cl_kernel kernel = clCreateKernel(program, "exact_rho_residual_f32", &err);
+    if (err != CL_SUCCESS || kernel == nullptr) {
+        const cl_int release_err = clReleaseProgram(program);
+        set_reason(
+            reason, reason_capacity,
+            "clCreateKernel exact_rho_residual_f32 failed (error %d, release error %d)",
+            err, release_err);
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    sidecar->residual_program = program;
+    sidecar->rho_residual_kernel = kernel;
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
+ggml_opencl_htp_result ensure_residual_queue(
+        ggml_opencl_htp_sidecar * sidecar,
+        char * reason,
+        size_t reason_capacity) {
+    std::lock_guard<std::mutex> lock(sidecar->queue_mutex);
+    if (sidecar->residual_queue != nullptr &&
+        sidecar->residual_queue_is_in_order) {
+        set_reason(reason, reason_capacity, "ok");
+        return GGML_OPENCL_HTP_OK;
+    }
+    const char * fail_create = std::getenv(
+        "SD_HTP_SPARSE_OPENCL_TEST_FAIL_RESIDUAL_QUEUE_CREATE");
+    if (fail_create != nullptr && fail_create[0] != '\0' &&
+        std::strcmp(fail_create, "0") != 0) {
+        set_reason(
+            reason, reason_capacity,
+            "injected residual queue creation failure");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    const cl_queue_properties queue_properties[] = {
+        CL_QUEUE_PROPERTIES,
+        static_cast<cl_queue_properties>(
+            sidecar->profiling_enabled ? CL_QUEUE_PROFILING_ENABLE : 0),
+        0,
+    };
+    cl_int err = CL_SUCCESS;
+    cl_command_queue queue = clCreateCommandQueueWithProperties(
+        sidecar->context, sidecar->device, queue_properties, &err);
+    if (err != CL_SUCCESS || queue == nullptr) {
+        set_reason(
+            reason, reason_capacity,
+            "residual clCreateCommandQueueWithProperties failed (error %d)", err);
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    cl_command_queue_properties actual_properties = 0;
+    err = clGetCommandQueueInfo(
+        queue, CL_QUEUE_PROPERTIES,
+        sizeof(actual_properties), &actual_properties, nullptr);
+    if (err != CL_SUCCESS) {
+        const cl_int release_err = clReleaseCommandQueue(queue);
+        set_reason(
+            reason, reason_capacity,
+            "failed to query residual OpenCL queue properties "
+            "(error %d, release error %d)",
+            err, release_err);
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    if ((actual_properties & CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE) != 0) {
+        const cl_int release_err = clReleaseCommandQueue(queue);
+        set_reason(
+            reason, reason_capacity,
+            "OpenCL residual command queue is not in-order "
+            "(release error %d)", release_err);
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    sidecar->residual_queue = queue;
+    sidecar->residual_queue_is_in_order = true;
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
 } // namespace
 
 ggml_opencl_htp_sidecar * ggml_backend_opencl_htp_sidecar_create(
@@ -454,29 +718,34 @@ ggml_opencl_htp_sidecar * ggml_backend_opencl_htp_sidecar_create(
         return nullptr;
     }
 
+    const char * profiling = std::getenv("SD_HTP_SPARSE_OPENCL_PROFILE");
+    sidecar->profiling_enabled =
+        profiling != nullptr && profiling[0] != '\0' && std::strcmp(profiling, "0") != 0;
     const cl_queue_properties queue_properties[] = {
         CL_QUEUE_PROPERTIES,
-        0,
+        static_cast<cl_queue_properties>(
+            sidecar->profiling_enabled ? CL_QUEUE_PROFILING_ENABLE : 0),
         0,
     };
-    sidecar->queue = clCreateCommandQueueWithProperties(
+    sidecar->sparse_queue = clCreateCommandQueueWithProperties(
         sidecar->context, sidecar->device, queue_properties, &err);
-    if (err != CL_SUCCESS || sidecar->queue == nullptr) {
-        set_reason(reason, reason_capacity, "clCreateCommandQueueWithProperties failed (error %d)", err);
+    if (err != CL_SUCCESS || sidecar->sparse_queue == nullptr) {
+        set_reason(reason, reason_capacity,
+                   "sparse clCreateCommandQueueWithProperties failed (error %d)", err);
         return nullptr;
     }
 
     cl_command_queue_properties actual_queue_properties = 0;
-    err = clGetCommandQueueInfo(sidecar->queue, CL_QUEUE_PROPERTIES,
+    err = clGetCommandQueueInfo(sidecar->sparse_queue, CL_QUEUE_PROPERTIES,
                                 sizeof(actual_queue_properties), &actual_queue_properties, nullptr);
     if (err != CL_SUCCESS) {
         set_reason(reason, reason_capacity, "failed to query OpenCL queue properties (error %d)", err);
         return nullptr;
     }
-    sidecar->queue_is_in_order =
+    sidecar->sparse_queue_is_in_order =
         (actual_queue_properties & CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE) == 0;
-    if (!sidecar->queue_is_in_order) {
-        set_reason(reason, reason_capacity, "OpenCL command queue is not in-order");
+    if (!sidecar->sparse_queue_is_in_order) {
+        set_reason(reason, reason_capacity, "OpenCL sparse command queue is not in-order");
         return nullptr;
     }
 
@@ -512,7 +781,32 @@ bool ggml_backend_opencl_htp_sidecar_has_extension(
 }
 
 bool ggml_backend_opencl_htp_sidecar_queue_is_in_order(const ggml_opencl_htp_sidecar * sidecar) {
-    return sidecar != nullptr && sidecar->queue_is_in_order;
+    return sidecar != nullptr && sidecar->sparse_queue_is_in_order &&
+           (sidecar->residual_queue == nullptr ||
+            sidecar->residual_queue_is_in_order);
+}
+
+size_t ggml_backend_opencl_htp_sidecar_live_persistent_import_count(
+        const ggml_opencl_htp_sidecar * sidecar) {
+    if (sidecar == nullptr) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(sidecar->cache_mutex);
+    return sidecar->persistent_imports.size();
+}
+
+size_t ggml_backend_opencl_htp_sidecar_live_cache_event_count(
+        const ggml_opencl_htp_sidecar * sidecar) {
+    if (sidecar == nullptr) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(sidecar->cache_mutex);
+    size_t count = 0;
+    for (const ggml_opencl_htp_cache_record & record : sidecar->cache_records) {
+        count += record.producer_event != nullptr;
+        count += record.profiling_dependency_event != nullptr;
+    }
+    return count;
 }
 
 namespace {
@@ -536,6 +830,35 @@ ggml_opencl_htp_alias * find_alias(
     for (ggml_opencl_htp_alias & alias : graph->aliases) {
         if (alias.descriptor.backing == backing) {
             return &alias;
+        }
+    }
+    return nullptr;
+}
+
+ggml_opencl_htp_persistent_import * find_persistent_import(
+        ggml_opencl_htp_sidecar * sidecar,
+        ggml_backend_buffer_t backing) {
+    if (sidecar == nullptr || backing == nullptr) {
+        return nullptr;
+    }
+    for (ggml_opencl_htp_persistent_import & imported : sidecar->persistent_imports) {
+        if (imported.descriptor.backing == backing) {
+            return &imported;
+        }
+    }
+    return nullptr;
+}
+
+ggml_opencl_htp_persistent_import * find_persistent_import(
+        ggml_opencl_htp_sidecar * sidecar,
+        const char * key,
+        uint64_t generation) {
+    if (sidecar == nullptr || key == nullptr) {
+        return nullptr;
+    }
+    for (ggml_opencl_htp_persistent_import & imported : sidecar->persistent_imports) {
+        if (imported.generation == generation && imported.key == key) {
+            return &imported;
         }
     }
     return nullptr;
@@ -669,7 +992,8 @@ ggml_opencl_htp_result finish_graph_state(
     ggml_opencl_htp_result requested_result,
     const char * requested_reason,
     char * reason,
-    size_t reason_capacity) {
+    size_t reason_capacity,
+    bool finish_queue = true) {
     std::lock_guard<std::mutex> submission_lock(graph->submission_mutex);
     GGML_ASSERT(!graph->submission_worker_active);
     if (graph->state == ggml_opencl_htp_graph_state::finished) {
@@ -686,7 +1010,13 @@ ggml_opencl_htp_result finish_graph_state(
         }
     };
 
-    record_error("clFinish", clFinish(graph->sidecar->queue));
+    if (finish_queue) {
+        record_error("clFinish(sparse)", clFinish(graph->sidecar->sparse_queue));
+        if (graph->use_residual_queue) {
+            record_error(
+                "clFinish(residual)", clFinish(graph->sidecar->residual_queue));
+        }
+    }
     for (cl_event event : graph->events) {
         if (event != nullptr) {
             record_error("clReleaseEvent", clReleaseEvent(event));
@@ -712,6 +1042,7 @@ ggml_opencl_htp_result finish_graph_state(
     }
     graph->aliases.clear();
     graph->routed_nodes.clear();
+    graph->residual_owned_sparse_producers.clear();
     for (ggml_opencl_htp_prepared_sparse_dispatch & prepared :
             graph->prepared_sparse_dispatches) {
         if (prepared.staged_mask != nullptr) {
@@ -720,6 +1051,7 @@ ggml_opencl_htp_result finish_graph_state(
         }
     }
     graph->prepared_sparse_dispatches.clear();
+    graph->prepared_residual_dispatches.clear();
     graph->state = ggml_opencl_htp_graph_state::finished;
     graph->cleanup_failed = failed_operation != nullptr;
 
@@ -798,7 +1130,8 @@ ggml_opencl_htp_result fail_runtime_graph(
                     queued.reason, sizeof(queued.reason),
                     "submission cancelled after graph failure: %s", failure_reason);
             }
-            graph->submission_jobs.clear();
+            graph->sparse_submission_jobs.clear();
+            graph->residual_submission_jobs.clear();
             set_reason(reason, reason_capacity, "%s", failure_reason);
             graph->submission_cv.notify_all();
             return GGML_OPENCL_HTP_ERROR;
@@ -816,7 +1149,7 @@ ggml_opencl_htp_result fail_submitted_graph(
     cl_int operation_error,
     char * reason,
     size_t reason_capacity) {
-    const cl_int finish_err = clFinish(graph->sidecar->queue);
+    const cl_int finish_err = clFinish(graph->sidecar->sparse_queue);
     const cl_int release_err = event != nullptr ? clReleaseEvent(event) : CL_SUCCESS;
     return fail_runtime_graph(
         graph, reason, reason_capacity,
@@ -1196,6 +1529,154 @@ bool tensor_metadata_matches(
            tensor_backing(tensor) == metadata.backing;
 }
 
+ggml_opencl_htp_cache_record * find_cache_record(
+        ggml_opencl_htp_sidecar * sidecar,
+        const char * key,
+        uint64_t generation) {
+    if (sidecar == nullptr || key == nullptr) {
+        return nullptr;
+    }
+    for (ggml_opencl_htp_cache_record & record : sidecar->cache_records) {
+        if (record.generation == generation && record.key == key) {
+            return &record;
+        }
+    }
+    return nullptr;
+}
+
+const ggml_opencl_htp_cache_record * find_cache_record(
+        const ggml_opencl_htp_sidecar * sidecar,
+        const char * key,
+        uint64_t generation) {
+    return find_cache_record(
+        const_cast<ggml_opencl_htp_sidecar *>(sidecar), key, generation);
+}
+
+bool same_tensor_shape(const ggml_tensor * lhs, const ggml_tensor * rhs) {
+    return lhs != nullptr && rhs != nullptr &&
+           std::memcmp(lhs->ne, rhs->ne, sizeof(lhs->ne)) == 0;
+}
+
+ggml_opencl_htp_result validate_residual_dispatch(
+        ggml_opencl_htp_graph * graph,
+        const ggml_opencl_htp_residual_dispatch * dispatch,
+        ggml_opencl_htp_prepared_residual_dispatch * prepared,
+        char * reason,
+        size_t reason_capacity) {
+    if (graph == nullptr || dispatch == nullptr || prepared == nullptr) {
+        set_reason(reason, reason_capacity, "graph, residual dispatch, and prepared output must not be null");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    struct required_tensor {
+        const char * name;
+        const ggml_tensor * tensor;
+    };
+    const required_tensor required[] = {
+        { "dense_packed", dispatch->dense_packed },
+        { "sparse_packed_producer", dispatch->sparse_packed_producer },
+        { "residual_destination", dispatch->residual_destination },
+        { "rho_destination", dispatch->rho_destination },
+    };
+    for (const required_tensor & item : required) {
+        if (item.tensor == nullptr) {
+            return unsupported_sparse_node(
+                reason, reason_capacity, "%s must not be null", item.name);
+        }
+        if (item.tensor->type != GGML_TYPE_F32) {
+            return unsupported_sparse_node(
+                reason, reason_capacity, "%s must use F32 storage", item.name);
+        }
+        if (!ggml_is_contiguous(item.tensor)) {
+            return unsupported_sparse_node(
+                reason, reason_capacity, "%s must be contiguous", item.name);
+        }
+    }
+    if (dispatch->residual_cache_key == nullptr || dispatch->residual_cache_key[0] == '\0' ||
+        dispatch->rho_cache_key == nullptr || dispatch->rho_cache_key[0] == '\0') {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "residual and rho cache keys must not be empty");
+    }
+    if (std::strcmp(dispatch->residual_cache_key, dispatch->rho_cache_key) == 0) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "residual and rho cache keys must be distinct");
+    }
+    if (!same_tensor_shape(dispatch->dense_packed, dispatch->sparse_packed_producer) ||
+        dispatch->dense_packed->ne[0] < 2) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "dense and sparse packed shape must match and include O plus LSE");
+    }
+
+    const int64_t head_dim = dispatch->dense_packed->ne[0] - 1;
+    const ggml_tensor * residual = dispatch->residual_destination;
+    const ggml_tensor * rho = dispatch->rho_destination;
+    if (residual->ne[0] != head_dim ||
+        residual->ne[1] != dispatch->dense_packed->ne[1] ||
+        residual->ne[2] != dispatch->dense_packed->ne[2] ||
+        residual->ne[3] != dispatch->dense_packed->ne[3]) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "residual destination shape does not match packed O shape");
+    }
+    if (rho->ne[0] != 1 ||
+        rho->ne[1] != dispatch->dense_packed->ne[1] ||
+        rho->ne[2] != dispatch->dense_packed->ne[2] ||
+        rho->ne[3] != dispatch->dense_packed->ne[3]) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "rho destination shape does not match packed LSE shape");
+    }
+
+    struct binding_request {
+        const char * name;
+        const ggml_tensor * tensor;
+        ggml_opencl_htp_tensor_binding * binding;
+    };
+    const binding_request bindings[] = {
+        { "dense packed input", dispatch->dense_packed, &prepared->dense },
+        { "sparse packed input", dispatch->sparse_packed_producer, &prepared->sparse },
+        { "residual destination", dispatch->residual_destination, &prepared->residual },
+        { "rho destination", dispatch->rho_destination, &prepared->rho },
+    };
+    for (const binding_request & request : bindings) {
+        char binding_reason[256] = {};
+        if (resolve_tensor_binding(
+                graph, request.tensor, request.binding,
+                binding_reason, sizeof(binding_reason)) != GGML_OPENCL_HTP_OK) {
+            return unsupported_sparse_node(
+                reason, reason_capacity, "%s binding is unavailable: %s",
+                request.name, binding_reason);
+        }
+        if (request.binding->offset % sizeof(float) != 0) {
+            return unsupported_sparse_node(
+                reason, reason_capacity, "%s offset is not F32 aligned", request.name);
+        }
+    }
+    if (bindings_overlap(prepared->residual, prepared->rho)) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "residual and rho destination spans overlap");
+    }
+    if (bindings_overlap(prepared->residual, prepared->dense) ||
+        bindings_overlap(prepared->residual, prepared->sparse) ||
+        bindings_overlap(prepared->rho, prepared->dense) ||
+        bindings_overlap(prepared->rho, prepared->sparse)) {
+        return unsupported_sparse_node(
+            reason, reason_capacity, "residual destination storage overlaps a packed input span");
+    }
+
+    prepared->dispatch = *dispatch;
+    prepared->residual_cache_key = dispatch->residual_cache_key;
+    prepared->rho_cache_key = dispatch->rho_cache_key;
+    const ggml_tensor * tensors[] = {
+        dispatch->dense_packed,
+        dispatch->sparse_packed_producer,
+        dispatch->residual_destination,
+        dispatch->rho_destination,
+    };
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(tensors[0]); ++i) {
+        prepared->tensor_metadata[i] = capture_tensor_metadata(tensors[i]);
+    }
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
 ggml_opencl_htp_prepared_sparse_dispatch make_prepared_sparse_dispatch(
         const ggml_opencl_htp_sparse_dispatch & dispatch,
         const ggml_opencl_htp_sparse_bindings & bindings) {
@@ -1329,8 +1810,8 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_create(
         set_reason(reason, reason_capacity, "sidecar must not be null");
         return GGML_OPENCL_HTP_ERROR;
     }
-    if (sidecar->context == nullptr || sidecar->queue == nullptr ||
-        sidecar->page_size == 0 || !sidecar->queue_is_in_order) {
+    if (sidecar->context == nullptr || sidecar->sparse_queue == nullptr ||
+        sidecar->page_size == 0 || !sidecar->sparse_queue_is_in_order) {
         set_reason(reason, reason_capacity, "sidecar is not ready for graph imports");
         return GGML_OPENCL_HTP_UNSUPPORTED;
     }
@@ -1341,6 +1822,36 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_create(
         return GGML_OPENCL_HTP_ERROR;
     }
     created->sidecar = sidecar;
+    const char * residual_queue =
+        std::getenv("SD_HTP_SPARSE_OPENCL_RESIDUAL_QUEUE");
+    created->use_residual_queue =
+        residual_queue == nullptr ||
+        (residual_queue[0] != '\0' &&
+         std::strcmp(residual_queue, "0") != 0);
+    if (created->use_residual_queue) {
+        char queue_reason[256] = {};
+        if (ensure_residual_queue(
+                sidecar, queue_reason, sizeof(queue_reason)) !=
+            GGML_OPENCL_HTP_OK) {
+            const char * strict = std::getenv("SD_HTP_SPARSE_OPENCL_STRICT");
+            const bool strict_enabled =
+                strict != nullptr && strict[0] != '\0' &&
+                std::strcmp(strict, "0") != 0;
+            if (strict_enabled) {
+                set_reason(reason, reason_capacity, "%s", queue_reason);
+                return GGML_OPENCL_HTP_ERROR;
+            }
+            created->use_residual_queue = false;
+            std::lock_guard<std::mutex> lock(sidecar->queue_mutex);
+            if (!sidecar->residual_queue_fallback_logged) {
+                std::fprintf(
+                    stderr,
+                    "ggml-opencl: residual queue unavailable; using sparse queue: %s\n",
+                    queue_reason[0] != '\0' ? queue_reason : "unknown error");
+                sidecar->residual_queue_fallback_logged = true;
+            }
+        }
+    }
     std::snprintf(created->finish_reason, sizeof(created->finish_reason), "ok");
     *graph = created.release();
     set_reason(reason, reason_capacity, "ok");
@@ -1360,7 +1871,6 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_import(
         set_reason(reason, reason_capacity, "graph is already finished");
         return GGML_OPENCL_HTP_ERROR;
     }
-
     char validation_reason[256] = {};
     const ggml_opencl_htp_result validation = validate_import_descriptor(
         graph, descriptor, validation_reason, sizeof(validation_reason));
@@ -1379,6 +1889,37 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_import(
         }
         set_reason(reason, reason_capacity, "ok");
         return GGML_OPENCL_HTP_OK;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(graph->sidecar->cache_mutex);
+        if (ggml_opencl_htp_persistent_import * imported =
+                find_persistent_import(graph->sidecar, descriptor->backing)) {
+            if (!descriptors_equal(imported->descriptor, *descriptor)) {
+                return fail_graph(
+                    graph,
+                    reason, reason_capacity,
+                    "persistent backing %p was imported with different metadata",
+                    static_cast<void *>(descriptor->backing));
+            }
+            const cl_int retain_err = clRetainMemObject(imported->memory);
+            if (retain_err != CL_SUCCESS) {
+                return fail_graph(
+                    graph, reason, reason_capacity,
+                    "failed to retain persistent OpenCL import (error %d)", retain_err);
+            }
+            try {
+                graph->aliases.push_back({ imported->descriptor, imported->memory });
+            } catch (...) {
+                const cl_int release_err = clReleaseMemObject(imported->memory);
+                return fail_graph(
+                    graph, reason, reason_capacity,
+                    "failed to cache retained persistent import (release error %d)",
+                    release_err);
+            }
+            set_reason(reason, reason_capacity, "ok");
+            return GGML_OPENCL_HTP_OK;
+        }
     }
 
     cl_mem_dmabuf_host_ptr host_ptr = {};
@@ -1416,6 +1957,149 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_import(
     return GGML_OPENCL_HTP_OK;
 }
 
+ggml_opencl_htp_result ggml_backend_opencl_htp_persistent_import_acquire(
+        ggml_opencl_htp_sidecar * sidecar,
+        const ggml_opencl_htp_import_descriptor * descriptor,
+        const char * cache_key,
+        uint64_t generation,
+        uint64_t * import_identity,
+        char * reason,
+        size_t reason_capacity) {
+    if (sidecar == nullptr || cache_key == nullptr || cache_key[0] == '\0' ||
+        import_identity == nullptr) {
+        set_reason(reason, reason_capacity,
+                   "sidecar, cache key, and import identity output must be valid");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    ggml_opencl_htp_graph validation_graph;
+    validation_graph.sidecar = sidecar;
+    const ggml_opencl_htp_result validation = validate_import_descriptor(
+        &validation_graph, descriptor, reason, reason_capacity);
+    if (validation != GGML_OPENCL_HTP_OK) {
+        return validation;
+    }
+
+    std::lock_guard<std::mutex> lock(sidecar->cache_mutex);
+    if (ggml_opencl_htp_persistent_import * existing =
+            find_persistent_import(sidecar, cache_key, generation)) {
+        if (!descriptors_equal(existing->descriptor, *descriptor)) {
+            set_reason(reason, reason_capacity,
+                       "cache generation already has a different RPCMEM backing");
+            return GGML_OPENCL_HTP_UNSUPPORTED;
+        }
+        *import_identity = reinterpret_cast<uint64_t>(existing->memory);
+        set_reason(reason, reason_capacity, "ok");
+        return GGML_OPENCL_HTP_OK;
+    }
+    if (find_persistent_import(sidecar, descriptor->backing) != nullptr) {
+        set_reason(reason, reason_capacity,
+                   "RPCMEM backing is already owned by another cache generation");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+    const size_t generation_count = static_cast<size_t>(std::count_if(
+        sidecar->persistent_imports.begin(), sidecar->persistent_imports.end(),
+        [cache_key](const ggml_opencl_htp_persistent_import & imported) {
+            return imported.key == cache_key;
+        }));
+    if (generation_count >= 2) {
+        set_reason(reason, reason_capacity,
+                   "cache key already owns the maximum of two generations");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+
+    cl_mem_dmabuf_host_ptr host_ptr = {};
+    host_ptr.ext_host_ptr.allocation_type = CL_MEM_DMABUF_HOST_PTR_QCOM;
+    host_ptr.ext_host_ptr.host_cache_policy = CL_MEM_HOST_UNCACHED_QCOM;
+    host_ptr.dmabuf_filedesc = descriptor->fd;
+    host_ptr.dmabuf_hostptr = descriptor->base;
+    const cl_mem_flags flags =
+        CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR | CL_MEM_EXT_HOST_PTR_QCOM;
+    cl_int err = CL_SUCCESS;
+    cl_mem memory = clCreateBuffer(
+        sidecar->context, flags, descriptor->logical_size, &host_ptr, &err);
+    if (err != CL_SUCCESS || memory == nullptr) {
+        if (memory != nullptr) {
+            clReleaseMemObject(memory);
+        }
+        set_reason(reason, reason_capacity,
+                   "clCreateBuffer failed for persistent cache backing (error %d)", err);
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    try {
+        sidecar->persistent_imports.push_back({
+            cache_key, generation, *descriptor, memory,
+        });
+    } catch (...) {
+        const cl_int release_err = clReleaseMemObject(memory);
+        set_reason(reason, reason_capacity,
+                   "failed to retain persistent import state (release error %d)",
+                   release_err);
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    *import_identity = reinterpret_cast<uint64_t>(memory);
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_persistent_import_release(
+        ggml_opencl_htp_sidecar * sidecar,
+        const char * cache_key,
+        uint64_t generation,
+        char * reason,
+        size_t reason_capacity) {
+    if (sidecar == nullptr || cache_key == nullptr || cache_key[0] == '\0') {
+        set_reason(reason, reason_capacity, "sidecar and cache key must be valid");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    std::lock_guard<std::mutex> lock(sidecar->cache_mutex);
+    const auto found = std::find_if(
+        sidecar->persistent_imports.begin(), sidecar->persistent_imports.end(),
+        [cache_key, generation](const ggml_opencl_htp_persistent_import & imported) {
+            return imported.generation == generation && imported.key == cache_key;
+        });
+    if (found == sidecar->persistent_imports.end()) {
+        set_reason(reason, reason_capacity, "persistent cache generation was not found");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+    const cl_int release_err = found->memory != nullptr ?
+        clReleaseMemObject(found->memory) : CL_SUCCESS;
+    sidecar->persistent_imports.erase(found);
+    cl_int event_release_err = CL_SUCCESS;
+    for (auto record = sidecar->cache_records.begin();
+            record != sidecar->cache_records.end();) {
+        if (record->generation != generation || record->key != cache_key) {
+            ++record;
+            continue;
+        }
+        if (record->producer_event != nullptr) {
+            const cl_int err = clReleaseEvent(record->producer_event);
+            if (event_release_err == CL_SUCCESS) {
+                event_release_err = err;
+            }
+            record->producer_event = nullptr;
+        }
+        if (record->profiling_dependency_event != nullptr) {
+            const cl_int err = clReleaseEvent(
+                record->profiling_dependency_event);
+            if (event_release_err == CL_SUCCESS) {
+                event_release_err = err;
+            }
+            record->profiling_dependency_event = nullptr;
+        }
+        record = sidecar->cache_records.erase(record);
+    }
+    if (release_err != CL_SUCCESS || event_release_err != CL_SUCCESS) {
+        set_reason(reason, reason_capacity,
+                   "failed to release persistent OpenCL import/cache event "
+                   "(memory error %d, event error %d)",
+                   release_err, event_release_err);
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
 ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
     ggml_opencl_htp_sidecar * sidecar,
     const ggml_cgraph * cgraph,
@@ -1441,6 +2125,16 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
     }
 
     std::vector<ggml_opencl_htp_sparse_dispatch> dispatches;
+    struct residual_pair_candidate {
+        const ggml_tensor * rho = nullptr;
+        const ggml_tensor * residual = nullptr;
+        const ggml_tensor * dense = nullptr;
+        const ggml_tensor * sparse = nullptr;
+        std::string rho_key;
+        std::string residual_key;
+        uint64_t generation = 0;
+    };
+    std::vector<residual_pair_candidate> residual_pairs;
     std::vector<const ggml_tensor *> routed_nodes;
     std::vector<ggml_backend_buffer_t> required_backings;
     try {
@@ -1478,6 +2172,73 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
                 }
             }
         }
+        const char * residual_enabled =
+            std::getenv("SD_HTP_SPARSE_OPENCL_RESIDUAL");
+        if (residual_enabled != nullptr && residual_enabled[0] != '\0' &&
+            std::strcmp(residual_enabled, "0") != 0) {
+            for (int i = 0; i < node_count; ++i) {
+                const ggml_tensor * residual =
+                    ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), i);
+                if (residual == nullptr || residual->op != GGML_OP_CUSTOM ||
+                    std::strncmp(residual->name,
+                                 "htp_block_sparse_residual_b", 27) != 0) {
+                    continue;
+                }
+                const ggml_tensor * rho = residual->src[2];
+                if (rho == nullptr || rho->op != GGML_OP_CUSTOM ||
+                    std::strncmp(rho->name,
+                                 "htp_block_sparse_residual_rho_b", 31) != 0 ||
+                    residual->src[0] == nullptr || residual->src[1] == nullptr ||
+                    rho->src[0] != residual->src[0] || rho->src[1] != residual->src[1]) {
+                    set_reason(reason, reason_capacity,
+                               "tagged residual node %d has an invalid rho pair", i);
+                    return GGML_OPENCL_HTP_UNSUPPORTED;
+                }
+
+                ggml_opencl_htp_persistent_import * residual_import = nullptr;
+                ggml_opencl_htp_persistent_import * rho_import = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(sidecar->cache_mutex);
+                    residual_import = find_persistent_import(
+                        sidecar, tensor_backing(residual));
+                    rho_import = find_persistent_import(sidecar, tensor_backing(rho));
+                    if (residual_import == nullptr || rho_import == nullptr ||
+                        residual_import->generation != rho_import->generation ||
+                        residual_import->key != residual->name ||
+                        rho_import->key != rho->name) {
+                        set_reason(reason, reason_capacity,
+                                   "tagged residual pair lacks matching persistent cache imports");
+                        return GGML_OPENCL_HTP_UNSUPPORTED;
+                    }
+                    residual_pairs.push_back({
+                        rho,
+                        residual,
+                        residual->src[0],
+                        residual->src[1],
+                        rho_import->key,
+                        residual_import->key,
+                        residual_import->generation,
+                    });
+                }
+                routed_nodes.push_back(rho);
+                routed_nodes.push_back(residual);
+                const ggml_tensor * tensors[] = {
+                    residual->src[0], residual->src[1], rho, residual,
+                };
+                for (const ggml_tensor * tensor : tensors) {
+                    ggml_backend_buffer_t backing = tensor_backing(tensor);
+                    if (backing == nullptr) {
+                        set_reason(reason, reason_capacity,
+                                   "tagged residual tensor has no backing buffer");
+                        return GGML_OPENCL_HTP_UNSUPPORTED;
+                    }
+                    if (std::find(required_backings.begin(), required_backings.end(), backing) ==
+                        required_backings.end()) {
+                        required_backings.push_back(backing);
+                    }
+                }
+            }
+        }
     } catch (...) {
         set_reason(reason, reason_capacity, "failed to allocate preflight routing state");
         return GGML_OPENCL_HTP_ERROR;
@@ -1485,7 +2246,7 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
 
     if (dispatches.empty()) {
         set_reason(reason, reason_capacity, "graph has no eligible sparse with-LSE attention nodes");
-        return GGML_OPENCL_HTP_UNSUPPORTED;
+        return GGML_OPENCL_HTP_NO_WORK;
     }
 
     ggml_opencl_htp_graph * prepared = nullptr;
@@ -1607,6 +2368,70 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
             prepared->prepared_sparse_dispatches.push_back(
                 make_prepared_sparse_dispatch(dispatch, bindings));
         }
+        for (const residual_pair_candidate & pair : residual_pairs) {
+            const ggml_opencl_htp_residual_dispatch residual_dispatch = {
+                pair.dense,
+                pair.sparse,
+                pair.residual,
+                pair.rho,
+                pair.residual_key.c_str(),
+                pair.rho_key.c_str(),
+                pair.generation,
+            };
+            char residual_reason[512] = {};
+            const ggml_opencl_htp_result residual_result =
+                ggml_backend_opencl_htp_graph_prepare_exact_rho_residual(
+                    prepared, &residual_dispatch,
+                    residual_reason, sizeof(residual_reason));
+            if (residual_result != GGML_OPENCL_HTP_OK) {
+                return reject_preflight(
+                    residual_result,
+                    residual_reason[0] != '\0' ? residual_reason :
+                        "failed to prepare tagged residual pair");
+            }
+
+            bool has_other_consumer = false;
+            const int node_count =
+                ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
+            for (int node_index = 0;
+                 node_index < node_count && !has_other_consumer;
+                 ++node_index) {
+                const ggml_tensor * consumer =
+                    ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), node_index);
+                if (consumer == pair.rho || consumer == pair.residual) {
+                    continue;
+                }
+                for (int source = 0; source < GGML_MAX_SRC; ++source) {
+                    const ggml_tensor * input =
+                        consumer != nullptr ? consumer->src[source] : nullptr;
+                    for (size_t depth = 0; input != nullptr && depth < 64; ++depth) {
+                        if (input == pair.sparse) {
+                            has_other_consumer = true;
+                            break;
+                        }
+                        if (input->op != GGML_OP_VIEW &&
+                            input->op != GGML_OP_RESHAPE &&
+                            input->op != GGML_OP_PERMUTE &&
+                            input->op != GGML_OP_TRANSPOSE) {
+                            break;
+                        }
+                        input = input->src[0] != nullptr ?
+                            input->src[0] : input->view_src;
+                    }
+                    if (has_other_consumer) {
+                        break;
+                    }
+                }
+            }
+            if (!has_other_consumer &&
+                std::find(
+                    prepared->residual_owned_sparse_producers.begin(),
+                    prepared->residual_owned_sparse_producers.end(),
+                    pair.sparse) ==
+                    prepared->residual_owned_sparse_producers.end()) {
+                prepared->residual_owned_sparse_producers.push_back(pair.sparse);
+            }
+        }
         prepared->routed_nodes = std::move(routed_nodes);
     } catch (...) {
         return reject_preflight(GGML_OPENCL_HTP_ERROR, "failed to allocate binding preflight state");
@@ -1639,6 +2464,537 @@ bool ggml_backend_opencl_htp_graph_routes_node(
            node != nullptr &&
            std::find(graph->routed_nodes.begin(), graph->routed_nodes.end(), node) !=
                graph->routed_nodes.end();
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_graph_prepare_exact_rho_residual(
+        ggml_opencl_htp_graph * graph,
+        const ggml_opencl_htp_residual_dispatch * dispatch,
+        char * reason,
+        size_t reason_capacity) {
+    if (graph == nullptr || dispatch == nullptr) {
+        set_reason(reason, reason_capacity, "graph and residual dispatch must not be null");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    if (graph->state != ggml_opencl_htp_graph_state::active) {
+        set_reason(reason, reason_capacity, "graph is already finished");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    ggml_opencl_htp_prepared_residual_dispatch prepared;
+    const ggml_opencl_htp_result validation = validate_residual_dispatch(
+        graph, dispatch, &prepared, reason, reason_capacity);
+    if (validation != GGML_OPENCL_HTP_OK) {
+        return validation;
+    }
+
+    ggml_opencl_htp_sidecar * sidecar = graph->sidecar;
+    std::lock_guard<std::mutex> lock(sidecar->cache_mutex);
+    if (find_cache_record(sidecar, dispatch->residual_cache_key, dispatch->generation) != nullptr ||
+        find_cache_record(sidecar, dispatch->rho_cache_key, dispatch->generation) != nullptr) {
+        set_reason(
+            reason, reason_capacity,
+            "duplicate generation publication for cache key at generation %llu",
+            static_cast<unsigned long long>(dispatch->generation));
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+
+    try {
+        sidecar->cache_records.push_back({
+            prepared.residual_cache_key,
+            dispatch->generation,
+            GGML_OPENCL_HTP_CACHE_ALLOCATED,
+            {},
+            prepared.rho_cache_key,
+            nullptr,
+        });
+        sidecar->cache_records.push_back({
+            prepared.rho_cache_key,
+            dispatch->generation,
+            GGML_OPENCL_HTP_CACHE_ALLOCATED,
+            {},
+            prepared.residual_cache_key,
+            nullptr,
+        });
+        graph->prepared_residual_dispatches.push_back(std::move(prepared));
+    } catch (...) {
+        sidecar->cache_records.erase(
+            std::remove_if(
+                sidecar->cache_records.begin(), sidecar->cache_records.end(),
+                [&](const ggml_opencl_htp_cache_record & record) {
+                    return record.generation == dispatch->generation &&
+                           (record.key == dispatch->residual_cache_key ||
+                            record.key == dispatch->rho_cache_key);
+                }),
+            sidecar->cache_records.end());
+        set_reason(reason, reason_capacity, "failed to allocate residual preparation state");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_graph_queue_exact_rho_residual(
+        ggml_opencl_htp_graph * graph,
+        const char * residual_cache_key,
+        uint64_t generation,
+        char * reason,
+        size_t reason_capacity) {
+    if (graph == nullptr || residual_cache_key == nullptr || residual_cache_key[0] == '\0') {
+        set_reason(reason, reason_capacity, "graph and residual cache key must be valid");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    if (graph->state != ggml_opencl_htp_graph_state::active) {
+        set_reason(reason, reason_capacity, "graph is already finished");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    const char * residual_profile = std::getenv("SD_HTP_RESIDUAL_PROFILE");
+    const bool residual_profile_enabled =
+        residual_profile != nullptr && residual_profile[0] != '\0' &&
+        std::strcmp(residual_profile, "0") != 0;
+    const int64_t host_begin_us = residual_profile_enabled ? ggml_time_us() : 0;
+
+    ggml_opencl_htp_prepared_residual_dispatch * prepared = nullptr;
+    for (ggml_opencl_htp_prepared_residual_dispatch & candidate :
+            graph->prepared_residual_dispatches) {
+        if (candidate.dispatch.generation == generation &&
+            candidate.residual_cache_key == residual_cache_key) {
+            prepared = &candidate;
+            break;
+        }
+    }
+    if (prepared == nullptr) {
+        set_reason(reason, reason_capacity, "residual job was not prepared");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+
+    const ggml_tensor * tensors[] = {
+        prepared->dispatch.dense_packed,
+        prepared->dispatch.sparse_packed_producer,
+        prepared->dispatch.residual_destination,
+        prepared->dispatch.rho_destination,
+    };
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(tensors[0]); ++i) {
+        if (!tensor_metadata_matches(tensors[i], prepared->tensor_metadata[i])) {
+            set_reason(reason, reason_capacity, "prepared residual tensor metadata changed");
+            return GGML_OPENCL_HTP_ERROR;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(graph->sidecar->cache_mutex);
+        ggml_opencl_htp_cache_record * residual_record = find_cache_record(
+            graph->sidecar, prepared->residual_cache_key.c_str(), generation);
+        ggml_opencl_htp_cache_record * rho_record = find_cache_record(
+            graph->sidecar, prepared->rho_cache_key.c_str(), generation);
+        if (residual_record == nullptr || rho_record == nullptr ||
+            residual_record->state != GGML_OPENCL_HTP_CACHE_ALLOCATED ||
+            rho_record->state != GGML_OPENCL_HTP_CACHE_ALLOCATED) {
+            set_reason(reason, reason_capacity, "residual job is not in allocated state");
+            return GGML_OPENCL_HTP_UNSUPPORTED;
+        }
+        residual_record->state = GGML_OPENCL_HTP_CACHE_QUEUED;
+        rho_record->state = GGML_OPENCL_HTP_CACHE_QUEUED;
+    }
+
+    auto fail_cache_job = [&](const char * failure) {
+        std::lock_guard<std::mutex> lock(graph->sidecar->cache_mutex);
+        ggml_opencl_htp_cache_record * residual_record = find_cache_record(
+            graph->sidecar, prepared->residual_cache_key.c_str(), generation);
+        ggml_opencl_htp_cache_record * rho_record = find_cache_record(
+            graph->sidecar, prepared->rho_cache_key.c_str(), generation);
+        if (residual_record != nullptr) {
+            residual_record->state = GGML_OPENCL_HTP_CACHE_FAILED;
+            residual_record->failure_reason = failure;
+        }
+        if (rho_record != nullptr) {
+            rho_record->state = GGML_OPENCL_HTP_CACHE_FAILED;
+            rho_record->failure_reason = failure;
+        }
+        set_reason(reason, reason_capacity, "%s", failure);
+        return GGML_OPENCL_HTP_ERROR;
+    };
+
+    cl_event fused_event = nullptr;
+    cl_event sparse_dependency_event = nullptr;
+    cl_command_queue command_queue = graph->use_residual_queue ?
+        graph->sidecar->residual_queue : graph->sidecar->sparse_queue;
+    {
+        std::lock_guard<std::mutex> dispatch_lock(graph->sidecar->dispatch_mutex);
+        char kernel_reason[1024] = {};
+        if (ensure_residual_kernel(
+                graph->sidecar, kernel_reason, sizeof(kernel_reason)) != GGML_OPENCL_HTP_OK) {
+            return fail_cache_job(kernel_reason);
+        }
+
+        const auto sparse_pending = std::find_if(
+            graph->pending_events.begin(), graph->pending_events.end(),
+            [&](const ggml_opencl_htp_pending_event & pending) {
+                return pending.producer == prepared->dispatch.sparse_packed_producer;
+            });
+        const bool uses_staged_sparse =
+            sparse_pending != graph->pending_events.end() &&
+            sparse_pending->staged_output != nullptr;
+        const cl_mem dense_memory = prepared->dense.memory;
+        const cl_mem sparse_memory = uses_staged_sparse ?
+            sparse_pending->staged_output : prepared->sparse.memory;
+        const cl_mem rho_memory = prepared->rho.memory;
+        const cl_mem residual_memory = prepared->residual.memory;
+        const cl_ulong dense_offset = static_cast<cl_ulong>(prepared->dense.offset);
+        const cl_ulong sparse_offset = uses_staged_sparse ? 0 :
+            static_cast<cl_ulong>(prepared->sparse.offset);
+        const cl_ulong rho_offset = static_cast<cl_ulong>(prepared->rho.offset);
+        const cl_ulong residual_offset = static_cast<cl_ulong>(prepared->residual.offset);
+        const cl_ulong head_dim = static_cast<cl_ulong>(
+            prepared->dispatch.dense_packed->ne[0] - 1);
+        const cl_ulong row_count = static_cast<cl_ulong>(
+            prepared->dispatch.dense_packed->ne[1] *
+            prepared->dispatch.dense_packed->ne[2] *
+            prepared->dispatch.dense_packed->ne[3]);
+        struct kernel_arg {
+            size_t size;
+            const void * value;
+        };
+        const kernel_arg args[] = {
+            { sizeof(dense_memory), &dense_memory },
+            { sizeof(dense_offset), &dense_offset },
+            { sizeof(sparse_memory), &sparse_memory },
+            { sizeof(sparse_offset), &sparse_offset },
+            { sizeof(rho_memory), &rho_memory },
+            { sizeof(rho_offset), &rho_offset },
+            { sizeof(residual_memory), &residual_memory },
+            { sizeof(residual_offset), &residual_offset },
+            { sizeof(head_dim), &head_dim },
+            { sizeof(row_count), &row_count },
+        };
+        for (cl_uint index = 0; index < sizeof(args) / sizeof(args[0]); ++index) {
+            const cl_int err = clSetKernelArg(
+                graph->sidecar->rho_residual_kernel, index,
+                args[index].size, args[index].value);
+            if (err != CL_SUCCESS) {
+                char failure[256] = {};
+                std::snprintf(failure, sizeof(failure),
+                              "rho-residual clSetKernelArg(%u) failed (error %d)", index, err);
+                return fail_cache_job(failure);
+            }
+        }
+
+        const size_t local = 64;
+        const size_t global = static_cast<size_t>(row_count) * local;
+        cl_event sparse_event = sparse_pending != graph->pending_events.end() ?
+            sparse_pending->event : nullptr;
+        sparse_dependency_event = sparse_event;
+        std::atomic_thread_fence(std::memory_order_release);
+        if (graph->test_fail_next_rho_enqueue) {
+            graph->test_fail_next_rho_enqueue = false;
+            return fail_cache_job("injected rho enqueue failure");
+        }
+        if (graph->test_fail_next_residual_enqueue) {
+            graph->test_fail_next_residual_enqueue = false;
+            return fail_cache_job("injected residual enqueue failure");
+        }
+        cl_int err = clEnqueueNDRangeKernel(
+            command_queue, graph->sidecar->rho_residual_kernel,
+            1, nullptr, &global, &local,
+            sparse_event != nullptr ? 1 : 0,
+            sparse_event != nullptr ? &sparse_event : nullptr,
+            &fused_event);
+        if (err != CL_SUCCESS || fused_event == nullptr) {
+            if (fused_event != nullptr) {
+                clReleaseEvent(fused_event);
+                fused_event = nullptr;
+            }
+            char failure[256] = {};
+            std::snprintf(failure, sizeof(failure),
+                          "rho-residual clEnqueueNDRangeKernel failed (error %d)", err);
+            return fail_cache_job(failure);
+        }
+        trace_sidecar_queue_event(
+            "gpu_rho_residual_enqueue",
+            graph->use_residual_queue ? "residual" : "sparse",
+            prepared->dispatch.residual_destination);
+        const char * fail_residual_flush = std::getenv(
+            "SD_HTP_SPARSE_OPENCL_TEST_FAIL_RESIDUAL_QUEUE_FLUSH");
+        const bool inject_residual_flush_failure =
+            graph->use_residual_queue && fail_residual_flush != nullptr &&
+            fail_residual_flush[0] != '\0' &&
+            std::strcmp(fail_residual_flush, "0") != 0;
+        err = inject_residual_flush_failure ?
+            CL_OUT_OF_RESOURCES : clFlush(command_queue);
+        if (err != CL_SUCCESS) {
+            clFinish(command_queue);
+            clReleaseEvent(fused_event);
+            fused_event = nullptr;
+            char failure[256] = {};
+            std::snprintf(
+                failure, sizeof(failure),
+                inject_residual_flush_failure
+                    ? "injected residual queue flush failure (error %d)"
+                    : "clFlush failed after residual enqueue (error %d)",
+                err);
+            return fail_cache_job(failure);
+        }
+    }
+
+    const cl_int retain_err = clRetainEvent(fused_event);
+    if (retain_err != CL_SUCCESS) {
+        clFinish(command_queue);
+        clReleaseEvent(fused_event);
+        return fail_cache_job("failed to retain residual cache event");
+    }
+    if (graph->sidecar->profiling_enabled &&
+        sparse_dependency_event != nullptr) {
+        const cl_int dependency_retain_err =
+            clRetainEvent(sparse_dependency_event);
+        if (dependency_retain_err != CL_SUCCESS) {
+            clFinish(command_queue);
+            clReleaseEvent(fused_event);
+            clReleaseEvent(fused_event);
+            return fail_cache_job(
+                "failed to retain sparse profiling dependency event");
+        }
+    } else {
+        sparse_dependency_event = nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> lock(graph->sidecar->cache_mutex);
+        ggml_opencl_htp_cache_record * residual_record = find_cache_record(
+            graph->sidecar, prepared->residual_cache_key.c_str(), generation);
+        ggml_opencl_htp_cache_record * rho_record = find_cache_record(
+            graph->sidecar, prepared->rho_cache_key.c_str(), generation);
+        GGML_ASSERT(residual_record != nullptr && rho_record != nullptr);
+        residual_record->state = GGML_OPENCL_HTP_CACHE_SUBMITTED;
+        rho_record->state = GGML_OPENCL_HTP_CACHE_SUBMITTED;
+        residual_record->producer_event = fused_event;
+        rho_record->producer_event = fused_event;
+        residual_record->profiling_dependency_event =
+            sparse_dependency_event;
+        residual_record->profiling_owner = true;
+        rho_record->profiling_owner = false;
+    }
+    if (residual_profile_enabled) {
+        const int64_t host_end_us = ggml_time_us();
+        std::fprintf(
+            stderr,
+            "htp_opencl_residual_host_timing generation=%llu total_us=%lld\n",
+            static_cast<unsigned long long>(generation),
+            (long long) (host_end_us - host_begin_us));
+    }
+    set_reason(reason, reason_capacity, "submitted");
+    return GGML_OPENCL_HTP_OK;
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_exact_rho_residual_sync(
+        ggml_opencl_htp_graph * graph,
+        const ggml_tensor * residual_node,
+        char * reason,
+        size_t reason_capacity) {
+    if (graph == nullptr || residual_node == nullptr) {
+        set_reason(reason, reason_capacity, "graph and residual node must not be null");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    ggml_opencl_htp_prepared_residual_dispatch * prepared = nullptr;
+    for (ggml_opencl_htp_prepared_residual_dispatch & candidate :
+            graph->prepared_residual_dispatches) {
+        if (candidate.dispatch.residual_destination == residual_node ||
+            candidate.dispatch.rho_destination == residual_node) {
+            prepared = &candidate;
+            break;
+        }
+    }
+    if (prepared == nullptr) {
+        set_reason(reason, reason_capacity, "node is not a prepared residual destination");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+    trace_sidecar_event("gpu_residual_route", residual_node);
+    const ggml_opencl_htp_result queue_result =
+        ggml_backend_opencl_htp_graph_queue_exact_rho_residual(
+            graph,
+            prepared->residual_cache_key.c_str(),
+            prepared->dispatch.generation,
+            reason,
+            reason_capacity);
+    if (queue_result != GGML_OPENCL_HTP_OK) {
+        return queue_result;
+    }
+    bool waited = false;
+    return ggml_backend_opencl_htp_cache_wait(
+        graph->sidecar,
+        prepared->residual_cache_key.c_str(),
+        prepared->dispatch.generation,
+        &waited,
+        reason,
+        reason_capacity);
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_cache_query(
+        const ggml_opencl_htp_sidecar * sidecar,
+        const char * cache_key,
+        uint64_t generation,
+        ggml_opencl_htp_cache_state * state,
+        char * reason,
+        size_t reason_capacity) {
+    if (sidecar == nullptr || cache_key == nullptr || cache_key[0] == '\0' || state == nullptr) {
+        set_reason(reason, reason_capacity, "sidecar, cache key, and state output must be valid");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    std::lock_guard<std::mutex> lock(sidecar->cache_mutex);
+    ggml_opencl_htp_sidecar * mutable_sidecar =
+        const_cast<ggml_opencl_htp_sidecar *>(sidecar);
+    ggml_opencl_htp_cache_record * record =
+        find_cache_record(mutable_sidecar, cache_key, generation);
+    if (record == nullptr) {
+        *state = GGML_OPENCL_HTP_CACHE_EMPTY;
+        set_reason(reason, reason_capacity, "cache generation was not found");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+    if (mutable_sidecar->test_fail_next_residual_wait) {
+        mutable_sidecar->test_fail_next_residual_wait = false;
+        record->state = GGML_OPENCL_HTP_CACHE_FAILED;
+        record->failure_reason = "injected residual event wait failure";
+        if (ggml_opencl_htp_cache_record * peer = find_cache_record(
+                mutable_sidecar, record->peer_key.c_str(), generation)) {
+            peer->state = GGML_OPENCL_HTP_CACHE_FAILED;
+            peer->failure_reason = record->failure_reason;
+        }
+        *state = GGML_OPENCL_HTP_CACHE_FAILED;
+        set_reason(reason, reason_capacity, "%s", record->failure_reason.c_str());
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    if (record->state == GGML_OPENCL_HTP_CACHE_SUBMITTED &&
+        record->producer_event != nullptr) {
+        cl_int execution_status = CL_QUEUED;
+        const cl_int status_err = clGetEventInfo(
+            record->producer_event,
+            CL_EVENT_COMMAND_EXECUTION_STATUS,
+            sizeof(execution_status), &execution_status, nullptr);
+        if (status_err != CL_SUCCESS) {
+            record->state = GGML_OPENCL_HTP_CACHE_FAILED;
+            record->failure_reason = "failed to query residual event status";
+        } else if (execution_status == CL_COMPLETE) {
+            ggml_opencl_htp_cache_record * peer = find_cache_record(
+                mutable_sidecar, record->peer_key.c_str(), generation);
+            ggml_opencl_htp_cache_record * primary =
+                record->profiling_owner ? record : peer;
+            if (primary != nullptr && primary->producer_event != nullptr &&
+                sidecar->profiling_enabled) {
+                cl_ulong fused_start = 0;
+                cl_ulong fused_end = 0;
+                cl_ulong sparse_end = 0;
+                const bool dependency_profiling_ok =
+                    primary->profiling_dependency_event == nullptr ||
+                    clGetEventProfilingInfo(
+                        primary->profiling_dependency_event,
+                        CL_PROFILING_COMMAND_END,
+                        sizeof(sparse_end), &sparse_end, nullptr) == CL_SUCCESS;
+                const bool profiling_ok = dependency_profiling_ok &&
+                    clGetEventProfilingInfo(
+                        primary->producer_event, CL_PROFILING_COMMAND_START,
+                        sizeof(fused_start), &fused_start, nullptr) == CL_SUCCESS &&
+                    clGetEventProfilingInfo(
+                        primary->producer_event, CL_PROFILING_COMMAND_END,
+                        sizeof(fused_end), &fused_end, nullptr) == CL_SUCCESS;
+                if (profiling_ok) {
+                    std::fprintf(
+                        stderr,
+                        "htp_opencl_residual_timing generation=%llu "
+                        "fused_gpu_us=%.3f "
+                        "sparse_end_ns=%llu fused_start_ns=%llu\n",
+                        static_cast<unsigned long long>(generation),
+                        (fused_end - fused_start) / 1000.0,
+                        static_cast<unsigned long long>(sparse_end),
+                        static_cast<unsigned long long>(fused_start));
+                }
+            }
+            auto mark_ready_and_release = [](ggml_opencl_htp_cache_record * item) {
+                if (item == nullptr) {
+                    return;
+                }
+                item->state = GGML_OPENCL_HTP_CACHE_READY;
+                if (item->producer_event != nullptr) {
+                    clReleaseEvent(item->producer_event);
+                    item->producer_event = nullptr;
+                }
+                if (item->profiling_dependency_event != nullptr) {
+                    clReleaseEvent(item->profiling_dependency_event);
+                    item->profiling_dependency_event = nullptr;
+                }
+            };
+            mark_ready_and_release(record);
+            mark_ready_and_release(peer);
+            trace_sidecar_event("gpu_residual_complete", nullptr);
+        } else if (execution_status < 0) {
+            record->state = GGML_OPENCL_HTP_CACHE_FAILED;
+            record->failure_reason = "residual OpenCL command failed";
+            if (ggml_opencl_htp_cache_record * peer = find_cache_record(
+                    mutable_sidecar, record->peer_key.c_str(), generation)) {
+                peer->state = GGML_OPENCL_HTP_CACHE_FAILED;
+                peer->failure_reason = record->failure_reason;
+            }
+        }
+    }
+    *state = record->state;
+    set_reason(reason, reason_capacity, "%s",
+               record->failure_reason.empty() ? "ok" : record->failure_reason.c_str());
+    return record->state == GGML_OPENCL_HTP_CACHE_FAILED ?
+        GGML_OPENCL_HTP_ERROR : GGML_OPENCL_HTP_OK;
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_cache_wait(
+        ggml_opencl_htp_sidecar * sidecar,
+        const char * cache_key,
+        uint64_t generation,
+        bool * waited,
+        char * reason,
+        size_t reason_capacity) {
+    if (waited != nullptr) {
+        *waited = false;
+    }
+    ggml_opencl_htp_cache_state state = GGML_OPENCL_HTP_CACHE_EMPTY;
+    const ggml_opencl_htp_result query = ggml_backend_opencl_htp_cache_query(
+        sidecar, cache_key, generation, &state, reason, reason_capacity);
+    if (query != GGML_OPENCL_HTP_OK) {
+        return query;
+    }
+    if (state == GGML_OPENCL_HTP_CACHE_READY) {
+        set_reason(reason, reason_capacity, "ok");
+        return GGML_OPENCL_HTP_OK;
+    }
+    if (state != GGML_OPENCL_HTP_CACHE_SUBMITTED) {
+        set_reason(reason, reason_capacity, "cache generation has not been submitted");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+
+    cl_event event = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(sidecar->cache_mutex);
+        ggml_opencl_htp_cache_record * record =
+            find_cache_record(sidecar, cache_key, generation);
+        if (record == nullptr || record->producer_event == nullptr) {
+            set_reason(reason, reason_capacity, "cache producer event is unavailable");
+            return GGML_OPENCL_HTP_ERROR;
+        }
+        event = record->producer_event;
+        const cl_int retain_err = clRetainEvent(event);
+        if (retain_err != CL_SUCCESS) {
+            set_reason(reason, reason_capacity, "failed to retain cache producer event (error %d)", retain_err);
+            return GGML_OPENCL_HTP_ERROR;
+        }
+    }
+    const cl_int wait_err = clWaitForEvents(1, &event);
+    const cl_int release_err = clReleaseEvent(event);
+    if (wait_err != CL_SUCCESS || release_err != CL_SUCCESS) {
+        set_reason(
+            reason, reason_capacity,
+            "cache producer wait failed (wait error %d, release error %d)",
+            wait_err, release_err);
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    if (waited != nullptr) {
+        *waited = true;
+    }
+    return ggml_backend_opencl_htp_cache_query(
+        sidecar, cache_key, generation, &state, reason, reason_capacity);
 }
 
 ggml_opencl_htp_result ggml_backend_opencl_htp_graph_fill(
@@ -1683,7 +3039,7 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_fill(
 
     cl_event event = nullptr;
     const cl_int err = clEnqueueFillBuffer(
-        graph->sidecar->queue, alias->memory, &pattern, sizeof(pattern),
+        graph->sidecar->sparse_queue, alias->memory, &pattern, sizeof(pattern),
         offset, size, 0, nullptr, &event);
     if (err != CL_SUCCESS || event == nullptr) {
         if (event != nullptr) {
@@ -1703,7 +3059,7 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_fill(
         }
     }
     if (event_cache_failed) {
-        const cl_int finish_err = clFinish(graph->sidecar->queue);
+        const cl_int finish_err = clFinish(graph->sidecar->sparse_queue);
         const cl_int release_err = clReleaseEvent(event);
         return fail_graph(
             graph, reason, reason_capacity,
@@ -1787,7 +3143,7 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_stage_block_sparse_attn_mas
     trace_sidecar_event("gpu_sparse_mask_stage_begin", node);
     cl_event copy_event = nullptr;
     err = clEnqueueCopyBuffer(
-        graph->sidecar->queue,
+        graph->sidecar->sparse_queue,
         prepared->bindings.mask.memory,
         staged_mask,
         prepared->bindings.mask.offset,
@@ -1800,7 +3156,7 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_stage_block_sparse_attn_mas
         err = CL_INVALID_EVENT;
     }
     if (err == CL_SUCCESS) {
-        err = clFlush(graph->sidecar->queue);
+        err = clFlush(graph->sidecar->sparse_queue);
     }
     if (err == CL_SUCCESS) {
         err = clWaitForEvents(1, &copy_event);
@@ -2030,7 +3386,7 @@ static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
     cl_event event = nullptr;
     std::atomic_thread_fence(std::memory_order_release);
     cl_int err = clEnqueueNDRangeKernel(
-        graph->sidecar->queue, graph->sidecar->block_sparse_kernel,
+        graph->sidecar->sparse_queue, graph->sidecar->block_sparse_kernel,
         2, nullptr, global_work_size, local_work_size, 0, nullptr, &event);
     if (err != CL_SUCCESS || event == nullptr) {
         if (event != nullptr) {
@@ -2063,9 +3419,9 @@ static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
             graph, event, "cache sparse producer event", CL_OUT_OF_HOST_MEMORY,
             reason, reason_capacity);
     }
-    trace_sidecar_event("gpu_sparse_enqueue", node);
+    trace_sidecar_queue_event("gpu_sparse_enqueue", "sparse", node);
 
-    err = clFlush(graph->sidecar->queue);
+    err = clFlush(graph->sidecar->sparse_queue);
     if (err != CL_SUCCESS) {
         return fail_runtime_graph(
             graph, reason, reason_capacity,
@@ -2143,35 +3499,56 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_start_submission_thread(
     graph->submission_cancel_requested = false;
     graph->async_failure_result = GGML_OPENCL_HTP_OK;
     graph->async_failure_reason[0] = '\0';
-    graph->submission_jobs.clear();
+    graph->sparse_submission_jobs.clear();
+    graph->residual_submission_jobs.clear();
     graph->submission_records.clear();
     try {
         graph->submission_records.reserve(graph->routed_nodes.size());
         graph->submission_thread = std::thread([graph]() {
             for (;;) {
-                const ggml_tensor * node = nullptr;
+                ggml_opencl_htp_submission_job job;
                 {
                     std::unique_lock<std::mutex> lock(graph->submission_mutex);
                     graph->submission_cv.wait(lock, [graph]() {
-                        return graph->submission_stop_requested || !graph->submission_jobs.empty();
+                        return graph->submission_stop_requested ||
+                            !graph->sparse_submission_jobs.empty() ||
+                            !graph->residual_submission_jobs.empty();
                     });
-                    if (graph->submission_jobs.empty()) {
+                    const char * hold_residual = std::getenv(
+                        "SD_HTP_SPARSE_OPENCL_TEST_HOLD_RESIDUAL_FOR_SPARSE");
+                    while (!graph->submission_stop_requested &&
+                           hold_residual != nullptr && hold_residual[0] != '\0' &&
+                           std::strcmp(hold_residual, "0") != 0 &&
+                           graph->sparse_submission_jobs.empty() &&
+                           !graph->residual_submission_jobs.empty()) {
+                        graph->submission_cv.wait(lock);
+                    }
+                    if (graph->sparse_submission_jobs.empty() &&
+                        graph->residual_submission_jobs.empty()) {
                         if (graph->submission_stop_requested) {
                             return;
                         }
                         continue;
                     }
-                    node = graph->submission_jobs.front();
-                    graph->submission_jobs.pop_front();
+                    if (!graph->sparse_submission_jobs.empty()) {
+                        job = graph->sparse_submission_jobs.front();
+                        graph->sparse_submission_jobs.pop_front();
+                    } else {
+                        job = graph->residual_submission_jobs.front();
+                        graph->residual_submission_jobs.pop_front();
+                    }
                     const auto record = std::find_if(
                         graph->submission_records.begin(), graph->submission_records.end(),
-                        [node](const ggml_opencl_htp_submission_record & item) {
-                            return item.producer == node;
+                        [&job](const ggml_opencl_htp_submission_record & item) {
+                            return item.kind == job.kind &&
+                                   item.producer == job.producer;
                         });
                     if (record != graph->submission_records.end()) {
                         record->state = ggml_opencl_htp_submission_state::submitting;
                     }
                 }
+
+                trace_submission_scheduler_timing(job, ggml_time_us());
 
                 char submit_reason[256] = {};
                 ggml_opencl_htp_result result = GGML_OPENCL_HTP_ERROR;
@@ -2195,8 +3572,38 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_start_submission_thread(
                             submit_reason, sizeof(submit_reason),
                             "OpenCL submission cancelled before enqueue");
                     } else {
-                        result = ggml_backend_opencl_htp_graph_compute_block_sparse_attn_early_async(
-                            graph, node, submit_reason, sizeof(submit_reason));
+                        if (job.kind ==
+                            ggml_opencl_htp_submission_job_kind::sparse_attention) {
+                            result =
+                                ggml_backend_opencl_htp_graph_compute_block_sparse_attn_early_async(
+                                    graph, job.producer,
+                                    submit_reason, sizeof(submit_reason));
+                        } else {
+                            ggml_opencl_htp_prepared_residual_dispatch * prepared = nullptr;
+                            for (ggml_opencl_htp_prepared_residual_dispatch & candidate :
+                                    graph->prepared_residual_dispatches) {
+                                if (candidate.dispatch.rho_destination == job.producer) {
+                                    prepared = &candidate;
+                                    break;
+                                }
+                            }
+                            if (prepared == nullptr) {
+                                std::snprintf(
+                                    submit_reason, sizeof(submit_reason),
+                                    "residual submission job is no longer prepared");
+                            } else {
+                                trace_sidecar_event(
+                                    "gpu_residual_route",
+                                    prepared->dispatch.residual_destination);
+                                result =
+                                    ggml_backend_opencl_htp_graph_queue_exact_rho_residual(
+                                        graph,
+                                        prepared->residual_cache_key.c_str(),
+                                        prepared->dispatch.generation,
+                                        submit_reason,
+                                        sizeof(submit_reason));
+                            }
+                        }
                     }
                 } catch (...) {
                     std::snprintf(
@@ -2208,8 +3615,9 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_start_submission_thread(
                     std::lock_guard<std::mutex> lock(graph->submission_mutex);
                     const auto record = std::find_if(
                         graph->submission_records.begin(), graph->submission_records.end(),
-                        [node](const ggml_opencl_htp_submission_record & item) {
-                            return item.producer == node;
+                        [&job](const ggml_opencl_htp_submission_record & item) {
+                            return item.kind == job.kind &&
+                                   item.producer == job.producer;
                         });
                     if (record != graph->submission_records.end()) {
                         record->result = result;
@@ -2234,7 +3642,8 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_start_submission_thread(
                                 "submission thread stopped after producer failure: %s",
                                 submit_reason[0] != '\0' ? submit_reason : "unknown error");
                         }
-                        graph->submission_jobs.clear();
+                        graph->sparse_submission_jobs.clear();
+                        graph->residual_submission_jobs.clear();
                     }
                 }
                 graph->submission_cv.notify_all();
@@ -2292,10 +3701,14 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_queue_block_sparse_attn(
 
     try {
         ggml_opencl_htp_submission_record record;
+        record.kind = ggml_opencl_htp_submission_job_kind::sparse_attention;
         record.producer = node;
         std::snprintf(record.reason, sizeof(record.reason), "queued");
         graph->submission_records.push_back(record);
-        graph->submission_jobs.push_back(node);
+        graph->sparse_submission_jobs.push_back({
+            ggml_opencl_htp_submission_job_kind::sparse_attention, node,
+            sidecar_trace_enabled() ? ggml_time_us() : 0,
+        });
     } catch (...) {
         const auto record = std::find_if(
             graph->submission_records.begin(), graph->submission_records.end(),
@@ -2310,6 +3723,91 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_queue_block_sparse_attn(
     }
 
     trace_sidecar_event("gpu_sparse_submit_job", node);
+    graph->submission_cv.notify_one();
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
+ggml_opencl_htp_result
+ggml_backend_opencl_htp_graph_queue_exact_rho_residual_after_dense(
+        ggml_opencl_htp_graph * graph,
+        const ggml_tensor * dense_producer,
+        char * reason,
+        size_t reason_capacity) {
+    if (graph == nullptr || dense_producer == nullptr) {
+        set_reason(reason, reason_capacity,
+                   "graph and dense producer must not be null");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    std::lock_guard<std::mutex> lock(graph->submission_mutex);
+    if (graph->state != ggml_opencl_htp_graph_state::active) {
+        set_reason(reason, reason_capacity, "graph is already finished");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    if (!graph->submission_thread.joinable() || graph->submission_stop_requested) {
+        set_reason(reason, reason_capacity,
+                   "submission thread is not accepting residual work");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    size_t queued_count = 0;
+    for (ggml_opencl_htp_prepared_residual_dispatch & prepared :
+            graph->prepared_residual_dispatches) {
+        if (prepared.dispatch.dense_packed != dense_producer) {
+            continue;
+        }
+        const ggml_tensor * producer = prepared.dispatch.rho_destination;
+        const auto existing = std::find_if(
+            graph->submission_records.begin(), graph->submission_records.end(),
+            [producer](const ggml_opencl_htp_submission_record & item) {
+                return item.kind ==
+                           ggml_opencl_htp_submission_job_kind::exact_rho_residual &&
+                       item.producer == producer;
+            });
+        if (existing != graph->submission_records.end()) {
+            continue;
+        }
+        if (graph->submission_records.size() >= graph->routed_nodes.size()) {
+            set_reason(reason, reason_capacity,
+                       "OpenCL submission queue capacity exceeded");
+            return GGML_OPENCL_HTP_ERROR;
+        }
+        try {
+            ggml_opencl_htp_submission_record record;
+            record.kind =
+                ggml_opencl_htp_submission_job_kind::exact_rho_residual;
+            record.producer = producer;
+            std::snprintf(record.reason, sizeof(record.reason), "queued");
+            graph->submission_records.push_back(record);
+            graph->residual_submission_jobs.push_back({
+                ggml_opencl_htp_submission_job_kind::exact_rho_residual,
+                producer,
+                sidecar_trace_enabled() ? ggml_time_us() : 0,
+            });
+        } catch (...) {
+            const auto record = std::find_if(
+                graph->submission_records.begin(), graph->submission_records.end(),
+                [producer](const ggml_opencl_htp_submission_record & item) {
+                    return item.kind ==
+                               ggml_opencl_htp_submission_job_kind::exact_rho_residual &&
+                           item.producer == producer;
+                });
+            if (record != graph->submission_records.end()) {
+                graph->submission_records.erase(record);
+            }
+            set_reason(reason, reason_capacity,
+                       "failed to publish residual submission job");
+            return GGML_OPENCL_HTP_ERROR;
+        }
+        ++queued_count;
+        trace_sidecar_event("gpu_residual_submit_job", producer);
+    }
+    if (queued_count == 0) {
+        set_reason(reason, reason_capacity,
+                   "dense producer has no unqueued residual jobs");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
     graph->submission_cv.notify_one();
     set_reason(reason, reason_capacity, "ok");
     return GGML_OPENCL_HTP_OK;
@@ -2390,9 +3888,111 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_cancel_submission_thread(
                 queued.reason, sizeof(queued.reason),
                 "OpenCL submission cancelled before enqueue");
         }
-        graph->submission_jobs.clear();
+        graph->sparse_submission_jobs.clear();
+        graph->residual_submission_jobs.clear();
     }
     graph->submission_cv.notify_all();
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
+bool ggml_backend_opencl_htp_graph_sparse_output_is_residual_owned(
+        const ggml_opencl_htp_graph * graph,
+        const ggml_tensor * sparse_producer) {
+    return graph != nullptr && sparse_producer != nullptr &&
+        std::find(
+            graph->residual_owned_sparse_producers.begin(),
+            graph->residual_owned_sparse_producers.end(),
+            sparse_producer) != graph->residual_owned_sparse_producers.end();
+}
+
+ggml_opencl_htp_result
+ggml_backend_opencl_htp_graph_wait_for_sparse_input_lifetime(
+        ggml_opencl_htp_graph * graph,
+        const ggml_tensor * sparse_producer,
+        bool * waited,
+        char * reason,
+        size_t reason_capacity) {
+    if (waited != nullptr) {
+        *waited = false;
+    }
+    if (!ggml_backend_opencl_htp_graph_sparse_output_is_residual_owned(
+            graph, sparse_producer)) {
+        set_reason(reason, reason_capacity,
+                   "sparse producer is not residual-owned");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+    {
+        std::unique_lock<std::mutex> lock(graph->submission_mutex);
+        auto find_submission = [graph, sparse_producer]() {
+            return std::find_if(
+                graph->submission_records.begin(),
+                graph->submission_records.end(),
+                [sparse_producer](const ggml_opencl_htp_submission_record & item) {
+                    return item.kind ==
+                               ggml_opencl_htp_submission_job_kind::sparse_attention &&
+                           item.producer == sparse_producer;
+                });
+        };
+        auto submission = find_submission();
+        if (submission != graph->submission_records.end()) {
+            graph->submission_cv.wait(lock, [&find_submission, graph]() {
+                const auto current = find_submission();
+                GGML_ASSERT(current != graph->submission_records.end());
+                return current->state == ggml_opencl_htp_submission_state::submitted ||
+                       current->state == ggml_opencl_htp_submission_state::failed;
+            });
+            submission = find_submission();
+            if (submission->state == ggml_opencl_htp_submission_state::failed) {
+                set_reason(reason, reason_capacity, "%s", submission->reason);
+                return submission->result == GGML_OPENCL_HTP_OK ?
+                    GGML_OPENCL_HTP_ERROR : submission->result;
+            }
+        }
+    }
+
+    cl_event event = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(graph->sidecar->dispatch_mutex);
+        const auto pending = std::find_if(
+            graph->pending_events.begin(), graph->pending_events.end(),
+            [sparse_producer](const ggml_opencl_htp_pending_event & item) {
+                return item.producer == sparse_producer;
+            });
+        if (pending == graph->pending_events.end() || pending->event == nullptr) {
+            set_reason(reason, reason_capacity,
+                       "residual-owned sparse event is unavailable");
+            return GGML_OPENCL_HTP_ERROR;
+        }
+        event = pending->event;
+        const cl_int retain_err = clRetainEvent(event);
+        if (retain_err != CL_SUCCESS) {
+            set_reason(reason, reason_capacity,
+                       "failed to retain sparse input lifetime event (error %d)",
+                       retain_err);
+            return GGML_OPENCL_HTP_ERROR;
+        }
+    }
+
+    cl_int execution_status = CL_QUEUED;
+    cl_int err = clGetEventInfo(
+        event, CL_EVENT_COMMAND_EXECUTION_STATUS,
+        sizeof(execution_status), &execution_status, nullptr);
+    if (err == CL_SUCCESS && execution_status != CL_COMPLETE) {
+        trace_sidecar_event("gpu_sparse_input_lifetime_wait_begin", sparse_producer);
+        err = clWaitForEvents(1, &event);
+        trace_sidecar_event("gpu_sparse_input_lifetime_wait_end", sparse_producer);
+        if (waited != nullptr) {
+            *waited = true;
+        }
+    }
+    const cl_int release_err = clReleaseEvent(event);
+    if (err != CL_SUCCESS || release_err != CL_SUCCESS) {
+        set_reason(reason, reason_capacity,
+                   "sparse input lifetime wait failed (error %d, release error %d)",
+                   err, release_err);
+        return GGML_OPENCL_HTP_ERROR;
+    }
     set_reason(reason, reason_capacity, "ok");
     return GGML_OPENCL_HTP_OK;
 }
@@ -2447,6 +4047,25 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_wait_for_tensor(
             set_reason(reason, reason_capacity, "graph is already finished");
             return GGML_OPENCL_HTP_ERROR;
         }
+    }
+
+    for (ggml_opencl_htp_prepared_residual_dispatch & prepared :
+            graph->prepared_residual_dispatches) {
+        const bool is_residual =
+            prepared.dispatch.residual_destination == producer;
+        const bool is_rho = prepared.dispatch.rho_destination == producer;
+        if (!is_residual && !is_rho) {
+            continue;
+        }
+        const std::string & key = is_residual ?
+            prepared.residual_cache_key : prepared.rho_cache_key;
+        return ggml_backend_opencl_htp_cache_wait(
+            graph->sidecar,
+            key.c_str(),
+            prepared.dispatch.generation,
+            waited,
+            reason,
+            reason_capacity);
     }
 
     cl_event pending_event = nullptr;
@@ -2512,7 +4131,7 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_wait_for_tensor(
     if (staged_output != nullptr) {
         trace_sidecar_event("gpu_sparse_publish_begin", producer);
         cl_int publish_err = clEnqueueCopyBuffer(
-            graph->sidecar->queue,
+            graph->sidecar->sparse_queue,
             staged_output,
             destination.memory,
             0,
@@ -2525,7 +4144,7 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_wait_for_tensor(
             publish_err = CL_INVALID_EVENT;
         }
         if (publish_err == CL_SUCCESS) {
-            publish_err = clFlush(graph->sidecar->queue);
+            publish_err = clFlush(graph->sidecar->sparse_queue);
         }
         if (publish_err == CL_SUCCESS) {
             publish_err = clWaitForEvents(1, &publish_event);
@@ -2603,6 +4222,200 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_compute_block_sparse_attn_s
         graph, node, &waited, reason, reason_capacity);
 }
 
+namespace {
+
+ggml_opencl_htp_result query_deferred_graph_ready(
+        ggml_opencl_htp_graph * graph,
+        bool include_graph_events,
+        bool * ready,
+        char * reason,
+        size_t reason_capacity) {
+    if (graph == nullptr || ready == nullptr) {
+        set_reason(reason, reason_capacity, "graph and ready output must be valid");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    *ready = true;
+    for (ggml_opencl_htp_prepared_residual_dispatch & prepared :
+            graph->prepared_residual_dispatches) {
+        ggml_opencl_htp_cache_state state = GGML_OPENCL_HTP_CACHE_EMPTY;
+        const ggml_opencl_htp_result query = ggml_backend_opencl_htp_cache_query(
+            graph->sidecar,
+            prepared.residual_cache_key.c_str(),
+            prepared.dispatch.generation,
+            &state,
+            reason,
+            reason_capacity);
+        if (query != GGML_OPENCL_HTP_OK) {
+            return query;
+        }
+        if (state != GGML_OPENCL_HTP_CACHE_READY) {
+            *ready = false;
+        }
+    }
+    if (!include_graph_events) {
+        set_reason(reason, reason_capacity, "ok");
+        return GGML_OPENCL_HTP_OK;
+    }
+
+    auto query_event = [&](cl_event event) {
+        if (event == nullptr) {
+            return GGML_OPENCL_HTP_OK;
+        }
+        cl_int status = CL_QUEUED;
+        const cl_int err = clGetEventInfo(
+            event, CL_EVENT_COMMAND_EXECUTION_STATUS,
+            sizeof(status), &status, nullptr);
+        if (err != CL_SUCCESS || status < 0) {
+            set_reason(
+                reason, reason_capacity,
+                "deferred graph event query failed (error %d, status %d)",
+                err, status);
+            return GGML_OPENCL_HTP_ERROR;
+        }
+        if (status != CL_COMPLETE) {
+            *ready = false;
+        }
+        return GGML_OPENCL_HTP_OK;
+    };
+    for (cl_event event : graph->events) {
+        if (query_event(event) != GGML_OPENCL_HTP_OK) {
+            return GGML_OPENCL_HTP_ERROR;
+        }
+    }
+    for (const ggml_opencl_htp_pending_event & pending : graph->pending_events) {
+        if (query_event(pending.event) != GGML_OPENCL_HTP_OK) {
+            return GGML_OPENCL_HTP_ERROR;
+        }
+    }
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
+} // namespace
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_graph_defer(
+        ggml_opencl_htp_graph * graph,
+        bool * pending,
+        char * reason,
+        size_t reason_capacity) {
+    if (graph == nullptr || pending == nullptr) {
+        set_reason(reason, reason_capacity, "graph and pending output must be valid");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    *pending = false;
+    char stop_reason[256] = {};
+    const ggml_opencl_htp_result stop =
+        ggml_backend_opencl_htp_graph_stop_submission_thread(
+            graph, stop_reason, sizeof(stop_reason));
+    if (stop != GGML_OPENCL_HTP_OK) {
+        set_reason(reason, reason_capacity, "%s", stop_reason);
+        return stop;
+    }
+    bool ready = true;
+    const ggml_opencl_htp_result query = query_deferred_graph_ready(
+        graph, false, &ready, reason, reason_capacity);
+    if (query != GGML_OPENCL_HTP_OK) {
+        return query;
+    }
+    *pending = !graph->prepared_residual_dispatches.empty() && !ready;
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_graph_deferred_ready(
+        ggml_opencl_htp_graph * graph,
+        bool * ready,
+        char * reason,
+        size_t reason_capacity) {
+    return query_deferred_graph_ready(
+        graph, true, ready, reason, reason_capacity);
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_graph_wait_deferred(
+        ggml_opencl_htp_graph * graph,
+        char * reason,
+        size_t reason_capacity) {
+    if (graph == nullptr) {
+        set_reason(reason, reason_capacity, "graph must not be null");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    for (ggml_opencl_htp_prepared_residual_dispatch & prepared :
+            graph->prepared_residual_dispatches) {
+        ggml_opencl_htp_cache_state state = GGML_OPENCL_HTP_CACHE_EMPTY;
+        ggml_opencl_htp_result result = ggml_backend_opencl_htp_cache_query(
+            graph->sidecar,
+            prepared.residual_cache_key.c_str(),
+            prepared.dispatch.generation,
+            &state,
+            reason,
+            reason_capacity);
+        if (result != GGML_OPENCL_HTP_OK) {
+            return result;
+        }
+        if (state == GGML_OPENCL_HTP_CACHE_READY) {
+            continue;
+        }
+        if (state != GGML_OPENCL_HTP_CACHE_SUBMITTED) {
+            set_reason(reason, reason_capacity, "deferred residual was not submitted");
+            return GGML_OPENCL_HTP_ERROR;
+        }
+        bool waited = false;
+        result = ggml_backend_opencl_htp_cache_wait(
+            graph->sidecar,
+            prepared.residual_cache_key.c_str(),
+            prepared.dispatch.generation,
+            &waited,
+            reason,
+            reason_capacity);
+        if (result != GGML_OPENCL_HTP_OK) {
+            return result;
+        }
+    }
+
+    std::vector<cl_event> events;
+    events.reserve(graph->events.size() + graph->pending_events.size());
+    for (cl_event event : graph->events) {
+        if (event != nullptr) {
+            events.push_back(event);
+        }
+    }
+    for (const ggml_opencl_htp_pending_event & pending : graph->pending_events) {
+        if (pending.event != nullptr) {
+            events.push_back(pending.event);
+        }
+    }
+    if (!events.empty()) {
+        const cl_int err = clWaitForEvents(
+            static_cast<cl_uint>(events.size()), events.data());
+        if (err != CL_SUCCESS) {
+            set_reason(reason, reason_capacity,
+                       "deferred graph event wait failed (error %d)", err);
+            return GGML_OPENCL_HTP_ERROR;
+        }
+    }
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
+ggml_opencl_htp_result ggml_backend_opencl_htp_graph_reap_deferred(
+        ggml_opencl_htp_graph * graph,
+        char * reason,
+        size_t reason_capacity) {
+    bool ready = false;
+    const ggml_opencl_htp_result query =
+        ggml_backend_opencl_htp_graph_deferred_ready(
+            graph, &ready, reason, reason_capacity);
+    if (query != GGML_OPENCL_HTP_OK) {
+        return query;
+    }
+    if (!ready) {
+        set_reason(reason, reason_capacity, "deferred graph is still pending");
+        return GGML_OPENCL_HTP_UNSUPPORTED;
+    }
+    return finish_graph_state(
+        graph, GGML_OPENCL_HTP_OK, "ok", reason, reason_capacity, false);
+}
+
 ggml_opencl_htp_result ggml_backend_opencl_htp_graph_finish(
     ggml_opencl_htp_graph * graph,
     char * reason,
@@ -2615,10 +4428,67 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_finish(
     const ggml_opencl_htp_result stop_result =
         ggml_backend_opencl_htp_graph_stop_submission_thread(
             graph, stop_reason, sizeof(stop_reason));
+    ggml_opencl_htp_result residual_result = GGML_OPENCL_HTP_OK;
+    char residual_reason[256] = {};
+    bool traced_residual_wait = false;
+    if (stop_result == GGML_OPENCL_HTP_OK) {
+        for (ggml_opencl_htp_prepared_residual_dispatch & prepared :
+                graph->prepared_residual_dispatches) {
+            ggml_opencl_htp_cache_state state = GGML_OPENCL_HTP_CACHE_EMPTY;
+            const ggml_opencl_htp_result query =
+                ggml_backend_opencl_htp_cache_query(
+                    graph->sidecar,
+                    prepared.residual_cache_key.c_str(),
+                    prepared.dispatch.generation,
+                    &state,
+                    residual_reason,
+                    sizeof(residual_reason));
+            if (query != GGML_OPENCL_HTP_OK) {
+                residual_result = query;
+                break;
+            }
+            if (state == GGML_OPENCL_HTP_CACHE_READY) {
+                continue;
+            }
+            if (state != GGML_OPENCL_HTP_CACHE_SUBMITTED) {
+                // Aborted graphs can legitimately leave prepared cache slots
+                // unqueued. Their normal error path is reported separately.
+                continue;
+            }
+            if (!traced_residual_wait) {
+                trace_sidecar_event(
+                    "gpu_residual_graph_finish_wait_begin",
+                    prepared.dispatch.dense_packed);
+                traced_residual_wait = true;
+            }
+            bool waited = false;
+            residual_result = ggml_backend_opencl_htp_cache_wait(
+                graph->sidecar,
+                prepared.residual_cache_key.c_str(),
+                prepared.dispatch.generation,
+                &waited,
+                residual_reason,
+                sizeof(residual_reason));
+            if (residual_result != GGML_OPENCL_HTP_OK) {
+                break;
+            }
+        }
+    }
+    if (traced_residual_wait) {
+        trace_sidecar_event("gpu_residual_graph_finish_wait_end", nullptr);
+    }
+    const bool finish_ok =
+        stop_result == GGML_OPENCL_HTP_OK &&
+        residual_result == GGML_OPENCL_HTP_OK;
+    const char * finish_reason = stop_result != GGML_OPENCL_HTP_OK
+        ? stop_reason
+        : residual_result != GGML_OPENCL_HTP_OK
+            ? residual_reason
+            : "ok";
     return finish_graph_state(
         graph,
-        stop_result == GGML_OPENCL_HTP_OK ? GGML_OPENCL_HTP_OK : GGML_OPENCL_HTP_ERROR,
-        stop_result == GGML_OPENCL_HTP_OK ? "ok" : stop_reason,
+        finish_ok ? GGML_OPENCL_HTP_OK : GGML_OPENCL_HTP_ERROR,
+        finish_reason,
         reason, reason_capacity);
 }
 
@@ -2663,6 +4533,55 @@ size_t ggml_backend_opencl_htp_graph_pending_sparse_submission_count(
         }));
 }
 
+size_t ggml_backend_opencl_htp_graph_submitted_sparse_count(
+        const ggml_opencl_htp_graph * graph) {
+    if (graph == nullptr) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(graph->submission_mutex);
+    return static_cast<size_t>(std::count_if(
+        graph->submission_records.begin(), graph->submission_records.end(),
+        [](const ggml_opencl_htp_submission_record & item) {
+            return item.kind ==
+                       ggml_opencl_htp_submission_job_kind::sparse_attention &&
+                   item.state == ggml_opencl_htp_submission_state::submitted;
+        }));
+}
+
+size_t ggml_backend_opencl_htp_graph_pending_residual_submission_count(
+        const ggml_opencl_htp_graph * graph) {
+    if (graph == nullptr) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(graph->submission_mutex);
+    return static_cast<size_t>(std::count_if(
+        graph->submission_records.begin(), graph->submission_records.end(),
+        [](const ggml_opencl_htp_submission_record & item) {
+            return item.kind ==
+                       ggml_opencl_htp_submission_job_kind::exact_rho_residual &&
+                   (item.state == ggml_opencl_htp_submission_state::queued ||
+                    item.state == ggml_opencl_htp_submission_state::submitting);
+        }));
+}
+
+size_t ggml_backend_opencl_htp_graph_pending_residual_event_count(
+        const ggml_opencl_htp_graph * graph) {
+    if (graph == nullptr || graph->sidecar == nullptr) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(graph->sidecar->cache_mutex);
+    size_t count = 0;
+    for (const ggml_opencl_htp_prepared_residual_dispatch & prepared :
+            graph->prepared_residual_dispatches) {
+        const ggml_opencl_htp_cache_record * record = find_cache_record(
+            graph->sidecar, prepared.residual_cache_key.c_str(),
+            prepared.dispatch.generation);
+        count += record != nullptr &&
+                 record->state == GGML_OPENCL_HTP_CACHE_SUBMITTED;
+    }
+    return count;
+}
+
 void ggml_backend_opencl_htp_graph_test_fail_next_event_cache(ggml_opencl_htp_graph * graph) {
     if (graph != nullptr && graph->state == ggml_opencl_htp_graph_state::active) {
         graph->test_fail_next_event_cache = true;
@@ -2681,4 +4600,37 @@ void ggml_backend_opencl_htp_graph_test_fail_next_sparse_wait(
     if (graph != nullptr && graph->state == ggml_opencl_htp_graph_state::active) {
         graph->test_fail_next_sparse_wait = true;
     }
+}
+
+void ggml_backend_opencl_htp_graph_test_fail_next_rho_enqueue(
+        ggml_opencl_htp_graph * graph) {
+    if (graph != nullptr && graph->state == ggml_opencl_htp_graph_state::active) {
+        graph->test_fail_next_rho_enqueue = true;
+    }
+}
+
+void ggml_backend_opencl_htp_graph_test_fail_next_residual_enqueue(
+        ggml_opencl_htp_graph * graph) {
+    if (graph != nullptr && graph->state == ggml_opencl_htp_graph_state::active) {
+        graph->test_fail_next_residual_enqueue = true;
+    }
+}
+
+void ggml_backend_opencl_htp_graph_test_fail_next_residual_wait(
+        ggml_opencl_htp_graph * graph) {
+    if (graph == nullptr || graph->sidecar == nullptr ||
+        graph->state != ggml_opencl_htp_graph_state::active) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(graph->sidecar->cache_mutex);
+    graph->sidecar->test_fail_next_residual_wait = true;
+}
+
+void ggml_backend_opencl_htp_sidecar_test_fail_next_residual_wait(
+        ggml_opencl_htp_sidecar * sidecar) {
+    if (sidecar == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(sidecar->cache_mutex);
+    sidecar->test_fail_next_residual_wait = true;
 }
