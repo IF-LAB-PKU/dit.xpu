@@ -857,6 +857,7 @@ public:
         x                = ggml_add(ctx->ggml_ctx, patch_embed, pos_embed);  // [N, H*W, hidden_size]
         const int64_t token_h = (H + patch_size - 1) / patch_size;
         const int64_t token_w = (W + patch_size - 1) / patch_size;
+        const bool patch_major_layout_enabled = ctx->block_sparse_attn_enabled;
         const bool block_sparse_step_shift_enabled = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_STEP_SHIFT");
         int block_sparse_shift_y = ctx->block_sparse_attn_enabled ?
             sd_htp_block_sparse_step_shift(block_sparse_step_shift_enabled, block_sparse_step_index) :
@@ -874,14 +875,15 @@ public:
                          static_cast<long long>(token_w),
                          static_cast<long long>(depth));
         }
-        x = sd_patch_major_reorder_node(ctx->ggml_ctx,
-                                        x,
-                                        static_cast<int>(token_h),
-                                        static_cast<int>(token_w),
-                                        SD_HTP_BLOCK_SPARSE_PATCH_SIZE,
-                                        false,
-                                        block_sparse_shift_y,
-                                        block_sparse_shift_x);
+        x = sd_optional_patch_major_reorder_node(ctx->ggml_ctx,
+                                                 x,
+                                                 static_cast<int>(token_h),
+                                                 static_cast<int>(token_w),
+                                                 SD_HTP_BLOCK_SPARSE_PATCH_SIZE,
+                                                 patch_major_layout_enabled,
+                                                 false,
+                                                 block_sparse_shift_y,
+                                                 block_sparse_shift_x);
 
         auto c = t_embedder->forward(ctx, t);  // [N, hidden_size]
         if (y != nullptr && adm_in_channels != -1) {
@@ -913,14 +915,15 @@ public:
                                      skip_layers);  // (N, H*W, patch_size ** 2 * out_channels)
         ctx->block_sparse_token_h = previous_block_sparse_token_h;
         ctx->block_sparse_token_w = previous_block_sparse_token_w;
-        x = sd_patch_major_reorder_node(ctx->ggml_ctx,
-                                        x,
-                                        static_cast<int>(token_h),
-                                        static_cast<int>(token_w),
-                                        SD_HTP_BLOCK_SPARSE_PATCH_SIZE,
-                                        true,
-                                        block_sparse_shift_y,
-                                        block_sparse_shift_x);
+        x = sd_optional_patch_major_reorder_node(ctx->ggml_ctx,
+                                                 x,
+                                                 static_cast<int>(token_h),
+                                                 static_cast<int>(token_w),
+                                                 SD_HTP_BLOCK_SPARSE_PATCH_SIZE,
+                                                 patch_major_layout_enabled,
+                                                 true,
+                                                 block_sparse_shift_y,
+                                                 block_sparse_shift_x);
 
         auto final_layer = std::dynamic_pointer_cast<FinalLayer>(blocks["final_layer"]);
         x = final_layer->forward(ctx, x, c);  // (N, T, patch_size ** 2 * out_channels)

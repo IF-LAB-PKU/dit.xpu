@@ -529,6 +529,28 @@ static void test_patch_major_reorder_tensor_roundtrip() {
     std::printf("[PASS] patch-major tensor reorder roundtrip\n");
 }
 
+static void test_optional_patch_major_reorder_policy() {
+    constexpr int c = 3;
+    constexpr int h = 8;
+    constexpr int w = 8;
+    ggml_context * ctx = make_ctx(8);
+    ggml_tensor * src = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, c, h * w, 1);
+    GGML_ASSERT(src != nullptr);
+
+    ggml_tensor * disabled = sd_optional_patch_major_reorder_node(
+        ctx, src, h, w, 4, false, false);
+    GGML_ASSERT(disabled == src);
+
+    ggml_tensor * enabled = sd_optional_patch_major_reorder_node(
+        ctx, src, h, w, 4, true, false);
+    GGML_ASSERT(enabled != nullptr && enabled != src);
+    GGML_ASSERT(enabled->op == GGML_OP_CUSTOM);
+    ggml_free(ctx);
+
+    std::printf("[PASS] optional patch-major reorder policy\n");
+}
+
 static void test_patch_major_shifted_reorder_tensor_roundtrip() {
     constexpr int c = 3;
     constexpr int h = 13;
@@ -1783,6 +1805,7 @@ int main() {
     test_patch_major_mapping_roundtrip();
     test_patch_major_shift_mapping_roundtrip();
     test_patch_major_reorder_tensor_roundtrip();
+    test_optional_patch_major_reorder_policy();
     test_patch_major_shifted_reorder_tensor_roundtrip();
     test_patch_major_shifted_to_shifted_reorder_tensor_roundtrip();
     test_block_sparse_step_shift_policy();
