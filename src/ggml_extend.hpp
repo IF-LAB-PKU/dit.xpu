@@ -424,6 +424,35 @@ __STATIC_INLINE__ ggml_tensor* sd_patch_major_reorder_node(ggml_context* ctx,
     return result;
 }
 
+__STATIC_INLINE__ ggml_tensor* sd_optional_patch_major_reorder_node(
+        ggml_context* ctx,
+        ggml_tensor* x,
+        int token_h,
+        int token_w,
+        int patch,
+        bool enabled,
+        bool inverse,
+        int shift_y = 0,
+        int shift_x = 0,
+        int src_shift_y = 0,
+        int src_shift_x = 0,
+        bool src_patch_major = false) {
+    if (!enabled) {
+        return x;
+    }
+    return sd_patch_major_reorder_node(ctx,
+                                       x,
+                                       token_h,
+                                       token_w,
+                                       patch,
+                                       inverse,
+                                       shift_y,
+                                       shift_x,
+                                       src_shift_y,
+                                       src_shift_x,
+                                       src_patch_major);
+}
+
 __STATIC_INLINE__ void ggml_ext_block_sparse_promote_16_mask_to_32_index(const int32_t* mask16,
                                                                          int32_t* index32,
                                                                          int n_q16_blocks,
@@ -6164,13 +6193,11 @@ protected:
                plan.valid &&
                max_graph_vram_bytes > 0 &&
                plan.segments.size() > 1 &&
-               params_backend != runtime_backend &&
                !ggml_backend_is_cpu(runtime_backend);
     }
 
     bool can_attempt_graph_cut_segmented_compute() const {
         return max_graph_vram_bytes > 0 &&
-               params_backend != runtime_backend &&
                !ggml_backend_is_cpu(runtime_backend);
     }
 
