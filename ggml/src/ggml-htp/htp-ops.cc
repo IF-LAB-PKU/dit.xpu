@@ -315,6 +315,24 @@ void dump_htp_dispatch_state(const char * prefix,
 
 extern "C" {
 
+int htp_ops_resolve_halo_kv_load_mode(void) {
+    const char * value = std::getenv("SD_HTP_HALO_KV_LOAD");
+    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "l2fetch") == 0) {
+        return HTP_HALO_KV_LOAD_L2_PREFETCH;
+    }
+    if (std::strcmp(value, "baseline") == 0) {
+        return HTP_HALO_KV_LOAD_BASELINE;
+    }
+    if (std::strcmp(value, "userdma") == 0) {
+        return HTP_HALO_KV_LOAD_USERDMA_AB;
+    }
+
+    std::fprintf(stderr,
+                 "[ggml-htp] invalid SD_HTP_HALO_KV_LOAD=%s (expected baseline, l2fetch, or userdma)\n",
+                 value);
+    return -EINVAL;
+}
+
 bool htp_ops_support_op(const struct ggml_tensor * dst) {
     auto * ctx = ggml_backend_htp_context::instance();
     if (ctx->skip_htp_ops || !ctx->ops_backend_initialized) {
@@ -1363,6 +1381,39 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                         GGML_ASSERT((int32_t) mask->ne[0] == computed_n_k_blocks);
                     }
 
+                    const ggml_flash_attn_ext_sparse_policy ggml_sparse_policy =
+                        ggml_flash_attn_ext_get_sparse_policy(dst);
+                    int32_t sparse_policy = HTP_SPARSE_POLICY_NONE;
+                    int32_t image_tokens = 0;
+                    int32_t text_tokens = 0;
+                    int32_t image_block_rows = 0;
+                    int32_t image_block_cols = 0;
+                    int32_t halo_kv_load_mode = HTP_HALO_KV_LOAD_BASELINE;
+                    const int32_t halo_trace = env_flag_enabled("SD_HTP_HALO_KV_TRACE") ? 1 : 0;
+                    if (ggml_sparse_policy == GGML_FLASH_ATTN_EXT_SPARSE_POLICY_STATIC_HALO) {
+                        const int resolved_mode = htp_ops_resolve_halo_kv_load_mode();
+                        if (resolved_mode < 0) {
+                            return resolved_mode;
+                        }
+                        sparse_policy = HTP_SPARSE_POLICY_STATIC_HALO;
+                        image_tokens = ggml_flash_attn_ext_get_image_tokens(dst);
+                        text_tokens = ggml_flash_attn_ext_get_text_tokens(dst);
+                        image_block_rows = ggml_flash_attn_ext_get_image_block_rows(dst);
+                        image_block_cols = ggml_flash_attn_ext_get_image_block_cols(dst);
+                        halo_kv_load_mode = resolved_mode;
+                        if (halo_trace != 0) {
+                            std::fprintf(stderr,
+                                         "htp_halo_kv_dispatch policy=%d image_tokens=%d text_tokens=%d "
+                                         "image_block_rows=%d image_block_cols=%d loader=%d\n",
+                                         sparse_policy,
+                                         image_tokens,
+                                         text_tokens,
+                                         image_block_rows,
+                                         image_block_cols,
+                                         halo_kv_load_mode);
+                        }
+                    }
+
                     BlockSparseAttnParams op_params{
                         .o          = { o_fd,    (int32_t) o_offset    },
                         .q          = { q_fd,    (int32_t) q_offset    },
@@ -1382,6 +1433,19 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                         .max_kept_blocks = is_index ? (int32_t) mask->ne[0] : 0,
                         .with_lse = with_lse ? 1 : 0,
                         .elapsed_us = 0,
+                        .sparse_policy = sparse_policy,
+                        .image_tokens = image_tokens,
+                        .text_tokens = text_tokens,
+                        .halo_kv_load_mode = halo_kv_load_mode,
+                        .halo_trace = halo_trace,
+                        .image_block_rows = image_block_rows,
+                        .image_block_cols = image_block_cols,
+                        .halo_exec_mode = -1,
+                        .halo_image_rows_updated = 0,
+                        .halo_text_q_image_row_updates = 0,
+                        .halo_text_q_image_block_updates = 0,
+                        .halo_image_q_batch_updates = 0,
+                        .halo_image_q_segment_updates = 0,
                     };
                     *reinterpret_cast<BlockSparseAttnParams *>(param_buf) = op_params;
 
@@ -1573,24 +1637,70 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
 
     std::atomic_thread_fence(std::memory_order_acquire);
     auto * completed_request = message_header_get_request_ptr(msg_hdr, 0);
-    const int ret = completed_request->state;
+    int ret = completed_request->state;
+    auto * compute_request = reinterpret_cast<OpComputeRequest *>(completed_request->data);
+    const auto * block_sparse_params = op_index == HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16
+        ? reinterpret_cast<const BlockSparseAttnParams *>(compute_request->payload)
+        : nullptr;
     const char * internal_trace = std::getenv("SD_HTP_ATTN_INTERNAL_TRACE");
     if (internal_trace != nullptr && internal_trace[0] != '\0' && std::strcmp(internal_trace, "0") != 0 &&
         (op_index == HTP_OPS_FLASH_ATTN_QO_F32_KV_F16 ||
          op_index == HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16)) {
-        auto * compute_request = reinterpret_cast<OpComputeRequest *>(completed_request->data);
         const int32_t elapsed_us = op_index == HTP_OPS_FLASH_ATTN_QO_F32_KV_F16
             ? reinterpret_cast<const FlashAttnParams *>(compute_request->payload)->elapsed_us
-            : reinterpret_cast<const BlockSparseAttnParams *>(compute_request->payload)->elapsed_us;
+            : block_sparse_params->elapsed_us;
         std::fprintf(
             stderr,
-            "htp_attention_internal kind=%s elapsed_us=%d qo=%d kv=%d heads=%d with_lse=%d\n",
+            "htp_attention_internal kind=%s elapsed_us=%d qo=%d kv=%d heads=%d with_lse=%d "
+            "halo_exec_mode=%d image_rows=%d text_q_rows=%d text_q_block_updates=%d "
+            "image_q_batches=%d image_q_segments=%d\n",
             op_index == HTP_OPS_FLASH_ATTN_QO_F32_KV_F16 ? "dense" : "block_sparse",
             elapsed_us,
             dispatch_m,
             dispatch_k,
             dispatch_n,
-            ggml_get_op_params_i32(dst, 6) != 0 ? 1 : 0);
+            ggml_get_op_params_i32(dst, 6) != 0 ? 1 : 0,
+            block_sparse_params != nullptr ? block_sparse_params->halo_exec_mode : -1,
+            block_sparse_params != nullptr ? block_sparse_params->halo_image_rows_updated : 0,
+            block_sparse_params != nullptr ? block_sparse_params->halo_text_q_image_row_updates : 0,
+            block_sparse_params != nullptr ? block_sparse_params->halo_text_q_image_block_updates : 0,
+            block_sparse_params != nullptr ? block_sparse_params->halo_image_q_batch_updates : 0,
+            block_sparse_params != nullptr ? block_sparse_params->halo_image_q_segment_updates : 0);
+    }
+    if (block_sparse_params != nullptr && env_flag_enabled("SD_HTP_HALO_REQUIRE_USERDMA_TRACE")) {
+        const int text_q_blocks = (block_sparse_params->text_tokens + 31) / 32;
+        const int expected_row_updates = block_sparse_params->image_block_rows * text_q_blocks;
+        const int expected_block_updates = expected_row_updates * block_sparse_params->image_block_cols;
+        const int expected_image_q_batches =
+            block_sparse_params->image_block_rows * block_sparse_params->image_block_cols;
+        const int expected_image_q_segments =
+            block_sparse_params->image_block_cols *
+            (3 * block_sparse_params->image_block_rows - 2 +
+             (block_sparse_params->text_tokens > 0 ? block_sparse_params->image_block_rows : 0));
+        if (ret != 0 || block_sparse_params->halo_exec_mode != HTP_HALO_EXEC_TRACE_USERDMA_ROWS ||
+            block_sparse_params->halo_image_rows_updated != block_sparse_params->image_block_rows ||
+            block_sparse_params->halo_text_q_image_row_updates != expected_row_updates ||
+            block_sparse_params->halo_text_q_image_block_updates != expected_block_updates ||
+            block_sparse_params->halo_image_q_batch_updates != expected_image_q_batches ||
+            block_sparse_params->halo_image_q_segment_updates != expected_image_q_segments) {
+            std::fprintf(
+                stderr,
+                "htp_halo_userdma_trace_mismatch ret=%d mode=%d rows=%d/%d text_q_rows=%d/%d "
+                "text_q_blocks=%d/%d image_q_batches=%d/%d image_q_segments=%d/%d\n",
+                ret,
+                block_sparse_params->halo_exec_mode,
+                block_sparse_params->halo_image_rows_updated,
+                block_sparse_params->image_block_rows,
+                block_sparse_params->halo_text_q_image_row_updates,
+                expected_row_updates,
+                block_sparse_params->halo_text_q_image_block_updates,
+                expected_block_updates,
+                block_sparse_params->halo_image_q_batch_updates,
+                expected_image_q_batches,
+                block_sparse_params->halo_image_q_segment_updates,
+                expected_image_q_segments);
+            ret = -EIO;
+        }
     }
     if (debug_hash_index >= 0) {
         const uint64_t output_hash = htp_hash_tensor_bytes(dst);

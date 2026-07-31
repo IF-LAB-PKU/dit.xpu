@@ -9,7 +9,10 @@
 #include <ggml-backend.h>
 #include <ggml-htp.h>
 
+#include "../src/ggml-htp/op_reg.h"
+
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +20,8 @@
 #include <limits>
 #include <string>
 #include <vector>
+
+extern "C" int htp_ops_resolve_halo_kv_load_mode(void);
 
 struct EnvGuard {
     const char * name;
@@ -107,6 +112,84 @@ static void test_block_sparse_mask_format_is_explicit_for_ambiguous_shapes() {
     GGML_ASSERT(ggml_flash_attn_ext_get_mask_format(index_attn) == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
 
     ggml_free(ctx);
+}
+
+static void test_flash_attn_static_halo_metadata() {
+    constexpr int head_dim = 4;
+    constexpr int image_tokens = 256;
+    constexpr int text_tokens = 154;
+    constexpr int image_block_rows = 2;
+    constexpr int image_block_cols = 4;
+    constexpr int seq_len = image_tokens + text_tokens;
+    constexpr int block_size = 32;
+    constexpr int n_blocks = (seq_len + block_size - 1) / block_size;
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+    GGML_ASSERT(ctx != nullptr);
+
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, seq_len, 1, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, seq_len, 1, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, seq_len, 1, 1);
+    ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_blocks, n_blocks);
+    ggml_tensor * attn = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_block_sparse(
+        attn, block_size, block_size, GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
+
+    GGML_ASSERT(ggml_flash_attn_ext_get_sparse_policy(attn) ==
+                GGML_FLASH_ATTN_EXT_SPARSE_POLICY_NONE);
+    GGML_ASSERT(ggml_flash_attn_ext_get_image_tokens(attn) == 0);
+    GGML_ASSERT(ggml_flash_attn_ext_get_text_tokens(attn) == 0);
+    GGML_ASSERT(ggml_flash_attn_ext_get_image_block_rows(attn) == 0);
+    GGML_ASSERT(ggml_flash_attn_ext_get_image_block_cols(attn) == 0);
+
+    ggml_flash_attn_ext_set_static_halo(attn, image_tokens, text_tokens);
+
+    GGML_ASSERT(ggml_flash_attn_ext_get_sparse_policy(attn) ==
+                GGML_FLASH_ATTN_EXT_SPARSE_POLICY_STATIC_HALO);
+    GGML_ASSERT(ggml_flash_attn_ext_get_image_tokens(attn) == image_tokens);
+    GGML_ASSERT(ggml_flash_attn_ext_get_text_tokens(attn) == text_tokens);
+    GGML_ASSERT(ggml_flash_attn_ext_get_image_block_rows(attn) == 0);
+    GGML_ASSERT(ggml_flash_attn_ext_get_image_block_cols(attn) == 0);
+
+    ggml_flash_attn_ext_set_static_halo_2d(
+        attn, image_tokens, text_tokens, image_block_rows, image_block_cols);
+
+    GGML_ASSERT(ggml_flash_attn_ext_get_sparse_policy(attn) ==
+                GGML_FLASH_ATTN_EXT_SPARSE_POLICY_STATIC_HALO);
+    GGML_ASSERT(ggml_flash_attn_ext_get_image_tokens(attn) == image_tokens);
+    GGML_ASSERT(ggml_flash_attn_ext_get_text_tokens(attn) == text_tokens);
+    GGML_ASSERT(ggml_flash_attn_ext_get_image_block_rows(attn) == image_block_rows);
+    GGML_ASSERT(ggml_flash_attn_ext_get_image_block_cols(attn) == image_block_cols);
+
+    ggml_free(ctx);
+}
+
+static void test_halo_kv_load_mode_selector() {
+    {
+        EnvGuard load_mode("SD_HTP_HALO_KV_LOAD", nullptr);
+        GGML_ASSERT(htp_ops_resolve_halo_kv_load_mode() == HTP_HALO_KV_LOAD_L2_PREFETCH);
+    }
+    {
+        EnvGuard load_mode("SD_HTP_HALO_KV_LOAD", "baseline");
+        GGML_ASSERT(htp_ops_resolve_halo_kv_load_mode() == HTP_HALO_KV_LOAD_BASELINE);
+    }
+    {
+        EnvGuard load_mode("SD_HTP_HALO_KV_LOAD", "l2fetch");
+        GGML_ASSERT(htp_ops_resolve_halo_kv_load_mode() == HTP_HALO_KV_LOAD_L2_PREFETCH);
+    }
+    {
+        EnvGuard load_mode("SD_HTP_HALO_KV_LOAD", "userdma");
+        GGML_ASSERT(htp_ops_resolve_halo_kv_load_mode() == HTP_HALO_KV_LOAD_USERDMA_AB);
+    }
+    {
+        EnvGuard load_mode("SD_HTP_HALO_KV_LOAD", "invalid");
+        GGML_ASSERT(htp_ops_resolve_halo_kv_load_mode() == -EINVAL);
+    }
 }
 
 static float gen_value(int t, int h, int d, int seed) {
@@ -709,7 +792,11 @@ struct AttentionRunner : GGMLRunner {
                                             const std::vector<float> & q_data,
                                             const std::vector<ggml_fp16_t> & k_data,
                                             const std::vector<ggml_fp16_t> & v_data,
-                                            const std::vector<int32_t> & block_index) {
+                                            const std::vector<int32_t> & block_index,
+                                            int static_image_tokens = 0,
+                                            int static_text_tokens = 0,
+                                            int static_image_block_rows = 0,
+                                            int static_image_block_cols = 0) {
         set_flash_attention_enabled(true);
         set_htp_attention_enabled(true);
         set_block_sparse_attention_enabled(true);
@@ -755,6 +842,17 @@ struct AttentionRunner : GGMLRunner {
             ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
             ggml_flash_attn_ext_set_block_sparse(
                 out, block_q, block_k, GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
+            if (static_image_tokens > 0) {
+                if (static_image_block_rows > 0 && static_image_block_cols > 0) {
+                    ggml_flash_attn_ext_set_static_halo_2d(out,
+                                                           static_image_tokens,
+                                                           static_text_tokens,
+                                                           static_image_block_rows,
+                                                           static_image_block_cols);
+                } else {
+                    ggml_flash_attn_ext_set_static_halo(out, static_image_tokens, static_text_tokens);
+                }
+            }
             out = ggml_view_3d(runner_ctx.ggml_ctx, out, head_dim, n_heads, qo_len, out->nb[1], out->nb[2], 0);
             out = ggml_ext_cont(runner_ctx.ggml_ctx, out);
             out = ggml_reshape_3d(runner_ctx.ggml_ctx, out, head_dim * n_heads, qo_len, 1);
@@ -778,7 +876,11 @@ struct AttentionRunner : GGMLRunner {
                                                      const std::vector<float> & q_data,
                                                      const std::vector<ggml_fp16_t> & k_data,
                                                      const std::vector<ggml_fp16_t> & v_data,
-                                                     const std::vector<int32_t> * block_index) {
+                                                     const std::vector<int32_t> * block_index,
+                                                     int static_image_tokens = 0,
+                                                     int static_text_tokens = 0,
+                                                     int static_image_block_rows = 0,
+                                                     int static_image_block_cols = 0) {
         set_flash_attention_enabled(true);
         set_htp_attention_enabled(true);
         set_block_sparse_attention_enabled(block_index != nullptr);
@@ -843,6 +945,17 @@ struct AttentionRunner : GGMLRunner {
             if (block_index != nullptr) {
                 ggml_flash_attn_ext_set_block_sparse(
                     packed, block_q, block_k, GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
+                if (static_image_tokens > 0) {
+                    if (static_image_block_rows > 0 && static_image_block_cols > 0) {
+                        ggml_flash_attn_ext_set_static_halo_2d(packed,
+                                                              static_image_tokens,
+                                                              static_text_tokens,
+                                                              static_image_block_rows,
+                                                              static_image_block_cols);
+                    } else {
+                        ggml_flash_attn_ext_set_static_halo(packed, static_image_tokens, static_text_tokens);
+                    }
+                }
             }
             GGML_ASSERT(packed->ne[0] == head_dim + 1);
 
@@ -1231,6 +1344,207 @@ static std::vector<int32_t> full_keep_block_index(int qo_len, int kv_len, int n_
         }
     }
     return index;
+}
+
+static void test_static_halo_characterization(AttentionRunner & runner,
+                                              const char * load_mode,
+                                              int n_heads = 1,
+                                              int head_dim = 64,
+                                              int token_h = 16,
+                                              int token_w = 32,
+                                              bool pass_static_grid = true,
+                                              bool malformed_head1 = false) {
+    GGML_ASSERT(token_h > 0 && token_w > 0 && token_h % 4 == 0 && token_w % 8 == 0);
+    const int image_tokens = token_h * token_w;
+    constexpr int text_tokens = 154;
+    const int seq_len = image_tokens + text_tokens;
+    const int n_kv_heads = n_heads;
+    constexpr int block_size = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    const int blocks_per_head = (seq_len + block_size - 1) / block_size;
+
+    std::vector<int32_t> block_index(size_t(n_heads) * size_t(blocks_per_head) * size_t(blocks_per_head), -1);
+    GGML_ASSERT(ggml_ext_block_sparse_fill_direct_halo_index_32(block_index.data(),
+                                                                blocks_per_head,
+                                                                seq_len,
+                                                                seq_len,
+                                                                image_tokens,
+                                                                text_tokens,
+                                                                token_h,
+                                                                token_w,
+                                                                n_heads,
+                                                                n_kv_heads,
+                                                                false));
+
+    if (malformed_head1) {
+        GGML_ASSERT(n_heads == 2 && token_h == 16 && token_w == 32);
+        int32_t * row = block_index.data() + size_t(blocks_per_head) * size_t(blocks_per_head);
+        const int head_base = blocks_per_head;
+        GGML_ASSERT(row[0] == head_base && row[1] == head_base + 1 &&
+                    row[2] == head_base + 4 && row[3] == head_base + 5);
+        row[0] = head_base + 1;
+        row[1] = head_base + 2;
+    }
+
+    const std::vector<float> q = gen_q(seq_len, n_heads, head_dim, 301);
+    const std::vector<ggml_fp16_t> k = gen_kv_f16(seq_len, n_kv_heads, head_dim, 302);
+    const std::vector<ggml_fp16_t> v = gen_kv_f16(seq_len, n_kv_heads, head_dim, 303);
+    const std::vector<float> dense_mask =
+        dense_mask_from_block_index(block_index, seq_len, seq_len, n_heads, n_kv_heads);
+    const RefAttentionWithLse ref =
+        reference_attention_with_lse(seq_len, seq_len, n_heads, n_kv_heads, head_dim, q, k, v, &dense_mask);
+
+    EnvGuard halo_load_mode("SD_HTP_HALO_KV_LOAD", load_mode);
+    EnvGuard sparse_opencl("SD_HTP_SPARSE_OPENCL", "0");
+    const bool require_userdma_trace =
+        std::strcmp(load_mode, "userdma") == 0 && pass_static_grid && !malformed_head1;
+    const bool collect_halo_trace = require_userdma_trace || malformed_head1;
+    EnvGuard halo_trace("SD_HTP_HALO_KV_TRACE", collect_halo_trace ? "1" : nullptr);
+    EnvGuard require_halo_trace("SD_HTP_HALO_REQUIRE_USERDMA_TRACE", require_userdma_trace ? "1" : nullptr);
+    const std::vector<float> sparse = runner.run_htp_sparse_index(4,
+                                                                  seq_len,
+                                                                  seq_len,
+                                                                  n_heads,
+                                                                  n_kv_heads,
+                                                                  head_dim,
+                                                                  q,
+                                                                  k,
+                                                                  v,
+                                                                  block_index,
+                                                                  image_tokens,
+                                                                  text_tokens,
+                                                                  pass_static_grid ? token_h / 4 : 0,
+                                                                  pass_static_grid ? token_w / 8 : 0);
+    const DiffStats out_stats = diff_stats(ref.out, sparse);
+    const std::vector<float> packed = runner.run_htp_flash_with_lse_packed(4,
+                                                                           seq_len,
+                                                                           seq_len,
+                                                                           n_heads,
+                                                                           n_kv_heads,
+                                                                           head_dim,
+                                                                           q,
+                                                                           k,
+                                                                           v,
+                                                                           &block_index,
+                                                                           image_tokens,
+                                                                           text_tokens,
+                                                                           pass_static_grid ? token_h / 4 : 0,
+                                                                           pass_static_grid ? token_w / 8 : 0);
+    const PackedWithLseDiffStats packed_stats =
+        packed_with_lse_diff_stats(ref.out, ref.lse, packed, seq_len, n_heads, head_dim);
+    std::printf("[STATIC_HALO_%s_H%d_D%d] out_max_abs=%.9g packed_out_max_abs=%.9g lse_max_abs=%.9g "
+                "out_worst=%zu out_worst_q=%zu lse_worst=%zu lse_worst_q=%zu\n",
+                load_mode,
+                n_heads,
+                head_dim,
+                out_stats.max_abs,
+                packed_stats.out_max_abs,
+                packed_stats.lse_max_abs,
+                out_stats.worst,
+                out_stats.worst / (size_t(n_heads) * size_t(head_dim)),
+                packed_stats.lse_worst,
+                packed_stats.lse_worst / size_t(n_heads));
+    const bool baseline = std::strcmp(load_mode, "baseline") == 0;
+    const double out_tolerance = baseline ? 3e-3 : (head_dim == 128 ? 4.1e-3 : 4e-3);
+    GGML_ASSERT(out_stats.max_abs <= out_tolerance);
+    GGML_ASSERT(packed_stats.out_max_abs <= out_tolerance);
+    GGML_ASSERT(packed_stats.lse_max_abs <= 5e-3);
+}
+
+static void test_static_halo_stable_normal_high_logit(AttentionRunner & runner) {
+    constexpr int token_h = 16;
+    constexpr int token_w = 32;
+    constexpr int image_tokens = token_h * token_w;
+    constexpr int text_tokens = 154;
+    constexpr int seq_len = image_tokens + text_tokens;
+    constexpr int n_heads = 1;
+    constexpr int n_kv_heads = 1;
+    constexpr int head_dim = 64;
+    constexpr int block_size = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
+    constexpr int blocks_per_head = (seq_len + block_size - 1) / block_size;
+
+    std::vector<int32_t> block_index(size_t(blocks_per_head) * size_t(blocks_per_head), -1);
+    GGML_ASSERT(ggml_ext_block_sparse_fill_direct_halo_index_32(block_index.data(),
+                                                                blocks_per_head,
+                                                                seq_len,
+                                                                seq_len,
+                                                                image_tokens,
+                                                                text_tokens,
+                                                                token_h,
+                                                                token_w,
+                                                                n_heads,
+                                                                n_kv_heads,
+                                                                false));
+
+    std::vector<float> q = gen_q(seq_len, n_heads, head_dim, 912);
+    for (int token = 0; token < 32; ++token) {
+        for (int d = 0; d < head_dim; ++d) {
+            q[size_t(token) * head_dim + size_t(d)] = 4.0f;
+        }
+    }
+    std::vector<ggml_fp16_t> k(size_t(seq_len) * head_dim);
+    for (int token = 0; token < seq_len; ++token) {
+        const float key_value = token < 32 ? 4.0f : (token < 64 ? 3.5f : 0.0f);
+        for (int d = 0; d < head_dim; ++d) {
+            k[size_t(token) * head_dim + size_t(d)] = ggml_fp32_to_fp16(key_value);
+        }
+    }
+    const std::vector<ggml_fp16_t> v = gen_kv_f16(seq_len, n_kv_heads, head_dim, 911);
+    const std::vector<float> dense_mask =
+        dense_mask_from_block_index(block_index, seq_len, seq_len, n_heads, n_kv_heads);
+
+    float max_unshifted_logit = -std::numeric_limits<float>::infinity();
+    const float scale = 1.0f / std::sqrt(float(head_dim));
+    for (int token = 0; token < seq_len; ++token) {
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            score += q[size_t(d)] * ggml_fp16_to_fp32(k[size_t(token) * head_dim + size_t(d)]);
+        }
+        max_unshifted_logit = std::max(max_unshifted_logit, score * scale);
+    }
+    const float naive_exp = std::exp(max_unshifted_logit);
+    GGML_ASSERT(!std::isfinite(naive_exp));
+
+    const RefAttentionWithLse ref =
+        reference_attention_with_lse(seq_len, seq_len, n_heads, n_kv_heads, head_dim, q, k, v, &dense_mask);
+    GGML_ASSERT(std::all_of(ref.out.begin(), ref.out.end(), [](float x) { return std::isfinite(x); }));
+    GGML_ASSERT(std::all_of(ref.lse.begin(), ref.lse.end(), [](float x) { return std::isfinite(x); }));
+
+    for (const char * load_mode : {"l2fetch", "userdma"}) {
+        EnvGuard halo_load_mode("SD_HTP_HALO_KV_LOAD", load_mode);
+        EnvGuard sparse_opencl("SD_HTP_SPARSE_OPENCL", "0");
+        EnvGuard halo_trace("SD_HTP_HALO_KV_TRACE", "1");
+        EnvGuard require_userdma_trace("SD_HTP_HALO_REQUIRE_USERDMA_TRACE",
+                                       std::strcmp(load_mode, "userdma") == 0 ? "1" : nullptr);
+        const std::vector<float> packed = runner.run_htp_flash_with_lse_packed(4,
+                                                                               seq_len,
+                                                                               seq_len,
+                                                                               n_heads,
+                                                                               n_kv_heads,
+                                                                               head_dim,
+                                                                               q,
+                                                                               k,
+                                                                               v,
+                                                                               &block_index,
+                                                                               image_tokens,
+                                                                               text_tokens,
+                                                                               token_h / 4,
+                                                                               token_w / 8);
+        GGML_ASSERT(std::all_of(packed.begin(), packed.end(), [](float x) { return std::isfinite(x); }));
+        const PackedWithLseDiffStats stats =
+            packed_with_lse_diff_stats(ref.out, ref.lse, packed, seq_len, n_heads, head_dim);
+        const size_t worst_lse_base = stats.lse_worst * size_t(head_dim + 1) + size_t(head_dim);
+        std::printf("[STATIC_HALO_STABLE_NORMAL_%s] max_logit=%.9g out_max_abs=%.9g lse_max_abs=%.9g "
+                    "lse_worst=%zu ref_lse=%.9g got_lse=%.9g\n",
+                    load_mode,
+                    max_unshifted_logit,
+                    stats.out_max_abs,
+                    stats.lse_max_abs,
+                    stats.lse_worst,
+                    ref.lse[stats.lse_worst],
+                    packed[worst_lse_base]);
+        GGML_ASSERT(stats.out_max_abs <= 4e-3);
+        GGML_ASSERT(stats.lse_max_abs <= 5e-3);
+    }
 }
 
 static std::vector<int32_t> fragmented_per_head_block_index(int qo_len,
@@ -2231,6 +2545,22 @@ static const NamedTestCase named_test_cases[] = {
     {"cache-full-k-4250-d128", true},
     {"cache-chunked-5281-d128", true},
     {"cache-d128-multi-kv", true},
+    {"static-halo-baseline", true},
+    {"static-halo-baseline-d128", true},
+    {"static-halo-l2", true},
+    {"static-halo-l2-d128", true},
+    {"static-halo-l2-2h", true},
+    {"static-halo-l2-mixed-fallback", true},
+    {"static-halo-l2-6x4", true},
+    {"static-halo-l2-5x3", true},
+    {"static-halo-userdma", true},
+    {"static-halo-userdma-2h", true},
+    {"static-halo-userdma-mixed-fallback", true},
+    {"static-halo-userdma-d128", true},
+    {"static-halo-userdma-6x4", true},
+    {"static-halo-userdma-5x3", true},
+    {"static-halo-userdma-fallback", true},
+    {"static-halo-stable-normal-high-logit", true},
     {"benchmark-410", true},
     {"benchmark-image-sizes-r90", true},
 };
@@ -2296,6 +2626,8 @@ int main(int argc, char ** argv) {
 
     test_block_sparse_keep_ratio_policy();
     test_block_sparse_mask_format_is_explicit_for_ambiguous_shapes();
+    test_flash_attn_static_halo_metadata();
+    test_halo_kv_load_mode_selector();
 
     if (!ggml_backend_htp_runtime_available()) {
         std::printf("[SKIP] HTP runtime unavailable (%s)\n", ggml_backend_htp_runtime_error());
@@ -2328,6 +2660,38 @@ int main(int argc, char ** argv) {
         test_cache_chunked_5281_d128(runner);
     } else if (selected_case == "cache-d128-multi-kv") {
         test_cache_d128_multi_kv(runner);
+    } else if (selected_case == "static-halo-baseline") {
+        test_static_halo_characterization(runner, "baseline");
+    } else if (selected_case == "static-halo-baseline-d128") {
+        test_static_halo_characterization(runner, "baseline", 1, 128);
+    } else if (selected_case == "static-halo-l2") {
+        test_static_halo_characterization(runner, "l2fetch");
+    } else if (selected_case == "static-halo-l2-d128") {
+        test_static_halo_characterization(runner, "l2fetch", 1, 128);
+    } else if (selected_case == "static-halo-l2-2h") {
+        test_static_halo_characterization(runner, "l2fetch", 2);
+    } else if (selected_case == "static-halo-l2-mixed-fallback") {
+        test_static_halo_characterization(runner, "l2fetch", 2, 64, 16, 32, true, true);
+    } else if (selected_case == "static-halo-l2-6x4") {
+        test_static_halo_characterization(runner, "l2fetch", 1, 64, 24, 32);
+    } else if (selected_case == "static-halo-l2-5x3") {
+        test_static_halo_characterization(runner, "l2fetch", 1, 64, 20, 24);
+    } else if (selected_case == "static-halo-userdma") {
+        test_static_halo_characterization(runner, "userdma");
+    } else if (selected_case == "static-halo-userdma-2h") {
+        test_static_halo_characterization(runner, "userdma", 2);
+    } else if (selected_case == "static-halo-userdma-mixed-fallback") {
+        test_static_halo_characterization(runner, "userdma", 2, 64, 16, 32, true, true);
+    } else if (selected_case == "static-halo-userdma-d128") {
+        test_static_halo_characterization(runner, "userdma", 1, 128);
+    } else if (selected_case == "static-halo-userdma-6x4") {
+        test_static_halo_characterization(runner, "userdma", 1, 64, 24, 32);
+    } else if (selected_case == "static-halo-userdma-5x3") {
+        test_static_halo_characterization(runner, "userdma", 1, 64, 20, 24);
+    } else if (selected_case == "static-halo-userdma-fallback") {
+        test_static_halo_characterization(runner, "userdma", 1, 64, 16, 32, false);
+    } else if (selected_case == "static-halo-stable-normal-high-logit") {
+        test_static_halo_stable_normal_high_logit(runner);
     } else {
         test_cache_outputs_survive_until_persistence(runner);
         test_dense_exp2_paths_match_cpu(runner);
@@ -2336,6 +2700,9 @@ int main(int argc, char ** argv) {
         run_case(runner, 256, 256, 24, 24, 64);
         run_case(runner, 410, 410, 24, 24, 64);
         run_case(runner, 512, 512, 24, 24, 64);
+        test_static_halo_characterization(runner, "baseline");
+        test_static_halo_characterization(runner, "l2fetch");
+        test_static_halo_characterization(runner, "userdma");
     }
 
     ggml_backend_free(htp);

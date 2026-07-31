@@ -14,10 +14,24 @@
 namespace {
 
 constexpr int64_t k_head_dim = 64;
-constexpr int64_t k_heads = 24;
+constexpr int64_t k_default_heads = 1;
 constexpr int64_t k_block_size = 32;
 constexpr int k_warmup_runs = 4;
 constexpr int k_measured_runs = 20;
+
+int64_t benchmark_heads() {
+    static const int64_t heads = [] {
+        const char * value = std::getenv("ATTN_PERF_HEADS");
+        if (value == nullptr || value[0] == '\0') {
+            return k_default_heads;
+        }
+        char * end = nullptr;
+        const long long parsed = std::strtoll(value, &end, 10);
+        GGML_ASSERT(end != value && *end == '\0' && parsed > 0);
+        return int64_t(parsed);
+    }();
+    return heads;
+}
 
 struct benchmark_case {
     const char * name;
@@ -64,10 +78,11 @@ void fill_qkv(
     ggml_tensor * k,
     ggml_tensor * v,
     int64_t sequence_length) {
-    std::vector<float> q_values(static_cast<size_t>(k_head_dim * sequence_length * k_heads));
-    std::vector<ggml_fp16_t> k_values(static_cast<size_t>(k_head_dim * sequence_length * k_heads));
+    const int64_t heads = benchmark_heads();
+    std::vector<float> q_values(static_cast<size_t>(k_head_dim * sequence_length * heads));
+    std::vector<ggml_fp16_t> k_values(static_cast<size_t>(k_head_dim * sequence_length * heads));
     std::vector<ggml_fp16_t> v_values(k_values.size());
-    for (int64_t head = 0; head < k_heads; ++head) {
+    for (int64_t head = 0; head < heads; ++head) {
         for (int64_t token = 0; token < sequence_length; ++token) {
             for (int64_t dim = 0; dim < k_head_dim; ++dim) {
                 const size_t index = static_cast<size_t>(
@@ -89,6 +104,7 @@ void fill_qkv(
 }
 
 std::vector<int32_t> make_direct_halo_mask(const benchmark_case & c, double * kept_ratio) {
+    const int64_t heads = benchmark_heads();
     GGML_ASSERT(c.sequence_length == int64_t(c.image_height) * c.image_width + c.text_tokens);
     GGML_ASSERT(c.image_height % 4 == 0 && c.image_width % 8 == 0);
     const int64_t blocks = (c.sequence_length + k_block_size - 1) / k_block_size;
@@ -97,15 +113,15 @@ std::vector<int32_t> make_direct_halo_mask(const benchmark_case & c, double * ke
     const int image_blocks = image_block_rows * image_block_columns;
     GGML_ASSERT(image_blocks + (c.text_tokens + k_block_size - 1) / k_block_size == blocks);
 
-    std::vector<int32_t> index(static_cast<size_t>(k_heads * blocks * blocks), -1);
+    std::vector<int32_t> index(static_cast<size_t>(heads * blocks * blocks), -1);
     int64_t kept = 0;
-    for (int64_t head = 0; head < k_heads; ++head) {
+    for (int64_t head = 0; head < heads; ++head) {
         for (int64_t query_block = 0; query_block < blocks; ++query_block) {
             int32_t * row = index.data() + (head * blocks + query_block) * blocks;
             int count = 0;
             if (query_block >= image_blocks) {
                 for (int64_t key_block = 0; key_block < blocks; ++key_block) {
-                    row[count++] = static_cast<int32_t>(key_block);
+                    row[count++] = static_cast<int32_t>(head * blocks + key_block);
                 }
             } else {
                 const int query_y = int(query_block) / image_block_columns;
@@ -116,17 +132,18 @@ std::vector<int32_t> make_direct_halo_mask(const benchmark_case & c, double * ke
                     for (int key_x = std::max(0, query_x - 1);
                          key_x <= std::min(image_block_columns - 1, query_x + 1);
                          ++key_x) {
-                        row[count++] = key_y * image_block_columns + key_x;
+                        row[count++] = static_cast<int32_t>(
+                            head * blocks + key_y * image_block_columns + key_x);
                     }
                 }
                 for (int64_t text_block = image_blocks; text_block < blocks; ++text_block) {
-                    row[count++] = static_cast<int32_t>(text_block);
+                    row[count++] = static_cast<int32_t>(head * blocks + text_block);
                 }
             }
             kept += count;
         }
     }
-    *kept_ratio = double(kept) / double(k_heads * blocks * blocks);
+    *kept_ratio = double(kept) / double(heads * blocks * blocks);
     return index;
 }
 
@@ -158,6 +175,7 @@ timing_stats time_synchronous(Run && run) {
 }
 
 timing_stats benchmark_opencl_dense(ggml_backend_t opencl, const benchmark_case & c) {
+    const int64_t heads = benchmark_heads();
     const ggml_init_params params = {
         /* .mem_size   = */ 1024 * 1024,
         /* .mem_buffer = */ nullptr,
@@ -165,9 +183,9 @@ timing_stats benchmark_opencl_dense(ggml_backend_t opencl, const benchmark_case 
     };
     ggml_context * ctx = ggml_init(params);
     GGML_ASSERT(ctx != nullptr);
-    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k_head_dim, c.sequence_length, k_heads, 1);
-    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k_head_dim, c.sequence_length, k_heads, 1);
-    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k_head_dim, c.sequence_length, k_heads, 1);
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k_head_dim, c.sequence_length, heads, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k_head_dim, c.sequence_length, heads, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k_head_dim, c.sequence_length, heads, 1);
     const int64_t padded_k = ((c.sequence_length + 63) / 64) * 64;
     ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, padded_k, c.sequence_length, 1, 1);
     ggml_tensor * output = ggml_flash_attn_ext(
@@ -201,6 +219,7 @@ timing_stats benchmark_htp(
     const benchmark_case & c,
     bool sparse,
     double * kept_ratio) {
+    const int64_t heads = benchmark_heads();
     const ggml_init_params params = {
         /* .mem_size   = */ 1024 * 1024,
         /* .mem_buffer = */ nullptr,
@@ -208,16 +227,16 @@ timing_stats benchmark_htp(
     };
     ggml_context * ctx = ggml_init(params);
     GGML_ASSERT(ctx != nullptr);
-    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k_head_dim, c.sequence_length, k_heads, 1);
-    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k_head_dim, c.sequence_length, k_heads, 1);
-    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k_head_dim, c.sequence_length, k_heads, 1);
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k_head_dim, c.sequence_length, heads, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k_head_dim, c.sequence_length, heads, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k_head_dim, c.sequence_length, heads, 1);
     const int64_t blocks = (c.sequence_length + k_block_size - 1) / k_block_size;
     std::vector<int32_t> sparse_mask;
     std::vector<ggml_fp16_t> dense_mask;
     ggml_tensor * mask = nullptr;
     if (sparse) {
         sparse_mask = make_direct_halo_mask(c, kept_ratio);
-        mask = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, blocks, k_heads * blocks, 1, 1);
+        mask = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, blocks, heads * blocks, 1, 1);
     } else {
         const int64_t padded_k = ((c.sequence_length + 63) / 64) * 64;
         dense_mask.assign(static_cast<size_t>(padded_k * c.sequence_length), ggml_fp32_to_fp16(0.0f));
@@ -229,6 +248,14 @@ timing_stats benchmark_htp(
     if (sparse) {
         ggml_flash_attn_ext_set_block_sparse(
             output, k_block_size, k_block_size, GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
+        if (c.text_tokens > 0) {
+            ggml_flash_attn_ext_set_static_halo_2d(
+                output,
+                c.image_height * c.image_width,
+                c.text_tokens,
+                c.image_height / 4,
+                c.image_width / 8);
+        }
     }
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
@@ -261,6 +288,7 @@ timing_stats benchmark_sparse(
     ggml_backend_t htp,
     const benchmark_case & c,
     double * kept_ratio) {
+    const int64_t heads = benchmark_heads();
     const ggml_init_params params = {
         /* .mem_size   = */ 1024 * 1024,
         /* .mem_buffer = */ nullptr,
@@ -268,12 +296,12 @@ timing_stats benchmark_sparse(
     };
     ggml_context * ctx = ggml_init(params);
     GGML_ASSERT(ctx != nullptr);
-    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k_head_dim, c.sequence_length, k_heads, 1);
-    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k_head_dim, c.sequence_length, k_heads, 1);
-    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k_head_dim, c.sequence_length, k_heads, 1);
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k_head_dim, c.sequence_length, heads, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k_head_dim, c.sequence_length, heads, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k_head_dim, c.sequence_length, heads, 1);
     const int64_t blocks = (c.sequence_length + k_block_size - 1) / k_block_size;
     const std::vector<int32_t> sparse_mask = make_direct_halo_mask(c, kept_ratio);
-    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, blocks, k_heads * blocks, 1, 1);
+    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, blocks, heads * blocks, 1, 1);
     ggml_tensor * output = ggml_flash_attn_ext_with_lse(
         ctx, q, k, v, mask, 1.0f / std::sqrt(float(k_head_dim)), 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(output, GGML_PREC_F32);
@@ -339,7 +367,7 @@ void run_case(
         std::printf(
             "[ATTN_PERF_RESULT] resolution=%s type=%s qo=%lld heads=%lld backend=%s "
             "mean=%.3fms p50=%.3fms p95=%.3fms\n",
-            c.name, attention_type, (long long) c.sequence_length, (long long) k_heads, name,
+            c.name, attention_type, (long long) c.sequence_length, (long long) benchmark_heads(), name,
             result.mean_ms, result.p50_ms, result.p95_ms);
         std::fflush(stdout);
         return result;
@@ -400,6 +428,12 @@ int main() {
     }
     if (selected("1024-self")) {
         run_case(sidecar, htp, opencl, "self", { "1024", 4096, 64, 64, 0 });
+    }
+    if (selected("2048-joint")) {
+        run_case(sidecar, htp, opencl, "joint", { "2048", 16538, 128, 128, 154 });
+    }
+    if (selected("4096-joint")) {
+        run_case(sidecar, htp, opencl, "joint", { "4096", 65690, 256, 256, 154 });
     }
 
     ggml_backend_free(opencl);
