@@ -2401,6 +2401,11 @@ extern "C" {
         GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX  = 2,
     };
 
+    enum ggml_flash_attn_ext_sparse_policy {
+        GGML_FLASH_ATTN_EXT_SPARSE_POLICY_NONE        = 0,
+        GGML_FLASH_ATTN_EXT_SPARSE_POLICY_STATIC_HALO = 1,
+    };
+
     GGML_API struct ggml_tensor * ggml_flash_attn_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2437,6 +2442,33 @@ extern "C" {
             enum ggml_flash_attn_ext_mask_format   format);
 
     GGML_API enum ggml_flash_attn_ext_mask_format ggml_flash_attn_ext_get_mask_format(
+            const struct ggml_tensor * tensor);
+
+    GGML_API void ggml_flash_attn_ext_set_static_halo(
+            struct ggml_tensor * tensor,
+            int32_t              image_tokens,
+            int32_t              text_tokens);
+
+    GGML_API void ggml_flash_attn_ext_set_static_halo_2d(
+            struct ggml_tensor * tensor,
+            int32_t              image_tokens,
+            int32_t              text_tokens,
+            int32_t              image_block_rows,
+            int32_t              image_block_cols);
+
+    GGML_API enum ggml_flash_attn_ext_sparse_policy ggml_flash_attn_ext_get_sparse_policy(
+            const struct ggml_tensor * tensor);
+
+    GGML_API int32_t ggml_flash_attn_ext_get_image_tokens(
+            const struct ggml_tensor * tensor);
+
+    GGML_API int32_t ggml_flash_attn_ext_get_text_tokens(
+            const struct ggml_tensor * tensor);
+
+    GGML_API int32_t ggml_flash_attn_ext_get_image_block_rows(
+            const struct ggml_tensor * tensor);
+
+    GGML_API int32_t ggml_flash_attn_ext_get_image_block_cols(
             const struct ggml_tensor * tensor);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(

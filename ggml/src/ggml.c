@@ -5363,6 +5363,11 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
     ggml_set_op_params(result, params, sizeof(params));
     ggml_set_op_params_i32(result, 6, with_lse ? 1 : 0);
     ggml_set_op_params_i32(result, 7, GGML_FLASH_ATTN_EXT_MASK_DEFAULT);
+    ggml_set_op_params_i32(result, 8, GGML_FLASH_ATTN_EXT_SPARSE_POLICY_NONE);
+    ggml_set_op_params_i32(result, 9, 0);
+    ggml_set_op_params_i32(result, 10, 0);
+    ggml_set_op_params_i32(result, 11, 0);
+    ggml_set_op_params_i32(result, 12, 0);
 
     result->op     = GGML_OP_FLASH_ATTN_EXT;
     result->src[0] = q;
@@ -5449,6 +5454,84 @@ enum ggml_flash_attn_ext_mask_format ggml_flash_attn_ext_get_mask_format(
     GGML_ASSERT(format >= GGML_FLASH_ATTN_EXT_MASK_DEFAULT &&
                 format <= GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
     return (enum ggml_flash_attn_ext_mask_format) format;
+}
+
+void ggml_flash_attn_ext_set_static_halo(
+        struct ggml_tensor * tensor,
+        int32_t              image_tokens,
+        int32_t              text_tokens) {
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(tensor->src[0] != NULL && tensor->src[1] != NULL);
+    GGML_ASSERT(tensor->src[3] != NULL && tensor->src[3]->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_flash_attn_ext_get_mask_format(tensor) == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
+    GGML_ASSERT(image_tokens > 0 && image_tokens % 32 == 0);
+    GGML_ASSERT(text_tokens >= 0);
+    GGML_ASSERT(tensor->src[0]->ne[1] == image_tokens + text_tokens);
+    GGML_ASSERT(tensor->src[1]->ne[1] == image_tokens + text_tokens);
+
+    ggml_set_op_params_i32(tensor, 8, GGML_FLASH_ATTN_EXT_SPARSE_POLICY_STATIC_HALO);
+    ggml_set_op_params_i32(tensor, 9, image_tokens);
+    ggml_set_op_params_i32(tensor, 10, text_tokens);
+    ggml_set_op_params_i32(tensor, 11, 0);
+    ggml_set_op_params_i32(tensor, 12, 0);
+}
+
+void ggml_flash_attn_ext_set_static_halo_2d(
+        struct ggml_tensor * tensor,
+        int32_t              image_tokens,
+        int32_t              text_tokens,
+        int32_t              image_block_rows,
+        int32_t              image_block_cols) {
+    GGML_ASSERT(image_block_rows > 0 && image_block_cols > 0);
+    GGML_ASSERT(image_block_rows <= INT32_MAX / image_block_cols);
+
+    const int32_t image_blocks = image_block_rows * image_block_cols;
+    GGML_ASSERT(image_blocks <= INT32_MAX / 32);
+    GGML_ASSERT(image_blocks * 32 == image_tokens);
+
+    ggml_flash_attn_ext_set_static_halo(tensor, image_tokens, text_tokens);
+    ggml_set_op_params_i32(tensor, 11, image_block_rows);
+    ggml_set_op_params_i32(tensor, 12, image_block_cols);
+}
+
+enum ggml_flash_attn_ext_sparse_policy ggml_flash_attn_ext_get_sparse_policy(
+        const struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_FLASH_ATTN_EXT);
+
+    const int32_t policy = ggml_get_op_params_i32(tensor, 8);
+    GGML_ASSERT(policy >= GGML_FLASH_ATTN_EXT_SPARSE_POLICY_NONE &&
+                policy <= GGML_FLASH_ATTN_EXT_SPARSE_POLICY_STATIC_HALO);
+    return (enum ggml_flash_attn_ext_sparse_policy) policy;
+}
+
+int32_t ggml_flash_attn_ext_get_image_tokens(
+        const struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_FLASH_ATTN_EXT);
+    return ggml_get_op_params_i32(tensor, 9);
+}
+
+int32_t ggml_flash_attn_ext_get_text_tokens(
+        const struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_FLASH_ATTN_EXT);
+    return ggml_get_op_params_i32(tensor, 10);
+}
+
+int32_t ggml_flash_attn_ext_get_image_block_rows(
+        const struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_FLASH_ATTN_EXT);
+    return ggml_get_op_params_i32(tensor, 11);
+}
+
+int32_t ggml_flash_attn_ext_get_image_block_cols(
+        const struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_FLASH_ATTN_EXT);
+    return ggml_get_op_params_i32(tensor, 12);
 }
 
 void ggml_flash_attn_ext_add_sinks(

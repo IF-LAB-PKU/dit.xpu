@@ -2416,6 +2416,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             const float block_sparse_keep_ratio = sd_htp_block_sparse_keep_ratio();
             const bool block_sparse_patch_halo = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_PATCH_HALO");
             const bool block_sparse_center_sink = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_CENTER_SINK");
+            bool block_sparse_static_halo = false;
             if (block_sparse_force_full_keep || block_sparse_keep_ratio == 1.0f) {
                 block_mask = ggml_ext_block_sparse_full_keep_mask_node(ctx, n_q_blocks, n_k_blocks);
                 block_mask_format = GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX;
@@ -2432,6 +2433,21 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                                              static_cast<int>(n_kv_head),
                                                                              block_sparse_center_sink);
                 block_mask_format = GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX;
+                block_sparse_static_halo = !block_sparse_center_sink &&
+                                           block_sparse_token_h > 0 &&
+                                           block_sparse_token_w > 0 &&
+                                           block_sparse_token_h % 4 == 0 &&
+                                           block_sparse_token_w % 8 == 0 &&
+                                           n_head > 0 &&
+                                           n_kv_head > 0 &&
+                                           n_head % n_kv_head == 0 &&
+                                           protected_start == static_cast<int64_t>(block_sparse_token_h) *
+                                                                  block_sparse_token_w &&
+                                           protected_len > 0 &&
+                                           L_q == protected_start + protected_len &&
+                                           L_k == protected_start + protected_len &&
+                                           protected_start > 0 &&
+                                           protected_start % SD_HTP_BLOCK_SPARSE_MASK_BLOCK == 0;
             } else if (!sd_htp_block_sparse_score_enabled(block_sparse_keep_ratio)) {
                 if (block_sparse_center_sink) {
                     block_mask = ggml_ext_block_sparse_structural_index_32_node(ctx,
@@ -2530,6 +2546,13 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             }
             GGML_ASSERT(block_mask_format != GGML_FLASH_ATTN_EXT_MASK_DEFAULT);
             ggml_flash_attn_ext_set_block_sparse(candidate, block_q, block_k, block_mask_format);
+            if (block_sparse_static_halo) {
+                ggml_flash_attn_ext_set_static_halo_2d(candidate,
+                                                       protected_start,
+                                                       protected_len,
+                                                       block_sparse_token_h / 4,
+                                                       block_sparse_token_w / 8);
+            }
             if ((candidate_is_htp_layout && keep_for_htp_hybrid) || backend == nullptr || ggml_backend_supports_op(backend, candidate)) {
                 ggml_tensor* sparse_out = flash_attn_o_view(candidate, sparse_with_lse);
                 ggml_tensor* sparse_lse = sparse_with_lse ? flash_attn_lse_view(candidate) : nullptr;
