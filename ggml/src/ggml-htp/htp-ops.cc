@@ -252,6 +252,22 @@ bool is_block_sparse_score_custom(const ggml_tensor * dst) {
            ggml_is_contiguous(k_mean);
 }
 
+bool is_qkv_mul_rms_packed_custom(const ggml_tensor * dst) {
+    return dst != nullptr && dst->op == GGML_OP_CUSTOM &&
+           std::strcmp(dst->name, "qkv_mul_rms_packed") == 0 &&
+           dst->src[0] != nullptr && dst->src[1] != nullptr &&
+           dst->src[2] != nullptr && dst->src[3] != nullptr && dst->src[4] != nullptr &&
+           dst->src[0]->type == GGML_TYPE_F32 && dst->src[1]->type == GGML_TYPE_F16 &&
+           dst->src[2]->type == GGML_TYPE_F32 && dst->src[3]->type == GGML_TYPE_F32 &&
+           dst->src[4]->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16 &&
+           dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1;
+}
+
+bool is_packed_sparse_attention(const ggml_tensor * dst) {
+    return dst != nullptr && dst->op == GGML_OP_FLASH_ATTN_EXT &&
+           std::strcmp(dst->name, "packed_sparse_attention") == 0;
+}
+
 bool htp_attention_impl_is_normal() {
     const char * v = std::getenv("SD_HTP_ATTENTION_IMPL");
     return v != nullptr && std::strcmp(v, "normal") == 0;
@@ -263,6 +279,8 @@ const char * htp_op_index_name(int op_index) {
             return "HTP_OPS_RMS_NORM_F32";
         case HTP_OPS_MAT_MUL_PERMUTED_W16A32:
             return "HTP_OPS_MAT_MUL_PERMUTED_W16A32";
+        case HTP_OPS_QKV_MUL_RMS_PACKED_W16A32:
+            return "HTP_OPS_QKV_MUL_RMS_PACKED_W16A32";
         case HTP_OPS_MAT_MUL_PERMUTED_W4D16A32:
             return "HTP_OPS_MAT_MUL_PERMUTED_W4D16A32";
         case HTP_OPS_MAT_MUL_PERMUTED_W8D16A32:
@@ -273,6 +291,8 @@ const char * htp_op_index_name(int op_index) {
             return "HTP_OPS_FLASH_ATTN_QO_F32_KV_F16";
         case HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16:
             return "HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16";
+        case HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16:
+            return "HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16";
         case HTP_OPS_BLOCK_SPARSE_SCORE_QO_F32_KM_F16:
             return "HTP_OPS_BLOCK_SPARSE_SCORE_QO_F32_KM_F16";
         default:
@@ -409,11 +429,27 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                     dst->ne[2] == q->ne[1] &&
                     dst->ne[3] == q->ne[3];
 
+                if (is_packed_sparse_attention(dst)) {
+                    return dst->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F16 &&
+                           k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+                           mask->type == GGML_TYPE_I32 && mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX &&
+                           with_lse && q->ne[0] == 64 && q->ne[1] == k->ne[1] &&
+                           q->ne[2] == 24 && k->ne[2] == 24 && q->ne[3] == 1 &&
+                           ggml_flash_attn_ext_get_sparse_policy(dst) == GGML_FLASH_ATTN_EXT_SPARSE_POLICY_STATIC_HALO;
+                }
+
                 return dst->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
                        v->type == GGML_TYPE_F16 && (mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32) &&
                        mask_format_ok && shape_ok && max_bias == 0 && logit_softcap == 0;
             }
         case GGML_OP_CUSTOM:
+            if (is_qkv_mul_rms_packed_custom(dst)) {
+                const ggml_tensor * activation = dst->src[0];
+                const ggml_tensor * weight = dst->src[1];
+                return activation->ne[0] > 0 && activation->ne[1] > 0 &&
+                       activation->ne[0] % 32 == 0 && weight->ne[0] == activation->ne[0] &&
+                       weight->ne[1] == 3 * 24 * 64;
+            }
             return is_block_sparse_score_custom(dst);
         default:
             return false;
@@ -423,6 +459,13 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
 bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
     if (!htp_ops_support_op(dst) || !tensor_ready_for_htp_dispatch(dst)) {
         return false;
+    }
+
+    if (is_qkv_mul_rms_packed_custom(dst)) {
+        for (int i = 0; i < 5; ++i) {
+            if (!tensor_ready_for_htp_dispatch_view_backed(dst->src[i])) return false;
+        }
+        return tensor_ready_for_htp_dispatch_view_backed(dst);
     }
 
     if (dst->op == GGML_OP_FLASH_ATTN_EXT) {
@@ -1449,7 +1492,9 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     };
                     *reinterpret_cast<BlockSparseAttnParams *>(param_buf) = op_params;
 
-                    op_index   = HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16;
+                    op_index   = is_packed_sparse_attention(dst) ?
+                        HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16 :
+                        HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16;
                     args_size  = sizeof(BlockSparseAttnParams);
                     dispatch_m = op_params.qo_len;
                     dispatch_k = op_params.kv_len;
@@ -1483,6 +1528,43 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
 
         case GGML_OP_CUSTOM:
             {
+                if (is_qkv_mul_rms_packed_custom(dst)) {
+                    prepare_tensor_rpcmem_mapping_with_extra(dst, dst->src[1]);
+                    auto mappings = get_all_rpcmem_mappings(dst);
+                    if (mappings.size() != 6) {
+                        dump_missing_mapping_diagnostics(dst, mappings);
+                        return -EINVAL;
+                    }
+                    const int tokens = (int) dst->src[0]->ne[1];
+                    const int input_dim = (int) dst->src[0]->ne[0];
+                    const int head_dim = 64;
+                    const int n_heads = 24;
+                    const size_t token_tiles = (tokens + 31) / 32;
+                    const size_t qkv_size = n_heads * token_tiles * (head_dim / 32) * 1024 * sizeof(uint16_t);
+                    auto [packed_fd, packed_offset] = mappings[0];
+                    auto [activation_fd, activation_offset] = mappings[1];
+                    auto [weight_fd, weight_offset] = mappings[2];
+                    auto [bias_fd, bias_offset] = mappings[3];
+                    auto [qnorm_fd, qnorm_offset] = mappings[4];
+                    auto [knorm_fd, knorm_offset] = mappings[5];
+                    QkvMulRmsPackedParams op_params{
+                        .q = { packed_fd, (int32_t) packed_offset },
+                        .k_out = { packed_fd, (int32_t) (packed_offset + qkv_size) },
+                        .v = { packed_fd, (int32_t) (packed_offset + 2 * qkv_size) },
+                        .activation = { activation_fd, (int32_t) activation_offset },
+                        .weight = { weight_fd, (int32_t) weight_offset },
+                        .bias = { bias_fd, (int32_t) bias_offset },
+                        .q_norm = { qnorm_fd, (int32_t) qnorm_offset },
+                        .k_norm = { knorm_fd, (int32_t) knorm_offset },
+                        .tokens = tokens, .input_dim = input_dim,
+                        .n_heads = n_heads, .head_dim = head_dim, .elapsed_us = 0,
+                    };
+                    *reinterpret_cast<QkvMulRmsPackedParams *>(param_buf) = op_params;
+                    op_index = HTP_OPS_QKV_MUL_RMS_PACKED_W16A32;
+                    args_size = sizeof(op_params);
+                    dispatch_m = tokens; dispatch_k = input_dim; dispatch_n = 3 * n_heads * head_dim;
+                    break;
+                }
                 if (!is_block_sparse_score_custom(dst)) {
                     break;
                 }
