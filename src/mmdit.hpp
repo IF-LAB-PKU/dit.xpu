@@ -198,6 +198,22 @@ public:
         return {q, k, v};
     }
 
+    ggml_tensor* param(const std::string& name) const {
+        if (name == "weight" || name == "bias") {
+            auto qkv = std::dynamic_pointer_cast<Linear>(blocks.at("qkv"));
+            return qkv->get_param(name);
+        }
+        if (name == "q_norm") {
+            auto norm = std::dynamic_pointer_cast<UnaryBlock>(blocks.at("ln_q"));
+            return norm->get_param("weight");
+        }
+        if (name == "k_norm") {
+            auto norm = std::dynamic_pointer_cast<UnaryBlock>(blocks.at("ln_k"));
+            return norm->get_param("weight");
+        }
+        return nullptr;
+    }
+
     ggml_tensor* post_attention(GGMLRunnerContext* ctx, ggml_tensor* x) {
         GGML_ASSERT(!pre_only);
 
@@ -326,6 +342,25 @@ public:
             n_mods = 9;
         }
         blocks["adaLN_modulation.1"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, n_mods * hidden_size));
+    }
+
+    std::shared_ptr<SelfAttention> attention() const {
+        return std::dynamic_pointer_cast<SelfAttention>(blocks.at("attn"));
+    }
+
+    std::pair<ggml_tensor*, std::vector<ggml_tensor*>> prepare_attention_input(GGMLRunnerContext* ctx,
+                                                                                  ggml_tensor* x,
+                                                                                  ggml_tensor* c) {
+        auto norm1              = std::dynamic_pointer_cast<LayerNorm>(blocks["norm1"]);
+        auto adaLN_modulation_1 = std::dynamic_pointer_cast<Linear>(blocks["adaLN_modulation.1"]);
+        const int n_mods = self_attn ? 9 : (pre_only ? 2 : 6);
+        auto m = adaLN_modulation_1->forward(ctx, ggml_silu(ctx->ggml_ctx, c));
+        auto m_vec = ggml_ext_chunk(ctx->ggml_ctx, m, n_mods, 0);
+        auto attn_in = modulate(ctx->ggml_ctx, norm1->forward(ctx, x), m_vec[0], m_vec[1]);
+        if (pre_only) {
+            return {attn_in, {nullptr, nullptr, nullptr, nullptr, nullptr}};
+        }
+        return {attn_in, {x, m_vec[2], m_vec[3], m_vec[4], m_vec[5]}};
     }
 
     std::tuple<std::vector<ggml_tensor*>, std::vector<ggml_tensor*>, std::vector<ggml_tensor*>> pre_attention_x(GGMLRunnerContext* ctx,
@@ -518,6 +553,87 @@ public:
     }
 };
 
+struct PackedJointQkv {
+    std::vector<ggml_tensor*> qkv;
+    ggml_tensor* storage = nullptr;
+};
+
+__STATIC_INLINE__ bool mmdit_packed_qkv_enabled(const GGMLRunnerContext* ctx) {
+    return ctx != nullptr && sd_env_flag_enabled_default("SD_HTP_PACKED_ATTENTION", true) &&
+           ctx->block_sparse_attn_enabled &&
+           ctx->block_sparse_residual_mode != SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
+           sd_env_flag_enabled("SD_HTP_COMPUTE");
+}
+
+__STATIC_INLINE__ PackedJointQkv mmdit_make_packed_joint_qkv(GGMLRunnerContext* ctx,
+                                                              const std::shared_ptr<DismantledBlock>& image_block,
+                                                              const std::shared_ptr<DismantledBlock>& text_block,
+                                                              ggml_tensor* image_in,
+                                                              ggml_tensor* text_in) {
+    PackedJointQkv result;
+    if (!mmdit_packed_qkv_enabled(ctx) || image_block == nullptr || text_block == nullptr ||
+        image_in == nullptr || text_in == nullptr || image_in->ne[0] != text_in->ne[0] ||
+        image_in->ne[2] != 1 || text_in->ne[2] != 1) {
+        return result;
+    }
+    const int image_tokens = static_cast<int>(image_in->ne[1]);
+    const int text_tokens = static_cast<int>(text_in->ne[1]);
+    if (image_tokens <= 0 || text_tokens <= 0 || image_tokens % 32 != 0) {
+        return result;
+    }
+    auto image_attn = image_block->attention();
+    auto text_attn = text_block->attention();
+    if (image_attn == nullptr || text_attn == nullptr || image_attn->num_heads != 24 ||
+        text_attn->num_heads != 24 || image_attn->qk_norm != "rms" || text_attn->qk_norm != "rms") {
+        return result;
+    }
+    ggml_tensor* image_weight = image_attn->param("weight");
+    ggml_tensor* image_bias = image_attn->param("bias");
+    ggml_tensor* image_q_norm = image_attn->param("q_norm");
+    ggml_tensor* image_k_norm = image_attn->param("k_norm");
+    ggml_tensor* text_weight = text_attn->param("weight");
+    ggml_tensor* text_bias = text_attn->param("bias");
+    ggml_tensor* text_q_norm = text_attn->param("q_norm");
+    ggml_tensor* text_k_norm = text_attn->param("k_norm");
+    const auto valid_branch = [](ggml_tensor* activation, ggml_tensor* weight, ggml_tensor* bias,
+                                 ggml_tensor* q_norm, ggml_tensor* k_norm) {
+        return activation != nullptr && weight != nullptr && q_norm != nullptr &&
+               k_norm != nullptr && activation->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F16 &&
+               (bias == nullptr || (bias->type == GGML_TYPE_F32 && bias->ne[0] == 3 * 24 * 64)) &&
+               q_norm->type == GGML_TYPE_F32 && k_norm->type == GGML_TYPE_F32 &&
+               weight->ne[0] == activation->ne[0] && weight->ne[1] == 3 * 24 * 64 &&
+               q_norm->ne[0] == 64 && k_norm->ne[0] == 64 &&
+               (weight->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) != 0;
+    };
+    if (!valid_branch(image_in, image_weight, image_bias, image_q_norm, image_k_norm) ||
+        !valid_branch(text_in, text_weight, text_bias, text_q_norm, text_k_norm)) {
+        return result;
+    }
+    const int token_tiles = (image_tokens + text_tokens + 31) / 32;
+    const size_t qkv_bytes = size_t(24) * size_t(token_tiles) * size_t(2 * 1024) * sizeof(ggml_fp16_t);
+    ggml_tensor* args[] = { image_in, image_weight, image_bias, image_q_norm, image_k_norm,
+                            text_in, text_weight, text_bias, text_q_norm, text_k_norm };
+    result.storage = ggml_custom_4d(ctx->ggml_ctx, GGML_TYPE_F16,
+                                    static_cast<int64_t>(3 * qkv_bytes / sizeof(ggml_fp16_t)),
+                                    1, 1, 1, args, 10,
+                                    [](ggml_tensor*, int, int, void*) {}, 1, nullptr);
+    ggml_set_name(result.storage, "qkv_mul_rms_packed_dual");
+    const size_t head_stride = size_t(token_tiles) * size_t(2 * 1024) * sizeof(ggml_fp16_t);
+    result.qkv = {
+        ggml_view_4d(ctx->ggml_ctx, result.storage, 64, image_tokens + text_tokens, 24, 1,
+                     sizeof(ggml_fp16_t), 64 * sizeof(ggml_fp16_t), head_stride, 0),
+        ggml_view_4d(ctx->ggml_ctx, result.storage, 64, image_tokens + text_tokens, 24, 1,
+                     sizeof(ggml_fp16_t), 64 * sizeof(ggml_fp16_t), head_stride, qkv_bytes),
+        ggml_view_4d(ctx->ggml_ctx, result.storage, 64, image_tokens + text_tokens, 24, 1,
+                     sizeof(ggml_fp16_t), 64 * sizeof(ggml_fp16_t), head_stride, 2 * qkv_bytes),
+    };
+    for (ggml_tensor* tensor : result.qkv) {
+        tensor->op = GGML_OP_NONE;
+        tensor->type = GGML_TYPE_F16;
+    }
+    return result;
+}
+
 __STATIC_INLINE__ std::pair<ggml_tensor*, ggml_tensor*>
 block_mixing(GGMLRunnerContext* ctx,
              ggml_tensor* context,
@@ -528,25 +644,42 @@ block_mixing(GGMLRunnerContext* ctx,
     // context: [N, n_context, hidden_size]
     // x: [N, n_token, hidden_size]
     // c: [N, hidden_size]
-    auto context_qkv_intermediates = context_block->pre_attention(ctx, context, c);
-    auto context_qkv               = context_qkv_intermediates.first;
-    auto context_intermediates     = context_qkv_intermediates.second;
-
     std::vector<ggml_tensor*> x_qkv, x_qkv2, x_intermediates;
+    std::vector<ggml_tensor*> context_qkv, context_intermediates;
+    PackedJointQkv packed_joint;
 
     if (x_block->self_attn) {
+        auto context_qkv_intermediates = context_block->pre_attention(ctx, context, c);
+        context_qkv                    = context_qkv_intermediates.first;
+        context_intermediates           = context_qkv_intermediates.second;
         auto x_qkv_intermediates = x_block->pre_attention_x(ctx, x, c);
         x_qkv                    = std::get<0>(x_qkv_intermediates);
         x_qkv2                   = std::get<1>(x_qkv_intermediates);
         x_intermediates          = std::get<2>(x_qkv_intermediates);
     } else {
-        auto x_qkv_intermediates = x_block->pre_attention(ctx, x, c);
-        x_qkv                    = x_qkv_intermediates.first;
-        x_intermediates          = x_qkv_intermediates.second;
+        auto context_prepared = context_block->prepare_attention_input(ctx, context, c);
+        auto x_prepared       = x_block->prepare_attention_input(ctx, x, c);
+        packed_joint = mmdit_make_packed_joint_qkv(ctx, x_block, context_block,
+                                                   x_prepared.first, context_prepared.first);
+        if (packed_joint.storage != nullptr) {
+            context_intermediates = context_prepared.second;
+            x_intermediates       = x_prepared.second;
+        } else {
+            auto context_attn = context_block->attention();
+            auto x_attn = x_block->attention();
+            context_qkv = context_attn->pre_attention(ctx, context_prepared.first);
+            context_intermediates = context_prepared.second;
+            x_qkv = x_attn->pre_attention(ctx, x_prepared.first);
+            x_intermediates = x_prepared.second;
+        }
     }
     std::vector<ggml_tensor*> qkv;
-    for (int i = 0; i < 3; i++) {
-        qkv.push_back(ggml_concat(ctx->ggml_ctx, x_qkv[i], context_qkv[i], 1));
+    if (packed_joint.storage != nullptr) {
+        qkv = packed_joint.qkv;
+    } else {
+        for (int i = 0; i < 3; i++) {
+            qkv.push_back(ggml_concat(ctx->ggml_ctx, x_qkv[i], context_qkv[i], 1));
+        }
     }
 
     auto attn = mmdit_residual_attention(ctx,
@@ -857,7 +990,9 @@ public:
         x                = ggml_add(ctx->ggml_ctx, patch_embed, pos_embed);  // [N, H*W, hidden_size]
         const int64_t token_h = (H + patch_size - 1) / patch_size;
         const int64_t token_w = (W + patch_size - 1) / patch_size;
-        const bool patch_major_layout_enabled = ctx->block_sparse_attn_enabled;
+        const bool patch_major_layout_enabled = sd_htp_patch_major_layout_enabled(
+            ctx->block_sparse_attn_enabled,
+            ctx->block_sparse_residual_mode);
         const bool block_sparse_step_shift_enabled = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_STEP_SHIFT");
         int block_sparse_shift_y = ctx->block_sparse_attn_enabled ?
             sd_htp_block_sparse_step_shift(block_sparse_step_shift_enabled, block_sparse_step_index) :

@@ -693,6 +693,15 @@ static void test_block_sparse_residual_mode_policy() {
     std::printf("[PASS] block sparse residual mode policy\n");
 }
 
+static void test_patch_major_layout_policy() {
+    GGML_ASSERT(!sd_htp_patch_major_layout_enabled(false, SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF));
+    GGML_ASSERT(!sd_htp_patch_major_layout_enabled(false, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY));
+    GGML_ASSERT(sd_htp_patch_major_layout_enabled(false, SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR));
+    GGML_ASSERT(sd_htp_patch_major_layout_enabled(true, SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF));
+
+    std::printf("[PASS] patch-major layout policy\n");
+}
+
 static void test_block_sparse_residual_warmup_anchor_policy() {
     GGML_ASSERT(!sd_htp_block_sparse_warmup_residual_anchor_step(0, 4, 20, 4));
     GGML_ASSERT(!sd_htp_block_sparse_warmup_residual_anchor_step(3, 4, 20, 4));
@@ -1812,6 +1821,7 @@ int main() {
     test_direct_32_token_halo_policy();
     test_block_sparse_dense_interval_policy();
     test_block_sparse_residual_mode_policy();
+    test_patch_major_layout_policy();
     test_block_sparse_residual_warmup_anchor_policy();
     test_block_sparse_residual_anchor_has_sparse_consumer_policy();
     test_block_sparse_residual_cache_key_policy();

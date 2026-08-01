@@ -141,6 +141,11 @@ enum sd_htp_block_sparse_residual_mode {
     SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR = 2,
 };
 
+__STATIC_INLINE__ bool sd_htp_patch_major_layout_enabled(bool sparse_attn_enabled,
+                                                          int residual_mode) {
+    return sparse_attn_enabled || residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR;
+}
+
 __STATIC_INLINE__ sd_htp_block_sparse_residual_mode sd_htp_block_sparse_residual_mode(bool enabled,
                                                                                       bool periodic_dense,
                                                                                       int sparse_step_index) {
@@ -2184,6 +2189,19 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                       const std::function<void(const std::string&, ggml_tensor*)>* block_sparse_cache_tensor = nullptr,
                                                       int block_sparse_token_h = 0,
                                                       int block_sparse_token_w = 0) {  // avoid overflow
+    auto packed_qkv_storage = [](ggml_tensor* tensor) -> ggml_tensor* {
+        for (int depth = 0; tensor != nullptr && depth < 8; ++depth) {
+            if (tensor->name[0] != '\0' && std::strcmp(tensor->name, "qkv_mul_rms_packed_dual") == 0) {
+                return tensor;
+            }
+            tensor = tensor->view_src;
+        }
+        return nullptr;
+    };
+    ggml_tensor* packed_qkv = packed_qkv_storage(q);
+    const bool packed_layout = packed_qkv != nullptr && packed_qkv_storage(k) == packed_qkv &&
+                               packed_qkv_storage(v) == packed_qkv &&
+                               sd_env_flag_enabled_default("SD_HTP_PACKED_ATTENTION", true);
     int64_t L_q;
     int64_t L_k;
     int64_t C;
@@ -2193,7 +2211,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
     ggml_tensor* q_htp_flash = nullptr;
     ggml_tensor* k_htp_flash_base = nullptr;
     ggml_tensor* v_htp_flash_base = nullptr;
-    if (!skip_reshape) {
+    if (!skip_reshape && !packed_layout) {
         L_q       = q->ne[1];
         L_k       = k->ne[1];
         C         = q->ne[0];
@@ -2316,6 +2334,20 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         if (!with_lse && kv_scale != 1.0f) {
             out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
         }
+        return out;
+    };
+
+    auto build_packed_kqv = [&](ggml_tensor* mask_in, bool with_lse = false) -> ggml_tensor* {
+        if (!packed_layout || q->type != GGML_TYPE_F16 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) {
+            return nullptr;
+        }
+        if (mask_in != nullptr && mask_in->type != GGML_TYPE_I32) {
+            return nullptr;
+        }
+        ggml_tensor* out = with_lse ? ggml_flash_attn_ext_with_lse(ctx, q, k, v, mask_in, scale, 0, 0)
+                                    : ggml_flash_attn_ext(ctx, q, k, v, mask_in, scale, 0, 0);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "packed_sparse_attention");
         return out;
     };
 
@@ -2507,7 +2539,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                 block_sparse_residual_cache_name != nullptr &&
                 block_sparse_cache_tensor != nullptr &&
                 *block_sparse_cache_tensor;
-            const bool sparse_with_lse = anchor_can_cache_residual && can_cache_exact_rho;
+            const bool sparse_with_lse = packed_layout || (anchor_can_cache_residual && can_cache_exact_rho);
             ggml_tensor* dense_candidate = nullptr;
             ggml_tensor* dense_lse = nullptr;
             bool candidate_is_htp_layout = false;
@@ -2526,7 +2558,10 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             }
 
             ggml_tensor* candidate = nullptr;
-            if (dense_candidate != nullptr && candidate_is_htp_layout) {
+            if (packed_layout) {
+                candidate = build_packed_kqv(block_mask, sparse_with_lse);
+                candidate_is_htp_layout = false;
+            } else if (dense_candidate != nullptr && candidate_is_htp_layout) {
                 candidate = ggml_flash_attn_ext_with_lse(
                     ctx,
                     dense_candidate->src[0],
@@ -2696,6 +2731,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             if (kqv == nullptr) {
                 const bool htp_dense_candidate = use_htp_flash_layout && sd_env_flag_enabled("SD_HTP_ATTENTION");
                 kqv = htp_dense_candidate ? build_htp_kqv(mask) : nullptr;
+                if (kqv == nullptr && packed_layout) {
+                    kqv = build_packed_kqv(mask);
+                }
                 if (kqv == nullptr) {
                     kqv = build_kqv(q, k, v, mask);
                 }
@@ -5250,10 +5288,22 @@ protected:
         return ggml_backend_supports_op(htp_backend, node);
     }
 
+    bool is_htp_supported_packed_qkv(ggml_tensor* node) const {
+        if (!htp_op_routing_enabled() || !htp_attention_enabled || node == nullptr ||
+            node->op != GGML_OP_CUSTOM ||
+            std::strcmp(node->name, "qkv_mul_rms_packed_dual") != 0) {
+            return false;
+        }
+        return ggml_backend_supports_op(htp_backend, node);
+    }
+
     // 当前阶段把 diffusion 里的 F16 matmul、score、以及 dense/block-sparse flash attention 纳入 HTP 自动路由。
     bool is_htp_target_op(ggml_tensor* node) const {
         if (!htp_op_routing_enabled() || node == nullptr) {
             return false;
+        }
+        if (is_htp_supported_packed_qkv(node)) {
+            return true;
         }
         if (is_htp_supported_block_sparse_score(node)) {
             return true;
@@ -5279,6 +5329,9 @@ protected:
     bool should_place_param_in_htp_rpcmem(ggml_tensor* tensor) const {
         if (!htp_op_routing_enabled() || !sd_env_flag_enabled("SD_HTP_COMPUTE") || htp_backend == nullptr || tensor == nullptr) {
             return false;
+        }
+        if ((tensor->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_QKV_PARAM) != 0) {
+            return tensor->view_src == nullptr && tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor);
         }
         // packed GGUF 里这类权重已经是 HTP kernel 需要的 W16A32 布局，不能留在普通 CPU buffer；
         // 直接放进 RPCMEM 后，HTP matmul 可以把原 tensor 本体当作 packed weight 使用。
@@ -5650,10 +5703,20 @@ protected:
                     continue;
                 }
 
-                const bool routed_to_htp = j == 0 &&
-                                           node->op == GGML_OP_MUL_MAT &&
-                                           src == node->src[0] &&
-                                           is_htp_target_op(node);
+                const bool routed_to_htp_matmul = j == 0 &&
+                                                   node->op == GGML_OP_MUL_MAT &&
+                                                   src == node->src[0] &&
+                                                   is_htp_target_op(node);
+                // The dual packed QKV custom node consumes two offline-packed
+                // weights at src[1] and src[6]. They are HTP inputs, not
+                // row-major CPU consumers, so keep them in the packed-only
+                // placement contract.
+                const bool routed_to_htp_dual_qkv =
+                    node->op == GGML_OP_CUSTOM &&
+                    std::strcmp(node->name, "qkv_mul_rms_packed_dual") == 0 &&
+                    (j == 1 || j == 6) &&
+                    is_htp_target_op(node);
+                const bool routed_to_htp = routed_to_htp_matmul || routed_to_htp_dual_qkv;
                 if (routed_to_htp) {
                     continue;
                 }
@@ -6959,11 +7022,28 @@ protected:
     virtual void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") {}
 
 public:
+    ggml_tensor* get_param(const std::string& name) const {
+        auto it = params.find(name);
+        return it != params.end() ? it->second : nullptr;
+    }
+
     void init(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, std::string prefix = "") {
         if (prefix.size() > 0) {
             prefix = prefix + ".";
         }
         init_params(ctx, tensor_storage_map, prefix);
+        // Mark dual packed QKV's F32 bias and RMSNorm scales before parameter
+        // placement, so they are allocated in RPCMEM with the packed weights.
+        const bool packed_qkv_param_prefix = prefix.find("attn.qkv.") != std::string::npos ||
+                                             prefix.find("attn.ln_q.") != std::string::npos ||
+                                             prefix.find("attn.ln_k.") != std::string::npos;
+        if (packed_qkv_param_prefix) {
+            for (auto& pair : params) {
+                if (pair.second != nullptr && pair.second->type == GGML_TYPE_F32) {
+                    pair.second->flags |= SD_GGML_TENSOR_FLAG_HTP_PACKED_QKV_PARAM;
+                }
+            }
+        }
         init_blocks(ctx, tensor_storage_map, prefix);
     }
 
