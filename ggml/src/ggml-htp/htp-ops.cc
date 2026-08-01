@@ -263,6 +263,24 @@ bool is_qkv_mul_rms_packed_custom(const ggml_tensor * dst) {
            dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1;
 }
 
+bool is_qkv_mul_rms_packed_dual_custom(const ggml_tensor * dst) {
+    if (dst == nullptr || dst->op != GGML_OP_CUSTOM ||
+        std::strcmp(dst->name, "qkv_mul_rms_packed_dual") != 0 ||
+        dst->type != GGML_TYPE_F16 || dst->ne[1] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return false;
+    }
+    for (int i = 0; i < 10; ++i) {
+        if (dst->src[i] == nullptr && i != 2 && i != 7) return false;
+    }
+    for (int i = 0; i < 10; ++i) {
+        const ggml_tensor * src = dst->src[i];
+        if (src == nullptr) continue;
+        if ((i == 1 || i == 6) && src->type != GGML_TYPE_F16) return false;
+        if (i != 1 && i != 6 && src->type != GGML_TYPE_F32) return false;
+    }
+    return true;
+}
+
 bool is_packed_sparse_attention(const ggml_tensor * dst) {
     return dst != nullptr && dst->op == GGML_OP_FLASH_ATTN_EXT &&
            std::strcmp(dst->name, "packed_sparse_attention") == 0;
@@ -281,6 +299,8 @@ const char * htp_op_index_name(int op_index) {
             return "HTP_OPS_MAT_MUL_PERMUTED_W16A32";
         case HTP_OPS_QKV_MUL_RMS_PACKED_W16A32:
             return "HTP_OPS_QKV_MUL_RMS_PACKED_W16A32";
+        case HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_W16A32:
+            return "HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_W16A32";
         case HTP_OPS_MAT_MUL_PERMUTED_W4D16A32:
             return "HTP_OPS_MAT_MUL_PERMUTED_W4D16A32";
         case HTP_OPS_MAT_MUL_PERMUTED_W8D16A32:
@@ -443,6 +463,19 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                        mask_format_ok && shape_ok && max_bias == 0 && logit_softcap == 0;
             }
         case GGML_OP_CUSTOM:
+            if (is_qkv_mul_rms_packed_dual_custom(dst)) {
+                const ggml_tensor * image_activation = dst->src[0];
+                const ggml_tensor * text_activation = dst->src[5];
+                const ggml_tensor * image_weight = dst->src[1];
+                const ggml_tensor * text_weight = dst->src[6];
+                return image_activation->ne[0] == text_activation->ne[0] &&
+                       image_activation->ne[0] % 32 == 0 &&
+                       image_weight->ne[0] == image_activation->ne[0] &&
+                       text_weight->ne[0] == text_activation->ne[0] &&
+                       image_weight->ne[1] == 3 * 24 * 64 &&
+                       text_weight->ne[1] == 3 * 24 * 64 &&
+                       dst->ne[0] > 0;
+            }
             if (is_qkv_mul_rms_packed_custom(dst)) {
                 const ggml_tensor * activation = dst->src[0];
                 const ggml_tensor * weight = dst->src[1];
@@ -466,6 +499,19 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
             if (!tensor_ready_for_htp_dispatch_view_backed(dst->src[i])) return false;
         }
         return tensor_ready_for_htp_dispatch_view_backed(dst);
+    }
+
+    if (is_qkv_mul_rms_packed_dual_custom(dst)) {
+        for (int i = 0; i < 10; ++i) {
+            if (dst->src[i] == nullptr) continue;
+            if (!tensor_ready_for_htp_dispatch_view_backed(dst->src[i])) {
+                return false;
+            }
+        }
+        if (!tensor_ready_for_htp_dispatch_view_backed(dst)) {
+            return false;
+        }
+        return true;
     }
 
     if (dst->op == GGML_OP_FLASH_ATTN_EXT) {
@@ -1528,6 +1574,47 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
 
         case GGML_OP_CUSTOM:
             {
+                if (is_qkv_mul_rms_packed_dual_custom(dst)) {
+                    prepare_tensor_rpcmem_mapping_with_extra(dst, dst->src[0]);
+                    const auto & mapper = ggml_backend_htp_context::instance()->mapper;
+                    std::vector<std::pair<int, ssize_t>> mappings;
+                    mappings.push_back(mapper.get_tensor_mapping(dst));
+                    for (int i = 0; i < 10; ++i) {
+                        mappings.push_back(dst->src[i] != nullptr ? mapper.get_tensor_mapping(dst->src[i]) : std::make_pair(-1, (ssize_t) 0));
+                    }
+                    const int image_tokens = (int) dst->src[0]->ne[1];
+                    const int text_tokens = (int) dst->src[5]->ne[1];
+                    const int input_dim = (int) dst->src[0]->ne[0];
+                    const int head_dim = 64;
+                    const int n_heads = 24;
+                    const size_t token_tiles = (size_t) (image_tokens + text_tokens + 31) / 32;
+                    const size_t qkv_size = (size_t) n_heads * token_tiles * (head_dim / 32) * 1024 * sizeof(uint16_t);
+                    auto [packed_fd, packed_offset] = mappings[0];
+                    QkvMulRmsPackedDualParams op_params{
+                        .q = { packed_fd, (int32_t) packed_offset },
+                        .k_out = { packed_fd, (int32_t) (packed_offset + qkv_size) },
+                        .v = { packed_fd, (int32_t) (packed_offset + 2 * qkv_size) },
+                        .image_activation = { mappings[1].first, (int32_t) mappings[1].second },
+                        .image_weight = { mappings[2].first, (int32_t) mappings[2].second },
+                        .image_bias = { mappings[3].first, (int32_t) mappings[3].second },
+                        .image_q_norm = { mappings[4].first, (int32_t) mappings[4].second },
+                        .image_k_norm = { mappings[5].first, (int32_t) mappings[5].second },
+                        .text_activation = { mappings[6].first, (int32_t) mappings[6].second },
+                        .text_weight = { mappings[7].first, (int32_t) mappings[7].second },
+                        .text_bias = { mappings[8].first, (int32_t) mappings[8].second },
+                        .text_q_norm = { mappings[9].first, (int32_t) mappings[9].second },
+                        .text_k_norm = { mappings[10].first, (int32_t) mappings[10].second },
+                        .image_tokens = image_tokens, .text_tokens = text_tokens,
+                        .input_dim = input_dim, .n_heads = n_heads, .head_dim = head_dim, .elapsed_us = 0,
+                    };
+                    *reinterpret_cast<QkvMulRmsPackedDualParams *>(param_buf) = op_params;
+                    op_index = HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_W16A32;
+                    args_size = sizeof(op_params);
+                    dispatch_m = image_tokens + text_tokens;
+                    dispatch_k = input_dim;
+                    dispatch_n = 3 * n_heads * head_dim;
+                    break;
+                }
                 if (is_qkv_mul_rms_packed_custom(dst)) {
                     prepare_tensor_rpcmem_mapping_with_extra(dst, dst->src[1]);
                     auto mappings = get_all_rpcmem_mappings(dst);
