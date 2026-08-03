@@ -3112,7 +3112,34 @@ static bool sd_version_supports_image_generation(SDVersion version) {
     return !sd_version_supports_video_generation(version);
 }
 
+static void sd_htp_default_opencl_dual_queue_env() {
+    if (!sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_ATTN") ||
+        !sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE") ||
+        !sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO")) {
+        return;
+    }
+    const char * opencl_route = sd_env_value("SD_HTP_SPARSE_OPENCL");
+    if (opencl_route != nullptr && std::strcmp(opencl_route, "0") == 0) {
+        return;
+    }
+
+    static constexpr const char * k_opencl_dual_queue_defaults[] = {
+        "SD_HTP_SPARSE_OPENCL",
+        "SD_HTP_SPARSE_OPENCL_ASYNC",
+        "SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT",
+        "SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD",
+        "SD_HTP_SPARSE_OPENCL_RESIDUAL",
+        "SD_HTP_SPARSE_OPENCL_DEFER_RESIDUAL",
+        "SD_HTP_SPARSE_OPENCL_RESIDUAL_QUEUE",
+    };
+    for (const char * name : k_opencl_dual_queue_defaults) {
+        setenv(name, "1", 0);
+    }
+}
+
 sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
+    sd_htp_default_opencl_dual_queue_env();
+
     sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
     if (sd_ctx == nullptr) {
         return nullptr;
