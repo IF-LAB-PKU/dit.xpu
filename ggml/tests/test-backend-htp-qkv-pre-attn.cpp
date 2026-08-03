@@ -217,7 +217,9 @@ void run_case(int resolution, int warmups, int runs) {
     const int token_h = resolution / 16;
     const int token_w = resolution / 16;
     const int image_tokens = token_h * token_w;
-    const int tokens = image_tokens + 154;
+    const bool self_graph = std::getenv("GGML_HTP_QKV_SELF_GRAPH") != nullptr &&
+                            std::strcmp(std::getenv("GGML_HTP_QKV_SELF_GRAPH"), "0") != 0;
+    const int tokens = self_graph ? image_tokens : image_tokens + 154;
     const int image_block_rows = token_h / 4;
     const int image_block_cols = token_w / 8;
     ggml_backend_htp_set_hybrid_enabled(true);
@@ -371,9 +373,10 @@ void run_case(int resolution, int warmups, int runs) {
         ? double(sorted[sorted.size() / 2])
         : 0.5 * double(sorted[sorted.size() / 2 - 1] + sorted[sorted.size() / 2]);
     const double average = double(std::accumulate(elapsed.begin(), elapsed.end(), int64_t{0})) / elapsed.size();
-    std::printf("sd35_qkv_sparse_e2e: path=%s resolution=%d tokens=%d warmups=%d runs=%d "
+    std::printf("sd35_qkv_sparse_e2e: graph=%s path=%s resolution=%d tokens=%d warmups=%d runs=%d "
                 "avg_us=%.1f median_us=%.1f min_us=%lld samples_us=",
-                packed_graph ? "packed" : "legacy", resolution, tokens, warmups, runs,
+                self_graph ? "self" : "joint", packed_graph ? "packed" : "legacy",
+                resolution, tokens, warmups, runs,
                 average, median, (long long) sorted.front());
     for (size_t i = 0; i < elapsed.size(); ++i) {
         std::printf("%s%lld", i == 0 ? "" : ",", (long long) elapsed[i]);

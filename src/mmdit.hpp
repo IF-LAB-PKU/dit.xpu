@@ -348,6 +348,11 @@ public:
         return std::dynamic_pointer_cast<SelfAttention>(blocks.at("attn"));
     }
 
+    std::shared_ptr<SelfAttention> attention2() const {
+        auto iter = blocks.find("attn2");
+        return iter == blocks.end() ? nullptr : std::dynamic_pointer_cast<SelfAttention>(iter->second);
+    }
+
     std::pair<ggml_tensor*, std::vector<ggml_tensor*>> prepare_attention_input(GGMLRunnerContext* ctx,
                                                                                   ggml_tensor* x,
                                                                                   ggml_tensor* c) {
@@ -363,15 +368,12 @@ public:
         return {attn_in, {x, m_vec[2], m_vec[3], m_vec[4], m_vec[5]}};
     }
 
-    std::tuple<std::vector<ggml_tensor*>, std::vector<ggml_tensor*>, std::vector<ggml_tensor*>> pre_attention_x(GGMLRunnerContext* ctx,
-                                                                                                                ggml_tensor* x,
-                                                                                                                ggml_tensor* c) {
+    std::tuple<ggml_tensor*, ggml_tensor*, std::vector<ggml_tensor*>> prepare_attention_x_inputs(
+        GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* c) {
         GGML_ASSERT(self_attn);
         // x: [N, n_token, hidden_size]
         // c: [N, hidden_size]
         auto norm1              = std::dynamic_pointer_cast<LayerNorm>(blocks["norm1"]);
-        auto attn               = std::dynamic_pointer_cast<SelfAttention>(blocks["attn"]);
-        auto attn2              = std::dynamic_pointer_cast<SelfAttention>(blocks["attn2"]);
         auto adaLN_modulation_1 = std::dynamic_pointer_cast<Linear>(blocks["adaLN_modulation.1"]);
 
         int n_mods = 9;
@@ -391,12 +393,19 @@ public:
         auto x_norm = norm1->forward(ctx, x);
 
         auto attn_in = modulate(ctx->ggml_ctx, x_norm, shift_msa, scale_msa);
-        auto qkv     = attn->pre_attention(ctx, attn_in);
-
         auto attn2_in = modulate(ctx->ggml_ctx, x_norm, shift_msa2, scale_msa2);
-        auto qkv2     = attn2->pre_attention(ctx, attn2_in);
+        return {attn_in, attn2_in, {x, gate_msa, shift_mlp, scale_mlp, gate_mlp, gate_msa2}};
+    }
 
-        return {qkv, qkv2, {x, gate_msa, shift_mlp, scale_mlp, gate_mlp, gate_msa2}};
+    std::tuple<std::vector<ggml_tensor*>, std::vector<ggml_tensor*>, std::vector<ggml_tensor*>> pre_attention_x(
+        GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* c) {
+        auto prepared = prepare_attention_x_inputs(ctx, x, c);
+        auto attn = attention();
+        auto attn2 = attention2();
+        GGML_ASSERT(attn != nullptr && attn2 != nullptr);
+        return {attn->pre_attention(ctx, std::get<0>(prepared)),
+                attn2->pre_attention(ctx, std::get<1>(prepared)),
+                std::get<2>(prepared)};
     }
 
     std::pair<std::vector<ggml_tensor*>, std::vector<ggml_tensor*>> pre_attention(GGMLRunnerContext* ctx,
@@ -558,6 +567,58 @@ struct PackedJointQkv {
     ggml_tensor* storage = nullptr;
 };
 
+__STATIC_INLINE__ bool mmdit_packed_qkv_enabled(const GGMLRunnerContext* ctx);
+
+__STATIC_INLINE__ PackedJointQkv mmdit_make_packed_single_qkv(
+    GGMLRunnerContext* ctx,
+    const std::shared_ptr<SelfAttention>& attention,
+    ggml_tensor* input) {
+    PackedJointQkv result;
+    if (!mmdit_packed_qkv_enabled(ctx) || attention == nullptr || input == nullptr ||
+        input->ne[2] != 1 || input->ne[1] <= 0 || input->ne[1] % 32 != 0) {
+        return result;
+    }
+    if (attention->num_heads != 24 || attention->qk_norm != "rms") {
+        return result;
+    }
+    ggml_tensor* weight = attention->param("weight");
+    ggml_tensor* bias = attention->param("bias");
+    ggml_tensor* q_norm = attention->param("q_norm");
+    ggml_tensor* k_norm = attention->param("k_norm");
+    if (input->type != GGML_TYPE_F32 || weight == nullptr || weight->type != GGML_TYPE_F16 ||
+        q_norm == nullptr || k_norm == nullptr || q_norm->type != GGML_TYPE_F32 ||
+        k_norm->type != GGML_TYPE_F32 || weight->ne[0] != input->ne[0] ||
+        weight->ne[1] != 3 * 24 * 64 || q_norm->ne[0] != 64 || k_norm->ne[0] != 64 ||
+        (bias != nullptr && (bias->type != GGML_TYPE_F32 || bias->ne[0] != 3 * 24 * 64)) ||
+        (weight->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) == 0) {
+        return result;
+    }
+
+    const int image_tokens = static_cast<int>(input->ne[1]);
+    const int token_tiles = (image_tokens + 31) / 32;
+    const size_t qkv_bytes = size_t(24) * size_t(token_tiles) * size_t(2 * 1024) * sizeof(ggml_fp16_t);
+    ggml_tensor* args[] = {input, weight, bias, q_norm, k_norm};
+    result.storage = ggml_custom_4d(ctx->ggml_ctx, GGML_TYPE_F16,
+                                    static_cast<int64_t>(3 * qkv_bytes / sizeof(ggml_fp16_t)),
+                                    1, 1, 1, args, 5,
+                                    [](ggml_tensor*, int, int, void*) {}, 1, nullptr);
+    ggml_set_name(result.storage, "qkv_mul_rms_packed");
+    const size_t head_stride = size_t(token_tiles) * size_t(2 * 1024) * sizeof(ggml_fp16_t);
+    result.qkv = {
+        ggml_view_4d(ctx->ggml_ctx, result.storage, 64, image_tokens, 24, 1,
+                     sizeof(ggml_fp16_t), 64 * sizeof(ggml_fp16_t), head_stride, 0),
+        ggml_view_4d(ctx->ggml_ctx, result.storage, 64, image_tokens, 24, 1,
+                     sizeof(ggml_fp16_t), 64 * sizeof(ggml_fp16_t), head_stride, qkv_bytes),
+        ggml_view_4d(ctx->ggml_ctx, result.storage, 64, image_tokens, 24, 1,
+                     sizeof(ggml_fp16_t), 64 * sizeof(ggml_fp16_t), head_stride, 2 * qkv_bytes),
+    };
+    for (ggml_tensor* tensor : result.qkv) {
+        tensor->op = GGML_OP_NONE;
+        tensor->type = GGML_TYPE_F16;
+    }
+    return result;
+}
+
 __STATIC_INLINE__ bool mmdit_packed_qkv_enabled(const GGMLRunnerContext* ctx) {
     return ctx != nullptr && sd_env_flag_enabled_default("SD_HTP_PACKED_ATTENTION", true) &&
            ctx->block_sparse_attn_enabled &&
@@ -647,15 +708,28 @@ block_mixing(GGMLRunnerContext* ctx,
     std::vector<ggml_tensor*> x_qkv, x_qkv2, x_intermediates;
     std::vector<ggml_tensor*> context_qkv, context_intermediates;
     PackedJointQkv packed_joint;
+    PackedJointQkv packed_self2;
 
     if (x_block->self_attn) {
-        auto context_qkv_intermediates = context_block->pre_attention(ctx, context, c);
-        context_qkv                    = context_qkv_intermediates.first;
-        context_intermediates           = context_qkv_intermediates.second;
-        auto x_qkv_intermediates = x_block->pre_attention_x(ctx, x, c);
-        x_qkv                    = std::get<0>(x_qkv_intermediates);
-        x_qkv2                   = std::get<1>(x_qkv_intermediates);
-        x_intermediates          = std::get<2>(x_qkv_intermediates);
+        auto context_prepared = context_block->prepare_attention_input(ctx, context, c);
+        auto x_prepared = x_block->prepare_attention_x_inputs(ctx, x, c);
+        ggml_tensor* x_joint_in = std::get<0>(x_prepared);
+        ggml_tensor* x_self2_in = std::get<1>(x_prepared);
+        context_intermediates = context_prepared.second;
+        x_intermediates = std::get<2>(x_prepared);
+
+        packed_joint = mmdit_make_packed_joint_qkv(
+            ctx, x_block, context_block, x_joint_in, context_prepared.first);
+        if (packed_joint.storage == nullptr) {
+            context_qkv = context_block->attention()->pre_attention(ctx, context_prepared.first);
+            x_qkv = x_block->attention()->pre_attention(ctx, x_joint_in);
+        }
+
+        auto self2_attention = x_block->attention2();
+        GGML_ASSERT(self2_attention != nullptr);
+        packed_self2 = mmdit_make_packed_single_qkv(ctx, self2_attention, x_self2_in);
+        x_qkv2 = packed_self2.storage != nullptr ?
+            packed_self2.qkv : self2_attention->pre_attention(ctx, x_self2_in);
     } else {
         auto context_prepared = context_block->prepare_attention_input(ctx, context, c);
         auto x_prepared       = x_block->prepare_attention_input(ctx, x, c);
@@ -719,7 +793,12 @@ block_mixing(GGMLRunnerContext* ctx,
     }
 
     if (x_block->self_attn) {
-        auto attn2 = mmdit_residual_attention(ctx, x_qkv2, x_block->num_heads, "self2");  // [N, n_token, hidden_size]
+        auto attn2 = mmdit_residual_attention(ctx,
+                                              x_qkv2,
+                                              x_block->num_heads,
+                                              "self2",
+                                              0,
+                                              0);  // [N, n_token, hidden_size]
 
         x = x_block->post_attention_x(ctx,
                                       x_attn,
