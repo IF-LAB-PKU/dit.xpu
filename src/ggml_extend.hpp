@@ -2191,7 +2191,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                       int block_sparse_token_w = 0) {  // avoid overflow
     auto packed_qkv_storage = [](ggml_tensor* tensor) -> ggml_tensor* {
         for (int depth = 0; tensor != nullptr && depth < 8; ++depth) {
-            if (tensor->name[0] != '\0' && std::strcmp(tensor->name, "qkv_mul_rms_packed_dual") == 0) {
+            if (tensor->name[0] != '\0' &&
+                (std::strcmp(tensor->name, "qkv_mul_rms_packed") == 0 ||
+                 std::strcmp(tensor->name, "qkv_mul_rms_packed_dual") == 0)) {
                 return tensor;
             }
             tensor = tensor->view_src;
@@ -2465,6 +2467,14 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                                              static_cast<int>(n_kv_head),
                                                                              block_sparse_center_sink);
                 block_mask_format = GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX;
+                const int64_t image_tokens = static_cast<int64_t>(block_sparse_token_h) *
+                                             block_sparse_token_w;
+                const bool image_only_halo = protected_start == 0 && protected_len == 0 &&
+                                             L_q == image_tokens && L_k == image_tokens;
+                const bool joint_halo = protected_start == image_tokens && protected_len > 0 &&
+                                        L_q == protected_start + protected_len &&
+                                        L_k == protected_start + protected_len &&
+                                        protected_start % SD_HTP_BLOCK_SPARSE_MASK_BLOCK == 0;
                 block_sparse_static_halo = !block_sparse_center_sink &&
                                            block_sparse_token_h > 0 &&
                                            block_sparse_token_w > 0 &&
@@ -2473,13 +2483,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                            n_head > 0 &&
                                            n_kv_head > 0 &&
                                            n_head % n_kv_head == 0 &&
-                                           protected_start == static_cast<int64_t>(block_sparse_token_h) *
-                                                                  block_sparse_token_w &&
-                                           protected_len > 0 &&
-                                           L_q == protected_start + protected_len &&
-                                           L_k == protected_start + protected_len &&
-                                           protected_start > 0 &&
-                                           protected_start % SD_HTP_BLOCK_SPARSE_MASK_BLOCK == 0;
+                                           (image_only_halo || joint_halo);
             } else if (!sd_htp_block_sparse_score_enabled(block_sparse_keep_ratio)) {
                 if (block_sparse_center_sink) {
                     block_mask = ggml_ext_block_sparse_structural_index_32_node(ctx,
@@ -2582,9 +2586,10 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             GGML_ASSERT(block_mask_format != GGML_FLASH_ATTN_EXT_MASK_DEFAULT);
             ggml_flash_attn_ext_set_block_sparse(candidate, block_q, block_k, block_mask_format);
             if (block_sparse_static_halo) {
+                const int image_tokens = block_sparse_token_h * block_sparse_token_w;
                 ggml_flash_attn_ext_set_static_halo_2d(candidate,
-                                                       protected_start,
-                                                       protected_len,
+                                                       image_tokens,
+                                                       protected_len > 0 ? protected_len : 0,
                                                        block_sparse_token_h / 4,
                                                        block_sparse_token_w / 8);
             }
@@ -5291,7 +5296,8 @@ protected:
     bool is_htp_supported_packed_qkv(ggml_tensor* node) const {
         if (!htp_op_routing_enabled() || !htp_attention_enabled || node == nullptr ||
             node->op != GGML_OP_CUSTOM ||
-            std::strcmp(node->name, "qkv_mul_rms_packed_dual") != 0) {
+            (std::strcmp(node->name, "qkv_mul_rms_packed") != 0 &&
+             std::strcmp(node->name, "qkv_mul_rms_packed_dual") != 0)) {
             return false;
         }
         return ggml_backend_supports_op(htp_backend, node);
@@ -5711,12 +5717,12 @@ protected:
                 // weights at src[1] and src[6]. They are HTP inputs, not
                 // row-major CPU consumers, so keep them in the packed-only
                 // placement contract.
-                const bool routed_to_htp_dual_qkv =
+                const bool routed_to_htp_packed_qkv =
                     node->op == GGML_OP_CUSTOM &&
-                    std::strcmp(node->name, "qkv_mul_rms_packed_dual") == 0 &&
-                    (j == 1 || j == 6) &&
+                    ((std::strcmp(node->name, "qkv_mul_rms_packed_dual") == 0 && (j == 1 || j == 6)) ||
+                     (std::strcmp(node->name, "qkv_mul_rms_packed") == 0 && j == 1)) &&
                     is_htp_target_op(node);
-                const bool routed_to_htp = routed_to_htp_matmul || routed_to_htp_dual_qkv;
+                const bool routed_to_htp = routed_to_htp_matmul || routed_to_htp_packed_qkv;
                 if (routed_to_htp) {
                     continue;
                 }
@@ -7036,7 +7042,10 @@ public:
         // placement, so they are allocated in RPCMEM with the packed weights.
         const bool packed_qkv_param_prefix = prefix.find("attn.qkv.") != std::string::npos ||
                                              prefix.find("attn.ln_q.") != std::string::npos ||
-                                             prefix.find("attn.ln_k.") != std::string::npos;
+                                             prefix.find("attn.ln_k.") != std::string::npos ||
+                                             prefix.find("attn2.qkv.") != std::string::npos ||
+                                             prefix.find("attn2.ln_q.") != std::string::npos ||
+                                             prefix.find("attn2.ln_k.") != std::string::npos;
         if (packed_qkv_param_prefix) {
             for (auto& pair : params) {
                 if (pair.second != nullptr && pair.second->type == GGML_TYPE_F32) {
