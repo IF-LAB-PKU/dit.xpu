@@ -1353,10 +1353,11 @@ static void test_static_halo_characterization(AttentionRunner & runner,
                                               int token_h = 16,
                                               int token_w = 32,
                                               bool pass_static_grid = true,
-                                              bool malformed_head1 = false) {
+                                              bool malformed_head1 = false,
+                                              int text_tokens = 154) {
     GGML_ASSERT(token_h > 0 && token_w > 0 && token_h % 4 == 0 && token_w % 8 == 0);
     const int image_tokens = token_h * token_w;
-    constexpr int text_tokens = 154;
+    GGML_ASSERT(text_tokens > 0);
     const int seq_len = image_tokens + text_tokens;
     const int n_kv_heads = n_heads;
     constexpr int block_size = SD_HTP_BLOCK_SPARSE_MASK_BLOCK;
@@ -2557,6 +2558,8 @@ static const NamedTestCase named_test_cases[] = {
     {"static-halo-userdma-2h", true},
     {"static-halo-userdma-mixed-fallback", true},
     {"static-halo-userdma-d128", true},
+    {"flux2-static-halo-l2-d128", true},
+    {"flux2-static-halo-userdma-d128", true},
     {"static-halo-userdma-6x4", true},
     {"static-halo-userdma-5x3", true},
     {"static-halo-userdma-fallback", true},
@@ -2684,6 +2687,10 @@ int main(int argc, char ** argv) {
         test_static_halo_characterization(runner, "userdma", 2, 64, 16, 32, true, true);
     } else if (selected_case == "static-halo-userdma-d128") {
         test_static_halo_characterization(runner, "userdma", 1, 128);
+    } else if (selected_case == "flux2-static-halo-l2-d128") {
+        test_static_halo_characterization(runner, "l2fetch", 24, 128, 16, 16, true, false, 512);
+    } else if (selected_case == "flux2-static-halo-userdma-d128") {
+        test_static_halo_characterization(runner, "userdma", 24, 128, 16, 16, true, false, 512);
     } else if (selected_case == "static-halo-userdma-6x4") {
         test_static_halo_characterization(runner, "userdma", 1, 64, 24, 32);
     } else if (selected_case == "static-halo-userdma-5x3") {

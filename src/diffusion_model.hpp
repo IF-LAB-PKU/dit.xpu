@@ -294,6 +294,18 @@ struct FluxModel : public DiffusionModel {
         flux.set_htp_backend(backend);
     }
 
+    void set_block_sparse_attention_enabled(bool enabled) override {
+        flux.set_block_sparse_attention_enabled(enabled);
+    }
+
+    bool is_block_sparse_attention_enabled() const override {
+        return flux.is_block_sparse_attention_enabled();
+    }
+
+    void set_htp_attention_enabled(bool enabled) override {
+        flux.set_htp_attention_enabled(enabled);
+    }
+
     int64_t get_adm_in_channels() override {
         return 768;
     }
@@ -325,7 +337,12 @@ struct FluxModel : public DiffusionModel {
                             tensor_or_empty(diffusion_params.guidance),
                             diffusion_params.ref_latents ? *diffusion_params.ref_latents : empty_ref_latents,
                             diffusion_params.increase_ref_index,
-                            diffusion_params.skip_layers ? *diffusion_params.skip_layers : empty_skip_layers);
+                            diffusion_params.skip_layers ? *diffusion_params.skip_layers : empty_skip_layers,
+                            diffusion_params.block_sparse_residual_mode,
+                            diffusion_params.block_sparse_residual_scale,
+                            diffusion_params.block_sparse_residual_rho,
+                            diffusion_params.block_sparse_residual_exact_rho,
+                            diffusion_params.block_sparse_residual_branch_index);
     }
 };
 

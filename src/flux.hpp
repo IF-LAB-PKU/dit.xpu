@@ -80,6 +80,16 @@ namespace Flux {
             x = norm->forward(ctx, x);
             return x;
         }
+
+        ggml_tensor* param(const std::string& name) const {
+            const char* block_name = name == "q_norm" ? "query_norm" :
+                                     (name == "k_norm" ? "key_norm" : nullptr);
+            if (block_name == nullptr) {
+                return nullptr;
+            }
+            auto norm = std::dynamic_pointer_cast<RMSNorm>(blocks.at(block_name));
+            return norm->get_param("scale");
+        }
     };
 
     struct SelfAttention : public GGMLBlock {
@@ -115,6 +125,21 @@ namespace Flux {
             return {q, k, v};
         }
 
+        ggml_tensor* param(const std::string& name) const {
+            if (name == "weight" || name == "bias") {
+                auto qkv = std::dynamic_pointer_cast<Linear>(blocks.at("qkv"));
+                return qkv->get_param(name);
+            }
+            auto norm = std::dynamic_pointer_cast<QKNorm>(blocks.at("norm"));
+            if (name == "q_norm") {
+                return norm->param(name);
+            }
+            if (name == "k_norm") {
+                return norm->param(name);
+            }
+            return nullptr;
+        }
+
         ggml_tensor* post_attention(GGMLRunnerContext* ctx, ggml_tensor* x) {
             auto proj = std::dynamic_pointer_cast<Linear>(blocks["proj"]);
 
@@ -135,6 +160,204 @@ namespace Flux {
             return x;
         }
     };
+
+    struct PackedRopeQkv {
+        std::vector<ggml_tensor*> qkv;
+        ggml_tensor* storage = nullptr;
+    };
+
+    __STATIC_INLINE__ bool packed_flux2_context_enabled(const GGMLRunnerContext* ctx,
+                                                         int image_tokens,
+                                                         int text_tokens,
+                                                         ggml_tensor* pe) {
+        return ctx != nullptr && sd_env_flag_enabled("SD_HTP_PACKED_FLUX2") &&
+               sd_env_flag_enabled_default("SD_HTP_PACKED_ATTENTION", true) &&
+               sd_env_flag_enabled("SD_HTP_COMPUTE") && ctx->block_sparse_attn_enabled &&
+               ctx->block_sparse_residual_mode != SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
+               image_tokens > 0 && image_tokens % 32 == 0 && text_tokens > 0 &&
+               ctx->block_sparse_token_h > 0 && ctx->block_sparse_token_w > 0 &&
+               ctx->block_sparse_token_h % 4 == 0 && ctx->block_sparse_token_w % 8 == 0 &&
+               ctx->block_sparse_token_h * ctx->block_sparse_token_w == image_tokens &&
+               pe != nullptr && pe->type == GGML_TYPE_F32 && pe->ne[0] == 2 && pe->ne[1] == 2 &&
+               pe->ne[2] == 64 && pe->ne[3] >= image_tokens + text_tokens;
+    }
+
+    __STATIC_INLINE__ bool packed_flux2_qkv_branch_valid(ggml_tensor* activation,
+                                                          ggml_tensor* weight,
+                                                          ggml_tensor* bias,
+                                                          ggml_tensor* q_norm,
+                                                          ggml_tensor* k_norm) {
+        constexpr int n_heads = 24;
+        constexpr int head_dim = 128;
+        constexpr int qkv_dim = 3 * n_heads * head_dim;
+        return activation != nullptr && activation->type == GGML_TYPE_F32 && activation->ne[2] == 1 &&
+               weight != nullptr && weight->type == GGML_TYPE_F16 && weight->ne[0] == activation->ne[0] &&
+               weight->ne[1] == qkv_dim &&
+               (weight->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) != 0 &&
+               (bias == nullptr || (bias->type == GGML_TYPE_F32 && bias->ne[0] == qkv_dim)) &&
+               q_norm != nullptr && q_norm->type == GGML_TYPE_F32 && q_norm->ne[0] == head_dim &&
+               k_norm != nullptr && k_norm->type == GGML_TYPE_F32 && k_norm->ne[0] == head_dim;
+    }
+
+    __STATIC_INLINE__ PackedRopeQkv make_packed_flux2_qkv_views(GGMLRunnerContext* ctx,
+                                                                 ggml_tensor* storage,
+                                                                 int tokens) {
+        PackedRopeQkv result;
+        result.storage = storage;
+        constexpr int n_heads = 24;
+        constexpr int head_dim = 128;
+        const int token_tiles = (tokens + 31) / 32;
+        const size_t qkv_bytes = size_t(n_heads) * size_t(token_tiles) * size_t(head_dim / 32) *
+                                 size_t(1024) * sizeof(ggml_fp16_t);
+        const size_t head_stride = size_t(token_tiles) * size_t(head_dim / 32) *
+                                   size_t(1024) * sizeof(ggml_fp16_t);
+        result.qkv = {
+            ggml_view_4d(ctx->ggml_ctx, storage, head_dim, tokens, n_heads, 1,
+                         sizeof(ggml_fp16_t), head_dim * sizeof(ggml_fp16_t), head_stride, 0),
+            ggml_view_4d(ctx->ggml_ctx, storage, head_dim, tokens, n_heads, 1,
+                         sizeof(ggml_fp16_t), head_dim * sizeof(ggml_fp16_t), head_stride, qkv_bytes),
+            ggml_view_4d(ctx->ggml_ctx, storage, head_dim, tokens, n_heads, 1,
+                         sizeof(ggml_fp16_t), head_dim * sizeof(ggml_fp16_t), head_stride, 2 * qkv_bytes),
+        };
+        for (ggml_tensor* tensor : result.qkv) {
+            tensor->op = GGML_OP_NONE;
+            tensor->type = GGML_TYPE_F16;
+        }
+        return result;
+    }
+
+    __STATIC_INLINE__ PackedRopeQkv make_packed_flux2_dual_qkv(
+        GGMLRunnerContext* ctx,
+        const std::shared_ptr<SelfAttention>& image_attn,
+        const std::shared_ptr<SelfAttention>& text_attn,
+        ggml_tensor* image_activation,
+        ggml_tensor* text_activation,
+        ggml_tensor* pe) {
+        PackedRopeQkv result;
+        if (!sd_env_flag_enabled_default("SD_HTP_PACKED_FLUX2_DOUBLE", true)) {
+            return result;
+        }
+        const int image_tokens = image_activation != nullptr ? static_cast<int>(image_activation->ne[1]) : 0;
+        const int text_tokens = text_activation != nullptr ? static_cast<int>(text_activation->ne[1]) : 0;
+        const bool context_ok = packed_flux2_context_enabled(ctx, image_tokens, text_tokens, pe);
+        const bool heads_ok = image_attn != nullptr && text_attn != nullptr &&
+                              image_attn->num_heads == 24 && text_attn->num_heads == 24;
+        if (!context_ok || !heads_ok) {
+            if (sd_env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE")) {
+                LOG_INFO("flux2_packed_qkv skip=dual_context context_ok=%d heads_ok=%d image=%d text=%d grid=%dx%d sparse=%d residual=%d pe=[%lld,%lld,%lld,%lld]",
+                         context_ok ? 1 : 0, heads_ok ? 1 : 0, image_tokens, text_tokens,
+                         ctx != nullptr ? ctx->block_sparse_token_h : 0,
+                         ctx != nullptr ? ctx->block_sparse_token_w : 0,
+                         ctx != nullptr && ctx->block_sparse_attn_enabled ? 1 : 0,
+                         ctx != nullptr ? ctx->block_sparse_residual_mode : -1,
+                         pe != nullptr ? (long long) pe->ne[0] : 0,
+                         pe != nullptr ? (long long) pe->ne[1] : 0,
+                         pe != nullptr ? (long long) pe->ne[2] : 0,
+                         pe != nullptr ? (long long) pe->ne[3] : 0);
+            }
+            return result;
+        }
+        ggml_tensor* image_weight = image_attn->param("weight");
+        ggml_tensor* image_bias = image_attn->param("bias");
+        ggml_tensor* image_q_norm = image_attn->param("q_norm");
+        ggml_tensor* image_k_norm = image_attn->param("k_norm");
+        ggml_tensor* text_weight = text_attn->param("weight");
+        ggml_tensor* text_bias = text_attn->param("bias");
+        ggml_tensor* text_q_norm = text_attn->param("q_norm");
+        ggml_tensor* text_k_norm = text_attn->param("k_norm");
+        if (!packed_flux2_qkv_branch_valid(image_activation, image_weight, image_bias, image_q_norm, image_k_norm) ||
+            !packed_flux2_qkv_branch_valid(text_activation, text_weight, text_bias, text_q_norm, text_k_norm)) {
+            if (sd_env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE")) {
+                LOG_INFO("flux2_packed_qkv skip=dual_params image_weight=[%lld,%lld] type=%s flags=%u text_weight=[%lld,%lld] type=%s flags=%u",
+                         image_weight != nullptr ? (long long) image_weight->ne[0] : 0,
+                         image_weight != nullptr ? (long long) image_weight->ne[1] : 0,
+                         image_weight != nullptr ? ggml_type_name(image_weight->type) : "null",
+                         image_weight != nullptr ? image_weight->flags : 0,
+                         text_weight != nullptr ? (long long) text_weight->ne[0] : 0,
+                         text_weight != nullptr ? (long long) text_weight->ne[1] : 0,
+                         text_weight != nullptr ? ggml_type_name(text_weight->type) : "null",
+                         text_weight != nullptr ? text_weight->flags : 0);
+            }
+            return result;
+        }
+        const int tokens = image_tokens + text_tokens;
+        const int token_tiles = (tokens + 31) / 32;
+        const size_t region_bytes = size_t(24) * size_t(token_tiles) * 4 * size_t(1024) * sizeof(ggml_fp16_t);
+        ggml_tensor* args[] = {image_activation, image_weight, image_bias, image_q_norm, image_k_norm,
+                               text_activation, text_weight, text_bias, text_q_norm, text_k_norm, pe};
+        ggml_tensor* storage = ggml_custom_4d(ctx->ggml_ctx, GGML_TYPE_F16,
+                                              static_cast<int64_t>(3 * region_bytes / sizeof(ggml_fp16_t)),
+                                              1, 1, 1, args, 11,
+                                              [](ggml_tensor*, int, int, void*) {}, 1, nullptr);
+        ggml_set_name(storage, "qkv_mul_rms_packed_dual_rope");
+        if (sd_env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE")) {
+            LOG_INFO("flux2_packed_qkv kind=dual image_tokens=%d text_tokens=%d head_dim=128", image_tokens, text_tokens);
+        }
+        return make_packed_flux2_qkv_views(ctx, storage, tokens);
+    }
+
+    __STATIC_INLINE__ PackedRopeQkv make_packed_flux2_single_qkv(
+        GGMLRunnerContext* ctx,
+        ggml_tensor* activation,
+        ggml_tensor* weight,
+        ggml_tensor* bias,
+        ggml_tensor* q_norm,
+        ggml_tensor* k_norm,
+        ggml_tensor* pe,
+        int image_tokens) {
+        PackedRopeQkv result;
+        if (!sd_env_flag_enabled_default("SD_HTP_PACKED_FLUX2_SINGLE", true)) {
+            return result;
+        }
+        const int tokens = activation != nullptr ? static_cast<int>(activation->ne[1]) : 0;
+        const int text_tokens = tokens - image_tokens;
+        if (!packed_flux2_context_enabled(ctx, image_tokens, text_tokens, pe) ||
+            !packed_flux2_qkv_branch_valid(activation, weight, bias, q_norm, k_norm)) {
+            return result;
+        }
+        const int token_tiles = (tokens + 31) / 32;
+        const size_t region_bytes = size_t(24) * size_t(token_tiles) * 4 * size_t(1024) * sizeof(ggml_fp16_t);
+        ggml_tensor* args[] = {activation, weight, bias, q_norm, k_norm, pe};
+        ggml_tensor* storage = ggml_custom_4d(ctx->ggml_ctx, GGML_TYPE_F16,
+                                              static_cast<int64_t>(3 * region_bytes / sizeof(ggml_fp16_t)),
+                                              1, 1, 1, args, 6,
+                                              [](ggml_tensor*, int, int, void*) {}, 1, nullptr);
+        ggml_set_name(storage, "qkv_mul_rms_packed_rope");
+        if (sd_env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE")) {
+            LOG_INFO("flux2_packed_qkv kind=single image_tokens=%d text_tokens=%d head_dim=128", image_tokens, text_tokens);
+        }
+        return make_packed_flux2_qkv_views(ctx, storage, tokens);
+    }
+
+    __STATIC_INLINE__ ggml_tensor* packed_flux2_attention(GGMLRunnerContext* ctx,
+                                                           const PackedRopeQkv& packed,
+                                                           int image_tokens,
+                                                           int text_tokens) {
+        return ggml_ext_attention_ext(ctx->ggml_ctx,
+                                      ctx->backend,
+                                      packed.qkv[0],
+                                      packed.qkv[1],
+                                      packed.qkv[2],
+                                      24,
+                                      nullptr,
+                                      false,
+                                      ctx->flash_attn_enabled,
+                                      1.0f,
+                                      true,
+                                      image_tokens,
+                                      text_tokens,
+                                      SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
+                                      1.0f,
+                                      1.0f,
+                                      false,
+                                      nullptr,
+                                      nullptr,
+                                      nullptr,
+                                      nullptr,
+                                      nullptr,
+                                      ctx->block_sparse_token_h,
+                                      ctx->block_sparse_token_w);
+    }
 
     struct MLP : public UnaryBlock {
         bool use_mlp_silu_act;
@@ -319,7 +542,8 @@ namespace Flux {
                                                       ggml_tensor* pe,
                                                       ggml_tensor* mask                   = nullptr,
                                                       std::vector<ModulationOut> img_mods = {},
-                                                      std::vector<ModulationOut> txt_mods = {}) {
+                                                      std::vector<ModulationOut> txt_mods = {},
+                                                      ggml_tensor* packed_pe              = nullptr) {
             // img: [N, n_img_token, hidden_size]
             // txt: [N, n_txt_token, hidden_size]
             // pe: [n_img_token + n_txt_token, d_head/2, 2, 2]
@@ -360,41 +584,34 @@ namespace Flux {
             // prepare image for attention
             auto img_modulated = img_norm1->forward(ctx, img);
             img_modulated      = Flux::modulate(ctx->ggml_ctx, img_modulated, img_mod1.shift, img_mod1.scale);
-            auto img_qkv       = img_attn->pre_attention(ctx, img_modulated);  // q,k,v: [N, n_img_token, n_head, d_head]
-            auto img_q         = img_qkv[0];
-            auto img_k         = img_qkv[1];
-            auto img_v         = img_qkv[2];
 
             // prepare txt for attention
             auto txt_modulated = txt_norm1->forward(ctx, txt);
             txt_modulated      = Flux::modulate(ctx->ggml_ctx, txt_modulated, txt_mod1.shift, txt_mod1.scale);
-            auto txt_qkv       = txt_attn->pre_attention(ctx, txt_modulated);  // q,k,v: [N, n_txt_token, n_head, d_head]
-            auto txt_q         = txt_qkv[0];
-            auto txt_k         = txt_qkv[1];
-            auto txt_v         = txt_qkv[2];
-
-            // run actual attention
-            auto q = ggml_concat(ctx->ggml_ctx, txt_q, img_q, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
-            auto k = ggml_concat(ctx->ggml_ctx, txt_k, img_k, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
-            auto v = ggml_concat(ctx->ggml_ctx, txt_v, img_v, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
-
-            auto attn         = Rope::attention(ctx, q, k, v, pe, mask);  // [N, n_txt_token + n_img_token, n_head*d_head]
-            auto txt_attn_out = ggml_view_3d(ctx->ggml_ctx,
-                                             attn,
-                                             attn->ne[0],
-                                             txt->ne[1],
-                                             attn->ne[2],
-                                             attn->nb[1],
-                                             attn->nb[2],
-                                             0);  // [N, n_txt_token, hidden_size]
-            auto img_attn_out = ggml_view_3d(ctx->ggml_ctx,
-                                             attn,
-                                             attn->ne[0],
-                                             img->ne[1],
-                                             attn->ne[2],
-                                             attn->nb[1],
-                                             attn->nb[2],
-                                             txt->ne[1] * attn->nb[1]);  // [N, n_img_token, hidden_size]
+            ggml_tensor* attn = nullptr;
+            ggml_tensor* img_attn_out = nullptr;
+            ggml_tensor* txt_attn_out = nullptr;
+            auto packed = make_packed_flux2_dual_qkv(ctx, img_attn, txt_attn,
+                                                      img_modulated, txt_modulated, packed_pe);
+            if (packed.storage != nullptr && mask == nullptr) {
+                attn = packed_flux2_attention(ctx, packed, static_cast<int>(img->ne[1]),
+                                              static_cast<int>(txt->ne[1]));
+                img_attn_out = ggml_view_3d(ctx->ggml_ctx, attn, attn->ne[0], img->ne[1], attn->ne[2],
+                                            attn->nb[1], attn->nb[2], 0);
+                txt_attn_out = ggml_view_3d(ctx->ggml_ctx, attn, attn->ne[0], txt->ne[1], attn->ne[2],
+                                            attn->nb[1], attn->nb[2], img->ne[1] * attn->nb[1]);
+            } else {
+                auto img_qkv = img_attn->pre_attention(ctx, img_modulated);
+                auto txt_qkv = txt_attn->pre_attention(ctx, txt_modulated);
+                auto q = ggml_concat(ctx->ggml_ctx, txt_qkv[0], img_qkv[0], 2);
+                auto k = ggml_concat(ctx->ggml_ctx, txt_qkv[1], img_qkv[1], 2);
+                auto v = ggml_concat(ctx->ggml_ctx, txt_qkv[2], img_qkv[2], 2);
+                attn = Rope::attention(ctx, q, k, v, pe, mask);
+                txt_attn_out = ggml_view_3d(ctx->ggml_ctx, attn, attn->ne[0], txt->ne[1], attn->ne[2],
+                                            attn->nb[1], attn->nb[2], 0);
+                img_attn_out = ggml_view_3d(ctx->ggml_ctx, attn, attn->ne[0], img->ne[1], attn->ne[2],
+                                            attn->nb[1], attn->nb[2], txt->ne[1] * attn->nb[1]);
+            }
 
             // calculate the img bloks
             img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_attn->post_attention(ctx, img_attn_out), img_mod1.gate));
@@ -466,7 +683,8 @@ namespace Flux {
                              ggml_tensor* vec,
                              ggml_tensor* pe,
                              ggml_tensor* mask               = nullptr,
-                             std::vector<ModulationOut> mods = {}) {
+                             std::vector<ModulationOut> mods = {},
+                             ggml_tensor* packed_pe          = nullptr) {
             // x: [N, n_token, hidden_size]
             // pe: [n_token, d_head/2, 2, 2]
             // return: [N, n_token, hidden_size]
@@ -489,23 +707,96 @@ namespace Flux {
                 }
             }
 
-            auto x_mod   = Flux::modulate(ctx->ggml_ctx, pre_norm->forward(ctx, x), mod.shift, mod.scale);
-            auto qkv_mlp = linear1->forward(ctx, x_mod);  // [N, n_token, hidden_size * 3 + mlp_hidden_dim*mlp_mult_factor]
-
+            auto x_mod = Flux::modulate(ctx->ggml_ctx, pre_norm->forward(ctx, x), mod.shift, mod.scale);
             int64_t head_dim = hidden_size / num_heads;
-
-            auto q = ggml_view_4d(ctx->ggml_ctx, qkv_mlp, head_dim, num_heads, qkv_mlp->ne[1], qkv_mlp->ne[2],
-                                  qkv_mlp->nb[0] * head_dim, qkv_mlp->nb[1], qkv_mlp->nb[2], 0);
-            auto k = ggml_view_4d(ctx->ggml_ctx, qkv_mlp, head_dim, num_heads, qkv_mlp->ne[1], qkv_mlp->ne[2],
-                                  qkv_mlp->nb[0] * head_dim, qkv_mlp->nb[1], qkv_mlp->nb[2], (qkv_mlp->nb[0]) * hidden_size);
-            auto v = ggml_view_4d(ctx->ggml_ctx, qkv_mlp, head_dim, num_heads, qkv_mlp->ne[1], qkv_mlp->ne[2],
-                                  qkv_mlp->nb[0] * head_dim, qkv_mlp->nb[1], qkv_mlp->nb[2], (qkv_mlp->nb[0]) * 2 * hidden_size);
-
-            q         = norm->query_norm(ctx, q);
-            k         = norm->key_norm(ctx, k);
-            auto attn = Rope::attention(ctx, q, k, v, pe, mask);  // [N, n_token, hidden_size]
-
-            auto mlp = ggml_view_3d(ctx->ggml_ctx, qkv_mlp, mlp_hidden_dim * mlp_mult_factor, qkv_mlp->ne[1], qkv_mlp->ne[2], qkv_mlp->nb[1], qkv_mlp->nb[2], hidden_size * 3 * qkv_mlp->nb[0]);
+            ggml_tensor* attn = nullptr;
+            ggml_tensor* mlp = nullptr;
+            ggml_tensor* weight = linear1->get_param("weight");
+            ggml_tensor* bias = linear1->get_param("bias");
+            ggml_tensor* q_norm = norm->param("q_norm");
+            ggml_tensor* k_norm = norm->param("k_norm");
+            const int image_tokens = ctx->block_sparse_token_h * ctx->block_sparse_token_w;
+            PackedRopeQkv packed;
+            if (packed_pe != nullptr && weight != nullptr && weight->type == GGML_TYPE_F16 &&
+                weight->ne[0] == hidden_size && weight->ne[1] >= 3 * hidden_size) {
+                ggml_tensor* qkv_weight = ggml_view_2d(ctx->ggml_ctx, weight, hidden_size, 3 * hidden_size,
+                                                       weight->nb[1], 0);
+                qkv_weight->flags |= weight->flags & (SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32 |
+                                                      SD_GGML_TENSOR_FLAG_HTP_MUL_MAT_WEIGHT);
+                ggml_tensor* qkv_bias = bias != nullptr ?
+                    ggml_view_1d(ctx->ggml_ctx, bias, 3 * hidden_size, 0) : nullptr;
+                packed = make_packed_flux2_single_qkv(ctx, x_mod, qkv_weight, qkv_bias,
+                                                      q_norm, k_norm, packed_pe, image_tokens);
+            }
+            if (packed.storage != nullptr && mask == nullptr) {
+                attn = packed_flux2_attention(ctx, packed, image_tokens,
+                                              static_cast<int>(x->ne[1]) - image_tokens);
+                const int64_t mlp_cols = mlp_hidden_dim * mlp_mult_factor;
+                ggml_tensor* full_qkv_mlp = nullptr;
+                if (sd_env_flag_enabled("SD_HTP_PACKED_FLUX2_SINGLE_FULL_MLP")) {
+                    ggml_tensor* qkv_mlp = linear1->forward(ctx, x_mod);
+                    full_qkv_mlp = qkv_mlp;
+                    mlp = ggml_view_3d(ctx->ggml_ctx, qkv_mlp, mlp_cols, qkv_mlp->ne[1], qkv_mlp->ne[2],
+                                       qkv_mlp->nb[1], qkv_mlp->nb[2], 3 * hidden_size * qkv_mlp->nb[0]);
+                } else {
+                    ggml_tensor* mlp_weight = ggml_view_2d(ctx->ggml_ctx, weight, hidden_size, mlp_cols,
+                                                           weight->nb[1], 3 * hidden_size * weight->nb[1]);
+                    mlp_weight->flags |= weight->flags & (SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32 |
+                                                          SD_GGML_TENSOR_FLAG_HTP_MUL_MAT_WEIGHT);
+                    ggml_tensor* mlp_bias = bias != nullptr ?
+                        ggml_view_1d(ctx->ggml_ctx, bias, mlp_cols, 3 * hidden_size * bias->nb[0]) : nullptr;
+                    mlp = ggml_ext_linear(ctx->ggml_ctx, x_mod, mlp_weight, mlp_bias, false, 1.0f);
+                }
+                if (sd_env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE") && idx == 0) {
+                    LOG_INFO("flux2_single_weight root=[%lld,%lld] nb=[%zu,%zu,%zu,%zu] nbytes=%zu qkv_offset=%zu mlp_offset=%zu",
+                             (long long) weight->ne[0], (long long) weight->ne[1],
+                             weight->nb[0], weight->nb[1], weight->nb[2], weight->nb[3],
+                             ggml_nbytes(weight),
+                             (size_t) 0,
+                             (size_t) 3 * (size_t) hidden_size * weight->nb[1]);
+                    LOG_INFO("flux2_single_layout packed attn=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] mlp=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] xmod=[%lld,%lld,%lld,%lld] linear1=[%lld,%lld,%lld,%lld] linear2w=[%lld,%lld,%lld,%lld]",
+                             (long long) attn->ne[0], (long long) attn->ne[1], (long long) attn->ne[2], (long long) attn->ne[3],
+                             attn->nb[0], attn->nb[1], attn->nb[2], attn->nb[3],
+                             (long long) mlp->ne[0], (long long) mlp->ne[1], (long long) mlp->ne[2], (long long) mlp->ne[3],
+                             mlp->nb[0], mlp->nb[1], mlp->nb[2], mlp->nb[3],
+                             (long long) x_mod->ne[0], (long long) x_mod->ne[1], (long long) x_mod->ne[2], (long long) x_mod->ne[3],
+                             full_qkv_mlp != nullptr ? (long long) full_qkv_mlp->ne[0] : -1,
+                             full_qkv_mlp != nullptr ? (long long) full_qkv_mlp->ne[1] : -1,
+                             full_qkv_mlp != nullptr ? (long long) full_qkv_mlp->ne[2] : -1,
+                             full_qkv_mlp != nullptr ? (long long) full_qkv_mlp->ne[3] : -1,
+                             (long long) linear2->get_param("weight")->ne[0], (long long) linear2->get_param("weight")->ne[1],
+                             (long long) linear2->get_param("weight")->ne[2], (long long) linear2->get_param("weight")->ne[3]);
+                }
+            } else {
+                auto qkv_mlp = linear1->forward(ctx, x_mod);
+                if (sd_env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE") &&
+                    packed_pe != nullptr && idx == 0) {
+                    ggml_set_name(qkv_mlp, "flux2_single_dense_qkv_debug");
+                    if (qkv_mlp->data != nullptr && q_norm->data != nullptr && packed_pe->data != nullptr) {
+                        const float * raw = static_cast<const float *>(qkv_mlp->data);
+                        const float * gamma = static_cast<const float *>(q_norm->data);
+                        const float * pe_data = static_cast<const float *>(packed_pe->data);
+                        const int64_t output_dim = qkv_mlp->ne[0];
+                        LOG_INFO("flux2_dense_qkv_values raw_t0=[%.8g,%.8g,%.8g,%.8g] raw_t1=[%.8g,%.8g,%.8g,%.8g] qgamma=[%.8g,%.8g,%.8g,%.8g] pe=[%.8g,%.8g,%.8g,%.8g]",
+                                 raw[0], raw[1], raw[2], raw[3],
+                                 raw[output_dim], raw[output_dim + 1], raw[output_dim + 2], raw[output_dim + 3],
+                                 gamma[0], gamma[1], gamma[2], gamma[3],
+                                 pe_data[0], pe_data[1], pe_data[2], pe_data[3]);
+                    }
+                }
+                auto q = ggml_view_4d(ctx->ggml_ctx, qkv_mlp, head_dim, num_heads, qkv_mlp->ne[1], qkv_mlp->ne[2],
+                                      qkv_mlp->nb[0] * head_dim, qkv_mlp->nb[1], qkv_mlp->nb[2], 0);
+                auto k = ggml_view_4d(ctx->ggml_ctx, qkv_mlp, head_dim, num_heads, qkv_mlp->ne[1], qkv_mlp->ne[2],
+                                      qkv_mlp->nb[0] * head_dim, qkv_mlp->nb[1], qkv_mlp->nb[2], qkv_mlp->nb[0] * hidden_size);
+                auto v = ggml_view_4d(ctx->ggml_ctx, qkv_mlp, head_dim, num_heads, qkv_mlp->ne[1], qkv_mlp->ne[2],
+                                      qkv_mlp->nb[0] * head_dim, qkv_mlp->nb[1], qkv_mlp->nb[2], qkv_mlp->nb[0] * 2 * hidden_size);
+                q = norm->query_norm(ctx, q);
+                k = norm->key_norm(ctx, k);
+                attn = Rope::attention(ctx, q, k, v, packed_pe != nullptr ? packed_pe : pe, mask);
+                mlp = ggml_view_3d(ctx->ggml_ctx, qkv_mlp, mlp_hidden_dim * mlp_mult_factor,
+                                   qkv_mlp->ne[1], qkv_mlp->ne[2], qkv_mlp->nb[1], qkv_mlp->nb[2],
+                                   hidden_size * 3 * qkv_mlp->nb[0]);
+            }
             if (use_yak_mlp) {
                 mlp = ggml_ext_silu_act(ctx->ggml_ctx, mlp, false);
             } else if (use_mlp_silu_act) {
@@ -514,6 +805,14 @@ namespace Flux {
                 mlp = ggml_ext_gelu(ctx->ggml_ctx, mlp, true);
             }
             auto attn_mlp = ggml_concat(ctx->ggml_ctx, attn, mlp, 0);  // [N, n_token, hidden_size + mlp_hidden_dim]
+            if (packed.storage != nullptr && mask == nullptr &&
+                sd_env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE") && idx == 0) {
+                LOG_INFO("flux2_single_layout post_mlp=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] attn_mlp=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]",
+                         (long long) mlp->ne[0], (long long) mlp->ne[1], (long long) mlp->ne[2], (long long) mlp->ne[3],
+                         mlp->nb[0], mlp->nb[1], mlp->nb[2], mlp->nb[3],
+                         (long long) attn_mlp->ne[0], (long long) attn_mlp->ne[1], (long long) attn_mlp->ne[2], (long long) attn_mlp->ne[3],
+                         attn_mlp->nb[0], attn_mlp->nb[1], attn_mlp->nb[2], attn_mlp->nb[3]);
+            }
             auto output   = linear2->forward(ctx, attn_mlp);           // [N, n_token, hidden_size]
 
             output = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, output, mod.gate));
@@ -854,7 +1153,8 @@ namespace Flux {
                                   ggml_tensor* guidance,
                                   ggml_tensor* pe,
                                   ggml_tensor* mod_index_arange = nullptr,
-                                  std::vector<int> skip_layers  = {}) {
+                                  std::vector<int> skip_layers  = {},
+                                  ggml_tensor* packed_pe        = nullptr) {
             auto img_in      = std::dynamic_pointer_cast<Linear>(blocks["img_in"]);
             auto txt_in      = std::dynamic_pointer_cast<Linear>(blocks["txt_in"]);
             auto final_layer = std::dynamic_pointer_cast<LastLayer>(blocks["final_layer"]);
@@ -938,21 +1238,24 @@ namespace Flux {
 
                 auto block = std::dynamic_pointer_cast<DoubleStreamBlock>(blocks["double_blocks." + std::to_string(i)]);
 
-                auto img_txt = block->forward(ctx, img, txt, vec, pe, txt_img_mask, ds_img_mods, ds_txt_mods);
+                auto img_txt = block->forward(ctx, img, txt, vec, pe, txt_img_mask,
+                                              ds_img_mods, ds_txt_mods, packed_pe);
                 img          = img_txt.first;   // [N, n_img_token, hidden_size]
                 txt          = img_txt.second;  // [N, n_txt_token, hidden_size]
                 sd::ggml_graph_cut::mark_graph_cut(img, "flux.double_blocks." + std::to_string(i), "img");
                 sd::ggml_graph_cut::mark_graph_cut(txt, "flux.double_blocks." + std::to_string(i), "txt");
             }
 
-            auto txt_img = ggml_concat(ctx->ggml_ctx, txt, img, 1);  // [N, n_txt_token + n_img_token, hidden_size]
+            const bool image_first = packed_pe != nullptr;
+            auto txt_img = image_first ? ggml_concat(ctx->ggml_ctx, img, txt, 1) :
+                                         ggml_concat(ctx->ggml_ctx, txt, img, 1);
             for (int i = 0; i < params.depth_single_blocks; i++) {
                 if (skip_layers.size() > 0 && std::find(skip_layers.begin(), skip_layers.end(), i + params.depth) != skip_layers.end()) {
                     continue;
                 }
                 auto block = std::dynamic_pointer_cast<SingleStreamBlock>(blocks["single_blocks." + std::to_string(i)]);
 
-                txt_img = block->forward(ctx, txt_img, vec, pe, txt_img_mask, ss_mods);
+                txt_img = block->forward(ctx, txt_img, vec, pe, txt_img_mask, ss_mods, packed_pe);
                 sd::ggml_graph_cut::mark_graph_cut(txt_img, "flux.single_blocks." + std::to_string(i), "txt_img");
             }
 
@@ -963,7 +1266,7 @@ namespace Flux {
                                txt_img->ne[2],
                                txt_img->nb[1],
                                txt_img->nb[2],
-                               txt->ne[1] * txt_img->nb[1]);  // [N, n_img_token, hidden_size]
+                               image_first ? 0 : txt->ne[1] * txt_img->nb[1]);  // [N, n_img_token, hidden_size]
 
             if (final_layer) {
                 img = final_layer->forward(ctx, img, vec);  // (N, T, patch_size ** 2 * out_channels)
@@ -1066,7 +1369,8 @@ namespace Flux {
                                          ggml_tensor* mod_index_arange         = nullptr,
                                          ggml_tensor* dct                      = nullptr,
                                          std::vector<ggml_tensor*> ref_latents = {},
-                                         std::vector<int> skip_layers          = {}) {
+                                         std::vector<int> skip_layers          = {},
+                                         ggml_tensor* packed_pe                = nullptr) {
             GGML_ASSERT(x->ne[3] == 1);
 
             int64_t W      = x->ne[0];
@@ -1113,7 +1417,14 @@ namespace Flux {
                 }
             }
 
-            auto out = forward_orig(ctx, img, context, timestep, y, guidance, pe, mod_index_arange, skip_layers);  // [N, num_tokens, C * patch_size * patch_size]
+            const int previous_token_h = ctx->block_sparse_token_h;
+            const int previous_token_w = ctx->block_sparse_token_w;
+            ctx->block_sparse_token_h = (H + pad_h) / patch_size;
+            ctx->block_sparse_token_w = (W + pad_w) / patch_size;
+            auto out = forward_orig(ctx, img, context, timestep, y, guidance, pe,
+                                    mod_index_arange, skip_layers, packed_pe);
+            ctx->block_sparse_token_h = previous_token_h;
+            ctx->block_sparse_token_w = previous_token_w;
 
             if (out->ne[1] > img_tokens) {
                 out = ggml_view_3d(ctx->ggml_ctx, out, out->ne[0], img_tokens, out->ne[2], out->nb[1], out->nb[2], 0);
@@ -1135,7 +1446,8 @@ namespace Flux {
                              ggml_tensor* mod_index_arange         = nullptr,
                              ggml_tensor* dct                      = nullptr,
                              std::vector<ggml_tensor*> ref_latents = {},
-                             std::vector<int> skip_layers          = {}) {
+                             std::vector<int> skip_layers          = {},
+                             ggml_tensor* packed_pe                = nullptr) {
             // Forward pass of DiT.
             // x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
             // timestep: (N,) tensor of diffusion timesteps
@@ -1171,7 +1483,8 @@ namespace Flux {
                                            mod_index_arange,
                                            dct,
                                            ref_latents,
-                                           skip_layers);
+                                           skip_layers,
+                                           packed_pe);
             }
         }
     };
@@ -1181,6 +1494,7 @@ namespace Flux {
         FluxParams flux_params;
         Flux flux;
         std::vector<float> pe_vec;
+        std::vector<float> packed_pe_vec;
         std::vector<float> mod_index_arange_vec;
         std::vector<float> dct_vec;
         sd::Tensor<float> guidance_tensor;
@@ -1370,7 +1684,12 @@ namespace Flux {
                                  const sd::Tensor<float>& guidance_tensor                 = {},
                                  const std::vector<sd::Tensor<float>>& ref_latents_tensor = {},
                                  bool increase_ref_index                                  = false,
-                                 std::vector<int> skip_layers                             = {}) {
+                                 std::vector<int> skip_layers                             = {},
+                                 int block_sparse_residual_mode = SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
+                                 float block_sparse_residual_scale = 1.0f,
+                                 float block_sparse_residual_rho = 1.0f,
+                                 bool block_sparse_residual_exact_rho = false,
+                                 int block_sparse_residual_branch_index = 0) {
             ggml_tensor* x         = make_input(x_tensor);
             ggml_tensor* timesteps = make_input(timesteps_tensor);
             ggml_tensor* context   = make_optional_input(context_tensor);
@@ -1436,6 +1755,41 @@ namespace Flux {
             // pe->data = nullptr;
             set_backend_tensor_data(pe, pe_vec.data());
 
+            ggml_tensor* packed_pe = nullptr;
+            const bool packed_flux2_requested = sd_version_is_flux2(version) &&
+                                                sd_env_flag_enabled("SD_HTP_PACKED_FLUX2") &&
+                                                block_sparse_attn_enabled && ref_latents.empty() &&
+                                                !circular_y_enabled && !circular_x_enabled;
+            if (sd_env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE")) {
+                LOG_INFO("flux2_packed_request enabled=%d version=%d sparse=%d refs=%zu circular=%d/%d use_mask=%d",
+                         packed_flux2_requested ? 1 : 0, static_cast<int>(version),
+                         block_sparse_attn_enabled ? 1 : 0, ref_latents.size(),
+                         circular_y_enabled ? 1 : 0, circular_x_enabled ? 1 : 0, use_mask ? 1 : 0);
+            }
+            if (packed_flux2_requested) {
+                packed_pe_vec = Rope::gen_flux_pe(static_cast<int>(x->ne[1]),
+                                                   static_cast<int>(x->ne[0]),
+                                                   flux_params.patch_size,
+                                                   static_cast<int>(x->ne[3]),
+                                                   static_cast<int>(context->ne[1]),
+                                                   txt_arange_dims,
+                                                   ref_latents,
+                                                   increase_ref_index,
+                                                   flux_params.ref_index_scale,
+                                                   flux_params.theta,
+                                                   false,
+                                                   false,
+                                                   flux_params.axes_dim,
+                                                   false,
+                                                   true);
+                int packed_pos_len = static_cast<int>(packed_pe_vec.size() / flux_params.axes_dim_sum / 2);
+                packed_pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2,
+                                               flux_params.axes_dim_sum / 2, packed_pos_len);
+                set_backend_tensor_data(packed_pe, packed_pe_vec.data());
+            } else {
+                packed_pe_vec.clear();
+            }
+
             if (version == VERSION_CHROMA_RADIANCE) {
                 int patch_size     = flux_params.patch_size;
                 int nerf_max_freqs = flux_params.chroma_radiance_params.nerf_max_freqs;
@@ -1448,6 +1802,12 @@ namespace Flux {
             }
 
             auto runner_ctx = get_context();
+            runner_ctx.block_sparse_residual_mode = block_sparse_residual_mode;
+            runner_ctx.block_sparse_residual_scale = block_sparse_residual_scale;
+            runner_ctx.block_sparse_residual_rho = block_sparse_residual_rho;
+            runner_ctx.block_sparse_residual_exact_rho = block_sparse_residual_exact_rho;
+            runner_ctx.block_sparse_residual_branch_index = block_sparse_residual_branch_index;
+            runner_ctx.block_sparse_residual_attention_index = 0;
 
             ggml_tensor* out = flux.forward(&runner_ctx,
                                             x,
@@ -1460,7 +1820,8 @@ namespace Flux {
                                             mod_index_arange,
                                             dct,
                                             ref_latents,
-                                            skip_layers);
+                                            skip_layers,
+                                            packed_pe);
 
             ggml_build_forward_expand(gf, out);
 
@@ -1476,14 +1837,25 @@ namespace Flux {
                                   const sd::Tensor<float>& guidance                 = {},
                                   const std::vector<sd::Tensor<float>>& ref_latents = {},
                                   bool increase_ref_index                           = false,
-                                  std::vector<int> skip_layers                      = std::vector<int>()) {
+                                  std::vector<int> skip_layers                      = std::vector<int>(),
+                                  int block_sparse_residual_mode = SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
+                                  float block_sparse_residual_scale = 1.0f,
+                                  float block_sparse_residual_rho = 1.0f,
+                                  bool block_sparse_residual_exact_rho = false,
+                                  int block_sparse_residual_branch_index = 0) {
             // x: [N, in_channels, h, w]
             // timesteps: [N, ]
             // context: [N, max_position, hidden_size]
             // y: [N, adm_in_channels] or [1, adm_in_channels]
             // guidance: [N, ]
             auto get_graph = [&]() -> ggml_cgraph* {
-                return build_graph(x, timesteps, context, c_concat, y, guidance, ref_latents, increase_ref_index, skip_layers);
+                return build_graph(x, timesteps, context, c_concat, y, guidance, ref_latents,
+                                   increase_ref_index, skip_layers,
+                                   block_sparse_residual_mode,
+                                   block_sparse_residual_scale,
+                                   block_sparse_residual_rho,
+                                   block_sparse_residual_exact_rho,
+                                   block_sparse_residual_branch_index);
             };
 
             auto result = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
