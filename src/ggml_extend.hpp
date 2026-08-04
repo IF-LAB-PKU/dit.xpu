@@ -2193,7 +2193,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         for (int depth = 0; tensor != nullptr && depth < 8; ++depth) {
             if (tensor->name[0] != '\0' &&
                 (std::strcmp(tensor->name, "qkv_mul_rms_packed") == 0 ||
-                 std::strcmp(tensor->name, "qkv_mul_rms_packed_dual") == 0)) {
+                 std::strcmp(tensor->name, "qkv_mul_rms_packed_dual") == 0 ||
+                 std::strcmp(tensor->name, "qkv_mul_rms_packed_rope") == 0 ||
+                 std::strcmp(tensor->name, "qkv_mul_rms_packed_dual_rope") == 0)) {
                 return tensor;
             }
             tensor = tensor->view_src;
@@ -2204,6 +2206,13 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
     const bool packed_layout = packed_qkv != nullptr && packed_qkv_storage(k) == packed_qkv &&
                                packed_qkv_storage(v) == packed_qkv &&
                                sd_env_flag_enabled_default("SD_HTP_PACKED_ATTENTION", true);
+    if (sd_env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE") &&
+        q->ne[0] == 128 && q->ne[1] == 768 && q->ne[2] == 24) {
+        LOG_INFO("flux2_attention_layout packed=%d storage=%p qview=%p kview=%p vview=%p qtype=%s ktype=%s vtype=%s qviewsrc=%p",
+                 packed_layout ? 1 : 0, (void *) packed_qkv, (void *) q, (void *) k, (void *) v,
+                 ggml_type_name(q->type), ggml_type_name(k->type), ggml_type_name(v->type),
+                 q->view_src);
+    }
     int64_t L_q;
     int64_t L_k;
     int64_t C;
@@ -2564,7 +2573,11 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             ggml_tensor* candidate = nullptr;
             if (packed_layout) {
                 candidate = build_packed_kqv(block_mask, sparse_with_lse);
-                candidate_is_htp_layout = false;
+                // Packed Q/K/V are already in the HMX layout consumed by the
+                // HTP packed attention kernel. Treat this candidate as an HTP
+                // layout so a CPU graph backend cannot reject it and trigger
+                // the row-major fallback.
+                candidate_is_htp_layout = candidate != nullptr;
             } else if (dense_candidate != nullptr && candidate_is_htp_layout) {
                 candidate = ggml_flash_attn_ext_with_lse(
                     ctx,
@@ -5297,7 +5310,9 @@ protected:
         if (!htp_op_routing_enabled() || !htp_attention_enabled || node == nullptr ||
             node->op != GGML_OP_CUSTOM ||
             (std::strcmp(node->name, "qkv_mul_rms_packed") != 0 &&
-             std::strcmp(node->name, "qkv_mul_rms_packed_dual") != 0)) {
+             std::strcmp(node->name, "qkv_mul_rms_packed_dual") != 0 &&
+             std::strcmp(node->name, "qkv_mul_rms_packed_rope") != 0 &&
+             std::strcmp(node->name, "qkv_mul_rms_packed_dual_rope") != 0)) {
             return false;
         }
         return ggml_backend_supports_op(htp_backend, node);
@@ -5407,8 +5422,9 @@ protected:
                 continue;
             }
             ggml_tensor* weight = node->src[0];
-            if (should_prepare_htp_packed_f16_weight(weight) && seen.insert(weight).second) {
-                tensors.push_back(weight);
+            ggml_tensor* root = get_htp_tensor_backing_root(weight);
+            if (should_prepare_htp_packed_f16_weight(root) && seen.insert(root).second) {
+                tensors.push_back(root);
             }
         }
         return tensors;
@@ -5713,16 +5729,35 @@ protected:
                                                    node->op == GGML_OP_MUL_MAT &&
                                                    src == node->src[0] &&
                                                    is_htp_target_op(node);
+                if (j == 0 && node->op == GGML_OP_MUL_MAT && !routed_to_htp_matmul &&
+                    sd_env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE")) {
+                    LOG_INFO("flux2_packed_matmul_skip weight_contig=%d activation_contig=%d output_contig=%d backend_support=%d prepared=%d weight=[%lld,%lld] activation=[%lld,%lld,%lld,%lld]",
+                             ggml_is_contiguous(node->src[0]) ? 1 : 0,
+                             node->src[1] != nullptr && ggml_is_contiguous(node->src[1]) ? 1 : 0,
+                             ggml_is_contiguous(node) ? 1 : 0,
+                             ggml_backend_supports_op(htp_backend, node) ? 1 : 0,
+                             htp_packed_f16_weight_is_prepared(node->src[0]) ? 1 : 0,
+                             (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[1],
+                             node->src[1] != nullptr ? (long long) node->src[1]->ne[0] : 0,
+                             node->src[1] != nullptr ? (long long) node->src[1]->ne[1] : 0,
+                             node->src[1] != nullptr ? (long long) node->src[1]->ne[2] : 0,
+                             node->src[1] != nullptr ? (long long) node->src[1]->ne[3] : 0);
+                }
                 // The dual packed QKV custom node consumes two offline-packed
                 // weights at src[1] and src[6]. They are HTP inputs, not
                 // row-major CPU consumers, so keep them in the packed-only
                 // placement contract.
                 const bool routed_to_htp_packed_qkv =
                     node->op == GGML_OP_CUSTOM &&
-                    ((std::strcmp(node->name, "qkv_mul_rms_packed_dual") == 0 && (j == 1 || j == 6)) ||
-                     (std::strcmp(node->name, "qkv_mul_rms_packed") == 0 && j == 1)) &&
+                    (( (std::strcmp(node->name, "qkv_mul_rms_packed_dual") == 0 ||
+                        std::strcmp(node->name, "qkv_mul_rms_packed_dual_rope") == 0) && (j == 1 || j == 6)) ||
+                     ((std::strcmp(node->name, "qkv_mul_rms_packed") == 0 ||
+                       std::strcmp(node->name, "qkv_mul_rms_packed_rope") == 0) && j == 1)) &&
                     is_htp_target_op(node);
-                const bool routed_to_htp = routed_to_htp_matmul || routed_to_htp_packed_qkv;
+                const bool routed_packed_view = j == 0 && node->op == GGML_OP_VIEW &&
+                                                (node->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) != 0 &&
+                                                ggml_is_contiguous(node);
+                const bool routed_to_htp = routed_to_htp_matmul || routed_to_htp_packed_qkv || routed_packed_view;
                 if (routed_to_htp) {
                     continue;
                 }
@@ -7045,7 +7080,9 @@ public:
                                              prefix.find("attn.ln_k.") != std::string::npos ||
                                              prefix.find("attn2.qkv.") != std::string::npos ||
                                              prefix.find("attn2.ln_q.") != std::string::npos ||
-                                             prefix.find("attn2.ln_k.") != std::string::npos;
+                                             prefix.find("attn2.ln_k.") != std::string::npos ||
+                                             prefix.find("norm.query_norm.") != std::string::npos ||
+                                             prefix.find("norm.key_norm.") != std::string::npos;
         if (packed_qkv_param_prefix) {
             for (auto& pair : params) {
                 if (pair.second != nullptr && pair.second->type == GGML_TYPE_F32) {

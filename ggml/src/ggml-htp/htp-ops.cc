@@ -35,6 +35,10 @@
 
 namespace {
 
+bool packed_head_dim_supported(int head_dim) {
+    return head_dim == 64 || head_dim == 128;
+}
+
 // HTP hybrid 路径里部分张量可能还是 view，这里统一回退到真正持有 buffer 的 backing tensor。
 const ggml_tensor * get_tensor_with_backing_buffer(const ggml_tensor * tensor) {
     while (tensor != nullptr && tensor->buffer == nullptr && tensor->view_src != nullptr) {
@@ -281,6 +285,39 @@ bool is_qkv_mul_rms_packed_dual_custom(const ggml_tensor * dst) {
     return true;
 }
 
+bool is_qkv_mul_rms_packed_rope_custom(const ggml_tensor * dst) {
+    if (dst == nullptr || dst->op != GGML_OP_CUSTOM ||
+        std::strcmp(dst->name, "qkv_mul_rms_packed_rope") != 0 ||
+        dst->type != GGML_TYPE_F16 || dst->ne[1] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return false;
+    }
+    for (int i = 0; i <= 5; ++i) {
+        if (dst->src[i] == nullptr && i != 2) return false;
+    }
+    return dst->src[0]->type == GGML_TYPE_F32 && dst->src[1]->type == GGML_TYPE_F16 &&
+           (dst->src[2] == nullptr || dst->src[2]->type == GGML_TYPE_F32) &&
+           dst->src[3]->type == GGML_TYPE_F32 && dst->src[4]->type == GGML_TYPE_F32 &&
+           dst->src[5]->type == GGML_TYPE_F32;
+}
+
+bool is_qkv_mul_rms_packed_dual_rope_custom(const ggml_tensor * dst) {
+    if (dst == nullptr || dst->op != GGML_OP_CUSTOM ||
+        std::strcmp(dst->name, "qkv_mul_rms_packed_dual_rope") != 0 ||
+        dst->type != GGML_TYPE_F16 || dst->ne[1] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return false;
+    }
+    for (int i = 0; i <= 10; ++i) {
+        if (dst->src[i] == nullptr && i != 2 && i != 7) return false;
+    }
+    for (int i = 0; i <= 10; ++i) {
+        const ggml_tensor * src = dst->src[i];
+        if (src == nullptr) continue;
+        if ((i == 1 || i == 6) && src->type != GGML_TYPE_F16) return false;
+        if (i != 1 && i != 6 && src->type != GGML_TYPE_F32) return false;
+    }
+    return true;
+}
+
 bool is_packed_sparse_attention(const ggml_tensor * dst) {
     return dst != nullptr && dst->op == GGML_OP_FLASH_ATTN_EXT &&
            std::strcmp(dst->name, "packed_sparse_attention") == 0;
@@ -301,6 +338,10 @@ const char * htp_op_index_name(int op_index) {
             return "HTP_OPS_QKV_MUL_RMS_PACKED_W16A32";
         case HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_W16A32:
             return "HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_W16A32";
+        case HTP_OPS_QKV_MUL_RMS_PACKED_ROPE_W16A32:
+            return "HTP_OPS_QKV_MUL_RMS_PACKED_ROPE_W16A32";
+        case HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_ROPE_W16A32:
+            return "HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_ROPE_W16A32";
         case HTP_OPS_MAT_MUL_PERMUTED_W4D16A32:
             return "HTP_OPS_MAT_MUL_PERMUTED_W4D16A32";
         case HTP_OPS_MAT_MUL_PERMUTED_W8D16A32:
@@ -453,35 +494,75 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                     return dst->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F16 &&
                            k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
                            mask->type == GGML_TYPE_I32 && mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX &&
-                           with_lse && q->ne[0] == 64 && q->ne[1] == k->ne[1] &&
+                           with_lse && packed_head_dim_supported((int) q->ne[0]) && q->ne[1] == k->ne[1] &&
                            q->ne[2] == 24 && k->ne[2] == 24 && q->ne[3] == 1 &&
                            ggml_flash_attn_ext_get_sparse_policy(dst) == GGML_FLASH_ATTN_EXT_SPARSE_POLICY_STATIC_HALO;
                 }
 
                 return dst->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
                        v->type == GGML_TYPE_F16 && (mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32) &&
-                       mask_format_ok && shape_ok && max_bias == 0 && logit_softcap == 0;
+                       packed_head_dim_supported((int) q->ne[0]) && mask_format_ok && shape_ok &&
+                       max_bias == 0 && logit_softcap == 0;
             }
         case GGML_OP_CUSTOM:
+            if (is_qkv_mul_rms_packed_dual_rope_custom(dst)) {
+                const ggml_tensor * image_activation = dst->src[0];
+                const ggml_tensor * text_activation = dst->src[5];
+                const ggml_tensor * image_weight = dst->src[1];
+                const ggml_tensor * text_weight = dst->src[6];
+                const int image_head_dim = image_weight->ne[1] % (3 * 24) == 0 ?
+                    (int) (image_weight->ne[1] / (3 * 24)) : 0;
+                const int text_head_dim = text_weight->ne[1] % (3 * 24) == 0 ?
+                    (int) (text_weight->ne[1] / (3 * 24)) : 0;
+                return image_activation->ne[0] == text_activation->ne[0] &&
+                       image_activation->ne[0] % 32 == 0 && image_head_dim == text_head_dim &&
+                       packed_head_dim_supported(image_head_dim) &&
+                       image_weight->ne[0] == image_activation->ne[0] &&
+                       text_weight->ne[0] == text_activation->ne[0] &&
+                       image_weight->ne[1] == 3 * 24 * image_head_dim &&
+                       text_weight->ne[1] == 3 * 24 * text_head_dim &&
+                       dst->src[3]->ne[0] == image_head_dim && dst->src[4]->ne[0] == image_head_dim &&
+                       dst->src[8]->ne[0] == text_head_dim && dst->src[9]->ne[0] == text_head_dim;
+            }
+            if (is_qkv_mul_rms_packed_rope_custom(dst)) {
+                const ggml_tensor * activation = dst->src[0];
+                const ggml_tensor * weight = dst->src[1];
+                const int head_dim = weight->ne[1] % (3 * 24) == 0 ?
+                    (int) (weight->ne[1] / (3 * 24)) : 0;
+                return activation->ne[0] > 0 && activation->ne[1] > 0 &&
+                       activation->ne[0] % 32 == 0 && weight->ne[0] == activation->ne[0] &&
+                       packed_head_dim_supported(head_dim) && weight->ne[1] == 3 * 24 * head_dim &&
+                       dst->src[3]->ne[0] == head_dim && dst->src[4]->ne[0] == head_dim;
+            }
             if (is_qkv_mul_rms_packed_dual_custom(dst)) {
                 const ggml_tensor * image_activation = dst->src[0];
                 const ggml_tensor * text_activation = dst->src[5];
                 const ggml_tensor * image_weight = dst->src[1];
                 const ggml_tensor * text_weight = dst->src[6];
+                const int image_head_dim = image_weight->ne[1] % (3 * 24) == 0 ?
+                    (int) (image_weight->ne[1] / (3 * 24)) : 0;
+                const int text_head_dim = text_weight->ne[1] % (3 * 24) == 0 ?
+                    (int) (text_weight->ne[1] / (3 * 24)) : 0;
                 return image_activation->ne[0] == text_activation->ne[0] &&
                        image_activation->ne[0] % 32 == 0 &&
                        image_weight->ne[0] == image_activation->ne[0] &&
                        text_weight->ne[0] == text_activation->ne[0] &&
-                       image_weight->ne[1] == 3 * 24 * 64 &&
-                       text_weight->ne[1] == 3 * 24 * 64 &&
+                       image_head_dim == text_head_dim && packed_head_dim_supported(image_head_dim) &&
+                       image_weight->ne[1] == 3 * 24 * image_head_dim &&
+                       text_weight->ne[1] == 3 * 24 * text_head_dim &&
+                       dst->src[3]->ne[0] == image_head_dim && dst->src[4]->ne[0] == image_head_dim &&
+                       dst->src[8]->ne[0] == text_head_dim && dst->src[9]->ne[0] == text_head_dim &&
                        dst->ne[0] > 0;
             }
             if (is_qkv_mul_rms_packed_custom(dst)) {
                 const ggml_tensor * activation = dst->src[0];
                 const ggml_tensor * weight = dst->src[1];
+                const int head_dim = weight->ne[1] % (3 * 24) == 0 ?
+                    (int) (weight->ne[1] / (3 * 24)) : 0;
                 return activation->ne[0] > 0 && activation->ne[1] > 0 &&
                        activation->ne[0] % 32 == 0 && weight->ne[0] == activation->ne[0] &&
-                       weight->ne[1] == 3 * 24 * 64;
+                       packed_head_dim_supported(head_dim) && weight->ne[1] == 3 * 24 * head_dim &&
+                       dst->src[3]->ne[0] == head_dim && dst->src[4]->ne[0] == head_dim;
             }
             return is_block_sparse_score_custom(dst);
         default:
@@ -501,6 +582,13 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
         return tensor_ready_for_htp_dispatch_view_backed(dst);
     }
 
+    if (is_qkv_mul_rms_packed_rope_custom(dst)) {
+        for (int i = 0; i <= 5; ++i) {
+            if (dst->src[i] != nullptr && !tensor_ready_for_htp_dispatch_view_backed(dst->src[i])) return false;
+        }
+        return tensor_ready_for_htp_dispatch_view_backed(dst);
+    }
+
     if (is_qkv_mul_rms_packed_dual_custom(dst)) {
         for (int i = 0; i < 10; ++i) {
             if (dst->src[i] == nullptr) continue;
@@ -512,6 +600,13 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
             return false;
         }
         return true;
+    }
+
+    if (is_qkv_mul_rms_packed_dual_rope_custom(dst)) {
+        for (int i = 0; i <= 10; ++i) {
+            if (dst->src[i] != nullptr && !tensor_ready_for_htp_dispatch_view_backed(dst->src[i])) return false;
+        }
+        return tensor_ready_for_htp_dispatch_view_backed(dst);
     }
 
     if (dst->op == GGML_OP_FLASH_ATTN_EXT) {
@@ -1449,6 +1544,70 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 auto [k_fd, k_offset]       = mappings[2];
                 auto [v_fd, v_offset]       = mappings[3];
                 auto [mask_fd, mask_offset] = mappings[4];
+                auto * v = dst->src[2];
+
+                if (env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE") &&
+                    q->ne[0] == 128 && q->ne[1] == 768 && q->ne[2] == 24) {
+                    std::fprintf(stderr,
+                                 "flux2_attn_boundary_meta q=%s k=%s v=%s nb=[%zu,%zu,%zu] k_nb=[%zu,%zu,%zu] v_nb=[%zu,%zu,%zu]\n",
+                                 ggml_type_name(q->type), ggml_type_name(k->type), ggml_type_name(v->type),
+                                 q->nb[0], q->nb[1], q->nb[2], k->nb[0], k->nb[1], k->nb[2],
+                                 v->nb[0], v->nb[1], v->nb[2]);
+                }
+
+                // Flux2 diagnostic: compare the first logical token/head values at the
+                // attention boundary. Packed Q/K/V are HMX tiled, while dense inputs
+                // are ordinary row-major tensors.
+                if (env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE") &&
+                    q->ne[0] == 128 && q->ne[1] == 768 && q->ne[2] == 24 &&
+                    q->type == GGML_TYPE_F16 && k->type == GGML_TYPE_F16 &&
+                    v->type == GGML_TYPE_F16) {
+                    const size_t token_tiles = (size_t) (q->ne[1] + 31) / 32;
+                    const size_t tile_elms = 1024;
+                    const size_t head_stride = token_tiles * 4 * tile_elms;
+                    const auto * qv = static_cast<const ggml_fp16_t *>(q->data);
+                    const auto * kv = static_cast<const ggml_fp16_t *>(k->data);
+                    const auto * vv = static_cast<const ggml_fp16_t *>(v->data);
+                    std::fprintf(stderr, "flux2_attn_packed_boundary q=");
+                    for (int i = 0; i < 8; ++i) {
+                        std::fprintf(stderr, "%s%.8g", i == 0 ? "" : ",",
+                                     ggml_fp16_to_fp32(qv[i]));
+                    }
+                    std::fprintf(stderr, " k=");
+                    for (int i = 0; i < 8; ++i) {
+                        std::fprintf(stderr, "%s%.8g", i == 0 ? "" : ",",
+                                     ggml_fp16_to_fp32(kv[i]));
+                    }
+                    std::fprintf(stderr, " v=");
+                    for (int i = 0; i < 8; ++i) {
+                        const size_t dim_tile = (size_t) i / 32;
+                        const size_t elem = dim_tile * token_tiles * tile_elms + (size_t) (i % 32);
+                        std::fprintf(stderr, "%s%.8g", i == 0 ? "" : ",",
+                                     ggml_fp16_to_fp32(vv[elem]));
+                    }
+                    std::fprintf(stderr, " stride=%zu\n", head_stride);
+                } else if (env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE") &&
+                           q->ne[0] == 128 && q->ne[1] == 768 && q->ne[2] == 24 &&
+                           q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 &&
+                           v->type == GGML_TYPE_F32) {
+                    const auto * qv = static_cast<const float *>(q->data);
+                    const auto * kv = static_cast<const float *>(k->data);
+                    const auto * vv = static_cast<const float *>(v->data);
+                    std::fprintf(stderr, "flux2_attn_dense_boundary q=");
+                    for (int i = 0; i < 8; ++i) {
+                        std::fprintf(stderr, "%s%.8g", i == 0 ? "" : ",", qv[i]);
+                    }
+                    std::fprintf(stderr, " k=");
+                    for (int i = 0; i < 8; ++i) {
+                        std::fprintf(stderr, "%s%.8g", i == 0 ? "" : ",", kv[i]);
+                    }
+                    std::fprintf(stderr, " v=");
+                    for (int i = 0; i < 8; ++i) {
+                        std::fprintf(stderr, "%s%.8g", i == 0 ? "" : ",",
+                                     vv[i]);
+                    }
+                    std::fprintf(stderr, "\n");
+                }
 
                 auto * mask = dst->src[3];
                 const bool with_lse = ggml_get_op_params_i32(dst, 6) != 0;
@@ -1574,6 +1733,99 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
 
         case GGML_OP_CUSTOM:
             {
+                if (is_qkv_mul_rms_packed_dual_rope_custom(dst)) {
+                    prepare_tensor_rpcmem_mapping_with_extra(dst, dst->src[0]);
+                    const auto & mapper = ggml_backend_htp_context::instance()->mapper;
+                    std::vector<std::pair<int, ssize_t>> mappings;
+                    mappings.push_back(mapper.get_tensor_mapping(dst));
+                    for (int i = 0; i <= 10; ++i) {
+                        mappings.push_back(dst->src[i] != nullptr ? mapper.get_tensor_mapping(dst->src[i]) : std::make_pair(-1, (ssize_t) 0));
+                    }
+                    const int image_tokens = (int) dst->src[0]->ne[1];
+                    const int text_tokens = (int) dst->src[5]->ne[1];
+                    const int input_dim = (int) dst->src[0]->ne[0];
+                    const int head_dim = (int) dst->src[3]->ne[0];
+                    const int n_heads = 24;
+                    const size_t token_tiles = (size_t) (image_tokens + text_tokens + 31) / 32;
+                    const size_t qkv_size = (size_t) n_heads * token_tiles * (size_t) (head_dim / 32) * 1024 * sizeof(uint16_t);
+                    auto [packed_fd, packed_offset] = mappings[0];
+                    QkvMulRmsPackedDualRopeParams op_params{
+                        .q = { packed_fd, (int32_t) packed_offset },
+                        .k_out = { packed_fd, (int32_t) (packed_offset + qkv_size) },
+                        .v = { packed_fd, (int32_t) (packed_offset + 2 * qkv_size) },
+                        .image_activation = { mappings[1].first, (int32_t) mappings[1].second },
+                        .image_weight = { mappings[2].first, (int32_t) mappings[2].second },
+                        .image_bias = { mappings[3].first, (int32_t) mappings[3].second },
+                        .image_q_norm = { mappings[4].first, (int32_t) mappings[4].second },
+                        .image_k_norm = { mappings[5].first, (int32_t) mappings[5].second },
+                        .text_activation = { mappings[6].first, (int32_t) mappings[6].second },
+                        .text_weight = { mappings[7].first, (int32_t) mappings[7].second },
+                        .text_bias = { mappings[8].first, (int32_t) mappings[8].second },
+                        .text_q_norm = { mappings[9].first, (int32_t) mappings[9].second },
+                        .text_k_norm = { mappings[10].first, (int32_t) mappings[10].second },
+                        .rope_pe = { mappings[11].first, (int32_t) mappings[11].second },
+                        .image_tokens = image_tokens, .text_tokens = text_tokens,
+                        .input_dim = input_dim, .n_heads = n_heads, .head_dim = head_dim,
+                        .image_rope_token_offset = 0,
+                        .text_rope_token_offset = image_tokens,
+                        .elapsed_us = 0,
+                    };
+                    *reinterpret_cast<QkvMulRmsPackedDualRopeParams *>(param_buf) = op_params;
+                    op_index = HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_ROPE_W16A32;
+                    args_size = sizeof(op_params);
+                    dispatch_m = image_tokens + text_tokens;
+                    dispatch_k = input_dim;
+                    dispatch_n = 3 * n_heads * head_dim;
+                    if (env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE")) {
+                        std::fprintf(stderr,
+                                     "[ggml-htp-trace] dispatch qkv_mul_rms_packed_dual_rope image=%d text=%d input=%d head_dim=%d\n",
+                                     image_tokens, text_tokens, input_dim, head_dim);
+                    }
+                    break;
+                }
+                if (is_qkv_mul_rms_packed_rope_custom(dst)) {
+                    prepare_tensor_rpcmem_mapping_with_extra(dst, dst->src[1]);
+                    const auto & mapper = ggml_backend_htp_context::instance()->mapper;
+                    std::vector<std::pair<int, ssize_t>> mappings;
+                    mappings.push_back(mapper.get_tensor_mapping(dst));
+                    for (int i = 0; i <= 5; ++i) {
+                        mappings.push_back(dst->src[i] != nullptr ? mapper.get_tensor_mapping(dst->src[i]) : std::make_pair(-1, (ssize_t) 0));
+                    }
+                    const int tokens = (int) dst->src[0]->ne[1];
+                    const int input_dim = (int) dst->src[0]->ne[0];
+                    const int head_dim = (int) dst->src[3]->ne[0];
+                    const int n_heads = 24;
+                    const size_t token_tiles = (size_t) (tokens + 31) / 32;
+                    const size_t qkv_size = (size_t) n_heads * token_tiles * (size_t) (head_dim / 32) * 1024 * sizeof(uint16_t);
+                    auto [packed_fd, packed_offset] = mappings[0];
+                    QkvMulRmsPackedRopeParams op_params{
+                        .q = { packed_fd, (int32_t) packed_offset },
+                        .k_out = { packed_fd, (int32_t) (packed_offset + qkv_size) },
+                        .v = { packed_fd, (int32_t) (packed_offset + 2 * qkv_size) },
+                        .activation = { mappings[1].first, (int32_t) mappings[1].second },
+                        .weight = { mappings[2].first, (int32_t) mappings[2].second },
+                        .bias = { mappings[3].first, (int32_t) mappings[3].second },
+                        .q_norm = { mappings[4].first, (int32_t) mappings[4].second },
+                        .k_norm = { mappings[5].first, (int32_t) mappings[5].second },
+                        .rope_pe = { mappings[6].first, (int32_t) mappings[6].second },
+                        .tokens = tokens, .input_dim = input_dim,
+                        .n_heads = n_heads, .head_dim = head_dim,
+                        .rope_token_offset = 0, .rope_token_count = tokens,
+                        .elapsed_us = 0,
+                    };
+                    *reinterpret_cast<QkvMulRmsPackedRopeParams *>(param_buf) = op_params;
+                    op_index = HTP_OPS_QKV_MUL_RMS_PACKED_ROPE_W16A32;
+                    args_size = sizeof(op_params);
+                    dispatch_m = tokens;
+                    dispatch_k = input_dim;
+                    dispatch_n = 3 * n_heads * head_dim;
+                    if (env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE")) {
+                        std::fprintf(stderr,
+                                     "[ggml-htp-trace] dispatch qkv_mul_rms_packed_rope tokens=%d input=%d head_dim=%d\n",
+                                     tokens, input_dim, head_dim);
+                    }
+                    break;
+                }
                 if (is_qkv_mul_rms_packed_dual_custom(dst)) {
                     prepare_tensor_rpcmem_mapping_with_extra(dst, dst->src[0]);
                     const auto & mapper = ggml_backend_htp_context::instance()->mapper;
@@ -1585,10 +1837,10 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     const int image_tokens = (int) dst->src[0]->ne[1];
                     const int text_tokens = (int) dst->src[5]->ne[1];
                     const int input_dim = (int) dst->src[0]->ne[0];
-                    const int head_dim = 64;
+                    const int head_dim = (int) dst->src[3]->ne[0];
                     const int n_heads = 24;
                     const size_t token_tiles = (size_t) (image_tokens + text_tokens + 31) / 32;
-                    const size_t qkv_size = (size_t) n_heads * token_tiles * (head_dim / 32) * 1024 * sizeof(uint16_t);
+                    const size_t qkv_size = (size_t) n_heads * token_tiles * (size_t) (head_dim / 32) * 1024 * sizeof(uint16_t);
                     auto [packed_fd, packed_offset] = mappings[0];
                     QkvMulRmsPackedDualParams op_params{
                         .q = { packed_fd, (int32_t) packed_offset },
@@ -1624,10 +1876,10 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     }
                     const int tokens = (int) dst->src[0]->ne[1];
                     const int input_dim = (int) dst->src[0]->ne[0];
-                    const int head_dim = 64;
+                    const int head_dim = (int) dst->src[3]->ne[0];
                     const int n_heads = 24;
                     const size_t token_tiles = (tokens + 31) / 32;
-                    const size_t qkv_size = n_heads * token_tiles * (head_dim / 32) * 1024 * sizeof(uint16_t);
+                    const size_t qkv_size = (size_t) n_heads * token_tiles * (size_t) (head_dim / 32) * 1024 * sizeof(uint16_t);
                     auto [packed_fd, packed_offset] = mappings[0];
                     auto [activation_fd, activation_offset] = mappings[1];
                     auto [weight_fd, weight_offset] = mappings[2];
@@ -1808,13 +2060,24 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     auto * completed_request = message_header_get_request_ptr(msg_hdr, 0);
     int ret = completed_request->state;
     auto * compute_request = reinterpret_cast<OpComputeRequest *>(completed_request->data);
-    const auto * block_sparse_params = op_index == HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16
+    if (env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE") && debug_f16_matmul && dst != nullptr &&
+        dst->type == GGML_TYPE_F32 && dispatch_m == 768 && dispatch_k == 3072 &&
+        (dispatch_n == 9216 || dispatch_n == 27648)) {
+        const float * values = static_cast<const float *>(dst->data);
+        std::fprintf(stderr, "flux2_dense_matmul_debug m=%d n=%d values=", dispatch_m, dispatch_n);
+        for (int i = 0; i < 8; ++i) {
+            std::fprintf(stderr, "%s%.8g", i == 0 ? "" : ",", values[i]);
+        }
+        std::fprintf(stderr, "\n");
+    }
+    const auto * block_sparse_params =
+        (op_index == HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16 ||
+         op_index == HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16)
         ? reinterpret_cast<const BlockSparseAttnParams *>(compute_request->payload)
         : nullptr;
     const char * internal_trace = std::getenv("SD_HTP_ATTN_INTERNAL_TRACE");
     if (internal_trace != nullptr && internal_trace[0] != '\0' && std::strcmp(internal_trace, "0") != 0 &&
-        (op_index == HTP_OPS_FLASH_ATTN_QO_F32_KV_F16 ||
-         op_index == HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16)) {
+        (op_index == HTP_OPS_FLASH_ATTN_QO_F32_KV_F16 || block_sparse_params != nullptr)) {
         const int32_t elapsed_us = op_index == HTP_OPS_FLASH_ATTN_QO_F32_KV_F16
             ? reinterpret_cast<const FlashAttnParams *>(compute_request->payload)->elapsed_us
             : block_sparse_params->elapsed_us;
@@ -1870,6 +2133,25 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 expected_image_q_segments);
             ret = -EIO;
         }
+    }
+    if (env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE") && dst != nullptr &&
+        (std::strcmp(dst->name, "qkv_mul_rms_packed_rope") == 0 ||
+         std::strcmp(dst->name, "flux2_single_dense_qkv_debug") == 0)) {
+        std::fprintf(stderr, "flux2_qkv_debug name=%s type=%s bytes=%zu values=",
+                     dst->name, ggml_type_name(dst->type), ggml_nbytes(dst));
+        const int count = 8;
+        if (dst->type == GGML_TYPE_F16) {
+            const ggml_fp16_t * values = static_cast<const ggml_fp16_t *>(dst->data);
+            for (int i = 0; i < count; ++i) {
+                std::fprintf(stderr, "%s%.8g", i == 0 ? "" : ",", ggml_fp16_to_fp32(values[i]));
+            }
+        } else if (dst->type == GGML_TYPE_F32) {
+            const float * values = static_cast<const float *>(dst->data);
+            for (int i = 0; i < count; ++i) {
+                std::fprintf(stderr, "%s%.8g", i == 0 ? "" : ",", values[i]);
+            }
+        }
+        std::fprintf(stderr, "\n");
     }
     if (debug_hash_index >= 0) {
         const uint64_t output_hash = htp_hash_tensor_bytes(dst);

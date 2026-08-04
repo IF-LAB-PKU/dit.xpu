@@ -745,7 +745,23 @@ ggml_tensor * ggml_backend_htp_get_packed_f16_weight(const ggml_tensor * origina
     }
     auto & packed = ggml_backend_htp_context::instance()->packed_f16_weights;
     auto it = packed.find(original);
-    return it != packed.end() ? it->second : nullptr;
+    if (it != packed.end()) {
+        return it->second;
+    }
+
+    // Offline-packed column-range views share the root tensor's W16A32
+    // storage. Preserve the view's byte offset for dispatch while inheriting
+    // the root's registration; downstream shape checks still reject invalid
+    // or non-contiguous views.
+    const ggml_tensor * root = original;
+    while (root->view_src != nullptr) {
+        root = root->view_src;
+    }
+    it = packed.find(root);
+    if (root != original && it != packed.end() && it->second == root && ggml_is_contiguous(original)) {
+        return const_cast<ggml_tensor *>(original);
+    }
+    return nullptr;
 }
 
 bool ggml_backend_htp_runtime_available(void) {
