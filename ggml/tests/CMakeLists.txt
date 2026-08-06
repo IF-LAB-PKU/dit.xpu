@@ -235,6 +235,18 @@ if (GGML_HTP)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
+    if (NOT GGML_BACKEND_DL)
+        set(TEST_TARGET test-backend-htp-z-image-attn)
+        add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+        # This fixture exercises ggml CPU reference math and Z-Image metadata only.
+        # Linking stable-diffusion would pull both ggml-htp's copied CPU fallback
+        # and ggml-cpu into the same executable, producing duplicate symbols.
+        target_link_libraries(${TEST_TARGET} PRIVATE ggml-base ggml-cpu Threads::Threads)
+        target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../.. ${CMAKE_CURRENT_LIST_DIR}/../../include)
+        add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+        set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
+    endif()
+
     if (TARGET stable-diffusion)
         # test-backend-htp-diffusion-f16-routing: source file not yet created, skip for now
         # set(TEST_TARGET test-backend-htp-diffusion-f16-routing)

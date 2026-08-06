@@ -653,7 +653,8 @@ namespace Rope {
                                                                       int context_len,
                                                                       int seq_multi_of,
                                                                       const std::vector<ggml_tensor*>& ref_latents,
-                                                                      bool increase_ref_index) {
+                                                                      bool increase_ref_index,
+                                                                      bool image_first = false) {
         int padded_context_len = context_len + bound_mod(context_len, seq_multi_of);
         auto txt_ids           = std::vector<std::vector<float>>(bs * padded_context_len, std::vector<float>(3, 0.0f));
         for (int i = 0; i < bs * padded_context_len; i++) {
@@ -670,7 +671,8 @@ namespace Rope {
             img_ids = concat_ids(img_ids, img_pad_ids, bs);
         }
 
-        auto ids = concat_ids(txt_ids, img_ids, bs);
+        // ids = image_first ? [img, txt] : [txt, img]
+        auto ids = image_first ? concat_ids(img_ids, txt_ids, bs) : concat_ids(txt_ids, img_ids, bs);
 
         // ignore ref_latents for now
         return ids;
@@ -688,8 +690,9 @@ namespace Rope {
                                                         int theta,
                                                         bool circular_h,
                                                         bool circular_w,
-                                                        const std::vector<int>& axes_dim) {
-        std::vector<std::vector<float>> ids = gen_z_image_ids(h, w, patch_size, bs, context_len, seq_multi_of, ref_latents, increase_ref_index);
+                                                        const std::vector<int>& axes_dim,
+                                                        bool image_first = false) {
+        std::vector<std::vector<float>> ids = gen_z_image_ids(h, w, patch_size, bs, context_len, seq_multi_of, ref_latents, increase_ref_index, image_first);
         std::vector<std::vector<int>> wrap_dims;
         if ((circular_h || circular_w) && bs > 0 && axes_dim.size() >= 3) {
             int pad_h = (patch_size - (h % patch_size)) % patch_size;
@@ -699,8 +702,9 @@ namespace Rope {
             if (h_len > 0 && w_len > 0) {
                 size_t pos_len = ids.size() / bs;
                 wrap_dims.assign(axes_dim.size(), std::vector<int>(pos_len, 0));
-                size_t cursor     = context_len + bound_mod(context_len, seq_multi_of);  // skip text (and its padding)
                 size_t img_tokens = static_cast<size_t>(h_len) * static_cast<size_t>(w_len);
+                // cursor points to start of image tokens in the sequence
+                size_t cursor = image_first ? 0 : context_len + bound_mod(context_len, seq_multi_of);
                 for (size_t token_i = 0; token_i < img_tokens; ++token_i) {
                     if (circular_h) {
                         wrap_dims[1][cursor + token_i] = h_len;
@@ -771,6 +775,51 @@ namespace Rope {
         k = apply_rope(ctx->ggml_ctx, k, pe, rope_interleaved);  // [N*n_head, L, d_head]
 
         auto x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, v->ne[1], mask, true, ctx->flash_attn_enabled, kv_scale);  // [N, L, n_head*d_head]
+        return x;
+    }
+
+    // Extended attention with block-sparse, protected regions, and residual support.
+    // This is the Z-Image raw/reordered HTP attention path — applies RoPE exactly once,
+    // then dispatches through ggml_ext_attention_ext with the full option set.
+    __STATIC_INLINE__ ggml_tensor* attention_ext(GGMLRunnerContext* ctx,
+                                                  ggml_tensor* q,
+                                                  ggml_tensor* k,
+                                                  ggml_tensor* v,
+                                                  ggml_tensor* pe,
+                                                  ggml_tensor* mask,
+                                                  float kv_scale            = 1.0f,
+                                                  bool rope_interleaved     = true,
+                                                  bool block_sparse_attn    = false,
+                                                  int protected_start       = 0,
+                                                  int protected_len         = 0) {
+        // q,k,v: [N, L, n_head, d_head]
+        // pe: [L, d_head/2, 2, 2]
+        // return: [N, L, n_head*d_head]
+        q = apply_rope(ctx->ggml_ctx, q, pe, rope_interleaved);  // [N*n_head, L, d_head]
+        k = apply_rope(ctx->ggml_ctx, k, pe, rope_interleaved);  // [N*n_kv_head, L, d_head]
+
+        auto x = ggml_ext_attention_ext(ctx->ggml_ctx,
+                                        ctx->backend,
+                                        q, k, v,
+                                        v->ne[1],  // n_head = n_kv_head for 30/30 GQA
+                                        mask,
+                                        true,                     // skip_reshape
+                                        ctx->flash_attn_enabled,
+                                        kv_scale,
+                                        block_sparse_attn,
+                                        protected_start,
+                                        protected_len,
+                                        ctx->block_sparse_residual_mode,
+                                        ctx->block_sparse_residual_scale,
+                                        ctx->block_sparse_residual_rho,
+                                        ctx->block_sparse_residual_exact_rho,
+                                        nullptr,  // residual_cache_name
+                                        nullptr,  // cached_residual
+                                        nullptr,  // rho_cache_name
+                                        nullptr,  // cached_rho
+                                        nullptr,  // cache_tensor callback
+                                        ctx->block_sparse_token_h,
+                                        ctx->block_sparse_token_w);
         return x;
     }
 };  // namespace Rope
