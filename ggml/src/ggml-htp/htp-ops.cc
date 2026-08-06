@@ -36,7 +36,23 @@
 namespace {
 
 bool packed_head_dim_supported(int head_dim) {
-    return head_dim == 64 || head_dim == 128;
+    return htp_packed_head_dim_supported(head_dim) != 0;
+}
+
+bool packed_qkv_weight_shape(const ggml_tensor * weight, int * n_heads, int * head_dim) {
+    if (weight == nullptr || n_heads == nullptr || head_dim == nullptr) {
+        return false;
+    }
+    for (const int heads : {24, 30}) {
+        for (const int dim : {64, 128}) {
+            if (weight->ne[1] == 3 * heads * dim) {
+                *n_heads = heads;
+                *head_dim = dim;
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // HTP hybrid 路径里部分张量可能还是 view，这里统一回退到真正持有 buffer 的 backing tensor。
@@ -491,12 +507,17 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                     dst->ne[3] == q->ne[3];
 
                 if (is_packed_sparse_attention(dst)) {
+                    const bool full_keep_packed =
+                        mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_MATRIX &&
+                        ggml_flash_attn_ext_get_sparse_policy(dst) == GGML_FLASH_ATTN_EXT_SPARSE_POLICY_NONE;
+                    const bool static_halo_packed =
+                        mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX &&
+                        ggml_flash_attn_ext_get_sparse_policy(dst) == GGML_FLASH_ATTN_EXT_SPARSE_POLICY_STATIC_HALO;
                     return dst->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F16 &&
                            k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
-                           mask->type == GGML_TYPE_I32 && mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX &&
-                           with_lse && packed_head_dim_supported((int) q->ne[0]) && q->ne[1] == k->ne[1] &&
-                           q->ne[2] == 24 && k->ne[2] == 24 && q->ne[3] == 1 &&
-                           ggml_flash_attn_ext_get_sparse_policy(dst) == GGML_FLASH_ATTN_EXT_SPARSE_POLICY_STATIC_HALO;
+                           mask->type == GGML_TYPE_I32 && (full_keep_packed || static_halo_packed) &&
+                           with_lse && q->ne[1] == k->ne[1] && k->ne[2] == q->ne[2] && q->ne[3] == 1 &&
+                           htp_packed_shape_supported((int) q->ne[2], (int) k->ne[2], (int) q->ne[0], 1);
                 }
 
                 return dst->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
@@ -510,28 +531,28 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                 const ggml_tensor * text_activation = dst->src[5];
                 const ggml_tensor * image_weight = dst->src[1];
                 const ggml_tensor * text_weight = dst->src[6];
-                const int image_head_dim = image_weight->ne[1] % (3 * 24) == 0 ?
-                    (int) (image_weight->ne[1] / (3 * 24)) : 0;
-                const int text_head_dim = text_weight->ne[1] % (3 * 24) == 0 ?
-                    (int) (text_weight->ne[1] / (3 * 24)) : 0;
+                int image_heads = 0, image_head_dim = 0;
+                int text_heads = 0, text_head_dim = 0;
+                const bool image_shape_ok = packed_qkv_weight_shape(image_weight, &image_heads, &image_head_dim);
+                const bool text_shape_ok = packed_qkv_weight_shape(text_weight, &text_heads, &text_head_dim);
                 return image_activation->ne[0] == text_activation->ne[0] &&
-                       image_activation->ne[0] % 32 == 0 && image_head_dim == text_head_dim &&
-                       packed_head_dim_supported(image_head_dim) &&
+                       image_activation->ne[0] % 32 == 0 && image_shape_ok && text_shape_ok &&
+                       htp_packed_shape_supported(image_heads, text_heads, image_head_dim, 1) &&
+                       image_head_dim == text_head_dim &&
                        image_weight->ne[0] == image_activation->ne[0] &&
                        text_weight->ne[0] == text_activation->ne[0] &&
-                       image_weight->ne[1] == 3 * 24 * image_head_dim &&
-                       text_weight->ne[1] == 3 * 24 * text_head_dim &&
+                       image_weight->ne[1] == text_weight->ne[1] &&
                        dst->src[3]->ne[0] == image_head_dim && dst->src[4]->ne[0] == image_head_dim &&
                        dst->src[8]->ne[0] == text_head_dim && dst->src[9]->ne[0] == text_head_dim;
             }
             if (is_qkv_mul_rms_packed_rope_custom(dst)) {
                 const ggml_tensor * activation = dst->src[0];
                 const ggml_tensor * weight = dst->src[1];
-                const int head_dim = weight->ne[1] % (3 * 24) == 0 ?
-                    (int) (weight->ne[1] / (3 * 24)) : 0;
+                int n_heads = 0, head_dim = 0;
+                const bool weight_shape_ok = packed_qkv_weight_shape(weight, &n_heads, &head_dim);
                 return activation->ne[0] > 0 && activation->ne[1] > 0 &&
                        activation->ne[0] % 32 == 0 && weight->ne[0] == activation->ne[0] &&
-                       packed_head_dim_supported(head_dim) && weight->ne[1] == 3 * 24 * head_dim &&
+                       weight_shape_ok && htp_packed_shape_supported(n_heads, n_heads, head_dim, 1) &&
                        dst->src[3]->ne[0] == head_dim && dst->src[4]->ne[0] == head_dim;
             }
             if (is_qkv_mul_rms_packed_dual_custom(dst)) {
@@ -539,17 +560,16 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                 const ggml_tensor * text_activation = dst->src[5];
                 const ggml_tensor * image_weight = dst->src[1];
                 const ggml_tensor * text_weight = dst->src[6];
-                const int image_head_dim = image_weight->ne[1] % (3 * 24) == 0 ?
-                    (int) (image_weight->ne[1] / (3 * 24)) : 0;
-                const int text_head_dim = text_weight->ne[1] % (3 * 24) == 0 ?
-                    (int) (text_weight->ne[1] / (3 * 24)) : 0;
+                int image_heads = 0, image_head_dim = 0;
+                int text_heads = 0, text_head_dim = 0;
+                const bool image_shape_ok = packed_qkv_weight_shape(image_weight, &image_heads, &image_head_dim);
+                const bool text_shape_ok = packed_qkv_weight_shape(text_weight, &text_heads, &text_head_dim);
                 return image_activation->ne[0] == text_activation->ne[0] &&
                        image_activation->ne[0] % 32 == 0 &&
                        image_weight->ne[0] == image_activation->ne[0] &&
                        text_weight->ne[0] == text_activation->ne[0] &&
-                       image_head_dim == text_head_dim && packed_head_dim_supported(image_head_dim) &&
-                       image_weight->ne[1] == 3 * 24 * image_head_dim &&
-                       text_weight->ne[1] == 3 * 24 * text_head_dim &&
+                       image_shape_ok && text_shape_ok && image_head_dim == text_head_dim &&
+                       htp_packed_shape_supported(image_heads, text_heads, image_head_dim, 1) &&
                        dst->src[3]->ne[0] == image_head_dim && dst->src[4]->ne[0] == image_head_dim &&
                        dst->src[8]->ne[0] == text_head_dim && dst->src[9]->ne[0] == text_head_dim &&
                        dst->ne[0] > 0;
@@ -557,11 +577,11 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
             if (is_qkv_mul_rms_packed_custom(dst)) {
                 const ggml_tensor * activation = dst->src[0];
                 const ggml_tensor * weight = dst->src[1];
-                const int head_dim = weight->ne[1] % (3 * 24) == 0 ?
-                    (int) (weight->ne[1] / (3 * 24)) : 0;
+                int n_heads = 0, head_dim = 0;
+                const bool weight_shape_ok = packed_qkv_weight_shape(weight, &n_heads, &head_dim);
                 return activation->ne[0] > 0 && activation->ne[1] > 0 &&
                        activation->ne[0] % 32 == 0 && weight->ne[0] == activation->ne[0] &&
-                       packed_head_dim_supported(head_dim) && weight->ne[1] == 3 * 24 * head_dim &&
+                       weight_shape_ok && htp_packed_shape_supported(n_heads, n_heads, head_dim, 1) &&
                        dst->src[3]->ne[0] == head_dim && dst->src[4]->ne[0] == head_dim;
             }
             return is_block_sparse_score_custom(dst);
@@ -1745,7 +1765,11 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     const int text_tokens = (int) dst->src[5]->ne[1];
                     const int input_dim = (int) dst->src[0]->ne[0];
                     const int head_dim = (int) dst->src[3]->ne[0];
-                    const int n_heads = 24;
+                    int n_heads = 0, weight_head_dim = 0;
+                    if (!packed_qkv_weight_shape(dst->src[1], &n_heads, &weight_head_dim) ||
+                        weight_head_dim != head_dim) {
+                        return -EINVAL;
+                    }
                     const size_t token_tiles = (size_t) (image_tokens + text_tokens + 31) / 32;
                     const size_t qkv_size = (size_t) n_heads * token_tiles * (size_t) (head_dim / 32) * 1024 * sizeof(uint16_t);
                     auto [packed_fd, packed_offset] = mappings[0];
@@ -1794,7 +1818,11 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     const int tokens = (int) dst->src[0]->ne[1];
                     const int input_dim = (int) dst->src[0]->ne[0];
                     const int head_dim = (int) dst->src[3]->ne[0];
-                    const int n_heads = 24;
+                    int n_heads = 0, weight_head_dim = 0;
+                    if (!packed_qkv_weight_shape(dst->src[1], &n_heads, &weight_head_dim) ||
+                        weight_head_dim != head_dim) {
+                        return -EINVAL;
+                    }
                     const size_t token_tiles = (size_t) (tokens + 31) / 32;
                     const size_t qkv_size = (size_t) n_heads * token_tiles * (size_t) (head_dim / 32) * 1024 * sizeof(uint16_t);
                     auto [packed_fd, packed_offset] = mappings[0];
@@ -1838,7 +1866,11 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     const int text_tokens = (int) dst->src[5]->ne[1];
                     const int input_dim = (int) dst->src[0]->ne[0];
                     const int head_dim = (int) dst->src[3]->ne[0];
-                    const int n_heads = 24;
+                    int n_heads = 0, weight_head_dim = 0;
+                    if (!packed_qkv_weight_shape(dst->src[1], &n_heads, &weight_head_dim) ||
+                        weight_head_dim != head_dim) {
+                        return -EINVAL;
+                    }
                     const size_t token_tiles = (size_t) (image_tokens + text_tokens + 31) / 32;
                     const size_t qkv_size = (size_t) n_heads * token_tiles * (size_t) (head_dim / 32) * 1024 * sizeof(uint16_t);
                     auto [packed_fd, packed_offset] = mappings[0];
@@ -1877,7 +1909,11 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     const int tokens = (int) dst->src[0]->ne[1];
                     const int input_dim = (int) dst->src[0]->ne[0];
                     const int head_dim = (int) dst->src[3]->ne[0];
-                    const int n_heads = 24;
+                    int n_heads = 0, weight_head_dim = 0;
+                    if (!packed_qkv_weight_shape(dst->src[1], &n_heads, &weight_head_dim) ||
+                        weight_head_dim != head_dim) {
+                        return -EINVAL;
+                    }
                     const size_t token_tiles = (tokens + 31) / 32;
                     const size_t qkv_size = (size_t) n_heads * token_tiles * (size_t) (head_dim / 32) * 1024 * sizeof(uint16_t);
                     auto [packed_fd, packed_offset] = mappings[0];

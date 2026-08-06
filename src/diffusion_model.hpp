@@ -693,6 +693,18 @@ struct ZImageModel : public DiffusionModel {
         z_image.set_htp_backend(backend);
     }
 
+    void set_block_sparse_attention_enabled(bool enabled) override {
+        z_image.set_block_sparse_attention_enabled(enabled);
+    }
+
+    bool is_block_sparse_attention_enabled() const override {
+        return z_image.is_block_sparse_attention_enabled();
+    }
+
+    void set_htp_attention_enabled(bool enabled) override {
+        z_image.set_htp_attention_enabled(enabled);
+    }
+
     int64_t get_adm_in_channels() override {
         return 768;
     }
@@ -719,7 +731,13 @@ struct ZImageModel : public DiffusionModel {
                                *diffusion_params.timesteps,
                                tensor_or_empty(diffusion_params.context),
                                diffusion_params.ref_latents ? *diffusion_params.ref_latents : empty_ref_latents,
-                               true);
+                               true,
+                               diffusion_params.block_sparse_step_index,
+                               diffusion_params.block_sparse_residual_mode,
+                               diffusion_params.block_sparse_residual_scale,
+                               diffusion_params.block_sparse_residual_rho,
+                               diffusion_params.block_sparse_residual_exact_rho,
+                               diffusion_params.block_sparse_residual_branch_index);
     }
 };
 

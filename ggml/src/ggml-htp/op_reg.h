@@ -18,6 +18,26 @@ enum HtpHaloKvLoadMode {
     HTP_HALO_KV_LOAD_USERDMA_AB  = 2,
 };
 
+// Packed HMX kernels intentionally support only the contracts exercised by
+// the deployed 8 Gen 3 binaries. Keep this predicate C-compatible so the
+// ggml host and DSP executor cannot drift apart.
+static inline int htp_packed_head_count_supported(int n_heads) {
+    return n_heads == 24 || n_heads == 30;
+}
+
+static inline int htp_packed_head_dim_supported(int head_dim) {
+    return head_dim == 64 || head_dim == 128;
+}
+
+static inline int htp_packed_shape_supported(int n_heads, int n_kv_heads,
+                                              int head_dim, int require_equal_kv) {
+    return n_heads > 0 && n_kv_heads > 0 && n_heads % n_kv_heads == 0 &&
+           htp_packed_head_count_supported(n_heads) &&
+           htp_packed_head_dim_supported(head_dim) &&
+           (!require_equal_kv || (n_heads == n_kv_heads &&
+                                  htp_packed_head_count_supported(n_kv_heads)));
+}
+
 enum HtpOpsIndex {
     HTP_OPS_RMS_NORM_F32,
     HTP_OPS_MAT_MUL_PERMUTED_W16A32,

@@ -175,7 +175,9 @@ bool convert(const char* input_path,
 
     ModelLoader model_loader;
 
-    if (!model_loader.init_from_file(input_path)) {
+    // HTP packing accepts standalone DiT files whose tensor names omit the runtime namespace.
+    const std::string input_prefix = htp_pack_dit ? "model.diffusion_model." : "";
+    if (!model_loader.init_from_file(input_path, input_prefix)) {
         LOG_ERROR("init model loader from file failed: '%s'", input_path);
         return false;
     }
