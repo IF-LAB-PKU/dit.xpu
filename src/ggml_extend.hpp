@@ -34,6 +34,7 @@
 #include "ggml.h"
 #include "ggml_extend_backend.h"
 #include "ggml_graph_cut.h"
+#include "ggml_qkv_buffer_plan.hpp"
 
 #include "htp_tensor_flags.h"
 #include "model.h"
@@ -2349,6 +2350,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
     ggml_tensor* q_htp_flash = nullptr;
     ggml_tensor* k_htp_flash_base = nullptr;
     ggml_tensor* v_htp_flash_base = nullptr;
+    const bool keep_for_htp_hybrid = sd_env_flag_enabled("SD_HTP_OPS") &&
+                                     sd_env_flag_enabled("SD_HTP_COMPUTE");
     if (!skip_reshape && !packed_layout) {
         L_q       = q->ne[1];
         L_k       = k->ne[1];
@@ -2384,14 +2387,24 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         N         = v->ne[3];
         n_kv_head = k->ne[2] / N;
         C         = d_head * n_head;
+
+        // RoPE returns contiguous [d, token, head] tensors, whose backing memory is
+        // head-major. The DSP dense attention ABI reads Q/K/V linearly as
+        // [token, head, d], so give it token-major backing views just like the
+        // non-skip path above.
+        if (skip_reshape && !packed_layout && N == 1 && keep_for_htp_hybrid &&
+            sd_env_flag_enabled("SD_HTP_ATTENTION")) {
+            ggml_tensor* q_token_major = ggml_ext_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+            q_htp_flash = ggml_permute(ctx, q_token_major, 0, 2, 1, 3);
+            k_htp_flash_base = ggml_ext_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+            v_htp_flash_base = ggml_ext_cont(ctx, v);
+        }
     }
 
     float scale = (1.0f / sqrt((float)d_head));
 
     int kv_pad       = 0;
     ggml_tensor* kqv = nullptr;
-    const bool keep_for_htp_hybrid = sd_env_flag_enabled("SD_HTP_OPS") &&
-                                     sd_env_flag_enabled("SD_HTP_COMPUTE");
     const bool use_htp_flash_layout = keep_for_htp_hybrid &&
                                       sd_env_flag_enabled("SD_HTP_ATTENTION") &&
                                       N == 1 &&
@@ -4927,6 +4940,7 @@ protected:
         uint64_t generation = 0;
         ggml_gallocr* allocator = nullptr;
         size_t bytes = 0;
+        bool qkv_released = false;
     };
     std::deque<RetiredComputeArenaGeneration> retired_compute_arenas_;
     uint64_t next_compute_arena_generation_ = 1;
@@ -5169,6 +5183,41 @@ protected:
         }
         for (auto it = retired_compute_arenas_.begin();
              it != retired_compute_arenas_.end();) {
+            if (!it->qkv_released) {
+                bool qkv_released = false;
+                char qkv_reason[512] = {};
+                if (!ggml_backend_htp_opencl_release_qkv_generation(
+                        htp_backend, it->generation, wait_all, &qkv_released,
+                        qkv_reason, sizeof(qkv_reason))) {
+                    LOG_ERROR(
+                        "%s release deferred QKV generation=%" PRIu64 " failed: %s",
+                        get_desc().c_str(), it->generation,
+                        qkv_reason[0] != '\0' ? qkv_reason : "unknown error");
+                    return false;
+                }
+                if (sd_env_flag_enabled("SD_HTP_QKV_RELEASE_TRACE")) {
+                    LOG_INFO(
+                        "qkv_release_poll generation=%" PRIu64 " wait=%d released=%d reason=%s",
+                        it->generation, wait_all ? 1 : 0,
+                        qkv_released ? 1 : 0,
+                        qkv_reason[0] != '\0' ? qkv_reason : "ok");
+                }
+                if (qkv_released) {
+                    const size_t qkv_bytes =
+                        ggml_gallocr_get_buffer_size(it->allocator, 2);
+                    if (!ggml_gallocr_free_buffer(it->allocator, 2, nullptr)) {
+                        LOG_ERROR("%s free deferred QKV allocator buffer failed",
+                                  get_desc().c_str());
+                        return false;
+                    }
+                    it->qkv_released = true;
+                    std::fprintf(
+                        stderr,
+                        "htp_opencl_event name=gpu_qkv_release ts_us=%lld "
+                        "generation=%" PRIu64 " bytes=%zu\n",
+                        (long long) ggml_time_us(), it->generation, qkv_bytes);
+                }
+            }
             bool released = false;
             char reason[512] = {};
             if (!sd_backend_htp_opencl_release_arena_generation(
@@ -5230,10 +5279,21 @@ protected:
         if (!compute_node_buffer_ids_.empty()) {
             bytes += ggml_gallocr_get_buffer_size(compute_allocr, 1);
         }
-        retired_compute_arenas_.push_back({ generation, compute_allocr, bytes });
+        if (!compute_node_buffer_ids_.empty()) {
+            bytes += ggml_gallocr_get_buffer_size(compute_allocr, 2);
+        }
+        retired_compute_arenas_.push_back({ generation, compute_allocr, bytes, false });
+        if (sd_env_flag_enabled("SD_HTP_QKV_RELEASE_TRACE")) {
+            LOG_INFO(
+                "qkv_retire generation=%" PRIu64 " bytes=%zu",
+                generation, bytes);
+        }
         compute_allocr = nullptr;
         compute_node_buffer_ids_.clear();
         compute_leaf_buffer_ids_.clear();
+        // Do not probe the just-computed generation here. HTP dense has
+        // returned, but its deferred OpenCL sparse work may still own QKV.
+        // The next arena poll releases QKV after sparse completion.
         return true;
     }
 
@@ -5329,11 +5389,12 @@ protected:
         compute_node_buffer_ids_.clear();
         compute_leaf_buffer_ids_.clear();
 
+        ggml_backend_buffer_type_t qkv_buft = htp_backend != nullptr ? ggml_backend_htp_qkv_buffer_type() : nullptr;
         if (htp_op_routing_enabled() && htp_buft != nullptr) {
-            // 为 CPU 与 HTP RPCMEM 同时创建 allocator，后续按节点/叶子打到不同 buffer。
+            // CPU、普通 HTP 以及可提前回收的 sparse QKV 使用三个独立 buffer。
             if (compute_allocr == nullptr) {
-                ggml_backend_buffer_type_t bufts[] = {runtime_buft, htp_buft};
-                compute_allocr                    = ggml_gallocr_new_n(bufts, 2);
+                ggml_backend_buffer_type_t bufts[] = {runtime_buft, htp_buft, qkv_buft};
+                compute_allocr                    = ggml_gallocr_new_n(bufts, 3);
             }
             plan_compute_buffer_ids(gf, &compute_node_buffer_ids_, &compute_leaf_buffer_ids_);
         } else {
@@ -5370,6 +5431,11 @@ protected:
             LOG_DEBUG("%s htp rpcmem buffer size: %.2f MB",
                       get_desc().c_str(),
                       rpcmem_buffer_size / 1024.0 / 1024.0);
+        }
+        if (compute_node_buffer_ids_.size() > 0 && qkv_buft != nullptr) {
+            const size_t qkv_buffer_size = ggml_gallocr_get_buffer_size(compute_allocr, 2);
+            LOG_DEBUG("%s sparse QKV buffer size: %.2f MB",
+                      get_desc().c_str(), qkv_buffer_size / 1024.0 / 1024.0);
         }
         return true;
     }
@@ -5936,6 +6002,126 @@ protected:
             ggml_tensor* leaf = sd::ggml_graph_cut::leaf_tensor(gf, i);
             if (tensor_directly_used_by_htp_target_op(leaf, target_nodes)) {
                 (*leaf_buffer_ids)[i] = 1;
+            }
+        }
+
+        // Residual-owned OpenCL sparse attention gets a separate arena.  The
+        // sparse node itself is placed there as well, which propagates the
+        // allocation choice to its Q/K/V roots through gallocr. The mask is
+        // intentionally kept in the normal arena because it may have a
+        // separate preparation/staging consumer.
+        if (!sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL")) {
+            return;
+        }
+        auto sparse_candidate = [](const ggml_tensor * node) {
+            if (node == nullptr || node->op != GGML_OP_FLASH_ATTN_EXT ||
+                node->src[0] == nullptr || node->src[1] == nullptr ||
+                node->src[2] == nullptr || node->src[3] == nullptr ||
+                node->src[4] != nullptr ||
+                node->src[1]->type != GGML_TYPE_F16 || node->src[2]->type != GGML_TYPE_F16 ||
+                node->src[3]->type != GGML_TYPE_I32 ||
+                (node->type != GGML_TYPE_F32 && node->type != GGML_TYPE_F16) ||
+                (node->src[0]->type != GGML_TYPE_F32 && node->src[0]->type != GGML_TYPE_F16)) {
+                return false;
+            }
+            int32_t block_q = 0;
+            int32_t block_k = 0;
+            int32_t with_lse = 0;
+            std::memcpy(&block_q, node->op_params + 4, sizeof(block_q));
+            std::memcpy(&block_k, node->op_params + 5, sizeof(block_k));
+            std::memcpy(&with_lse, node->op_params + 6, sizeof(with_lse));
+            return (node->src[0]->ne[0] == 64 || node->src[0]->ne[0] == 128) &&
+                   block_q == 32 && block_k == 32 && with_lse == 1;
+        };
+        auto root_of = [](ggml_tensor * tensor) {
+            while (tensor != nullptr && tensor->view_src != nullptr) {
+                tensor = tensor->view_src;
+            }
+            return tensor;
+        };
+        auto view_only = [](const ggml_tensor * tensor) {
+            return tensor != nullptr &&
+                (tensor->op == GGML_OP_VIEW || tensor->op == GGML_OP_RESHAPE ||
+                 tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_TRANSPOSE);
+        };
+        std::unordered_set<ggml_tensor *> sparse_roots;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (sd_env_flag_enabled("SD_HTP_QKV_RELEASE_TRACE") &&
+                node != nullptr && node->op == GGML_OP_FLASH_ATTN_EXT &&
+                node->src[3] != nullptr && node->src[3]->type == GGML_TYPE_I32) {
+                int32_t bq = 0, bk = 0, lse = 0;
+                std::memcpy(&bq, node->op_params + 4, sizeof(bq));
+                std::memcpy(&bk, node->op_params + 5, sizeof(bk));
+                std::memcpy(&lse, node->op_params + 6, sizeof(lse));
+                LOG_INFO("qkv_release_candidate node=%s qtype=%s ktype=%s vtype=%s qdim=%lld block=%d/%d lse=%d match=%d",
+                         node->name, ggml_type_name(node->src[0]->type),
+                         ggml_type_name(node->src[1]->type), ggml_type_name(node->src[2]->type),
+                         (long long) node->src[0]->ne[0], bq, bk, lse,
+                         sparse_candidate(node) ? 1 : 0);
+            }
+            if (!sparse_candidate(node)) {
+                continue;
+            }
+            bool conflict = false;
+            for (int j = 0; j < ggml_graph_n_nodes(gf) && !conflict; ++j) {
+                ggml_tensor * consumer = ggml_graph_node(gf, j);
+                if (consumer == node || view_only(consumer)) {
+                    continue;
+                }
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    ggml_tensor * src = consumer->src[s];
+                    for (int q = 0; q < 4; ++q) {
+                        ggml_tensor * sparse_root = root_of(node->src[q]);
+                        // The allocating root's producer is not a second
+                        // consumer. CPY commonly carries its destination as
+                        // src[1], which otherwise looks self-referential here.
+                        if (consumer == sparse_root) {
+                            continue;
+                        }
+                        if (sparse_root == root_of(src) &&
+                            !sparse_candidate(consumer) &&
+                            !(q < 3 &&
+                              sd_htp_anchor_dense_consumer_matches_qkv(
+                                  node, consumer, root_of) &&
+                              is_htp_supported_flash_attn(consumer))) {
+                            if (sd_env_flag_enabled("SD_HTP_QKV_RELEASE_TRACE")) {
+                                LOG_INFO("qkv_release_conflict sparse=%s root=%s consumer=%s op=%s src=%d",
+                                         node->name, root_of(node->src[q])->name,
+                                         consumer->name, ggml_op_name(consumer->op), s);
+                            }
+                            conflict = true;
+                            break;
+                        }
+                    }
+                    if (conflict) {
+                        break;
+                    }
+                }
+            }
+            if (!conflict) {
+                // Only Q/K/V are shared with the OpenCL sidecar and can be
+                // reclaimed as soon as dense and sparse attention finish.
+                // Masks remain in the normal arena because their graph-side
+                // preparation/staging may have independent consumers.
+                for (int q = 0; q < 3; ++q) {
+                    if (ggml_tensor * root = root_of(node->src[q])) {
+                        sparse_roots.insert(root);
+                    }
+                }
+            }
+        }
+        if (!sparse_roots.empty()) {
+            for (int i = 0; i < sd::ggml_graph_cut::leaf_count(gf); ++i) {
+                if (sparse_roots.count(root_of(sd::ggml_graph_cut::leaf_tensor(gf, i)))) {
+                    (*leaf_buffer_ids)[i] = 2;
+                }
+            }
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                if (sparse_roots.count(root_of(node))) {
+                    (*node_buffer_ids)[i] = 2;
+                }
             }
         }
     }
@@ -6656,9 +6842,15 @@ protected:
         if (use_htp_compute) {
             sd_backend_htp_set_hybrid_enabled(false);
         }
-        if (arena_generation != 0 &&
+        const bool arena_pending = arena_generation != 0 &&
             sd_backend_htp_opencl_arena_generation_pending(
-                htp_backend, arena_generation)) {
+                htp_backend, arena_generation);
+        if (sd_env_flag_enabled("SD_HTP_QKV_RELEASE_TRACE")) {
+            LOG_INFO(
+                "qkv_arena_state generation=%" PRIu64 " pending=%d",
+                arena_generation, arena_pending ? 1 : 0);
+        }
+        if (arena_pending) {
             if (!retire_current_compute_arena(arena_generation)) {
                 status = GGML_STATUS_FAILED;
             }

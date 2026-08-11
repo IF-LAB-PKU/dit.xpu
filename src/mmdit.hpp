@@ -571,6 +571,10 @@ __STATIC_INLINE__ bool mmdit_packed_head_dim_supported(int head_dim) {
     return head_dim == 64 || head_dim == 128;
 }
 
+__STATIC_INLINE__ bool mmdit_packed_head_count_supported(int num_heads) {
+    return num_heads == 24 || num_heads == 38;
+}
+
 __STATIC_INLINE__ bool mmdit_packed_qkv_enabled(const GGMLRunnerContext* ctx);
 
 __STATIC_INLINE__ PackedJointQkv mmdit_make_packed_single_qkv(
@@ -582,27 +586,28 @@ __STATIC_INLINE__ PackedJointQkv mmdit_make_packed_single_qkv(
         input->ne[2] != 1 || input->ne[1] <= 0 || input->ne[1] % 32 != 0) {
         return result;
     }
-    if (attention->num_heads != 24 || attention->qk_norm != "rms") {
+    const int num_heads = static_cast<int>(attention->num_heads);
+    if (!mmdit_packed_head_count_supported(num_heads) || attention->qk_norm != "rms") {
         return result;
     }
     ggml_tensor* weight = attention->param("weight");
     ggml_tensor* bias = attention->param("bias");
     ggml_tensor* q_norm = attention->param("q_norm");
     ggml_tensor* k_norm = attention->param("k_norm");
-    const int head_dim = weight != nullptr && weight->ne[1] % (3 * 24) == 0 ?
-        static_cast<int>(weight->ne[1] / (3 * 24)) : 0;
+    const int head_dim = weight != nullptr && weight->ne[1] % (3 * num_heads) == 0 ?
+        static_cast<int>(weight->ne[1] / (3 * num_heads)) : 0;
     if (input->type != GGML_TYPE_F32 || weight == nullptr || weight->type != GGML_TYPE_F16 ||
         q_norm == nullptr || k_norm == nullptr || q_norm->type != GGML_TYPE_F32 ||
         k_norm->type != GGML_TYPE_F32 || weight->ne[0] != input->ne[0] ||
         !mmdit_packed_head_dim_supported(head_dim) || q_norm->ne[0] != head_dim || k_norm->ne[0] != head_dim ||
-        (bias != nullptr && (bias->type != GGML_TYPE_F32 || bias->ne[0] != 3 * 24 * head_dim)) ||
+        (bias != nullptr && (bias->type != GGML_TYPE_F32 || bias->ne[0] != 3 * num_heads * head_dim)) ||
         (weight->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) == 0) {
         return result;
     }
 
     const int image_tokens = static_cast<int>(input->ne[1]);
     const int token_tiles = (image_tokens + 31) / 32;
-    const size_t qkv_bytes = size_t(24) * size_t(token_tiles) * size_t(head_dim / 32) * size_t(1024) * sizeof(ggml_fp16_t);
+    const size_t qkv_bytes = size_t(num_heads) * size_t(token_tiles) * size_t(head_dim / 32) * size_t(1024) * sizeof(ggml_fp16_t);
     ggml_tensor* args[] = {input, weight, bias, q_norm, k_norm};
     result.storage = ggml_custom_4d(ctx->ggml_ctx, GGML_TYPE_F16,
                                     static_cast<int64_t>(3 * qkv_bytes / sizeof(ggml_fp16_t)),
@@ -611,11 +616,11 @@ __STATIC_INLINE__ PackedJointQkv mmdit_make_packed_single_qkv(
     ggml_set_name(result.storage, "qkv_mul_rms_packed");
     const size_t head_stride = size_t(token_tiles) * size_t(head_dim / 32) * size_t(1024) * sizeof(ggml_fp16_t);
     result.qkv = {
-        ggml_view_4d(ctx->ggml_ctx, result.storage, head_dim, image_tokens, 24, 1,
+        ggml_view_4d(ctx->ggml_ctx, result.storage, head_dim, image_tokens, num_heads, 1,
                      sizeof(ggml_fp16_t), head_dim * sizeof(ggml_fp16_t), head_stride, 0),
-        ggml_view_4d(ctx->ggml_ctx, result.storage, head_dim, image_tokens, 24, 1,
+        ggml_view_4d(ctx->ggml_ctx, result.storage, head_dim, image_tokens, num_heads, 1,
                      sizeof(ggml_fp16_t), head_dim * sizeof(ggml_fp16_t), head_stride, qkv_bytes),
-        ggml_view_4d(ctx->ggml_ctx, result.storage, head_dim, image_tokens, 24, 1,
+        ggml_view_4d(ctx->ggml_ctx, result.storage, head_dim, image_tokens, num_heads, 1,
                      sizeof(ggml_fp16_t), head_dim * sizeof(ggml_fp16_t), head_stride, 2 * qkv_bytes),
     };
     for (ggml_tensor* tensor : result.qkv) {
@@ -650,10 +655,13 @@ __STATIC_INLINE__ PackedJointQkv mmdit_make_packed_joint_qkv(GGMLRunnerContext* 
     }
     auto image_attn = image_block->attention();
     auto text_attn = text_block->attention();
-    if (image_attn == nullptr || text_attn == nullptr || image_attn->num_heads != 24 ||
-        text_attn->num_heads != 24 || image_attn->qk_norm != "rms" || text_attn->qk_norm != "rms") {
+    if (image_attn == nullptr || text_attn == nullptr ||
+        image_attn->num_heads != text_attn->num_heads ||
+        !mmdit_packed_head_count_supported(static_cast<int>(image_attn->num_heads)) ||
+        image_attn->qk_norm != "rms" || text_attn->qk_norm != "rms") {
         return result;
     }
+    const int num_heads = static_cast<int>(image_attn->num_heads);
     ggml_tensor* image_weight = image_attn->param("weight");
     ggml_tensor* image_bias = image_attn->param("bias");
     ggml_tensor* image_q_norm = image_attn->param("q_norm");
@@ -662,18 +670,18 @@ __STATIC_INLINE__ PackedJointQkv mmdit_make_packed_joint_qkv(GGMLRunnerContext* 
     ggml_tensor* text_bias = text_attn->param("bias");
     ggml_tensor* text_q_norm = text_attn->param("q_norm");
     ggml_tensor* text_k_norm = text_attn->param("k_norm");
-    const int image_head_dim = image_weight != nullptr && image_weight->ne[1] % (3 * 24) == 0 ?
-        static_cast<int>(image_weight->ne[1] / (3 * 24)) : 0;
-    const int text_head_dim = text_weight != nullptr && text_weight->ne[1] % (3 * 24) == 0 ?
-        static_cast<int>(text_weight->ne[1] / (3 * 24)) : 0;
-    const auto valid_branch = [](ggml_tensor* activation, ggml_tensor* weight, ggml_tensor* bias,
+    const int image_head_dim = image_weight != nullptr && image_weight->ne[1] % (3 * num_heads) == 0 ?
+        static_cast<int>(image_weight->ne[1] / (3 * num_heads)) : 0;
+    const int text_head_dim = text_weight != nullptr && text_weight->ne[1] % (3 * num_heads) == 0 ?
+        static_cast<int>(text_weight->ne[1] / (3 * num_heads)) : 0;
+    const auto valid_branch = [num_heads](ggml_tensor* activation, ggml_tensor* weight, ggml_tensor* bias,
                                  ggml_tensor* q_norm, ggml_tensor* k_norm, int head_dim) {
         return activation != nullptr && weight != nullptr && q_norm != nullptr &&
                k_norm != nullptr && activation->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F16 &&
                mmdit_packed_head_dim_supported(head_dim) &&
-               (bias == nullptr || (bias->type == GGML_TYPE_F32 && bias->ne[0] == 3 * 24 * head_dim)) &&
+               (bias == nullptr || (bias->type == GGML_TYPE_F32 && bias->ne[0] == 3 * num_heads * head_dim)) &&
                q_norm->type == GGML_TYPE_F32 && k_norm->type == GGML_TYPE_F32 &&
-               weight->ne[0] == activation->ne[0] && weight->ne[1] == 3 * 24 * head_dim &&
+               weight->ne[0] == activation->ne[0] && weight->ne[1] == 3 * num_heads * head_dim &&
                q_norm->ne[0] == head_dim && k_norm->ne[0] == head_dim &&
                (weight->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) != 0;
     };
@@ -684,7 +692,7 @@ __STATIC_INLINE__ PackedJointQkv mmdit_make_packed_joint_qkv(GGMLRunnerContext* 
     }
     const int token_tiles = (image_tokens + text_tokens + 31) / 32;
     const int head_dim = image_head_dim;
-    const size_t qkv_bytes = size_t(24) * size_t(token_tiles) * size_t(head_dim / 32) * size_t(1024) * sizeof(ggml_fp16_t);
+    const size_t qkv_bytes = size_t(num_heads) * size_t(token_tiles) * size_t(head_dim / 32) * size_t(1024) * sizeof(ggml_fp16_t);
     ggml_tensor* args[] = { image_in, image_weight, image_bias, image_q_norm, image_k_norm,
                             text_in, text_weight, text_bias, text_q_norm, text_k_norm };
     result.storage = ggml_custom_4d(ctx->ggml_ctx, GGML_TYPE_F16,
@@ -694,11 +702,11 @@ __STATIC_INLINE__ PackedJointQkv mmdit_make_packed_joint_qkv(GGMLRunnerContext* 
     ggml_set_name(result.storage, "qkv_mul_rms_packed_dual");
     const size_t head_stride = size_t(token_tiles) * size_t(head_dim / 32) * size_t(1024) * sizeof(ggml_fp16_t);
     result.qkv = {
-        ggml_view_4d(ctx->ggml_ctx, result.storage, head_dim, image_tokens + text_tokens, 24, 1,
+        ggml_view_4d(ctx->ggml_ctx, result.storage, head_dim, image_tokens + text_tokens, num_heads, 1,
                      sizeof(ggml_fp16_t), head_dim * sizeof(ggml_fp16_t), head_stride, 0),
-        ggml_view_4d(ctx->ggml_ctx, result.storage, head_dim, image_tokens + text_tokens, 24, 1,
+        ggml_view_4d(ctx->ggml_ctx, result.storage, head_dim, image_tokens + text_tokens, num_heads, 1,
                      sizeof(ggml_fp16_t), head_dim * sizeof(ggml_fp16_t), head_stride, qkv_bytes),
-        ggml_view_4d(ctx->ggml_ctx, result.storage, head_dim, image_tokens + text_tokens, 24, 1,
+        ggml_view_4d(ctx->ggml_ctx, result.storage, head_dim, image_tokens + text_tokens, num_heads, 1,
                      sizeof(ggml_fp16_t), head_dim * sizeof(ggml_fp16_t), head_stride, 2 * qkv_bytes),
     };
     for (ggml_tensor* tensor : result.qkv) {

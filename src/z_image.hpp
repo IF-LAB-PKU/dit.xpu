@@ -767,30 +767,18 @@ namespace ZImage {
                 img_pe = ggml_ext_slice(ctx->ggml_ctx, pe, 3, total_txt_tokens, pe->ne[3]);
             }
 
-            // Context refiner: text-only. Represent the padded text stream as
-            // an image region with a synthetic grid and force a full-keep mask.
+            // Context refiner is text-only full attention. Keep it on the dense
+            // HTP route; there is no block pruning to exploit here.
             const bool single_stream_htp = ctx->htp_attention_enabled &&
                                             ctx->block_sparse_attn_enabled &&
                                             sd_env_flag_enabled("SD_HTP_COMPUTE");
-            const bool context_stream_geometry = total_txt_tokens > 0 &&
-                                                 total_txt_tokens % 32 == 0 &&
-                                                 total_txt_tokens % 4 == 0;
-            const int saved_stream_token_h = ctx->block_sparse_token_h;
-            const int saved_stream_token_w = ctx->block_sparse_token_w;
-            const bool context_stream_sparse = single_stream_htp && context_stream_geometry;
-            if (context_stream_sparse) {
-                ctx->block_sparse_token_h = 4;
-                ctx->block_sparse_token_w = static_cast<int>(total_txt_tokens / 4);
-            }
             for (int i = 0; i < z_image_params.num_refiner_layers; i++) {
                 auto block = std::dynamic_pointer_cast<JointTransformerBlock>(blocks["context_refiner." + std::to_string(i)]);
 
                 txt = block->forward(ctx, txt, txt_pe, nullptr, nullptr,
-                                     context_stream_sparse, 0, 0, true);
+                                     false, 0, 0, false);
                 sd::ggml_graph_cut::mark_graph_cut(txt, "z_image.context_refiner." + std::to_string(i), "txt");
             }
-            ctx->block_sparse_token_h = saved_stream_token_h;
-            ctx->block_sparse_token_w = saved_stream_token_w;
 
             // Noise refiner: image-only, using the real image grid and halo.
             const bool noise_stream_sparse = single_stream_htp &&

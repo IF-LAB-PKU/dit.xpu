@@ -2036,6 +2036,19 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 if (htp_ops_opencl_routes_node(tensor)) {
                     if (htp_ops_opencl_early_submit_was_submitted(tensor)) {
+                        if (htp_ops_opencl_sparse_is_residual_owned(tensor)) {
+                            if (params->ith == 0) {
+                                const char * trace = getenv("SD_HTP_SPARSE_OPENCL_TRACE");
+                                if (trace != NULL && trace[0] != '\0' && strcmp(trace, "0") != 0) {
+                                    fprintf(stderr,
+                                            "htp_opencl_event name=gpu_sparse_deferred_lifetime "
+                                            "ts_us=%lld producer=%s\n",
+                                            (long long) ggml_time_us(),
+                                            tensor->name[0] != '\0' ? tensor->name : "<unnamed>");
+                                }
+                            }
+                            break;
+                        }
                         if (params->ith == 0) {
                             const char * trace = getenv("SD_HTP_SPARSE_OPENCL_TRACE");
                             const bool trace_enabled =
@@ -2047,10 +2060,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                                         (long long) ggml_time_us(),
                                         tensor->name[0] != '\0' ? tensor->name : "<unnamed>");
                             }
-                            const int err =
-                                htp_ops_opencl_sparse_is_residual_owned(tensor)
-                                    ? htp_ops_opencl_wait_sparse_input_lifetime(tensor)
-                                    : htp_ops_opencl_wait_producer(tensor);
+                            const int err = htp_ops_opencl_wait_producer(tensor);
                             if (err != 0) {
                                 ggml_htp_mark_op_failed(params, tensor, err);
                             }

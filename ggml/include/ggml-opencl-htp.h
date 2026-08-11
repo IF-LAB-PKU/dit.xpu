@@ -294,6 +294,17 @@ ggml_backend_opencl_htp_graph_deferred_ready(
     char * reason,
     size_t reason_capacity);
 
+// QKV reaper. It releases only aliases backed by the dedicated RPCMEM-QKV
+// buffer after every sparse event has completed. When wait_for_sparse is true,
+// it waits for sparse submission and kernel completion first.
+GGML_BACKEND_API enum ggml_opencl_htp_result
+ggml_backend_opencl_htp_graph_reap_qkv_aliases(
+    ggml_opencl_htp_graph * graph,
+    bool wait_for_sparse,
+    bool * released,
+    char * reason,
+    size_t reason_capacity);
+
 GGML_BACKEND_API enum ggml_opencl_htp_result
 ggml_backend_opencl_htp_graph_wait_deferred(
     ggml_opencl_htp_graph * graph,

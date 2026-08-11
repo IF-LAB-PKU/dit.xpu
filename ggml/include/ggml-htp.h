@@ -55,7 +55,10 @@ GGML_BACKEND_API void ggml_backend_htp_async_cache_slot_free(
     ggml_backend_htp_async_cache_slot * slot);
 
 GGML_BACKEND_API bool ggml_backend_buft_is_rpcmem(ggml_backend_buffer_type_t buft);
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_htp_qkv_buffer_type(void);
 GGML_BACKEND_API void ggml_backend_htp_set_n_threads(ggml_backend_t backend, int n_threads);
+GGML_BACKEND_API void ggml_backend_htp_reset_attention_profile(ggml_backend_t backend);
+GGML_BACKEND_API int64_t ggml_backend_htp_get_last_attention_elapsed_us(ggml_backend_t backend);
 GGML_BACKEND_API void ggml_backend_htp_pack_f16_weight(ggml_fp16_t * dst, const ggml_fp16_t * src, int64_t k, int64_t n);
 GGML_BACKEND_API void ggml_backend_htp_register_packed_f16_weight(const struct ggml_tensor * original,
                                                                   struct ggml_tensor * packed);
@@ -78,6 +81,14 @@ GGML_BACKEND_API void ggml_backend_htp_opencl_set_compute_arena_generation(
 GGML_BACKEND_API bool ggml_backend_htp_opencl_arena_generation_pending(
     ggml_backend_t backend,
     uint64_t generation);
+
+GGML_BACKEND_API bool ggml_backend_htp_opencl_release_qkv_generation(
+    ggml_backend_t backend,
+    uint64_t generation,
+    bool wait_for_sparse,
+    bool * released,
+    char * reason,
+    size_t reason_capacity);
 
 GGML_BACKEND_API bool ggml_backend_htp_opencl_release_arena_generation(
     ggml_backend_t backend,

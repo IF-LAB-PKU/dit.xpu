@@ -48,6 +48,9 @@ typedef struct ggml_gallocr * ggml_gallocr_t;
 GGML_API ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft);
 GGML_API ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs);
 GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
+// Release one virtual buffer early. The call is idempotent and clears aliases
+// to the same virtual buffer so ggml_gallocr_free() cannot double-free it.
+GGML_API bool           ggml_gallocr_free_buffer(ggml_gallocr_t galloc, int buffer_id, struct ggml_cgraph * graph);
 
 // pre-allocate buffers from a measure graph - does not allocate or modify the graph
 // call with a worst-case graph to avoid buffer reallocations
