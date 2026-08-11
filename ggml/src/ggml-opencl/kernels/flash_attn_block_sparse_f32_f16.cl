@@ -1,11 +1,21 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
+#ifndef HEAD_DIM
 #define HEAD_DIM 64
-#define BLOCK_SIZE 32
-#define VEC_COUNT 16
+#endif
+#ifndef BLOCK_M
+#define BLOCK_M 32
+#endif
+#ifndef BLOCK_N
+#define BLOCK_N 32
+#endif
+#define MASK_BLOCK_SIZE 32
+#ifndef VEC_COUNT
+#define VEC_COUNT (HEAD_DIM / 4)
+#endif
 #define MASK_FORMAT_BLOCK_INDEX 2
 
-__attribute__((reqd_work_group_size(BLOCK_SIZE, 1, 1)))
+__attribute__((reqd_work_group_size(BLOCK_M, 1, 1)))
 __kernel void flash_attn_block_sparse_f32_f16(
         __global const uchar * q_base,
         ulong q_offset,
@@ -43,10 +53,10 @@ __kernel void flash_attn_block_sparse_f32_f16(
     const int head_batch = (int)get_global_id(1);
     const int h = head_batch % H;
     const int b = head_batch / H;
-    const int qt = query_block * BLOCK_SIZE + lane;
+    const int qt = query_block * BLOCK_M + lane;
     const int active_query = qt < Lq;
-    const int q_blocks_per_head = 1 + (Lq - 1) / BLOCK_SIZE;
-    const int k_blocks_per_head = 1 + (Lk - 1) / BLOCK_SIZE;
+    const int q_blocks_per_head = 1 + (Lq - 1) / MASK_BLOCK_SIZE;
+    const int k_blocks_per_head = 1 + (Lk - 1) / MASK_BLOCK_SIZE;
     const int heads_per_kv = H / Hkv;
     const int kvh = h / heads_per_kv;
     const int qb_abs = h * q_blocks_per_head + query_block;
@@ -65,8 +75,8 @@ __kernel void flash_attn_block_sparse_f32_f16(
         }
     }
 
-    __local half4 k_tile[BLOCK_SIZE][VEC_COUNT];
-    __local half4 v_tile[BLOCK_SIZE][VEC_COUNT];
+    __local half4 k_tile[BLOCK_N][VEC_COUNT];
+    __local half4 v_tile[BLOCK_N][VEC_COUNT];
     float maximum = -INFINITY;
     float sum = 0.0f;
 
@@ -95,43 +105,54 @@ __kernel void flash_attn_block_sparse_f32_f16(
             }
         }
 
-        const int key_start = kb_local * BLOCK_SIZE;
-        const int valid_keys = min(BLOCK_SIZE, Lk - key_start);
-        const int kt = key_start + lane;
-        if (lane < valid_keys) {
-            __global const uchar * k_row =
-                k_base + k_offset + (ulong)kt * k_nb1 + (ulong)kvh * k_nb2 + (ulong)b * k_nb3;
-            __global const uchar * v_row =
-                v_base + v_offset + (ulong)kt * v_nb1 + (ulong)kvh * v_nb2 + (ulong)b * v_nb3;
-            for (int i = 0; i < VEC_COUNT; ++i) {
-                k_tile[lane][i] = vload4(
-                    0, (__global const half *)(k_row + (ulong)(i * 4 * sizeof(half))));
-                v_tile[lane][i] = vload4(
-                    0, (__global const half *)(v_row + (ulong)(i * 4 * sizeof(half))));
-            }
-        } else {
-            for (int i = 0; i < VEC_COUNT; ++i) {
-                k_tile[lane][i] = (half4)(0.0f);
-                v_tile[lane][i] = (half4)(0.0f);
+        const int key_start = kb_local * MASK_BLOCK_SIZE;
+        const int valid_keys = min(MASK_BLOCK_SIZE, Lk - key_start);
+        for (int flat = lane; flat < BLOCK_N * VEC_COUNT; flat += BLOCK_M) {
+            const int row = flat / VEC_COUNT;
+            const int column = flat % VEC_COUNT;
+            const int kt = key_start + row;
+            if (row < valid_keys) {
+                __global const uchar * k_row =
+                    k_base + k_offset + (ulong)kt * k_nb1 + (ulong)kvh * k_nb2 + (ulong)b * k_nb3;
+                __global const uchar * v_row =
+                    v_base + v_offset + (ulong)kt * v_nb1 + (ulong)kvh * v_nb2 + (ulong)b * v_nb3;
+                k_tile[row][column] = vload4(
+                    0, (__global const half *)(k_row + (ulong)(column * 4 * sizeof(half))));
+                v_tile[row][column] = vload4(
+                    0, (__global const half *)(v_row + (ulong)(column * 4 * sizeof(half))));
+            } else {
+                k_tile[row][column] = (half4)(0.0f);
+                v_tile[row][column] = (half4)(0.0f);
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
         if (active_query) {
-            for (int j = 0; j < valid_keys; ++j) {
-                float score = 0.0f;
+            for (int j = 0; j < valid_keys; j += 2) {
+                float4 dot_acc0 = (float4)(0.0f);
+                float4 dot_acc1 = (float4)(0.0f);
+#pragma unroll
                 for (int i = 0; i < VEC_COUNT; ++i) {
-                    score += dot(q[i], convert_float4(k_tile[j][i]));
+                    dot_acc0 = mad(q[i], convert_float4(k_tile[j][i]), dot_acc0);
+                    dot_acc1 = mad(q[i], convert_float4(k_tile[j + 1][i]), dot_acc1);
                 }
-                score *= scale;
+                const float score0 =
+                    (dot_acc0.s0 + dot_acc0.s1 + dot_acc0.s2 + dot_acc0.s3) * scale;
+                const float score1 = j + 1 < valid_keys
+                    ? (dot_acc1.s0 + dot_acc1.s1 + dot_acc1.s2 + dot_acc1.s3) * scale
+                    : -INFINITY;
 
-                const float next_maximum = fmax(maximum, score);
+                const float next_maximum = fmax(maximum, fmax(score0, score1));
                 const float previous_scale = sum == 0.0f ? 0.0f : exp(maximum - next_maximum);
-                const float weight = exp(score - next_maximum);
+                const float weight0 = exp(score0 - next_maximum);
+                const float weight1 = exp(score1 - next_maximum);
+#pragma unroll
                 for (int i = 0; i < VEC_COUNT; ++i) {
-                    output[i] = output[i] * previous_scale + convert_float4(v_tile[j][i]) * weight;
+                    output[i] = output[i] * previous_scale +
+                        convert_float4(v_tile[j][i]) * weight0 +
+                        convert_float4(v_tile[j + 1][i]) * weight1;
                 }
-                sum = sum * previous_scale + weight;
+                sum = sum * previous_scale + weight0 + weight1;
                 maximum = next_maximum;
             }
         }

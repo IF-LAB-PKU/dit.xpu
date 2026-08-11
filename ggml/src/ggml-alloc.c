@@ -578,6 +578,48 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc);
 }
 
+bool ggml_gallocr_free_buffer(ggml_gallocr_t galloc, int buffer_id, struct ggml_cgraph * graph) {
+    if (galloc == NULL || buffer_id < 0 || buffer_id >= galloc->n_buffers) {
+        return false;
+    }
+    struct vbuffer * target = galloc->buffers[buffer_id];
+    if (target == NULL) {
+        return true;
+    }
+    if (graph != NULL) {
+        // Invalidate tensor bindings before releasing the backend chunks. This
+        // prevents a later graph/cache inspection from dereferencing stale
+        // RPCMEM addresses.
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            struct ggml_tensor * tensor = graph->nodes[i];
+            if (tensor != NULL && tensor->buffer != NULL &&
+                ggml_backend_buffer_get_type(tensor->buffer) == galloc->bufts[buffer_id]) {
+                tensor->buffer = NULL;
+                tensor->data = NULL;
+                tensor->extra = NULL;
+            }
+        }
+        for (int i = 0; i < graph->n_leafs; ++i) {
+            struct ggml_tensor * tensor = graph->leafs[i];
+            if (tensor != NULL && tensor->buffer != NULL &&
+                ggml_backend_buffer_get_type(tensor->buffer) == galloc->bufts[buffer_id]) {
+                tensor->buffer = NULL;
+                tensor->data = NULL;
+                tensor->extra = NULL;
+            }
+        }
+    }
+    // A buffer type may be repeated in the allocator. Clear every alias before
+    // freeing the shared virtual buffer, preventing a later double free.
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        if (galloc->buffers[i] == target) {
+            galloc->buffers[i] = NULL;
+        }
+    }
+    ggml_vbuffer_free(target);
+    return true;
+}
+
 typedef struct ggml_gallocr * ggml_gallocr_t;
 
 static struct hash_node * ggml_gallocr_hash_get(ggml_gallocr_t galloc, struct ggml_tensor * t) {

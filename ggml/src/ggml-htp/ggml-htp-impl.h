@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -38,6 +39,7 @@ struct ggml_backend_htp_context {
 
     bool skip_htp_ops = false;
     bool runtime_available = false;
+    std::atomic<int64_t> last_attention_elapsed_us{-1};
     std::string runtime_error;
     std::unordered_map<const ggml_tensor *, ggml_tensor *> packed_f16_weights;
     // The HTP RPC channel, work buffer, and sidecar graph session are process singletons.

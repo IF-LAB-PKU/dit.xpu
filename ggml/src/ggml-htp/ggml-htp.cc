@@ -91,6 +91,27 @@ bool ggml_backend_htp_get_hybrid_enabled(void) {
     return g_htp_hybrid_enabled.load(std::memory_order_relaxed);
 }
 
+static bool ggml_backend_htp_is_view_only(const ggml_tensor * tensor) {
+    return tensor != nullptr &&
+        (tensor->op == GGML_OP_VIEW || tensor->op == GGML_OP_RESHAPE ||
+         tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_TRANSPOSE);
+}
+
+static ggml_tensor * ggml_backend_htp_allocating_root(ggml_tensor * tensor) {
+    for (size_t depth = 0; tensor != nullptr && depth < 64; ++depth) {
+        if (tensor->view_src != nullptr) {
+            tensor = tensor->view_src;
+            continue;
+        }
+        if (ggml_backend_htp_is_view_only(tensor) && tensor->src[0] != nullptr) {
+            tensor = tensor->src[0];
+            continue;
+        }
+        return tensor;
+    }
+    return nullptr;
+}
+
 size_t ggml_backend_htp_opencl_retain_deferred_residual_inputs(
         struct ggml_cgraph * graph) {
     if (graph == nullptr) {
@@ -98,7 +119,17 @@ size_t ggml_backend_htp_opencl_retain_deferred_residual_inputs(
     }
     static constexpr char rho_prefix[] =
         "htp_block_sparse_residual_rho_b";
-    size_t retained = 0;
+    std::vector<ggml_tensor *> retained_roots;
+    auto retain_root = [&retained_roots](ggml_tensor * tensor) {
+        ggml_tensor * root = ggml_backend_htp_allocating_root(tensor);
+        if (root == nullptr ||
+            std::find(retained_roots.begin(), retained_roots.end(), root) !=
+                retained_roots.end()) {
+            return;
+        }
+        ggml_set_output(root);
+        retained_roots.push_back(root);
+    };
     for (int i = 0; i < graph->n_nodes; ++i) {
         ggml_tensor * node = graph->nodes[i];
         if (node == nullptr || node->op != GGML_OP_CUSTOM ||
@@ -106,10 +137,16 @@ size_t ggml_backend_htp_opencl_retain_deferred_residual_inputs(
             node->src[0] == nullptr || node->src[1] == nullptr) {
             continue;
         }
-        ggml_set_output(node->src[0]);
-        ++retained;
+        retain_root(node->src[0]);
+        ggml_tensor * sparse = node->src[1];
+        if (sparse->op != GGML_OP_FLASH_ATTN_EXT) {
+            continue;
+        }
+        for (int source = 0; source < 4; ++source) {
+            retain_root(sparse->src[source]);
+        }
     }
-    return retained;
+    return retained_roots.size();
 }
 
 static bool ggml_backend_htp_use_hybrid_graph_compute() {
@@ -417,6 +454,11 @@ static const char * ggml_backend_htp_buffer_type_get_name(ggml_backend_buffer_ty
     return "RPCMEM";
 }
 
+static const char * ggml_backend_htp_qkv_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return "RPCMEM-QKV";
+}
+
 static ggml_backend_buffer_t ggml_backend_htp_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     auto * ctx            = new ggml_backend_htp_buffer_context();
     auto * htp_ctx        = ggml_backend_htp_context::acquire_instance();
@@ -508,8 +550,26 @@ static ggml_backend_buffer_type_t ggml_backend_htp_buffer_type(void) {
     return &buft;
 }
 
+ggml_backend_buffer_type_t ggml_backend_htp_qkv_buffer_type(void) {
+    static struct ggml_backend_buffer_type buft = {
+        /* .iface   = */ {
+            /* .get_name       = */ ggml_backend_htp_qkv_buffer_type_get_name,
+            /* .alloc_buffer   = */ ggml_backend_htp_buffer_type_alloc_buffer,
+            /* .get_alignment  = */ ggml_backend_htp_buffer_type_get_alignment,
+            /* .get_max_size   = */ ggml_backend_htp_buffer_type_get_max_size,
+            /* .get_alloc_size = */ ggml_backend_htp_buffer_type_get_alloc_size,
+            /* .is_host        = */ ggml_backend_htp_buffer_type_is_host,
+        },
+        /* .device  = */ nullptr,
+        /* .context = */ nullptr,
+    };
+    buft.device = ggml_backend_reg_dev_get(ggml_backend_htp_reg(), 0);
+    return &buft;
+}
+
 bool ggml_backend_buft_is_rpcmem(ggml_backend_buffer_type_t buft) {
-    return buft != nullptr && buft->iface.get_name == ggml_backend_htp_buffer_type_get_name;
+    return buft != nullptr && (buft->iface.get_name == ggml_backend_htp_buffer_type_get_name ||
+                               buft->iface.get_name == ggml_backend_htp_qkv_buffer_type_get_name);
 }
 
 bool ggml_backend_htp_get_rpcmem_info(
@@ -1235,6 +1295,22 @@ bool ggml_backend_is_htp(ggml_backend_t backend) {
     return backend != nullptr && ggml_guid_matches(backend->guid, ggml_backend_htp_guid());
 }
 
+void ggml_backend_htp_reset_attention_profile(ggml_backend_t backend) {
+    if (!ggml_backend_is_htp(backend)) {
+        return;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    ctx->last_attention_elapsed_us.store(-1, std::memory_order_release);
+}
+
+int64_t ggml_backend_htp_get_last_attention_elapsed_us(ggml_backend_t backend) {
+    if (!ggml_backend_is_htp(backend)) {
+        return -1;
+    }
+    const auto * ctx = static_cast<const ggml_backend_htp_context *>(backend->context);
+    return ctx->last_attention_elapsed_us.load(std::memory_order_acquire);
+}
+
 void ggml_backend_htp_opencl_set_compute_arena_generation(
         ggml_backend_t backend,
         uint64_t generation) {
@@ -1269,6 +1345,56 @@ bool ggml_backend_htp_opencl_arena_generation_pending(
 #else
     GGML_UNUSED(backend);
     GGML_UNUSED(generation);
+    return false;
+#endif
+}
+
+bool ggml_backend_htp_opencl_release_qkv_generation(
+        ggml_backend_t backend,
+        uint64_t generation,
+        bool wait_for_sparse,
+        bool * released,
+        char * reason,
+        size_t reason_capacity) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (released != nullptr) {
+        *released = false;
+    }
+    if (!ggml_backend_is_htp(backend) || generation == 0 || released == nullptr) {
+        if (reason != nullptr && reason_capacity > 0) {
+            std::snprintf(reason, reason_capacity, "invalid backend, generation, or output");
+        }
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    auto found = std::find_if(
+        ctx->deferred_opencl_graphs.begin(), ctx->deferred_opencl_graphs.end(),
+        [generation](const ggml_backend_htp_context::deferred_opencl_graph & item) {
+            return item.arena_generation == generation;
+        });
+    if (found == ctx->deferred_opencl_graphs.end()) {
+        if (released != nullptr) {
+            // The deferred graph already completed and released its aliases.
+            *released = true;
+        }
+        if (reason != nullptr && reason_capacity > 0) {
+            std::snprintf(reason, reason_capacity, "generation is not deferred");
+        }
+        return true;
+    }
+    return ggml_backend_opencl_htp_graph_reap_qkv_aliases(
+               found->graph, wait_for_sparse, released,
+               reason, reason_capacity) == GGML_OPENCL_HTP_OK;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(generation);
+    if (released != nullptr) {
+        *released = false;
+    }
+    if (reason != nullptr && reason_capacity > 0) {
+        std::snprintf(reason, reason_capacity, "OpenCL sidecar is unavailable");
+    }
     return false;
 #endif
 }

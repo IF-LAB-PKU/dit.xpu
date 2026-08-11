@@ -166,6 +166,19 @@ namespace Flux {
         ggml_tensor* storage = nullptr;
     };
 
+    // Flux2 anchor attention still needs the packed position encoding as the
+    // marker that selects the residual-attention path. The anchor deliberately
+    // keeps ordinary row-major QKV, so packed QKV itself remains disabled.
+    __STATIC_INLINE__ bool flux2_sparse_pe_required(bool is_flux2,
+                                                     bool sparse_graph,
+                                                     bool residual_anchor,
+                                                     bool packed_qkv_requested,
+                                                     bool has_refs,
+                                                     bool circular) {
+        return is_flux2 && sparse_graph && !has_refs && !circular &&
+               (residual_anchor || packed_qkv_requested);
+    }
+
     __STATIC_INLINE__ bool packed_flux2_context_enabled(const GGMLRunnerContext* ctx,
                                                          int image_tokens,
                                                          int text_tokens,
@@ -329,34 +342,110 @@ namespace Flux {
         return make_packed_flux2_qkv_views(ctx, storage, tokens);
     }
 
+    __STATIC_INLINE__ ggml_tensor* flux2_residual_attention(GGMLRunnerContext* ctx,
+                                                             ggml_tensor* q,
+                                                             ggml_tensor* k,
+                                                             ggml_tensor* v,
+                                                             int64_t num_heads,
+                                                             ggml_tensor* mask,
+                                                             bool skip_reshape,
+                                                             float kv_scale,
+                                                             bool block_sparse_attn,
+                                                             int image_tokens,
+                                                             int text_tokens,
+                                                             const char* residual_kind) {
+        const int residual_attention_slot = ctx->block_sparse_residual_attention_index++;
+        std::string residual_cache_name;
+        std::string rho_cache_name;
+        ggml_tensor* cached_residual = nullptr;
+        ggml_tensor* cached_rho = nullptr;
+        if (ctx->block_sparse_residual_mode != SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF) {
+            residual_cache_name = sd_htp_block_sparse_residual_cache_key(
+                ctx->block_sparse_residual_branch_index,
+                residual_kind,
+                residual_attention_slot);
+            if (ctx->block_sparse_residual_exact_rho) {
+                rho_cache_name = sd_htp_block_sparse_residual_rho_cache_key(
+                    ctx->block_sparse_residual_branch_index,
+                    residual_kind,
+                    residual_attention_slot);
+            }
+            if (ctx->block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY) {
+                cached_residual = ctx->cache_tensor_as_graph_input(residual_cache_name);
+                if (!rho_cache_name.empty()) {
+                    cached_rho = ctx->cache_tensor_as_graph_input(rho_cache_name);
+                }
+            }
+        }
+
+        return ggml_ext_attention_ext(ctx->ggml_ctx,
+                                      ctx->backend,
+                                      q,
+                                      k,
+                                      v,
+                                      num_heads,
+                                      mask,
+                                      skip_reshape,
+                                      ctx->flash_attn_enabled,
+                                      kv_scale,
+                                      block_sparse_attn ||
+                                          ctx->block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR,
+                                      image_tokens,
+                                      text_tokens,
+                                      ctx->block_sparse_residual_mode,
+                                      ctx->block_sparse_residual_scale,
+                                      ctx->block_sparse_residual_rho,
+                                      ctx->block_sparse_residual_exact_rho,
+                                      residual_cache_name.empty() ? nullptr : residual_cache_name.c_str(),
+                                      cached_residual,
+                                      rho_cache_name.empty() ? nullptr : rho_cache_name.c_str(),
+                                      cached_rho,
+                                      &ctx->cache_tensor,
+                                      ctx->block_sparse_token_h,
+                                      ctx->block_sparse_token_w);
+    }
+
+    __STATIC_INLINE__ ggml_tensor* flux2_rope_residual_attention(
+        GGMLRunnerContext* ctx,
+        ggml_tensor* q,
+        ggml_tensor* k,
+        ggml_tensor* v,
+        ggml_tensor* pe,
+        ggml_tensor* mask,
+        int image_tokens,
+        int text_tokens,
+        const char* residual_kind) {
+        q = Rope::apply_rope(ctx->ggml_ctx, q, pe);
+        k = Rope::apply_rope(ctx->ggml_ctx, k, pe);
+        return flux2_residual_attention(ctx,
+                                        q, k, v,
+                                        v->ne[1],
+                                        mask,
+                                        true,
+                                        1.0f,
+                                        ctx->block_sparse_attn_enabled,
+                                        image_tokens,
+                                        text_tokens,
+                                        residual_kind);
+    }
+
     __STATIC_INLINE__ ggml_tensor* packed_flux2_attention(GGMLRunnerContext* ctx,
                                                            const PackedRopeQkv& packed,
                                                            int image_tokens,
-                                                           int text_tokens) {
-        return ggml_ext_attention_ext(ctx->ggml_ctx,
-                                      ctx->backend,
-                                      packed.qkv[0],
-                                      packed.qkv[1],
-                                      packed.qkv[2],
-                                      24,
-                                      nullptr,
-                                      false,
-                                      ctx->flash_attn_enabled,
-                                      1.0f,
-                                      true,
-                                      image_tokens,
-                                      text_tokens,
-                                      SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
-                                      1.0f,
-                                      1.0f,
-                                      false,
-                                      nullptr,
-                                      nullptr,
-                                      nullptr,
-                                      nullptr,
-                                      nullptr,
-                                      ctx->block_sparse_token_h,
-                                      ctx->block_sparse_token_w);
+                                                           int text_tokens,
+                                                           const char* residual_kind) {
+        return flux2_residual_attention(ctx,
+                                        packed.qkv[0],
+                                        packed.qkv[1],
+                                        packed.qkv[2],
+                                        24,
+                                        nullptr,
+                                        false,
+                                        1.0f,
+                                        true,
+                                        image_tokens,
+                                        text_tokens,
+                                        residual_kind);
     }
 
     struct MLP : public UnaryBlock {
@@ -595,7 +684,7 @@ namespace Flux {
                                                       img_modulated, txt_modulated, packed_pe);
             if (packed.storage != nullptr && mask == nullptr) {
                 attn = packed_flux2_attention(ctx, packed, static_cast<int>(img->ne[1]),
-                                              static_cast<int>(txt->ne[1]));
+                                              static_cast<int>(txt->ne[1]), "double");
                 img_attn_out = ggml_view_3d(ctx->ggml_ctx, attn, attn->ne[0], img->ne[1], attn->ne[2],
                                             attn->nb[1], attn->nb[2], 0);
                 txt_attn_out = ggml_view_3d(ctx->ggml_ctx, attn, attn->ne[0], txt->ne[1], attn->ne[2],
@@ -603,14 +692,28 @@ namespace Flux {
             } else {
                 auto img_qkv = img_attn->pre_attention(ctx, img_modulated);
                 auto txt_qkv = txt_attn->pre_attention(ctx, txt_modulated);
-                auto q = ggml_concat(ctx->ggml_ctx, txt_qkv[0], img_qkv[0], 2);
-                auto k = ggml_concat(ctx->ggml_ctx, txt_qkv[1], img_qkv[1], 2);
-                auto v = ggml_concat(ctx->ggml_ctx, txt_qkv[2], img_qkv[2], 2);
-                attn = Rope::attention(ctx, q, k, v, pe, mask);
-                txt_attn_out = ggml_view_3d(ctx->ggml_ctx, attn, attn->ne[0], txt->ne[1], attn->ne[2],
-                                            attn->nb[1], attn->nb[2], 0);
-                img_attn_out = ggml_view_3d(ctx->ggml_ctx, attn, attn->ne[0], img->ne[1], attn->ne[2],
-                                            attn->nb[1], attn->nb[2], txt->ne[1] * attn->nb[1]);
+                const bool image_first = packed_pe != nullptr;
+                auto q = image_first ? ggml_concat(ctx->ggml_ctx, img_qkv[0], txt_qkv[0], 2) :
+                                       ggml_concat(ctx->ggml_ctx, txt_qkv[0], img_qkv[0], 2);
+                auto k = image_first ? ggml_concat(ctx->ggml_ctx, img_qkv[1], txt_qkv[1], 2) :
+                                       ggml_concat(ctx->ggml_ctx, txt_qkv[1], img_qkv[1], 2);
+                auto v = image_first ? ggml_concat(ctx->ggml_ctx, img_qkv[2], txt_qkv[2], 2) :
+                                       ggml_concat(ctx->ggml_ctx, txt_qkv[2], img_qkv[2], 2);
+                if (image_first) {
+                    attn = flux2_rope_residual_attention(
+                        ctx, q, k, v, packed_pe, mask,
+                        static_cast<int>(img->ne[1]), static_cast<int>(txt->ne[1]), "double");
+                    img_attn_out = ggml_view_3d(ctx->ggml_ctx, attn, attn->ne[0], img->ne[1], attn->ne[2],
+                                                attn->nb[1], attn->nb[2], 0);
+                    txt_attn_out = ggml_view_3d(ctx->ggml_ctx, attn, attn->ne[0], txt->ne[1], attn->ne[2],
+                                                attn->nb[1], attn->nb[2], img->ne[1] * attn->nb[1]);
+                } else {
+                    attn = Rope::attention(ctx, q, k, v, pe, mask);
+                    txt_attn_out = ggml_view_3d(ctx->ggml_ctx, attn, attn->ne[0], txt->ne[1], attn->ne[2],
+                                                attn->nb[1], attn->nb[2], 0);
+                    img_attn_out = ggml_view_3d(ctx->ggml_ctx, attn, attn->ne[0], img->ne[1], attn->ne[2],
+                                                attn->nb[1], attn->nb[2], txt->ne[1] * attn->nb[1]);
+                }
             }
 
             // calculate the img bloks
@@ -730,7 +833,8 @@ namespace Flux {
             }
             if (packed.storage != nullptr && mask == nullptr) {
                 attn = packed_flux2_attention(ctx, packed, image_tokens,
-                                              static_cast<int>(x->ne[1]) - image_tokens);
+                                              static_cast<int>(x->ne[1]) - image_tokens,
+                                              "single");
                 const int64_t mlp_cols = mlp_hidden_dim * mlp_mult_factor;
                 ggml_tensor* full_qkv_mlp = nullptr;
                 if (sd_env_flag_enabled("SD_HTP_PACKED_FLUX2_SINGLE_FULL_MLP")) {
@@ -792,7 +896,13 @@ namespace Flux {
                                       qkv_mlp->nb[0] * head_dim, qkv_mlp->nb[1], qkv_mlp->nb[2], qkv_mlp->nb[0] * 2 * hidden_size);
                 q = norm->query_norm(ctx, q);
                 k = norm->key_norm(ctx, k);
-                attn = Rope::attention(ctx, q, k, v, packed_pe != nullptr ? packed_pe : pe, mask);
+                if (packed_pe != nullptr) {
+                    attn = flux2_rope_residual_attention(
+                        ctx, q, k, v, packed_pe, mask, image_tokens,
+                        static_cast<int>(x->ne[1]) - image_tokens, "single");
+                } else {
+                    attn = Rope::attention(ctx, q, k, v, pe, mask);
+                }
                 mlp = ggml_view_3d(ctx->ggml_ctx, qkv_mlp, mlp_hidden_dim * mlp_mult_factor,
                                    qkv_mlp->ne[1], qkv_mlp->ne[2], qkv_mlp->nb[1], qkv_mlp->nb[2],
                                    hidden_size * 3 * qkv_mlp->nb[0]);
@@ -1756,17 +1866,29 @@ namespace Flux {
             set_backend_tensor_data(pe, pe_vec.data());
 
             ggml_tensor* packed_pe = nullptr;
+            const bool flux2_sparse_graph = sd_htp_patch_major_layout_enabled(
+                block_sparse_attn_enabled, block_sparse_residual_mode);
             const bool packed_flux2_requested = sd_version_is_flux2(version) &&
                                                 sd_env_flag_enabled("SD_HTP_PACKED_FLUX2") &&
-                                                block_sparse_attn_enabled && ref_latents.empty() &&
+                                                flux2_sparse_graph && ref_latents.empty() &&
+                                                block_sparse_residual_mode != SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
                                                 !circular_y_enabled && !circular_x_enabled;
+            const bool flux2_sparse_pe_requested = flux2_sparse_pe_required(
+                sd_version_is_flux2(version),
+                flux2_sparse_graph,
+                block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR,
+                packed_flux2_requested,
+                !ref_latents.empty(),
+                circular_y_enabled || circular_x_enabled);
             if (sd_env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE")) {
-                LOG_INFO("flux2_packed_request enabled=%d version=%d sparse=%d refs=%zu circular=%d/%d use_mask=%d",
-                         packed_flux2_requested ? 1 : 0, static_cast<int>(version),
+                LOG_INFO("flux2_packed_request enabled=%d pe=%d version=%d sparse=%d refs=%zu circular=%d/%d use_mask=%d",
+                         packed_flux2_requested ? 1 : 0,
+                         flux2_sparse_pe_requested ? 1 : 0,
+                         static_cast<int>(version),
                          block_sparse_attn_enabled ? 1 : 0, ref_latents.size(),
                          circular_y_enabled ? 1 : 0, circular_x_enabled ? 1 : 0, use_mask ? 1 : 0);
             }
-            if (packed_flux2_requested) {
+            if (flux2_sparse_pe_requested) {
                 packed_pe_vec = Rope::gen_flux_pe(static_cast<int>(x->ne[1]),
                                                    static_cast<int>(x->ne[0]),
                                                    flux_params.patch_size,
