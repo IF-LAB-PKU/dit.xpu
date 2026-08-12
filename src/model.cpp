@@ -1153,6 +1153,11 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
     return success;
 }
 
+static bool tensor_is_optional_when_missing(const std::string& name) {
+    return name.find("cond_stage_model.transformer.text_model.encoder.layers.23") != std::string::npos ||
+           name.find("alphas_cumprod") != std::string::npos;
+}
+
 bool ModelLoader::load_tensors(std::map<std::string, ggml_tensor*>& tensors,
                                std::set<std::string> ignore_tensors,
                                int n_threads,
@@ -1213,11 +1218,7 @@ bool ModelLoader::load_tensors(std::map<std::string, ggml_tensor*>& tensors,
     bool some_tensor_not_init = false;
 
     for (auto pair : tensors) {
-        if (pair.first.find("cond_stage_model.transformer.text_model.encoder.layers.23") != std::string::npos) {
-            continue;
-        }
-
-        if (pair.first.find("alphas_cumprod") != std::string::npos) {
+        if (tensor_is_optional_when_missing(pair.first)) {
             continue;
         }
 
@@ -1231,6 +1232,62 @@ bool ModelLoader::load_tensors(std::map<std::string, ggml_tensor*>& tensors,
         return false;
     }
     return true;
+}
+
+bool ModelLoader::load_tensor_subset(const std::map<std::string, ggml_tensor*>& tensors,
+                                     int n_threads) {
+    std::set<std::string> tensor_names_in_file;
+    std::mutex tensor_names_mutex;
+    auto on_new_tensor_cb = [&](const TensorStorage& tensor_storage, ggml_tensor** dst_tensor) -> bool {
+        const auto tensor_it = tensors.find(tensor_storage.name);
+        if (tensor_it == tensors.end()) {
+            return true;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(tensor_names_mutex);
+            tensor_names_in_file.insert(tensor_storage.name);
+        }
+
+        ggml_tensor* real = tensor_it->second;
+        if (real == nullptr) {
+            LOG_ERROR("tensor '%s' has a null destination", tensor_storage.name.c_str());
+            return false;
+        }
+        if (real->ne[0] != tensor_storage.ne[0] ||
+            real->ne[1] != tensor_storage.ne[1] ||
+            real->ne[2] != tensor_storage.ne[2] ||
+            real->ne[3] != tensor_storage.ne[3]) {
+            LOG_ERROR(
+                "tensor '%s' has wrong shape in model file: "
+                "got [%d, %d, %d, %d], expected [%d, %d, %d, %d]",
+                tensor_storage.name.c_str(),
+                (int)tensor_storage.ne[0], (int)tensor_storage.ne[1], (int)tensor_storage.ne[2], (int)tensor_storage.ne[3],
+                (int)real->ne[0], (int)real->ne[1], (int)real->ne[2], (int)real->ne[3]);
+            return false;
+        }
+
+        *dst_tensor = real;
+        if (tensor_storage.layout == TensorDataLayout::HTP_PERMUTED_W16A32) {
+            real->flags |= SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32;
+        }
+        return true;
+    };
+
+    if (!load_tensors(on_new_tensor_cb, n_threads, false)) {
+        LOG_ERROR("load tensor subset from file failed");
+        return false;
+    }
+
+    bool missing_tensor = false;
+    for (const auto& [name, _] : tensors) {
+        if (tensor_names_in_file.find(name) == tensor_names_in_file.end() &&
+            !tensor_is_optional_when_missing(name)) {
+            LOG_ERROR("tensor '%s' not in model file", name.c_str());
+            missing_tensor = true;
+        }
+    }
+    return !missing_tensor;
 }
 
 bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage, ggml_type type) {

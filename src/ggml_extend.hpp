@@ -2408,7 +2408,6 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
     const bool use_htp_flash_layout = keep_for_htp_hybrid &&
                                       sd_env_flag_enabled("SD_HTP_ATTENTION") &&
                                       N == 1 &&
-                                      kv_scale == 1.0f &&
                                       q_htp_flash != nullptr &&
                                       k_htp_flash_base != nullptr &&
                                       v_htp_flash_base != nullptr;
@@ -2512,6 +2511,16 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         if (q_in->type != GGML_TYPE_F32) {
             return nullptr;
         }
+        if (kv_scale != 1.0f) {
+            // The HTP dense kernel always applies 1/sqrt(head_dim) internally.
+            // Balance the F16 K scaling on F32 Q instead of relying on the
+            // ggml flash-attention scale parameter, which is not in its RPC ABI.
+            // Scale the token-major base so materialization does not turn the
+            // permuted attention view back into head-major backing storage.
+            ggml_tensor* q_base = ggml_permute(ctx, q_in, 0, 2, 1, 3);
+            q_base = ggml_ext_scale(ctx, q_base, 1.0f / kv_scale);
+            q_in = ggml_permute(ctx, q_base, 0, 2, 1, 3);
+        }
 
         ggml_tensor* k_base = k_htp_flash_base;
         ggml_tensor* v_base = v_htp_flash_base;
@@ -2552,8 +2561,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             }
         }
 
-        auto out = with_lse ? ggml_flash_attn_ext_with_lse(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0)
-                            : ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0);
+        auto out = with_lse ? ggml_flash_attn_ext_with_lse(ctx, q_in, k_in, v_in, mask_in, scale, 0, 0)
+                            : ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale, 0, 0);
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
         if (!with_lse && kv_scale != 1.0f) {
             out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
@@ -2565,8 +2574,10 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         GGML_ASSERT(packed != nullptr);
         GGML_ASSERT(!with_lse || packed->ne[0] == d_head + 1);
         ggml_tensor* out = ggml_view_3d(ctx, packed, d_head, n_head, L_q, packed->nb[1], packed->nb[2], 0);
-        if (with_lse && kv_scale != 1.0f) {
-            out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
+        // Packed QKV producers emit unscaled K/V, so their attention output
+        // must not receive the non-packed path's inverse V-scale compensation.
+        if (with_lse && kv_scale != 1.0f && !packed_layout) {
+            out = ggml_ext_scale(ctx, ggml_cont(ctx, out), 1.0f / kv_scale);
         }
         return out;
     };
@@ -2692,7 +2703,11 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                 block_sparse_residual_cache_name != nullptr &&
                 block_sparse_cache_tensor != nullptr &&
                 *block_sparse_cache_tensor;
-            const bool sparse_with_lse = packed_layout || (anchor_can_cache_residual && can_cache_exact_rho);
+            // Keep the raw flash-attention node available until sparse metadata
+            // has been attached. The non-LSE builders wrap kv-scaled outputs in
+            // a scale op, which cannot be passed to the flash-attention setters.
+            const bool sparse_with_lse = packed_layout || kv_scale != 1.0f ||
+                                         (anchor_can_cache_residual && can_cache_exact_rho);
             ggml_tensor* dense_candidate = nullptr;
             ggml_tensor* dense_lse = nullptr;
             bool candidate_is_htp_layout = false;
@@ -4974,6 +4989,7 @@ protected:
 
     sd::ggml_graph_cut::PlanCache graph_cut_plan_cache_;
     std::unordered_set<const ggml_tensor*> params_tensor_set_;
+    std::vector<ggml_tensor*> params_buffer_tensors_;
     // 记录每个 node/leaf 应该落在哪个 buffer，0=默认 runtime buffer，1=HTP RPCMEM buffer。
     std::vector<int> compute_node_buffer_ids_;
     std::vector<int> compute_leaf_buffer_ids_;
@@ -7096,6 +7112,7 @@ public:
     }
 
     bool alloc_params_buffer() {
+        params_buffer_tensors_.clear();
         size_t num_tensors = ggml_tensor_num(params_ctx);
         if (num_tensors > 0) {
             // ggml_backend_alloc_ctx_tensors fails when all tensors are already allocated
@@ -7121,8 +7138,14 @@ public:
             LOG_DEBUG("%s skipping params allocation (no tensors)", get_desc().c_str());
             return true;
         }
+        for (ggml_tensor* t = ggml_get_first_tensor(params_ctx); t != nullptr; t = ggml_get_next_tensor(params_ctx, t)) {
+            if (t->data == nullptr) {
+                params_buffer_tensors_.push_back(t);
+            }
+        }
         params_buffer = ggml_backend_alloc_ctx_tensors(params_ctx, params_backend);
         if (params_buffer == nullptr) {
+            params_buffer_tensors_.clear();
             LOG_ERROR("%s alloc params backend buffer failed, num_tensors = %i",
                       get_desc().c_str(),
                       num_tensors);
@@ -7145,6 +7168,12 @@ public:
             ggml_backend_buffer_free(params_buffer);
             params_buffer = nullptr;
         }
+        for (ggml_tensor* tensor : params_buffer_tensors_) {
+            tensor->buffer = nullptr;
+            tensor->data   = nullptr;
+            tensor->extra  = nullptr;
+        }
+        params_buffer_tensors_.clear();
     }
 
     size_t get_params_buffer_size() {

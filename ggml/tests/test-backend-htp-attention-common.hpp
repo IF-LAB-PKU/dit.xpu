@@ -36,6 +36,9 @@ struct CaseSpec {
     int resolution = 256;
     int image_block_rows = 4;
     int image_block_cols = 2;
+    bool dense_inference = false;
+    bool external_inference = false;
+    bool packed_inference = false;
 };
 
 enum class Route {
@@ -79,6 +82,7 @@ struct Graph {
     ggml_tensor * mask = nullptr;
     ggml_tensor * packed_storage = nullptr;
     ggml_tensor * rope = nullptr;
+    ggml_tensor * built_in_one = nullptr;
     std::vector<ggml_tensor *> activations;
     std::vector<ggml_tensor *> weights;
     std::vector<ggml_tensor *> biases;
@@ -93,6 +97,7 @@ const CaseSpec * cases();
 int case_count();
 int total_tokens(const CaseSpec & spec);
 bool selected(const ImageSize & size, const CaseSpec & spec);
+CaseSpec make_inference_case(const ImageSize & size, const CaseSpec & base, Route route);
 
 InputData make_input(const CaseSpec & spec);
 void append_reference_branch(const CaseSpec & spec, const BranchData & branch,
@@ -101,7 +106,7 @@ std::vector<int32_t> make_block_index(const CaseSpec & spec);
 std::vector<float> reference_attention(const CaseSpec & spec, const Reference & ref,
                                        const std::vector<int32_t> * index);
 
-Graph build_graph(const CaseSpec & spec, Route route);
+Graph build_graph(const CaseSpec & spec, Route route, ggml_backend_t backend = nullptr);
 bool upload_graph(Graph & graph, const InputData & data, ggml_backend_t backend);
 bool graph_contract(const Graph & graph, const CaseSpec & spec);
 void free_graph(Graph & graph);

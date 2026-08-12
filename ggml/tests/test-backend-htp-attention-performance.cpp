@@ -190,18 +190,21 @@ static bool benchmark_case(ggml_backend_t htp,
     double initial_temperature = -1.0;
     if (!wait_for_cooldown(&initial_temperature)) return false;
 
-    htp_attention_common::CaseSpec spec = base;
-    spec.image_tokens = size.image_tokens;
-    spec.image_block_rows = size.block_rows;
-    spec.image_block_cols = size.block_cols;
-    spec.resolution = size.resolution;
+    const htp_attention_common::CaseSpec spec =
+        htp_attention_common::make_inference_case(size, base, route);
     setenv("SD_HTP_BLOCK_SPARSE_ATTN", route == htp_attention_common::Route::Dense ? "0" : "1", 1);
     setenv("SD_HTP_PACKED_ATTENTION", route == htp_attention_common::Route::PackedSparse ? "1" : "0", 1);
     setenv("SD_HTP_HALO_KV_LOAD", loader, 1);
     setenv("SD_HTP_HALO_REQUIRE_USERDMA_TRACE", "0", 1);
     setenv("SD_HTP_HALO_REQUIRE_L2_TRACE", "0", 1);
+    if (spec.external_inference || spec.packed_inference) {
+        setenv("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", "0", 1);
+        setenv("SD_HTP_BLOCK_SPARSE_PATCH_HALO", "1", 1);
+        setenv("SD_HTP_PACKED_Z_IMAGE", spec.packed_inference ? "1" : "0", 1);
+        setenv("SD_HTP_SPARSE_OPENCL", "0", 1);
+    }
 
-    htp_attention_common::Graph graph = htp_attention_common::build_graph(spec, route);
+    htp_attention_common::Graph graph = htp_attention_common::build_graph(spec, route, htp);
     const htp_attention_common::InputData data = htp_attention_common::make_input(spec);
     const bool ready = htp_attention_common::graph_contract(graph, spec) &&
                        htp_attention_common::upload_graph(graph, data, htp);
@@ -243,6 +246,7 @@ static bool benchmark_case(ggml_backend_t htp,
 static int benchmark_matrix(ggml_backend_t htp, int warmups, int samples) {
     int measured = 0;
     int expected = 0;
+    const bool dense_only = std::getenv("HTP_ATTN_PERF_DENSE_ONLY") != nullptr;
     for (int si = 0; si < htp_attention_common::image_size_count(); ++si) {
         const htp_attention_common::ImageSize & size = htp_attention_common::image_sizes()[si];
         for (int ci = 0; ci < htp_attention_common::case_count(); ++ci) {
@@ -251,7 +255,7 @@ static int benchmark_matrix(ggml_backend_t htp, int warmups, int samples) {
             ++expected;
             measured += benchmark_case(htp, size, spec, htp_attention_common::Route::Dense,
                                        "none", warmups, samples) ? 1 : 0;
-            if (spec.sparse) {
+            if (spec.sparse && !dense_only) {
                 ++expected;
                 measured += benchmark_case(htp, size, spec, htp_attention_common::Route::ExternalSparseL2,
                                            "l2fetch", warmups, samples) ? 1 : 0;

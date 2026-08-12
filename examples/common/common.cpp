@@ -718,7 +718,10 @@ std::string SDContextParams::to_string() const {
     return oss.str();
 }
 
-sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool vae_decode_only, bool free_params_immediately, bool taesd_preview) {
+sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool vae_decode_only,
+                                                    bool free_params_immediately,
+                                                    bool taesd_preview,
+                                                    bool staged_params_loading) {
     embedding_vec.clear();
     embedding_vec.reserve(embedding_map.size());
     for (const auto& kv : embedding_map) {
@@ -749,6 +752,7 @@ sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool vae_decode_only, bool f
         tensor_type_rules.c_str(),
         vae_decode_only,
         free_params_immediately,
+        staged_params_loading,
         n_threads,
         wtype,
         rng_type,
