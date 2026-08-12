@@ -515,14 +515,16 @@ ggml_opencl_htp_result ensure_residual_kernel(
     }
 
     static constexpr const char * kernel_source = R"CLC(
-__kernel void exact_rho_residual_f32(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+
+__kernel void exact_rho_residual_f16(
         __global const float * dense,
         ulong dense_offset_bytes,
         __global const float * sparse,
         ulong sparse_offset_bytes,
         __global float * rho,
         ulong rho_offset_bytes,
-        __global float * residual,
+        __global half * residual,
         ulong residual_offset_bytes,
         ulong head_dim,
         ulong row_count) {
@@ -535,7 +537,7 @@ __kernel void exact_rho_residual_f32(
     const ulong dense_base = dense_offset_bytes / sizeof(float);
     const ulong sparse_base = sparse_offset_bytes / sizeof(float);
     const ulong rho_base = rho_offset_bytes / sizeof(float);
-    const ulong residual_base = residual_offset_bytes / sizeof(float);
+    const ulong residual_base = residual_offset_bytes / sizeof(half);
     __local float row_rho[1];
     if (lane == 0) {
         const float value = exp(
@@ -546,9 +548,9 @@ __kernel void exact_rho_residual_f32(
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     for (ulong d = lane; d < head_dim; d += (ulong) get_local_size(0)) {
-        residual[residual_base + row * head_dim + d] =
-            dense[dense_base + row * packed_dim + d] -
+        const float value = dense[dense_base + row * packed_dim + d] -
             sparse[sparse_base + row * packed_dim + d] * row_rho[0];
+        residual[residual_base + row * head_dim + d] = convert_half_rte(value);
     }
 }
 )CLC";
@@ -572,12 +574,12 @@ __kernel void exact_rho_residual_f32(
             err, release_err, build_log.c_str());
         return GGML_OPENCL_HTP_ERROR;
     }
-    cl_kernel kernel = clCreateKernel(program, "exact_rho_residual_f32", &err);
+    cl_kernel kernel = clCreateKernel(program, "exact_rho_residual_f16", &err);
     if (err != CL_SUCCESS || kernel == nullptr) {
         const cl_int release_err = clReleaseProgram(program);
         set_reason(
             reason, reason_capacity,
-            "clCreateKernel exact_rho_residual_f32 failed (error %d, release error %d)",
+            "clCreateKernel exact_rho_residual_f16 failed (error %d, release error %d)",
             err, release_err);
         return GGML_OPENCL_HTP_ERROR;
     }
@@ -1648,9 +1650,12 @@ ggml_opencl_htp_result validate_residual_dispatch(
             return unsupported_sparse_node(
                 reason, reason_capacity, "%s must not be null", item.name);
         }
-        if (item.tensor->type != GGML_TYPE_F32) {
+        const bool expected_f32 = std::strcmp(item.name, "residual_destination") != 0;
+        const ggml_type expected_type = expected_f32 ? GGML_TYPE_F32 : GGML_TYPE_F16;
+        if (item.tensor->type != expected_type) {
             return unsupported_sparse_node(
-                reason, reason_capacity, "%s must use F32 storage", item.name);
+                reason, reason_capacity, "%s must use %s storage", item.name,
+                expected_f32 ? "F32" : "F16");
         }
         if (!ggml_is_contiguous(item.tensor)) {
             return unsupported_sparse_node(
@@ -1710,9 +1715,11 @@ ggml_opencl_htp_result validate_residual_dispatch(
                 reason, reason_capacity, "%s binding is unavailable: %s",
                 request.name, binding_reason);
         }
-        if (request.binding->offset % sizeof(float) != 0) {
+        const size_t alignment = std::strcmp(request.name, "residual destination") == 0
+            ? sizeof(ggml_fp16_t) : sizeof(float);
+        if (request.binding->offset % alignment != 0) {
             return unsupported_sparse_node(
-                reason, reason_capacity, "%s offset is not F32 aligned", request.name);
+                reason, reason_capacity, "%s offset is not correctly aligned", request.name);
         }
     }
     if (bindings_overlap(prepared->residual, prepared->rho)) {
@@ -2098,9 +2105,9 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_persistent_import_acquire(
         [cache_key](const ggml_opencl_htp_persistent_import & imported) {
             return imported.key == cache_key;
         }));
-    if (generation_count >= 2) {
+    if (generation_count >= 1) {
         set_reason(reason, reason_capacity,
-                   "cache key already owns the maximum of two generations");
+                   "cache key already owns the maximum of one generation");
         return GGML_OPENCL_HTP_UNSUPPORTED;
     }
 

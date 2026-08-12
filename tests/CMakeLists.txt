@@ -5,6 +5,22 @@ target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../s
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
+set(TEST_TARGET test-backend-htp-residual-cache)
+add_executable(${TEST_TARGET} ../ggml/tests/${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
+if (APPLE)
+    target_link_options(${TEST_TARGET} PRIVATE "-Wl,-multiply_defined" "-Wl,suppress")
+else()
+    target_link_options(${TEST_TARGET} PRIVATE "-Wl,--allow-multiple-definition")
+endif()
+add_test(NAME ${TEST_TARGET}-fp16 COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET}-fp16 PROPERTY
+             ENVIRONMENT "HTP_RESIDUAL_CACHE_TEST=fp16;LLVM_PROFILE_FILE=${TEST_TARGET}-fp16.profraw")
+add_test(NAME ${TEST_TARGET}-lifecycle COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET}-lifecycle PROPERTY
+             ENVIRONMENT "HTP_RESIDUAL_CACHE_TEST=lifecycle;LLVM_PROFILE_FILE=${TEST_TARGET}-lifecycle.profraw")
+set_property(TEST ${TEST_TARGET}-lifecycle PROPERTY SKIP_RETURN_CODE 77)
+
 set(TEST_TARGET test-backend-htp-attention-correctness)
 add_executable(${TEST_TARGET}
                ../ggml/tests/test-backend-htp-attention-correctness.cpp

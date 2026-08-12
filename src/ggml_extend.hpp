@@ -922,6 +922,26 @@ __STATIC_INLINE__ bool sd_backend_htp_opencl_cache_query(
 #endif
 }
 
+__STATIC_INLINE__ bool sd_backend_htp_opencl_cache_wait(
+        ggml_backend_t backend,
+        const char* cache_key,
+        uint64_t generation,
+        bool* waited,
+        char* reason,
+        size_t reason_capacity) {
+#ifdef GGML_USE_HTP
+    return ggml_backend_htp_opencl_cache_wait(
+        backend, cache_key, generation, waited, reason, reason_capacity);
+#else
+    SD_UNUSED(backend); SD_UNUSED(cache_key); SD_UNUSED(generation);
+    SD_UNUSED(reason); SD_UNUSED(reason_capacity);
+    if (waited != nullptr) {
+        *waited = false;
+    }
+    return false;
+#endif
+}
+
 __STATIC_INLINE__ int align_up_offset(int n, int multiple) {
     return (multiple - n % multiple) % multiple;
 }
@@ -2260,15 +2280,17 @@ __STATIC_INLINE__ void sd_htp_exact_residual_cache_cpu(
     const ggml_tensor* rho = dst->src[2];
     GGML_ASSERT(dense != nullptr && sparse != nullptr && rho != nullptr);
     GGML_ASSERT(dense->type == GGML_TYPE_F32 && sparse->type == GGML_TYPE_F32 &&
-                rho->type == GGML_TYPE_F32);
+                rho->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16);
     const int64_t head_dim = dense->ne[0] - 1;
     const int64_t rows = dense->ne[1] * dense->ne[2] * dense->ne[3];
     for (int64_t row = ith; row < rows; row += nth) {
         const float scale = static_cast<const float*>(rho->data)[row];
         for (int64_t d = 0; d < head_dim; ++d) {
-            static_cast<float*>(dst->data)[row * head_dim + d] =
+            const float value =
                 static_cast<const float*>(dense->data)[row * dense->ne[0] + d] -
                 static_cast<const float*>(sparse->data)[row * sparse->ne[0] + d] * scale;
+            static_cast<ggml_fp16_t*>(dst->data)[row * head_dim + d] =
+                ggml_fp32_to_fp16(value);
         }
     }
 }
@@ -2828,7 +2850,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                 dense_candidate, candidate, rho,
                             };
                             residual = ggml_custom_4d(
-                                ctx, GGML_TYPE_F32, d_head, n_head, L_q, N,
+                                ctx, GGML_TYPE_F16, d_head, n_head, L_q, N,
                                 residual_args, 3, sd_htp_exact_residual_cache_cpu,
                                 GGML_N_TASKS_MAX, nullptr);
                         } else {
@@ -2840,16 +2862,21 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                     }
                     if (residual == nullptr) {
                         residual = ggml_sub(ctx, dense_out, sparse_reshape_out);
+                        residual = ggml_cast(ctx, residual, GGML_TYPE_F16);
                     }
                     ggml_set_name(residual, block_sparse_residual_cache_name);
                     (*block_sparse_cache_tensor)(block_sparse_residual_cache_name, residual);
                     if (sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
                         std::fprintf(stderr,
-                                     "block_sparse_residual anchor=1 exact_rho=%d rho=%.4f cache=%s rho_cache=%s shape=[%lld,%lld,%lld,%lld]\n",
+                                     "block_sparse_residual anchor=1 exact_rho=%d rho=%.4f cache=%s type=%s bytes=%zu rho_cache=%s rho_type=%s rho_bytes=%zu shape=[%lld,%lld,%lld,%lld]\n",
                                      rho != nullptr ? 1 : 0,
                                      block_sparse_residual_rho,
                                      block_sparse_residual_cache_name,
+                                     ggml_type_name(residual->type),
+                                     ggml_nbytes(residual),
                                      block_sparse_residual_rho_cache_name != nullptr ? block_sparse_residual_rho_cache_name : "<unnamed>",
+                                     rho != nullptr ? ggml_type_name(rho->type) : "none",
+                                     rho != nullptr ? ggml_nbytes(rho) : 0,
                                      (long long) residual->ne[0],
                                      (long long) residual->ne[1],
                                      (long long) residual->ne[2],
@@ -2863,6 +2890,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                            block_sparse_cached_residual->ne[2] == sparse_out->ne[2] &&
                            block_sparse_cached_residual->ne[3] == sparse_out->ne[3]) {
                     ggml_tensor* residual = block_sparse_cached_residual;
+                    if (residual->type == GGML_TYPE_F16) {
+                        residual = ggml_cast(ctx, residual, GGML_TYPE_F32);
+                    }
                     if (block_sparse_residual_scale != 1.0f) {
                         residual = ggml_ext_scale(ctx, residual, block_sparse_residual_scale);
                     }
@@ -4943,7 +4973,7 @@ protected:
         size_t consumer_count = 0;
         bool producer_pending = false;
     };
-    std::unordered_map<std::string, std::deque<AsyncResidualCacheGeneration>>
+    std::unordered_map<std::string, AsyncResidualCacheGeneration>
         async_residual_cache_slots_;
     std::map<ggml_tensor*, uint64_t> cache_backed_tensor_generation_map_;
     std::vector<std::pair<std::string, uint64_t>> active_async_cache_consumers_;
@@ -5077,10 +5107,8 @@ protected:
 
     void free_async_residual_cache_slots() {
         for (auto& keyed_slots : async_residual_cache_slots_) {
-            for (AsyncResidualCacheGeneration& generation : keyed_slots.second) {
-                sd_backend_htp_async_cache_slot_free(generation.slot);
-                generation.slot = nullptr;
-            }
+            sd_backend_htp_async_cache_slot_free(keyed_slots.second.slot);
+            keyed_slots.second.slot = nullptr;
         }
         async_residual_cache_slots_.clear();
     }
@@ -5092,10 +5120,8 @@ protected:
         if (found == async_residual_cache_slots_.end()) {
             return nullptr;
         }
-        for (AsyncResidualCacheGeneration& slot : found->second) {
-            if (slot.generation == generation) {
-                return &slot;
-            }
+        if (found->second.generation == generation) {
+            return &found->second;
         }
         return nullptr;
     }
@@ -5103,16 +5129,16 @@ protected:
     AsyncResidualCacheGeneration* latest_async_residual_cache_slot(
             const std::string& key) {
         auto found = async_residual_cache_slots_.find(key);
-        if (found == async_residual_cache_slots_.end() || found->second.empty()) {
+        if (found == async_residual_cache_slots_.end() || found->second.slot == nullptr) {
             return nullptr;
         }
-        return &found->second.back();
+        return &found->second;
     }
 
     bool async_residual_cache_backed(const std::string& key) const {
         const auto found = async_residual_cache_slots_.find(key);
         return found != async_residual_cache_slots_.end() &&
-               !found->second.empty() && found->second.back().slot != nullptr;
+               found->second.slot != nullptr;
     }
 
     void release_active_async_cache_consumers() {
@@ -5147,18 +5173,11 @@ protected:
                 find_async_residual_cache_slot(key, generation)) {
             return existing;
         }
-        std::deque<AsyncResidualCacheGeneration>& generations =
-            async_residual_cache_slots_[key];
-        if (generations.size() >= 2) {
-            AsyncResidualCacheGeneration& oldest = generations.front();
-            if (oldest.producer_pending || oldest.consumer_count != 0) {
-                LOG_DEBUG(
-                    "gpu_residual_cache_pressure_wait key=%s generation=%" PRIu64,
-                    key.c_str(), oldest.generation);
-                return nullptr;
-            }
-            sd_backend_htp_async_cache_slot_free(oldest.slot);
-            generations.pop_front();
+        auto existing = async_residual_cache_slots_.find(key);
+        if (existing != async_residual_cache_slots_.end()) {
+            LOG_ERROR("%s residual cache key still has a live generation: %s",
+                      get_desc().c_str(), key.c_str());
+            return nullptr;
         }
 
         char reason[512] = {};
@@ -5174,13 +5193,91 @@ protected:
         if (slot == nullptr) {
             LOG_ERROR("allocate async residual cache slot %s failed: %s",
                       key.c_str(), reason[0] != '\0' ? reason : "unknown error");
-            if (generations.empty()) {
-                async_residual_cache_slots_.erase(key);
-            }
             return nullptr;
         }
-        generations.push_back({ generation, slot, 0, false });
-        return &generations.back();
+        auto inserted = async_residual_cache_slots_.emplace(
+            key, AsyncResidualCacheGeneration{ generation, slot, 0, false });
+        if (!inserted.second) {
+            sd_backend_htp_async_cache_slot_free(slot);
+            LOG_ERROR("%s residual cache key insertion failed: %s",
+                      get_desc().c_str(), key.c_str());
+            return nullptr;
+        }
+        return &inserted.first->second;
+    }
+
+    bool replace_async_residual_cache_slots(
+            const std::vector<std::pair<std::string, ggml_tensor*>>& outputs) {
+        std::vector<std::pair<std::string, uint64_t>> old_slots;
+        old_slots.reserve(outputs.size());
+        for (const auto& output : outputs) {
+            auto found = async_residual_cache_slots_.find(output.first);
+            if (found == async_residual_cache_slots_.end() ||
+                found->second.slot == nullptr) {
+                continue;
+            }
+            old_slots.emplace_back(output.first, found->second.generation);
+        }
+        if (old_slots.empty()) {
+            return true;
+        }
+        if (!active_async_cache_consumers_.empty()) {
+            LOG_ERROR("%s residual cache replacement has active consumers",
+                      get_desc().c_str());
+            return false;
+        }
+        const bool trace = sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_TRACE");
+        if (trace) {
+            std::fprintf(stderr,
+                         "htp_opencl_event name=gpu_residual_cache_replace_wait_begin "
+                         "ts_us=%lld key_count=%zu\n",
+                         (long long) ggml_time_us(), old_slots.size());
+        }
+        if (!reap_retired_compute_arenas(true)) {
+            LOG_ERROR("%s residual cache replacement failed waiting deferred arenas",
+                      get_desc().c_str());
+            return false;
+        }
+        for (const auto& old : old_slots) {
+            bool waited = false;
+            char reason[512] = {};
+            if (!sd_backend_htp_opencl_cache_wait(
+                    htp_backend, old.first.c_str(), old.second,
+                    &waited, reason, sizeof(reason))) {
+                LOG_ERROR("%s residual cache wait failed: key=%s generation=%" PRIu64 " reason=%s",
+                          get_desc().c_str(), old.first.c_str(), old.second,
+                          reason[0] != '\0' ? reason : "unknown error");
+                return false;
+            }
+            auto found = async_residual_cache_slots_.find(old.first);
+            if (found != async_residual_cache_slots_.end() &&
+                found->second.generation == old.second) {
+                found->second.producer_pending = false;
+            }
+        }
+        if (trace) {
+            std::fprintf(stderr,
+                         "htp_opencl_event name=gpu_residual_cache_replace_wait_end "
+                         "ts_us=%lld key_count=%zu\n",
+                         (long long) ggml_time_us(), old_slots.size());
+        }
+        for (const auto& old : old_slots) {
+            auto found = async_residual_cache_slots_.find(old.first);
+            if (found == async_residual_cache_slots_.end() ||
+                found->second.generation != old.second) {
+                LOG_ERROR("%s residual cache generation changed during replacement: key=%s",
+                          get_desc().c_str(), old.first.c_str());
+                return false;
+            }
+            if (found->second.consumer_count != 0 || found->second.producer_pending) {
+                LOG_ERROR("%s residual cache generation is still busy: key=%s generation=%" PRIu64,
+                          get_desc().c_str(), old.first.c_str(), old.second);
+                return false;
+            }
+            sd_backend_htp_async_cache_slot_free(found->second.slot);
+            async_residual_cache_slots_.erase(found);
+        }
+        return true;
     }
 
     void alloc_compute_ctx() {
@@ -6358,6 +6455,13 @@ protected:
                          kv.second.c_str());
                 return false;
             }
+            if (graph_tensor->type != cache_tensor->type) {
+                LOG_WARN("%s block sparse residual cache type mismatch while binding: %s graph=%s cache=%s",
+                         get_desc().c_str(), kv.second.c_str(),
+                         ggml_type_name(graph_tensor->type),
+                         ggml_type_name(cache_tensor->type));
+                return false;
+            }
             for (int i = 0; i < GGML_MAX_DIMS; ++i) {
                 if (graph_tensor->ne[i] != cache_tensor->ne[i]) {
                     LOG_WARN("%s block sparse residual cache shape mismatch while binding: %s graph=[%lld,%lld,%lld,%lld] cache=[%lld,%lld,%lld,%lld]",
@@ -6423,24 +6527,65 @@ protected:
             return true;
         }
 
+        if (!replace_async_residual_cache_slots(outputs)) {
+            return false;
+        }
+
         const uint64_t generation = next_async_residual_cache_generation_++;
+        const bool trace = sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_TRACE");
+        bool allocation_failed = false;
+        struct BoundCacheOutput {
+            ggml_tensor* tensor;
+            ggml_backend_buffer_t buffer;
+            void* data;
+            void* extra;
+        };
+        std::vector<BoundCacheOutput> bound_outputs;
+        bound_outputs.reserve(outputs.size());
         for (const auto& output : outputs) {
             AsyncResidualCacheGeneration* cached =
                 allocate_async_residual_cache_slot(
                     output.first, output.second, generation);
             if (cached == nullptr || cached->slot == nullptr) {
-                if (sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_STRICT")) {
-                    return false;
-                }
-                continue;
+                allocation_failed = true;
+                break;
             }
             ggml_tensor* slot_tensor =
                 sd_backend_htp_async_cache_slot_tensor(cached->slot);
             GGML_ASSERT(slot_tensor != nullptr);
+            bound_outputs.push_back({
+                output.second,
+                output.second->buffer,
+                output.second->data,
+                output.second->extra,
+            });
             output.second->buffer = slot_tensor->buffer;
             output.second->data = slot_tensor->data;
             output.second->extra = slot_tensor->extra;
             cached->producer_pending = true;
+            if (trace) {
+                std::fprintf(
+                    stderr,
+                    "gpu_residual_cache_generation key=%s new=%" PRIu64 " live=1\n",
+                    output.first.c_str(), generation);
+            }
+        }
+        if (allocation_failed) {
+            for (const BoundCacheOutput& output : bound_outputs) {
+                output.tensor->buffer = output.buffer;
+                output.tensor->data = output.data;
+                output.tensor->extra = output.extra;
+            }
+            for (auto it = async_residual_cache_slots_.begin();
+                 it != async_residual_cache_slots_.end();) {
+                if (it->second.generation != generation) {
+                    ++it;
+                    continue;
+                }
+                sd_backend_htp_async_cache_slot_free(it->second.slot);
+                it = async_residual_cache_slots_.erase(it);
+            }
+            return !sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_STRICT");
         }
         return true;
     }
