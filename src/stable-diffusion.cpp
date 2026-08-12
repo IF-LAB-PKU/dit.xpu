@@ -233,6 +233,14 @@ static float get_cache_reuse_threshold(const sd_cache_params_t& params) {
 
 class StableDiffusionGGML {
 public:
+    enum class WeightStage {
+        NONE,
+        CONDITIONER,
+        DIFFUSION,
+        VAE,
+        EAGER,
+    };
+
     std::vector<MmapTensorStore> mmap_tensor_store;
     SDBackendManager backend_manager;
 
@@ -240,6 +248,7 @@ public:
     bool vae_decode_only         = false;
     bool external_vae_is_invalid = false;
     bool free_params_immediately = false;
+    bool staged_params_loading   = false;
 
     bool circular_x = false;
     bool circular_y = false;
@@ -277,6 +286,11 @@ public:
     bool is_using_edm_v_parameterization = false;
 
     std::map<std::string, ggml_tensor*> tensors;
+    std::map<std::string, ggml_tensor*> conditioner_tensors;
+    std::map<std::string, ggml_tensor*> diffusion_tensors;
+    std::map<std::string, ggml_tensor*> vae_tensors;
+    std::unique_ptr<ModelLoader> retained_model_loader;
+    WeightStage loaded_weight_stage = WeightStage::NONE;
 
     // lora_name => multiplier
     std::unordered_map<std::string, float> curr_lora_state;
@@ -343,10 +357,191 @@ public:
         }
     }
 
+    static const char* weight_stage_name(WeightStage stage) {
+        switch (stage) {
+            case WeightStage::NONE:
+                return "NONE";
+            case WeightStage::CONDITIONER:
+                return "CONDITIONER";
+            case WeightStage::DIFFUSION:
+                return "DIFFUSION";
+            case WeightStage::VAE:
+                return "VAE";
+            case WeightStage::EAGER:
+                return "EAGER";
+        }
+        return "UNKNOWN";
+    }
+
+    const std::map<std::string, ggml_tensor*>& weight_stage_tensors(WeightStage stage) const {
+        switch (stage) {
+            case WeightStage::CONDITIONER:
+                return conditioner_tensors;
+            case WeightStage::DIFFUSION:
+                return diffusion_tensors;
+            case WeightStage::VAE:
+                return vae_tensors;
+            default:
+                return tensors;
+        }
+    }
+
+    static std::pair<size_t, size_t> weight_stage_bytes(const std::map<std::string, ggml_tensor*>& stage_tensors) {
+        size_t total_bytes      = 0;
+        size_t htp_packed_bytes = 0;
+        for (const auto& [_, tensor] : stage_tensors) {
+            if (tensor == nullptr) {
+                continue;
+            }
+            const size_t tensor_bytes = ggml_nbytes(tensor);
+            total_bytes += tensor_bytes;
+            if ((tensor->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) != 0) {
+                htp_packed_bytes += tensor_bytes;
+            }
+        }
+        return {total_bytes, htp_packed_bytes};
+    }
+
+    bool allocate_weight_stage(WeightStage stage) {
+        switch (stage) {
+            case WeightStage::CONDITIONER:
+                if (clip_vision && !clip_vision->alloc_params_buffer()) {
+                    LOG_ERROR("CLIP vision params buffer allocation failed");
+                    return false;
+                }
+                if (cond_stage_model) {
+                    cond_stage_model->alloc_params_buffer();
+                }
+                if (use_pmid && pmid_model && !pmid_model->alloc_params_buffer()) {
+                    LOG_ERROR("PhotoMaker params buffer allocation failed");
+                    return false;
+                }
+                return true;
+            case WeightStage::DIFFUSION:
+                if (diffusion_model) {
+                    diffusion_model->alloc_params_buffer();
+                }
+                if (high_noise_diffusion_model) {
+                    high_noise_diffusion_model->alloc_params_buffer();
+                }
+                return true;
+            case WeightStage::VAE:
+                if (first_stage_model && !first_stage_model->alloc_params_buffer()) {
+                    LOG_ERROR("VAE params buffer allocation failed");
+                    return false;
+                }
+                if (preview_vae && !preview_vae->alloc_params_buffer()) {
+                    LOG_ERROR("preview VAE params buffer allocation failed");
+                    return false;
+                }
+                if (audio_vae_model && !audio_vae_model->alloc_params_buffer()) {
+                    LOG_ERROR("LTX audio VAE params buffer allocation failed");
+                    return false;
+                }
+                return true;
+            default:
+                return true;
+        }
+    }
+
+    void release_weight_stage_buffers(WeightStage stage) {
+        switch (stage) {
+            case WeightStage::CONDITIONER:
+                if (clip_vision) {
+                    clip_vision->free_params_buffer();
+                }
+                if (cond_stage_model) {
+                    cond_stage_model->free_params_buffer();
+                }
+                if (pmid_model) {
+                    pmid_model->free_params_buffer();
+                }
+                break;
+            case WeightStage::DIFFUSION:
+                if (diffusion_model) {
+                    diffusion_model->free_params_buffer();
+                }
+                if (high_noise_diffusion_model) {
+                    high_noise_diffusion_model->free_params_buffer();
+                }
+                break;
+            case WeightStage::VAE:
+                if (first_stage_model) {
+                    first_stage_model->free_params_buffer();
+                }
+                if (preview_vae) {
+                    preview_vae->free_params_buffer();
+                }
+                if (audio_vae_model) {
+                    audio_vae_model->free_params_buffer();
+                }
+                break;
+            case WeightStage::EAGER:
+                release_weight_stage_buffers(WeightStage::CONDITIONER);
+                release_weight_stage_buffers(WeightStage::DIFFUSION);
+                release_weight_stage_buffers(WeightStage::VAE);
+                break;
+            default:
+                break;
+        }
+    }
+
+    void release_weight_stage(WeightStage stage) {
+        if (!staged_params_loading || stage == WeightStage::NONE) {
+            return;
+        }
+        release_weight_stage_buffers(stage);
+        LOG_INFO("weight stage %s released", weight_stage_name(stage));
+        if (loaded_weight_stage == stage) {
+            loaded_weight_stage = WeightStage::NONE;
+        }
+    }
+
+    void release_all_weight_stages() {
+        if (!staged_params_loading) {
+            return;
+        }
+        release_weight_stage(loaded_weight_stage);
+    }
+
+    bool ensure_weight_stage(WeightStage target) {
+        if (!staged_params_loading || target == WeightStage::NONE) {
+            return true;
+        }
+        if (loaded_weight_stage == target) {
+            return true;
+        }
+
+        WeightStage previous = loaded_weight_stage;
+        release_weight_stage(previous);
+        const auto& stage_tensors                  = weight_stage_tensors(target);
+        const auto [total_bytes, htp_packed_bytes] = weight_stage_bytes(stage_tensors);
+        int64_t start_ms                           = ggml_time_ms();
+        LOG_INFO("loading weight stage %s from %s (%zu tensors, %zu bytes, htp_packed=%zu bytes)",
+                 weight_stage_name(target),
+                 weight_stage_name(previous),
+                 stage_tensors.size(),
+                 total_bytes,
+                 htp_packed_bytes);
+        if (!allocate_weight_stage(target) ||
+            !retained_model_loader->load_tensor_subset(stage_tensors, n_threads)) {
+            release_weight_stage_buffers(target);
+            loaded_weight_stage = WeightStage::NONE;
+            LOG_ERROR("loading weight stage %s failed", weight_stage_name(target));
+            return false;
+        }
+        loaded_weight_stage = target;
+        LOG_INFO("weight stage %s loaded in %.2fs",
+                 weight_stage_name(target),
+                 (ggml_time_ms() - start_ms) / 1000.f);
+        return true;
+    }
+
     bool init(const sd_ctx_params_t* sd_ctx_params) {
         n_threads               = sd_ctx_params->n_threads;
         vae_decode_only         = sd_ctx_params->vae_decode_only;
         free_params_immediately = sd_ctx_params->free_params_immediately;
+        staged_params_loading   = sd_ctx_params->staged_params_loading;
         offload_params_to_cpu   = sd_ctx_params->offload_params_to_cpu;
         max_vram                = sd_ctx_params->max_vram;
         backend_spec            = SAFE_STR(sd_ctx_params->backend);
@@ -369,7 +564,8 @@ public:
         }
         max_vram = sd::ggml_graph_cut::resolve_max_vram_gib(max_vram, backend_for(SDBackendModule::DIFFUSION));
 
-        ModelLoader model_loader;
+        retained_model_loader = std::make_unique<ModelLoader>();
+        ModelLoader& model_loader = *retained_model_loader;
 
         if (strlen(SAFE_STR(sd_ctx_params->model_path)) > 0) {
             LOG_INFO("loading model from '%s'", sd_ctx_params->model_path);
@@ -539,11 +735,19 @@ public:
         } else {
             apply_lora_immediately = false;
         }
+        if (staged_params_loading && apply_lora_immediately) {
+            LOG_WARN("staged parameter loading uses runtime LoRA adapters");
+            apply_lora_immediately = false;
+        }
 
         std::map<std::string, ggml_tensor*> mmap_able_tensors;
         bool enable_mmap_tensors = false;
         bool needs_writable_mmap = false;
-        if (sd_ctx_params->enable_mmap) {
+        const bool enable_model_mmap = sd_ctx_params->enable_mmap && !staged_params_loading;
+        if (sd_ctx_params->enable_mmap && staged_params_loading) {
+            LOG_WARN("mmap is disabled while staged parameter loading is enabled");
+        }
+        if (enable_model_mmap) {
             if (apply_lora_immediately) {
                 needs_writable_mmap = true;
                 LOG_WARN("in mode 'immediately', LoRAs will cause extra memory usage with mmap");
@@ -559,22 +763,33 @@ public:
                     backend_manager.runtime_backend_supports_host_buffer(module));
         };
 
-        auto get_param_tensors_p = [&](auto&& model, bool do_mmap, const char* prefix) {
+        auto get_param_tensors_p = [&](auto&& model,
+                                       bool do_mmap,
+                                       const char* prefix,
+                                       std::map<std::string, ggml_tensor*>* stage_tensors = nullptr) {
             std::map<std::string, ggml_tensor*> temp;
             model->get_param_tensors(temp, prefix);
             for (const auto& [key, tensor] : temp) {
                 tensors[key] = tensor;
+                if (stage_tensors != nullptr) {
+                    (*stage_tensors)[key] = tensor;
+                }
                 if (do_mmap) {
                     mmap_able_tensors[key] = tensor;
                 }
             }
         };
 
-        auto get_param_tensors = [&](auto&& model, bool do_mmap) {
+        auto get_param_tensors = [&](auto&& model,
+                                     bool do_mmap,
+                                     std::map<std::string, ggml_tensor*>* stage_tensors = nullptr) {
             std::map<std::string, ggml_tensor*> temp;
             model->get_param_tensors(temp);
             for (const auto& [key, tensor] : temp) {
                 tensors[key] = tensor;
+                if (stage_tensors != nullptr) {
+                    (*stage_tensors)[key] = tensor;
+                }
                 if (do_mmap) {
                     mmap_able_tensors[key] = tensor;
                 }
@@ -698,7 +913,9 @@ public:
                                                                              params_backend_for(SDBackendModule::CLIP_VISION),
                                                                              tensor_storage_map);
                     clip_vision->set_max_graph_vram_bytes(max_graph_vram_bytes);
-                    get_param_tensors(clip_vision, module_can_mmap(SDBackendModule::CLIP_VISION));
+                    get_param_tensors(clip_vision,
+                                      module_can_mmap(SDBackendModule::CLIP_VISION),
+                                      &conditioner_tensors);
                 }
             } else if (sd_version_is_qwen_image(version)) {
                 bool enable_vision = false;
@@ -798,10 +1015,14 @@ public:
             }
 
             cond_stage_model->set_max_graph_vram_bytes(max_graph_vram_bytes);
-            get_param_tensors(cond_stage_model, module_can_mmap(SDBackendModule::TE));
+            get_param_tensors(cond_stage_model,
+                              module_can_mmap(SDBackendModule::TE),
+                              &conditioner_tensors);
 
             diffusion_model->set_max_graph_vram_bytes(max_graph_vram_bytes);
-            get_param_tensors(diffusion_model, module_can_mmap(SDBackendModule::DIFFUSION));
+            get_param_tensors(diffusion_model,
+                              module_can_mmap(SDBackendModule::DIFFUSION),
+                              &diffusion_tensors);
 
             if (sd_version_is_unet_edit(version)) {
                 vae_decode_only = false;
@@ -809,7 +1030,9 @@ public:
 
             if (high_noise_diffusion_model) {
                 high_noise_diffusion_model->set_max_graph_vram_bytes(max_graph_vram_bytes);
-                get_param_tensors(high_noise_diffusion_model, module_can_mmap(SDBackendModule::DIFFUSION));
+                get_param_tensors(high_noise_diffusion_model,
+                                  module_can_mmap(SDBackendModule::DIFFUSION),
+                                  &diffusion_tensors);
             }
 
             if (!ensure_backend_pair(SDBackendModule::VAE)) {
@@ -888,17 +1111,20 @@ public:
                 LOG_INFO("using TAE for encoding / decoding");
                 first_stage_model = create_tae();
                 first_stage_model->set_max_graph_vram_bytes(max_graph_vram_bytes);
-                get_param_tensors_p(first_stage_model, vae_mmap, "tae");
+                get_param_tensors_p(first_stage_model, vae_mmap, "tae", &vae_tensors);
             } else {
                 LOG_INFO("using VAE for encoding / decoding");
                 first_stage_model = create_vae();
                 first_stage_model->set_max_graph_vram_bytes(max_graph_vram_bytes);
-                get_param_tensors_p(first_stage_model, vae_mmap, "first_stage_model");
+                get_param_tensors_p(first_stage_model,
+                                    vae_mmap,
+                                    "first_stage_model",
+                                    &vae_tensors);
                 if (use_tae && tae_preview_only) {
                     LOG_INFO("using TAE for preview");
                     preview_vae = create_tae();
                     preview_vae->set_max_graph_vram_bytes(max_graph_vram_bytes);
-                    get_param_tensors_p(preview_vae, vae_mmap, "tae");
+                    get_param_tensors_p(preview_vae, vae_mmap, "tae", &vae_tensors);
                 }
             }
 
@@ -906,7 +1132,7 @@ public:
                 audio_vae_model = std::make_shared<LTXV::LTXAudioVAERunner>(backend_for(SDBackendModule::VAE),
                                                                             params_backend_for(SDBackendModule::VAE),
                                                                             tensor_storage_map);
-                get_param_tensors_p(audio_vae_model, vae_mmap, "");
+                get_param_tensors_p(audio_vae_model, vae_mmap, "", &vae_tensors);
             }
 
             if (sd_ctx_params->vae_conv_direct) {
@@ -974,7 +1200,10 @@ public:
                 }
             }
             if (use_pmid) {
-                get_param_tensors_p(pmid_model, module_can_mmap(SDBackendModule::PHOTOMAKER), "pmid");
+                get_param_tensors_p(pmid_model,
+                                    module_can_mmap(SDBackendModule::PHOTOMAKER),
+                                    "pmid",
+                                    &conditioner_tensors);
             }
 
             if (sd_ctx_params->flash_attn) {
@@ -1009,6 +1238,25 @@ public:
             circular_x = sd_ctx_params->circular_x;
             circular_y = sd_ctx_params->circular_y;
         }
+
+        auto groups_overlap = [](const auto& lhs, const auto& rhs) {
+            for (const auto& [name, _] : lhs) {
+                if (rhs.find(name) != rhs.end()) {
+                    LOG_ERROR("weight tensor '%s' belongs to multiple stages", name.c_str());
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (groups_overlap(conditioner_tensors, diffusion_tensors) ||
+            groups_overlap(conditioner_tensors, vae_tensors) ||
+            groups_overlap(diffusion_tensors, vae_tensors)) {
+            return false;
+        }
+        LOG_INFO("weight stages: conditioner=%zu tensors, diffusion=%zu tensors, vae=%zu tensors",
+                 conditioner_tensors.size(),
+                 diffusion_tensors.size(),
+                 vae_tensors.size());
 
         ggml_init_params params;
         params.mem_size   = static_cast<size_t>(10 * 1024) * 1024;  // 10M
@@ -1062,22 +1310,6 @@ public:
             ignore_tensors.insert("model.visual.deepstack_merger_list.");
         }
 
-        if (enable_mmap_tensors) {
-            if (mmap_able_tensors.empty()) {
-                LOG_DEBUG("no tensors could be memory-mapped");
-            } else {
-                mmap_tensor_store = model_loader.mmap_tensors(mmap_able_tensors, ignore_tensors, needs_writable_mmap);
-            }
-        }
-
-        if (clip_vision && !clip_vision->alloc_params_buffer()) {
-            LOG_ERROR("CLIP vision params buffer allocation failed");
-            ggml_free(ctx);
-            return false;
-        }
-        if (cond_stage_model) {
-            cond_stage_model->alloc_params_buffer();
-        }
         if (sd_env_flag_enabled("SD_HTP_OPS")) {
             ggml_backend_t htp_backend = backend_manager.cached_backend("htp");
             if (htp_backend != nullptr && backend_manager.runtime_backend_is_cpu(SDBackendModule::DIFFUSION)) {
@@ -1104,40 +1336,66 @@ public:
                 LOG_INFO("enabled HTP op routing for diffusion runners");
             }
         }
-        if (diffusion_model) {
-            diffusion_model->alloc_params_buffer();
-        }
-        if (high_noise_diffusion_model) {
-            high_noise_diffusion_model->alloc_params_buffer();
-        }
-        if (first_stage_model && !first_stage_model->alloc_params_buffer()) {
-            LOG_ERROR("VAE params buffer allocation failed");
-            ggml_free(ctx);
-            return false;
-        }
-        if (preview_vae && !preview_vae->alloc_params_buffer()) {
-            LOG_ERROR("preview VAE params buffer allocation failed");
-            ggml_free(ctx);
-            return false;
-        }
-        if (audio_vae_model && !audio_vae_model->alloc_params_buffer()) {
-            LOG_ERROR("LTX audio VAE params buffer allocation failed");
-            ggml_free(ctx);
-            return false;
-        }
-        if (use_pmid && pmid_model && !pmid_model->alloc_params_buffer()) {
-            LOG_ERROR("PhotoMaker params buffer allocation failed");
-            ggml_free(ctx);
-            return false;
-        }
 
-        bool success = model_loader.load_tensors(tensors, ignore_tensors, n_threads, sd_ctx_params->enable_mmap);
-        if (!success) {
-            LOG_ERROR("load tensors from model loader failed");
-            ggml_free(ctx);
-            return false;
+        if (staged_params_loading) {
+            LOG_INFO("staged parameter loading enabled");
+            if (!ensure_weight_stage(WeightStage::CONDITIONER)) {
+                ggml_free(ctx);
+                return false;
+            }
+        } else {
+            if (enable_mmap_tensors) {
+                if (mmap_able_tensors.empty()) {
+                    LOG_DEBUG("no tensors could be memory-mapped");
+                } else {
+                    mmap_tensor_store = model_loader.mmap_tensors(mmap_able_tensors, ignore_tensors, needs_writable_mmap);
+                }
+            }
+
+            if (clip_vision && !clip_vision->alloc_params_buffer()) {
+                LOG_ERROR("CLIP vision params buffer allocation failed");
+                ggml_free(ctx);
+                return false;
+            }
+            if (cond_stage_model) {
+                cond_stage_model->alloc_params_buffer();
+            }
+            if (diffusion_model) {
+                diffusion_model->alloc_params_buffer();
+            }
+            if (high_noise_diffusion_model) {
+                high_noise_diffusion_model->alloc_params_buffer();
+            }
+            if (first_stage_model && !first_stage_model->alloc_params_buffer()) {
+                LOG_ERROR("VAE params buffer allocation failed");
+                ggml_free(ctx);
+                return false;
+            }
+            if (preview_vae && !preview_vae->alloc_params_buffer()) {
+                LOG_ERROR("preview VAE params buffer allocation failed");
+                ggml_free(ctx);
+                return false;
+            }
+            if (audio_vae_model && !audio_vae_model->alloc_params_buffer()) {
+                LOG_ERROR("LTX audio VAE params buffer allocation failed");
+                ggml_free(ctx);
+                return false;
+            }
+            if (use_pmid && pmid_model && !pmid_model->alloc_params_buffer()) {
+                LOG_ERROR("PhotoMaker params buffer allocation failed");
+                ggml_free(ctx);
+                return false;
+            }
+
+            bool success = model_loader.load_tensors(tensors, ignore_tensors, n_threads, enable_model_mmap);
+            if (!success) {
+                LOG_ERROR("load tensors from model loader failed");
+                ggml_free(ctx);
+                return false;
+            }
+            loaded_weight_stage = WeightStage::EAGER;
+            sd_debug_log_loaded_tensor_hashes(tensors);
         }
-        sd_debug_log_loaded_tensor_hashes(tensors);
 
         LOG_DEBUG("finished loaded file");
 
@@ -1231,10 +1489,18 @@ public:
             if (pred_type == PREDICTION_COUNT) {
                 if (sd_version_is_sd2(version)) {
                     // check is_using_v_parameterization_for_sd2
+                    if (staged_params_loading && !ensure_weight_stage(WeightStage::DIFFUSION)) {
+                        ggml_free(ctx);
+                        return false;
+                    }
                     if (is_using_v_parameterization_for_sd2(sd_version_is_inpaint(version))) {
                         pred_type = V_PRED;
                     } else {
                         pred_type = EPS_PRED;
+                    }
+                    if (staged_params_loading && !ensure_weight_stage(WeightStage::CONDITIONER)) {
+                        ggml_free(ctx);
+                        return false;
                     }
                 } else if (sd_version_is_sdxl(version)) {
                     if (tensor_storage_map.find("edm_vpred.sigma_max") != tensor_storage_map.end()) {
@@ -2502,6 +2768,9 @@ public:
     }
 
     sd::Tensor<float> encode_first_stage(const sd::Tensor<float>& x) {
+        if (!ensure_weight_stage(WeightStage::VAE)) {
+            return {};
+        }
         auto latents = encode_to_vae_latents(x);
         if (latents.empty()) {
             return {};
@@ -2513,6 +2782,9 @@ public:
     }
 
     sd::Tensor<float> decode_first_stage(const sd::Tensor<float>& x, bool decode_video = false) {
+        if (!ensure_weight_stage(WeightStage::VAE)) {
+            return {};
+        }
         auto latents = first_stage_model->diffusion_to_vae_latents(x);
         first_stage_model->set_temporal_tiling_enabled(vae_tiling_params.temporal_tiling);
         return first_stage_model->decode(n_threads, latents, vae_tiling_params, decode_video, circular_x, circular_y);
@@ -2820,6 +3092,7 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     *sd_ctx_params                         = {};
     sd_ctx_params->vae_decode_only         = true;
     sd_ctx_params->free_params_immediately = true;
+    sd_ctx_params->staged_params_loading   = false;
     sd_ctx_params->n_threads               = sd_get_num_physical_cores();
     sd_ctx_params->wtype                   = SD_TYPE_COUNT;
     sd_ctx_params->rng_type                = CUDA_RNG;
@@ -2867,6 +3140,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "tensor_type_rules: %s\n"
              "vae_decode_only: %s\n"
              "free_params_immediately: %s\n"
+             "staged_params_loading: %s\n"
              "n_threads: %d\n"
              "wtype: %s\n"
              "rng_type: %s\n"
@@ -2904,6 +3178,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              SAFE_STR(sd_ctx_params->tensor_type_rules),
              BOOL_STR(sd_ctx_params->vae_decode_only),
              BOOL_STR(sd_ctx_params->free_params_immediately),
+             BOOL_STR(sd_ctx_params->staged_params_loading),
              sd_ctx_params->n_threads,
              sd_type_name(sd_ctx_params->wtype),
              sd_rng_type_name(sd_ctx_params->rng_type),
@@ -4244,6 +4519,9 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
                                                                             GenerationRequest* request,
                                                                             SamplePlan* plan,
                                                                             ImageGenerationLatents* latents) {
+    if (!sd_ctx->sd->ensure_weight_stage(StableDiffusionGGML::WeightStage::CONDITIONER)) {
+        return std::nullopt;
+    }
     ConditionerParams condition_params;
     condition_params.text            = request->prompt;
     condition_params.clip_skip       = request->clip_skip;
@@ -4281,7 +4559,7 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     int64_t t1 = ggml_time_ms();
     LOG_INFO("get_learned_condition completed, taking %.2fs", (t1 - prepare_start_ms) * 1.0f / 1000);
 
-    if (sd_ctx->sd->free_params_immediately) {
+    if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->staged_params_loading) {
         sd_ctx->sd->cond_stage_model->free_params_buffer();
     }
 
@@ -4312,7 +4590,9 @@ static sd_image_t* decode_image_outputs(sd_ctx_t* sd_ctx,
         sd::Tensor<float> image = sd_ctx->sd->decode_first_stage(final_latents[i]);
         if (image.empty()) {
             LOG_ERROR("decode_first_stage failed for latent %" PRId64, i + 1);
-            if (sd_ctx->sd->free_params_immediately) {
+            if (sd_ctx->sd->staged_params_loading) {
+                sd_ctx->sd->release_weight_stage(StableDiffusionGGML::WeightStage::VAE);
+            } else if (sd_ctx->sd->free_params_immediately) {
                 sd_ctx->sd->first_stage_model->free_params_buffer();
             }
             return nullptr;
@@ -4324,7 +4604,9 @@ static sd_image_t* decode_image_outputs(sd_ctx_t* sd_ctx,
 
     int64_t t4 = ggml_time_ms();
     LOG_INFO("decode_first_stage completed, taking %.2fs", (t4 - t0) * 1.0f / 1000);
-    if (sd_ctx->sd->free_params_immediately) {
+    if (sd_ctx->sd->staged_params_loading) {
+        sd_ctx->sd->release_weight_stage(StableDiffusionGGML::WeightStage::VAE);
+    } else if (sd_ctx->sd->free_params_immediately) {
         sd_ctx->sd->first_stage_model->free_params_buffer();
     }
 
@@ -4554,6 +4836,10 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
     }
     ImageGenerationEmbeds embeds = std::move(*embeds_opt);
 
+    if (!sd_ctx->sd->ensure_weight_stage(StableDiffusionGGML::WeightStage::DIFFUSION)) {
+        return nullptr;
+    }
+
     std::vector<sd::Tensor<float>> final_latents;
     int64_t denoise_start = ggml_time_ms();
     for (int b = 0; b < request.batch_count; b++) {
@@ -4602,12 +4888,16 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
                   b + 1,
                   request.batch_count,
                   (sampling_end - sampling_start) * 1.0f / 1000);
-        if (sd_ctx->sd->free_params_immediately) {
+        if (sd_ctx->sd->staged_params_loading) {
+            sd_ctx->sd->release_weight_stage(StableDiffusionGGML::WeightStage::DIFFUSION);
+        } else if (sd_ctx->sd->free_params_immediately) {
             sd_ctx->sd->diffusion_model->free_params_buffer();
         }
         return nullptr;
     }
-    if (sd_ctx->sd->free_params_immediately && !request.hires.enabled) {
+    if (sd_ctx->sd->free_params_immediately &&
+        !sd_ctx->sd->staged_params_loading &&
+        !request.hires.enabled) {
         sd_ctx->sd->diffusion_model->free_params_buffer();
     }
     int64_t denoise_end = ggml_time_ms();
@@ -4739,6 +5029,9 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
         final_latents = std::move(hires_final_latents);
     }
 
+    if (!sd_ctx->sd->ensure_weight_stage(StableDiffusionGGML::WeightStage::VAE)) {
+        return nullptr;
+    }
     auto result = decode_image_outputs(sd_ctx, request, final_latents);
     if (result == nullptr) {
         return nullptr;

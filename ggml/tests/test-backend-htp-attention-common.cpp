@@ -209,7 +209,8 @@ static void add_standard_projection_inputs(Graph & graph, const CaseSpec & spec)
     }
 }
 
-static void build_standard_attention(Graph & graph, const CaseSpec & spec, Route route) {
+static void build_standard_attention(Graph & graph, const CaseSpec & spec, Route route,
+                                     ggml_backend_t backend) {
     const int branches = spec.dual ? 2 : 1;
     BranchQkv qkv[2];
     for (int b = 0; b < branches; ++b) {
@@ -225,6 +226,37 @@ static void build_standard_attention(Graph & graph, const CaseSpec & spec, Route
         k = ggml_concat(graph.ctx, k, qkv[1].k, concat_axis);
         v = ggml_concat(graph.ctx, v, qkv[1].v, concat_axis);
     }
+
+    if (spec.dense_inference || spec.external_inference) {
+        GGML_ASSERT(route == Route::Dense || route == Route::ExternalSparseL2);
+        GGML_ASSERT(std::strncmp(spec.model, "z-image", 7) == 0);
+        GGML_ASSERT(spec.rope);
+        ggml_tensor * q4 = ggml_reshape_4d(graph.ctx, q, spec.head_dim, spec.heads, q->ne[2], 1);
+        ggml_tensor * k4 = ggml_reshape_4d(graph.ctx, k, spec.head_dim, spec.heads, k->ne[2], 1);
+        apply_identity_rope(graph.ctx, &q4, &k4, graph.rope, spec.head_dim);
+        q = q4;
+        k = k4;
+
+        graph.debug_q = q;
+        graph.debug_k = k;
+        graph.debug_v = v;
+        const bool block_sparse = spec.external_inference;
+        const int protected_start = block_sparse && spec.text_tokens > 0 ? spec.image_tokens : 0;
+        const int protected_len = block_sparse ? spec.text_tokens : 0;
+        graph.output = ggml_ext_attention_ext(graph.ctx, backend, q, k, v,
+                                               spec.heads, nullptr,
+                                               true, true, 1.0f / 128.0f,
+                                               block_sparse,
+                                               protected_start,
+                                               protected_len,
+                                               SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
+                                               1.0f, 1.0f, false,
+                                               nullptr, nullptr, nullptr, nullptr, nullptr,
+                                               spec.image_block_rows * 4,
+                                               spec.image_block_cols * 8);
+        return;
+    }
+
     standard_attention_views(graph.ctx, spec, &q, &k, &v, graph.rope);
     graph.debug_q = q;
     graph.debug_k = k;
@@ -257,7 +289,7 @@ static void build_standard_attention(Graph & graph, const CaseSpec & spec, Route
                                    spec.heads * spec.head_dim, tokens, 1);
 }
 
-static void build_packed_attention(Graph & graph, const CaseSpec & spec) {
+static void build_packed_attention(Graph & graph, const CaseSpec & spec, ggml_backend_t backend) {
     add_standard_projection_inputs(graph, spec);
     const int tokens = total_tokens(spec);
     const int qkv = 3 * spec.heads * spec.head_dim;
@@ -291,21 +323,34 @@ static void build_packed_attention(Graph & graph, const CaseSpec & spec) {
         tensor->op = GGML_OP_NONE;
         tensor->type = GGML_TYPE_F16;
     }
-    graph.mask = ggml_new_tensor_4d(graph.ctx, GGML_TYPE_I32, (tokens + 31) / 32,
-                                    spec.heads * ((tokens + 31) / 32), 1, 1);
-    ggml_set_name(graph.mask, "block_sparse_index");
-    ggml_tensor * packed_output = ggml_flash_attn_ext_with_lse(
-        graph.ctx, q, k, v, graph.mask, 1.0f / std::sqrt(float(spec.head_dim)), 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(packed_output, GGML_PREC_F32);
-    ggml_flash_attn_ext_set_block_sparse(packed_output, kBlock, kBlock,
-                                          GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
-    ggml_flash_attn_ext_set_static_halo_2d(packed_output, spec.image_tokens, spec.text_tokens,
-                                            spec.image_block_rows, spec.image_block_cols);
-    ggml_set_name(packed_output, "packed_sparse_attention");
-    ggml_tensor * output_view = ggml_view_3d(graph.ctx, packed_output, spec.head_dim, spec.heads, tokens,
-                                             packed_output->nb[1], packed_output->nb[2], 0);
-    graph.output = ggml_reshape_3d(graph.ctx, ggml_cont(graph.ctx, output_view),
-                                   spec.heads * spec.head_dim, tokens, 1);
+    if (spec.packed_inference) {
+        const int protected_start = spec.text_tokens > 0 ? spec.image_tokens : 0;
+        graph.output = ggml_ext_attention_ext(
+            graph.ctx, backend, q, k, v, spec.heads, nullptr,
+            true, true, 1.0f / 128.0f, true,
+            protected_start, spec.text_tokens,
+            SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
+            1.0f, 1.0f, false,
+            nullptr, nullptr, nullptr, nullptr, nullptr,
+            spec.image_block_rows * 4,
+            spec.image_block_cols * 8);
+    } else {
+        graph.mask = ggml_new_tensor_4d(graph.ctx, GGML_TYPE_I32, (tokens + 31) / 32,
+                                        spec.heads * ((tokens + 31) / 32), 1, 1);
+        ggml_set_name(graph.mask, "block_sparse_index");
+        ggml_tensor * packed_output = ggml_flash_attn_ext_with_lse(
+            graph.ctx, q, k, v, graph.mask, 1.0f / std::sqrt(float(spec.head_dim)), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(packed_output, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_block_sparse(packed_output, kBlock, kBlock,
+                                              GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
+        ggml_flash_attn_ext_set_static_halo_2d(packed_output, spec.image_tokens, spec.text_tokens,
+                                                spec.image_block_rows, spec.image_block_cols);
+        ggml_set_name(packed_output, "packed_sparse_attention");
+        ggml_tensor * output_view = ggml_view_3d(graph.ctx, packed_output, spec.head_dim, spec.heads, tokens,
+                                                 packed_output->nb[1], packed_output->nb[2], 0);
+        graph.output = ggml_reshape_3d(graph.ctx, ggml_cont(graph.ctx, output_view),
+                                       spec.heads * spec.head_dim, tokens, 1);
+    }
     (void) qkv;
 }
 
@@ -328,6 +373,33 @@ bool selected(const ImageSize & size, const CaseSpec & spec) {
     if (family == nullptr) family = std::getenv("HTP_ATTN_PERF_TEST_FAMILY");
     if (family != nullptr && family[0] != '\0' && std::strcmp(family, spec.family) != 0) return false;
     return true;
+}
+
+CaseSpec make_inference_case(const ImageSize & size, const CaseSpec & base, Route route) {
+    CaseSpec spec = base;
+    spec.image_tokens = size.image_tokens;
+    spec.image_block_rows = size.block_rows;
+    spec.image_block_cols = size.block_cols;
+    spec.resolution = size.resolution;
+    if (route == Route::Dense && std::strncmp(spec.model, "z-image", 7) == 0) {
+        // Real Z-Image inference concatenates the streams before attention and
+        // applies one shared QKV projection to the resulting activation x.
+        spec.dual = false;
+        spec.dense_inference = true;
+        if (std::strcmp(spec.family, "context-refiner") == 0) {
+            spec.image_tokens = 0;
+            spec.text_tokens = kTextTokens;
+        }
+    } else if (route == Route::ExternalSparseL2 &&
+               std::strncmp(spec.model, "z-image", 7) == 0) {
+        spec.dual = false;
+        spec.external_inference = true;
+    } else if (route == Route::PackedSparse &&
+               std::strncmp(spec.model, "z-image", 7) == 0) {
+        spec.dual = false;
+        spec.packed_inference = true;
+    }
+    return spec;
 }
 
 InputData make_input(const CaseSpec & spec) {
@@ -455,17 +527,21 @@ std::vector<float> reference_attention(const CaseSpec & spec, const Reference & 
     return result;
 }
 
-Graph build_graph(const CaseSpec & spec, Route route) {
+Graph build_graph(const CaseSpec & spec, Route route, ggml_backend_t backend) {
     Graph graph;
     graph.route = route;
     const ggml_init_params params = {128 * 1024 * 1024, nullptr, true};
     graph.ctx = ggml_init(params);
     GGML_ASSERT(graph.ctx != nullptr);
+    if (spec.dense_inference) {
+        graph.built_in_one = ggml_new_tensor_1d(graph.ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(graph.built_in_one, "ggml_runner_build_in_tensor:one");
+    }
     if (route == Route::PackedSparse) {
-        build_packed_attention(graph, spec);
+        build_packed_attention(graph, spec, backend);
     } else {
         add_standard_projection_inputs(graph, spec);
-        build_standard_attention(graph, spec, route);
+        build_standard_attention(graph, spec, route, backend);
     }
     graph.graph = ggml_new_graph_custom(graph.ctx, 512, false);
     GGML_ASSERT(graph.graph != nullptr);
@@ -477,6 +553,10 @@ bool upload_graph(Graph & graph, const InputData & data, ggml_backend_t backend)
     graph.buffer = ggml_backend_alloc_ctx_tensors_from_buft(
         graph.ctx, ggml_backend_get_default_buffer_type(backend));
     if (graph.buffer == nullptr || data.branches.size() != graph.activations.size()) return false;
+    if (graph.built_in_one != nullptr) {
+        const float one = 1.0f;
+        ggml_backend_tensor_set(graph.built_in_one, &one, 0, sizeof(one));
+    }
     for (size_t i = 0; i < data.branches.size(); ++i) {
         const BranchData & branch = data.branches[i];
         ggml_backend_tensor_set(graph.activations[i], branch.activation.data(), 0,
@@ -495,6 +575,9 @@ bool upload_graph(Graph & graph, const InputData & data, ggml_backend_t backend)
     }
     if (graph.rope != nullptr) {
         ggml_backend_tensor_set(graph.rope, data.rope.data(), 0, data.rope.size() * sizeof(float));
+    }
+    if (graph.mask == nullptr) {
+        return true;
     }
     if (graph.mask->type == GGML_TYPE_I32) {
         ggml_backend_tensor_set(graph.mask, data.block_index.data(), 0,
@@ -541,6 +624,14 @@ bool graph_contract(const Graph & graph, const CaseSpec & spec) {
         }
     }
     if (attention_nodes != 1 || !has_activation) return false;
+    if (spec.external_inference &&
+        (graph.mask != nullptr || graph.activations.size() != 1 || projection_nodes != 1)) {
+        return false;
+    }
+    if (spec.packed_inference &&
+        (graph.mask != nullptr || graph.activations.size() != 1 || packed_nodes != 1)) {
+        return false;
+    }
     if (graph.route == Route::PackedSparse) {
         return packed_nodes == 1 && projection_nodes == 0;
     }

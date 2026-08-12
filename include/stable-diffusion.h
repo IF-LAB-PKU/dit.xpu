@@ -189,6 +189,7 @@ typedef struct {
     const char* tensor_type_rules;
     bool vae_decode_only;
     bool free_params_immediately;
+    bool staged_params_loading;
     int n_threads;
     enum sd_type_t wtype;
     enum rng_type_t rng_type;

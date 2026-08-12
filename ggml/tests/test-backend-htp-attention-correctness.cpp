@@ -57,11 +57,8 @@ static bool run_case(ggml_backend_t htp,
                      const htp_attention_common::ImageSize & size,
                      const htp_attention_common::CaseSpec & base,
                      htp_attention_common::Route route) {
-    htp_attention_common::CaseSpec spec = base;
-    spec.image_tokens = size.image_tokens;
-    spec.image_block_rows = size.block_rows;
-    spec.image_block_cols = size.block_cols;
-    spec.resolution = size.resolution;
+    const htp_attention_common::CaseSpec spec =
+        htp_attention_common::make_inference_case(size, base, route);
 
     const bool block_sparse = route != htp_attention_common::Route::Dense;
     const bool q_is_f16 = route == htp_attention_common::Route::PackedSparse;
@@ -76,7 +73,13 @@ static bool run_case(ggml_backend_t htp,
     setenv("SD_HTP_BLOCK_SPARSE_ATTN", block_sparse ? "1" : "0", 1);
     setenv("SD_HTP_PACKED_ATTENTION", q_is_f16 ? "1" : "0", 1);
     setenv("SD_HTP_HALO_KV_LOAD", block_sparse ? "l2fetch" : "none", 1);
-    htp_attention_common::Graph graph = htp_attention_common::build_graph(spec, route);
+    if (spec.external_inference || spec.packed_inference) {
+        setenv("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", "0", 1);
+        setenv("SD_HTP_BLOCK_SPARSE_PATCH_HALO", "1", 1);
+        setenv("SD_HTP_PACKED_Z_IMAGE", spec.packed_inference ? "1" : "0", 1);
+        setenv("SD_HTP_SPARSE_OPENCL", "0", 1);
+    }
+    htp_attention_common::Graph graph = htp_attention_common::build_graph(spec, route, htp);
     const bool ready = htp_attention_common::graph_contract(graph, spec) &&
                        htp_attention_common::upload_graph(graph, data, htp) &&
                        size_t(ggml_nelements(graph.output)) == expected.size();
@@ -109,20 +112,32 @@ static bool run_case(ggml_backend_t htp,
 static int run_matrix(ggml_backend_t htp) {
     int passed = 0;
     int expected = 0;
+    const bool dense_only = std::getenv("HTP_ATTN_TEST_DENSE_ONLY") != nullptr;
+    const char * route_filter = std::getenv("HTP_ATTN_TEST_ROUTE");
+    const auto route_enabled = [route_filter](const char * name) {
+        return route_filter == nullptr || route_filter[0] == '\0' ||
+               std::strcmp(route_filter, name) == 0;
+    };
     for (int si = 0; si < htp_attention_common::image_size_count(); ++si) {
         const htp_attention_common::ImageSize & size = htp_attention_common::image_sizes()[si];
         for (int ci = 0; ci < htp_attention_common::case_count(); ++ci) {
             const htp_attention_common::CaseSpec & spec = htp_attention_common::cases()[ci];
             if (!htp_attention_common::selected(size, spec)) continue;
-            ++expected;
-            passed += run_case(htp, size, spec, htp_attention_common::Route::Dense) ? 1 : 0;
-            if (spec.sparse) {
+            if (route_enabled("dense")) {
                 ++expected;
-                passed += run_case(htp, size, spec,
-                                   htp_attention_common::Route::ExternalSparseL2) ? 1 : 0;
-                ++expected;
-                passed += run_case(htp, size, spec,
-                                   htp_attention_common::Route::PackedSparse) ? 1 : 0;
+                passed += run_case(htp, size, spec, htp_attention_common::Route::Dense) ? 1 : 0;
+            }
+            if (spec.sparse && !dense_only) {
+                if (route_enabled("external-sparse")) {
+                    ++expected;
+                    passed += run_case(htp, size, spec,
+                                       htp_attention_common::Route::ExternalSparseL2) ? 1 : 0;
+                }
+                if (route_enabled("packed-sparse")) {
+                    ++expected;
+                    passed += run_case(htp, size, spec,
+                                       htp_attention_common::Route::PackedSparse) ? 1 : 0;
+                }
             }
         }
     }
@@ -136,7 +151,6 @@ int main() {
     if (std::getenv("HTP_ATTN_SHARED_FIXTURE_CONTRACT") != nullptr) {
         return htp_attention_common::run_fixture_contract_test();
     }
-
     setenv("SD_HTP_OPS", "1", 1);
     setenv("SD_HTP_COMPUTE", "1", 1);
     setenv("SD_HTP_ATTENTION", "1", 1);
