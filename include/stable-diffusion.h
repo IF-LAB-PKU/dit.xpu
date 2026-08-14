@@ -439,6 +439,8 @@ SD_API enum scheduler_t sd_get_default_scheduler(const sd_ctx_t* sd_ctx, enum sa
 SD_API void sd_img_gen_params_init(sd_img_gen_params_t* sd_img_gen_params);
 SD_API char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params);
 SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_gen_params);
+// Runs image latent preparation, prompt conditioning, and sampling without VAE decode or image output.
+SD_API bool denoise_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_gen_params);
 
 SD_API void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params);
 SD_API bool generate_video(sd_ctx_t* sd_ctx,
@@ -470,7 +472,8 @@ SD_API bool convert(const char* input_path,
                     enum sd_type_t output_type,
                     const char* tensor_type_rules,
                     bool convert_name,
-                    bool htp_pack_dit);
+                    bool htp_pack_dit,
+                    bool force_f16);
 
 SD_API bool preprocess_canny(sd_image_t image,
                              float high_threshold,

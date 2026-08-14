@@ -15,6 +15,7 @@
 
 #include <CL/cl.h>
 
+#include <atomic>
 #include <inttypes.h>
 #include <string.h>
 
@@ -37,6 +38,9 @@
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
 #define UNUSED(x) (void)(x)
+
+static std::atomic<bool> g_opencl_attention_profiling_enabled{false};
+static std::atomic<int64_t> g_opencl_last_attention_elapsed_us{-1};
 
 #define CL_CHECK(err)                                               \
     do {                                                            \
@@ -4853,6 +4857,26 @@ ggml_backend_t ggml_backend_opencl_init(void) {
 
 bool ggml_backend_is_opencl(ggml_backend_t backend) {
     return backend && backend->iface.get_name == ggml_backend_opencl_name;
+}
+
+void ggml_backend_opencl_set_attention_profiling_enabled(bool enabled) {
+    g_opencl_attention_profiling_enabled.store(enabled, std::memory_order_release);
+}
+
+bool ggml_backend_opencl_attention_profiling_enabled(void) {
+    return g_opencl_attention_profiling_enabled.load(std::memory_order_acquire);
+}
+
+void ggml_backend_opencl_reset_attention_profile(void) {
+    g_opencl_last_attention_elapsed_us.store(-1, std::memory_order_release);
+}
+
+void ggml_backend_opencl_record_attention_elapsed_us(int64_t elapsed_us) {
+    g_opencl_last_attention_elapsed_us.store(elapsed_us, std::memory_order_release);
+}
+
+int64_t ggml_backend_opencl_get_last_attention_elapsed_us(void) {
+    return g_opencl_last_attention_elapsed_us.load(std::memory_order_acquire);
 }
 
 //
@@ -10437,18 +10461,36 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     CL_CHECK(clSetKernelArg(kernel, 38, sizeof(cl_mem),   &sinks_buffer));
     CL_CHECK(clSetKernelArg(kernel, 39, sizeof(cl_ulong), &offset_sinks));
 
-    if (n_q == 1) {
-        const size_t wg_size = 64;
-        size_t local_work_size[] = { wg_size, 1 };
-        size_t global_work_size[] = { wg_size, (size_t)(n_head * n_batch) };
+    const size_t wg_size =
+        n_q == 1 ? 64 : static_cast<size_t>(backend_ctx->kernels_flash_attn_bm.at(dk_dv));
+    size_t local_work_size[] = { wg_size, 1 };
+    size_t global_work_size[] = {
+        n_q == 1 ? wg_size : static_cast<size_t>((n_q + wg_size - 1) / wg_size) * wg_size,
+        static_cast<size_t>(n_head * n_batch),
+    };
+    if (!ggml_backend_opencl_attention_profiling_enabled()) {
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
-    } else {
-        const int block_m = backend_ctx->kernels_flash_attn_bm.at(dk_dv);
-        const size_t wg_size = block_m;
-        size_t local_work_size[] = { wg_size, 1 };
-        size_t global_work_size[] = { (size_t)((n_q + block_m - 1) / block_m) * wg_size, (size_t)(n_head * n_batch) };
-        backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+        return;
     }
+
+    // Exclude commands submitted by earlier graph nodes from the attention
+    // timing window, then mirror HTP's submit-to-worker-completion interval.
+    CL_CHECK(clFinish(backend_ctx->queue));
+    cl_event event = nullptr;
+    const int64_t begin_us = ggml_time_us();
+    CL_CHECK(clEnqueueNDRangeKernel(
+        backend_ctx->queue,
+        kernel,
+        2,
+        nullptr,
+        global_work_size,
+        local_work_size,
+        0,
+        nullptr,
+        &event));
+    CL_CHECK(clWaitForEvents(1, &event));
+    ggml_backend_opencl_record_attention_elapsed_us(ggml_time_us() - begin_us);
+    CL_CHECK(clReleaseEvent(event));
 }
 
 static void ggml_cl_mul_mat_f16_f32_tiled(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {

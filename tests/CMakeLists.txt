@@ -5,9 +5,27 @@ target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../s
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
+set(TEST_TARGET test-convert-f16)
+add_executable(${TEST_TARGET} test-convert-f16.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../src)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+set(TEST_TARGET test-denoise)
+add_executable(${TEST_TARGET}
+               ../examples/common/common.cpp
+               ../examples/common/log.cpp
+               test-denoise.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
+target_include_directories(${TEST_TARGET} PRIVATE
+                           ${CMAKE_CURRENT_LIST_DIR}/..
+                           ${CMAKE_CURRENT_LIST_DIR}/../examples
+                           ${CMAKE_CURRENT_LIST_DIR}/../src)
+
 set(TEST_TARGET test-backend-htp-residual-cache)
 add_executable(${TEST_TARGET} ../ggml/tests/${TEST_TARGET}.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../src)
 if (APPLE)
     target_link_options(${TEST_TARGET} PRIVATE "-Wl,-multiply_defined" "-Wl,suppress")
 else()
@@ -20,6 +38,9 @@ add_test(NAME ${TEST_TARGET}-lifecycle COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET}-lifecycle PROPERTY
              ENVIRONMENT "HTP_RESIDUAL_CACHE_TEST=lifecycle;LLVM_PROFILE_FILE=${TEST_TARGET}-lifecycle.profraw")
 set_property(TEST ${TEST_TARGET}-lifecycle PROPERTY SKIP_RETURN_CODE 77)
+add_test(NAME ${TEST_TARGET}-graph-order COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET}-graph-order PROPERTY
+             ENVIRONMENT "HTP_RESIDUAL_CACHE_TEST=graph-order;LLVM_PROFILE_FILE=${TEST_TARGET}-graph-order.profraw")
 
 set(TEST_TARGET test-backend-htp-attention-correctness)
 add_executable(${TEST_TARGET}
@@ -38,6 +59,20 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 set(TEST_TARGET test-backend-htp-attention-performance)
 add_executable(${TEST_TARGET}
                ../ggml/tests/test-backend-htp-attention-performance.cpp
+               ../ggml/tests/test-backend-htp-attention-common.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
+if (APPLE)
+    target_link_options(${TEST_TARGET} PRIVATE "-Wl,-multiply_defined" "-Wl,suppress")
+else()
+    target_link_options(${TEST_TARGET} PRIVATE "-Wl,--allow-multiple-definition")
+endif()
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/.. ${CMAKE_CURRENT_LIST_DIR}/../include)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
+
+set(TEST_TARGET test-backend-opencl-attention-kernel-performance)
+add_executable(${TEST_TARGET}
+               ../ggml/tests/test-backend-opencl-attention-kernel-performance.cpp
                ../ggml/tests/test-backend-htp-attention-common.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
 if (APPLE)

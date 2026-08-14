@@ -15,7 +15,8 @@ static constexpr const char* SD_GGUF_HTP_LAYOUT_W16A32 = "permuted_w16a32";
 static ggml_type get_export_tensor_type(ModelLoader& model_loader,
                                         const TensorStorage& tensor_storage,
                                         ggml_type type,
-                                        const TensorTypeRules& tensor_type_rules) {
+                                        const TensorTypeRules& tensor_type_rules,
+                                        bool force_f16) {
     const std::string& name = tensor_storage.name;
     ggml_type tensor_type   = tensor_storage.type;
     ggml_type dst_type      = type;
@@ -28,7 +29,9 @@ static ggml_type get_export_tensor_type(ModelLoader& model_loader,
         }
     }
 
-    if (model_loader.tensor_should_be_converted(tensor_storage, dst_type)) {
+    if (force_f16 && tensor_storage.type == GGML_TYPE_BF16) {
+        tensor_type = GGML_TYPE_F16;
+    } else if (model_loader.tensor_should_be_converted(tensor_storage, dst_type)) {
         tensor_type = dst_type;
     }
 
@@ -39,11 +42,12 @@ static bool load_tensors_for_export(ModelLoader& model_loader,
                                     ggml_context* ggml_ctx,
                                     ggml_type type,
                                     const TensorTypeRules& tensor_type_rules,
+                                    bool force_f16,
                                     std::vector<TensorWriteInfo>& tensors) {
     std::mutex tensor_mutex;
     auto on_new_tensor_cb = [&](const TensorStorage& tensor_storage, ggml_tensor** dst_tensor) -> bool {
         const std::string& name = tensor_storage.name;
-        ggml_type tensor_type   = get_export_tensor_type(model_loader, tensor_storage, type, tensor_type_rules);
+        ggml_type tensor_type   = get_export_tensor_type(model_loader, tensor_storage, type, tensor_type_rules, force_f16);
 
         std::lock_guard<std::mutex> lock(tensor_mutex);
         ggml_tensor* tensor = ggml_new_tensor(ggml_ctx, tensor_type, tensor_storage.n_dims, tensor_storage.ne);
@@ -163,7 +167,8 @@ bool convert(const char* input_path,
              sd_type_t output_type,
              const char* tensor_type_rules,
              bool convert_name,
-             bool htp_pack_dit) {
+             bool htp_pack_dit,
+             bool force_f16) {
     const bool output_is_safetensors = ends_with(output_path, ".safetensors");
     if (htp_pack_dit && output_is_safetensors) {
         LOG_ERROR("--htp-pack-dit only supports GGUF output");
@@ -209,7 +214,7 @@ bool convert(const char* input_path,
     }
 
     std::vector<TensorWriteInfo> tensors;
-    bool success = load_tensors_for_export(model_loader, ggml_ctx, type, type_rules, tensors);
+    bool success = load_tensors_for_export(model_loader, ggml_ctx, type, type_rules, force_f16, tensors);
     std::vector<std::string> packed_tensor_names;
     if (success && htp_pack_dit) {
         // --htp-pack-dit 只在导出 GGUF 时执行一次重排；推理阶段只消费这个 packed GGUF。

@@ -2309,6 +2309,53 @@ __STATIC_INLINE__ bool sd_htp_opencl_deferred_residual_enabled() {
                "SD_HTP_SPARSE_OPENCL_DEFER_RESIDUAL", true);
 }
 
+__STATIC_INLINE__ bool sd_htp_release_compute_buffer_after_residual_anchor(
+    int block_sparse_residual_mode,
+    bool opencl_residual_route_enabled) {
+    return block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
+           !opencl_residual_route_enabled;
+}
+
+enum sd_cache_storage_update_mode {
+    SD_CACHE_STORAGE_MERGE = 0,
+    SD_CACHE_STORAGE_APPEND = 1,
+    SD_CACHE_STORAGE_REPLACE_SEGMENTS = 2,
+};
+
+struct sd_cache_storage_update_plan {
+    sd_cache_storage_update_mode mode = SD_CACHE_STORAGE_MERGE;
+    std::vector<size_t> replace_segment_indices;
+};
+
+__STATIC_INLINE__ sd_cache_storage_update_plan sd_plan_cache_storage_update(
+    const std::vector<std::unordered_set<std::string>>& existing_segment_names,
+    const std::unordered_set<std::string>& pending_names,
+    bool has_keep_filter) {
+    sd_cache_storage_update_plan plan;
+    if (has_keep_filter || pending_names.empty()) {
+        return plan;
+    }
+    for (size_t segment_idx = 0; segment_idx < existing_segment_names.size();
+         ++segment_idx) {
+        const auto& segment_names = existing_segment_names[segment_idx];
+        size_t overlap_count = 0;
+        for (const std::string& name : segment_names) {
+            overlap_count += pending_names.count(name);
+        }
+        if (overlap_count == 0) {
+            continue;
+        }
+        if (overlap_count != segment_names.size()) {
+            return plan;
+        }
+        plan.replace_segment_indices.push_back(segment_idx);
+    }
+    plan.mode = plan.replace_segment_indices.empty()
+                    ? SD_CACHE_STORAGE_APPEND
+                    : SD_CACHE_STORAGE_REPLACE_SEGMENTS;
+    return plan;
+}
+
 // q: [N, L_q, C(n_head*d_head)] or [N*n_head, L_q, d_head]
 // k: [N, L_k, n_kv_head*d_head] or [N*n_kv_head, L_k, d_head]
 // v: [N, L_k, n_kv_head*d_head] or [N, L_k, n_kv_head, d_head]
@@ -2335,7 +2382,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                       ggml_tensor* block_sparse_cached_residual = nullptr,
                                                       const char* block_sparse_residual_rho_cache_name = nullptr,
                                                       ggml_tensor* block_sparse_cached_rho = nullptr,
-                                                      const std::function<void(const std::string&, ggml_tensor*)>* block_sparse_cache_tensor = nullptr,
+                                                      const std::function<ggml_tensor*(const std::string&, ggml_tensor*)>* block_sparse_cache_tensor = nullptr,
                                                       int block_sparse_token_h = 0,
                                                       int block_sparse_token_w = 0,
                                                       bool block_sparse_force_full_keep = false) {  // avoid overflow
@@ -4878,6 +4925,22 @@ struct WeightAdapter {
     virtual size_t get_extra_graph_size()                                                                                             = 0;
 };
 
+__STATIC_INLINE__ ggml_tensor* sd_cache_tensor_and_expand_graph(
+    ggml_cgraph* graph,
+    const std::function<ggml_tensor*(const std::string&, ggml_tensor*)>& cache_tensor,
+    const std::string& name,
+    ggml_tensor* tensor) {
+    if (!cache_tensor || tensor == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor* persisted = cache_tensor(name, tensor);
+    if (graph != nullptr && persisted != nullptr) {
+        ggml_set_output(persisted);
+        ggml_build_forward_expand(graph, persisted);
+    }
+    return persisted;
+}
+
 struct GGMLRunnerContext {
     ggml_backend_t backend                                           = nullptr;
     ggml_context* ggml_ctx                                           = nullptr;
@@ -4899,7 +4962,7 @@ struct GGMLRunnerContext {
     std::shared_ptr<WeightAdapter> weight_adapter                    = nullptr;
     std::vector<std::pair<ggml_tensor*, std::string>>* debug_tensors = nullptr;
     std::function<ggml_tensor*(const std::string&)> get_cache_tensor;
-    std::function<void(const std::string&, ggml_tensor*)> cache_tensor;
+    std::function<ggml_tensor*(const std::string&, ggml_tensor*)> cache_tensor;
     std::function<void(const std::string&, ggml_tensor*)> bind_cache_tensor;
 
     void capture_tensor(const std::string& name, ggml_tensor* tensor) {
@@ -4964,8 +5027,12 @@ protected:
     std::unordered_set<ggml_tensor*> htp_placed_param_tensors_;
     std::vector<ggml_tensor*> htp_packed_self_registered_weights_;
 
-    ggml_context* cache_ctx            = nullptr;
-    ggml_backend_buffer_t cache_buffer = nullptr;
+    struct CacheStorageSegment {
+        ggml_context* ctx = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        std::unordered_set<std::string> names;
+    };
+    std::vector<CacheStorageSegment> cache_storage_segments_;
 
     struct AsyncResidualCacheGeneration {
         uint64_t generation = 0;
@@ -5088,21 +5155,25 @@ protected:
         }
     }
 
-    void alloc_cache_ctx() {
+    ggml_context* new_cache_ctx() {
         ggml_init_params params;
         params.mem_size   = static_cast<size_t>(MAX_PARAMS_TENSOR_NUM * ggml_tensor_overhead());
         params.mem_buffer = nullptr;
         params.no_alloc   = true;
 
-        cache_ctx = ggml_init(params);
-        GGML_ASSERT(cache_ctx != nullptr);
+        ggml_context* ctx = ggml_init(params);
+        GGML_ASSERT(ctx != nullptr);
+        return ctx;
     }
 
     void free_cache_ctx() {
-        if (cache_ctx != nullptr) {
-            ggml_free(cache_ctx);
-            cache_ctx = nullptr;
+        for (CacheStorageSegment& segment : cache_storage_segments_) {
+            if (segment.ctx != nullptr) {
+                ggml_free(segment.ctx);
+                segment.ctx = nullptr;
+            }
         }
+        cache_storage_segments_.clear();
     }
 
     void free_async_residual_cache_slots() {
@@ -6240,61 +6311,49 @@ protected:
     }
 
     void free_cache_buffer() {
-        if (cache_buffer != nullptr) {
-            ggml_backend_buffer_free(cache_buffer);
-            cache_buffer = nullptr;
+        for (CacheStorageSegment& segment : cache_storage_segments_) {
+            if (segment.buffer != nullptr) {
+                ggml_backend_buffer_free(segment.buffer);
+                segment.buffer = nullptr;
+            }
         }
     }
 
-    bool copy_cache_tensors_to_cache_buffer(const std::unordered_set<std::string>* cache_keep_names = nullptr) {
-        ggml_context* old_cache_ctx            = cache_ctx;
-        ggml_backend_buffer_t old_cache_buffer = cache_buffer;
-        cache_ctx                              = nullptr;
-        cache_buffer                           = nullptr;
-        std::map<std::string, ggml_tensor*> merged_cache_sources;
-        if (old_cache_ctx != nullptr) {
-            for (ggml_tensor* tensor = ggml_get_first_tensor(old_cache_ctx); tensor != nullptr; tensor = ggml_get_next_tensor(old_cache_ctx, tensor)) {
-                if (cache_keep_names != nullptr && cache_keep_names->find(tensor->name) == cache_keep_names->end()) {
-                    continue;
-                }
-                if (async_residual_cache_backed(tensor->name)) {
-                    continue;
-                }
-                merged_cache_sources[tensor->name] = tensor;
-            }
+    void free_cache_storage_segment(CacheStorageSegment& segment) {
+        if (segment.buffer != nullptr) {
+            ggml_backend_buffer_free(segment.buffer);
+            segment.buffer = nullptr;
         }
-        for (const auto& kv : cache_tensor_map) {
-            if (cache_keep_names != nullptr && cache_keep_names->find(kv.first) == cache_keep_names->end()) {
-                continue;
-            }
-            if (async_residual_cache_backed(kv.first)) {
-                continue;
-            }
-            merged_cache_sources[kv.first] = kv.second;
+        if (segment.ctx != nullptr) {
+            ggml_free(segment.ctx);
+            segment.ctx = nullptr;
         }
-        cache_tensor_map.clear();
-        if (merged_cache_sources.empty()) {
-            if (old_cache_buffer != nullptr) {
-                ggml_backend_buffer_free(old_cache_buffer);
-            }
-            if (old_cache_ctx != nullptr) {
-                ggml_free(old_cache_ctx);
-            }
-            return true;
-        }
+        segment.names.clear();
+    }
 
-        alloc_cache_ctx();
+    bool allocate_cache_storage_segment(
+            const std::map<std::string, ggml_tensor*>& sources,
+            CacheStorageSegment* segment_out) {
+        GGML_ASSERT(segment_out != nullptr);
+        CacheStorageSegment segment;
+        segment.ctx = new_cache_ctx();
         std::vector<std::pair<ggml_tensor*, ggml_tensor*>> source_to_cache_tensors;
-        source_to_cache_tensors.reserve(merged_cache_sources.size());
-        for (const auto& kv : merged_cache_sources) {
+        source_to_cache_tensors.reserve(sources.size());
+        for (const auto& kv : sources) {
             ggml_tensor* source_tensor = sd::ggml_graph_cut::cache_source_tensor(kv.second);
-            auto cache_tensor          = ggml_dup_tensor(cache_ctx, source_tensor);
+            ggml_tensor* cache_tensor = ggml_dup_tensor(segment.ctx, source_tensor);
             ggml_set_name(cache_tensor, kv.first.c_str());
             source_to_cache_tensors.push_back({source_tensor, cache_tensor});
+            segment.names.insert(kv.first);
         }
-        size_t num_tensors = ggml_tensor_num(cache_ctx);
-        cache_buffer       = ggml_backend_alloc_ctx_tensors(cache_ctx, runtime_backend);
-        GGML_ASSERT(cache_buffer != nullptr);
+        const size_t num_tensors = ggml_tensor_num(segment.ctx);
+        segment.buffer = ggml_backend_alloc_ctx_tensors(segment.ctx, runtime_backend);
+        if (segment.buffer == nullptr) {
+            LOG_ERROR("%s alloc cache backend buffer failed, num_tensors=%zu",
+                      get_desc().c_str(), num_tensors);
+            free_cache_storage_segment(segment);
+            return false;
+        }
         for (const auto& kv : source_to_cache_tensors) {
             ggml_tensor* src              = kv.first;
             ggml_tensor* dst              = kv.second;
@@ -6312,9 +6371,12 @@ protected:
                           src ? src->view_src : nullptr,
                           (src && src->view_src) ? src->view_src->buffer : nullptr,
                           dst ? dst->buffer : nullptr);
+                free_cache_storage_segment(segment);
                 return false;
             }
-            const bool use_staging_copy = src->view_src != nullptr || !ggml_is_contiguous(src) || src->buffer == nullptr;
+            const bool use_staging_copy = src->view_src != nullptr ||
+                                          !ggml_is_contiguous(src) ||
+                                          src->buffer == nullptr;
             if (use_staging_copy) {
                 std::vector<uint8_t> host_data(ggml_nbytes(src));
                 ggml_backend_tensor_get(src, host_data.data(), 0, host_data.size());
@@ -6324,18 +6386,110 @@ protected:
             }
         }
         ggml_backend_synchronize(runtime_backend);
-        size_t cache_buffer_size = ggml_backend_buffer_get_size(cache_buffer);
-        LOG_DEBUG("%s cache backend buffer size = % 6.2f MB(%s) (%i tensors)",
+        const size_t cache_buffer_size = ggml_backend_buffer_get_size(segment.buffer);
+        LOG_DEBUG("%s cache backend buffer size = % 6.2f MB(%s) (%zu tensors)",
                   get_desc().c_str(),
                   cache_buffer_size / (1024.f * 1024.f),
                   ggml_backend_is_cpu(runtime_backend) ? "RAM" : "VRAM",
                   num_tensors);
-        if (old_cache_buffer != nullptr) {
-            ggml_backend_buffer_free(old_cache_buffer);
+        *segment_out = std::move(segment);
+        return true;
+    }
+
+    bool copy_cache_tensors_to_cache_buffer(
+            const std::unordered_set<std::string>* cache_keep_names = nullptr) {
+        std::map<std::string, ggml_tensor*> pending_sources;
+        for (const auto& kv : cache_tensor_map) {
+            if (cache_keep_names != nullptr &&
+                cache_keep_names->find(kv.first) == cache_keep_names->end()) {
+                continue;
+            }
+            if (!async_residual_cache_backed(kv.first)) {
+                pending_sources[kv.first] = kv.second;
+            }
         }
-        if (old_cache_ctx != nullptr) {
-            ggml_free(old_cache_ctx);
+        cache_tensor_map.clear();
+
+        if (cache_keep_names == nullptr && pending_sources.empty()) {
+            return true;
         }
+
+        std::vector<std::unordered_set<std::string>> existing_segment_names;
+        existing_segment_names.reserve(cache_storage_segments_.size());
+        for (const CacheStorageSegment& segment : cache_storage_segments_) {
+            existing_segment_names.push_back(segment.names);
+        }
+        std::unordered_set<std::string> pending_names;
+        pending_names.reserve(pending_sources.size());
+        for (const auto& pending : pending_sources) {
+            pending_names.insert(pending.first);
+        }
+        const sd_cache_storage_update_plan update_plan =
+            sd_plan_cache_storage_update(existing_segment_names,
+                                         pending_names,
+                                         cache_keep_names != nullptr);
+
+        if (update_plan.mode != SD_CACHE_STORAGE_MERGE) {
+            const size_t segments_before = cache_storage_segments_.size();
+            for (auto it = update_plan.replace_segment_indices.rbegin();
+                 it != update_plan.replace_segment_indices.rend(); ++it) {
+                const size_t segment_idx = *it;
+                GGML_ASSERT(segment_idx < cache_storage_segments_.size());
+                free_cache_storage_segment(cache_storage_segments_[segment_idx]);
+                cache_storage_segments_.erase(
+                    cache_storage_segments_.begin() + segment_idx);
+            }
+            CacheStorageSegment new_segment;
+            if (!allocate_cache_storage_segment(pending_sources, &new_segment)) {
+                return false;
+            }
+            const size_t new_segment_bytes =
+                ggml_backend_buffer_get_size(new_segment.buffer);
+            cache_storage_segments_.push_back(std::move(new_segment));
+            if (sd_env_flag_enabled("SD_HTP_DENOISE_STEP_TRACE")) {
+                LOG_INFO("cache_storage_update mode=%s segments_before=%zu replaced=%zu segments_after=%zu new_bytes=%zu",
+                         update_plan.mode == SD_CACHE_STORAGE_APPEND ? "append" : "replace",
+                         segments_before,
+                         update_plan.replace_segment_indices.size(),
+                         cache_storage_segments_.size(),
+                         new_segment_bytes);
+            }
+            return true;
+        }
+
+        std::map<std::string, ggml_tensor*> merged_cache_sources;
+        for (const CacheStorageSegment& segment : cache_storage_segments_) {
+            if (segment.ctx == nullptr) {
+                continue;
+            }
+            for (ggml_tensor* tensor = ggml_get_first_tensor(segment.ctx);
+                 tensor != nullptr;
+                 tensor = ggml_get_next_tensor(segment.ctx, tensor)) {
+                if (cache_keep_names != nullptr &&
+                    cache_keep_names->find(tensor->name) == cache_keep_names->end()) {
+                    continue;
+                }
+                if (!async_residual_cache_backed(tensor->name)) {
+                    merged_cache_sources[tensor->name] = tensor;
+                }
+            }
+        }
+        for (const auto& pending : pending_sources) {
+            merged_cache_sources[pending.first] = pending.second;
+        }
+        if (merged_cache_sources.empty()) {
+            free_cache_buffer();
+            free_cache_ctx();
+            return true;
+        }
+
+        CacheStorageSegment merged_segment;
+        if (!allocate_cache_storage_segment(merged_cache_sources, &merged_segment)) {
+            return false;
+        }
+        free_cache_buffer();
+        free_cache_ctx();
+        cache_storage_segments_.push_back(std::move(merged_segment));
         return true;
     }
 
@@ -7233,7 +7387,7 @@ public:
             return this->get_cache_tensor_by_name(name);
         };
         runner_ctx.cache_tensor = [this](const std::string& name, ggml_tensor* tensor) {
-            this->cache(name, tensor);
+            return this->cache(name, tensor);
         };
         runner_ctx.bind_cache_tensor = [this](const std::string& name, ggml_tensor* tensor) {
             if (tensor != nullptr) {
@@ -7394,11 +7548,12 @@ public:
         }
     }
 
-    void cache(const std::string name, ggml_tensor* tensor) {
+    ggml_tensor* cache(const std::string name, ggml_tensor* tensor) {
         if (tensor != nullptr && tensor->view_src != nullptr) {
             tensor = ggml_cont(compute_ctx, tensor);
         }
         cache_tensor_map[name] = tensor;
+        return tensor;
     }
 
     ggml_tensor* get_cache_tensor_by_name(const std::string& name) {
@@ -7409,10 +7564,16 @@ public:
                 return sd_backend_htp_async_cache_slot_tensor(generation->slot);
             }
         }
-        if (cache_ctx == nullptr) {
-            return nullptr;
+        for (auto it = cache_storage_segments_.rbegin();
+             it != cache_storage_segments_.rend(); ++it) {
+            if (it->ctx == nullptr || it->names.count(name) == 0) {
+                continue;
+            }
+            if (ggml_tensor* tensor = ggml_get_tensor(it->ctx, name.c_str())) {
+                return tensor;
+            }
         }
-        return ggml_get_tensor(cache_ctx, name.c_str());
+        return nullptr;
     }
 
     template <typename T>
