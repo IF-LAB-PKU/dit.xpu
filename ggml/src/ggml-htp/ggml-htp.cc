@@ -153,6 +153,308 @@ static bool ggml_backend_htp_use_hybrid_graph_compute() {
     return ggml_backend_htp_get_hybrid_enabled();
 }
 
+static const char * ggml_backend_htp_route_mode_name(enum ggml_htp_route_mode mode) {
+    switch (mode) {
+        case GGML_HTP_ROUTE_FUSED_OPENCL_RESIDUAL: return "fused";
+        case GGML_HTP_ROUTE_OPENCL_ANCHOR:         return "opencl";
+        case GGML_HTP_ROUTE_HTP_CPU:               return "htp-cpu";
+        case GGML_HTP_ROUTE_DISABLED:              return "disabled";
+        case GGML_HTP_ROUTE_INVALID:               return "invalid";
+    }
+    return "invalid";
+}
+
+static enum ggml_htp_route_mode ggml_backend_htp_requested_route_mode() {
+    if (!ggml_backend_htp_env_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE")) {
+        return GGML_HTP_ROUTE_DISABLED;
+    }
+    const bool fused =
+        ggml_backend_htp_env_enabled("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR");
+    const bool opencl_sparse =
+        ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL");
+    const bool opencl_residual =
+        ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL");
+    if (fused && !opencl_sparse && opencl_residual) {
+        return GGML_HTP_ROUTE_FUSED_OPENCL_RESIDUAL;
+    }
+    if (!fused && opencl_sparse && opencl_residual) {
+        return GGML_HTP_ROUTE_OPENCL_ANCHOR;
+    }
+    if (!fused && !opencl_sparse && !opencl_residual) {
+        return GGML_HTP_ROUTE_HTP_CPU;
+    }
+    return GGML_HTP_ROUTE_INVALID;
+}
+
+bool ggml_backend_htp_route_summary_validate(
+        const struct ggml_htp_route_summary * summary,
+        char * reason,
+        size_t reason_capacity) {
+    auto fail = [&](const char * message) {
+        if (reason != nullptr && reason_capacity > 0) {
+            std::snprintf(reason, reason_capacity, "%s", message);
+        }
+        return false;
+    };
+    if (summary == nullptr) {
+        return fail("route summary must not be null");
+    }
+    if (summary->mode == GGML_HTP_ROUTE_DISABLED) {
+        if (reason != nullptr && reason_capacity > 0) {
+            std::snprintf(reason, reason_capacity, "disabled");
+        }
+        return true;
+    }
+    if (summary->mode == GGML_HTP_ROUTE_INVALID) {
+        return fail("requested route flags are invalid");
+    }
+    if (summary->cpu_attention_fallback != 0) {
+        return fail("eligible attention fell back to CPU");
+    }
+    if (summary->anchor) {
+        if (summary->cache_pairs <= 0) {
+            return fail("anchor graph has no residual cache pairs");
+        }
+        switch (summary->mode) {
+            case GGML_HTP_ROUTE_FUSED_OPENCL_RESIDUAL:
+                if (summary->fused_anchor <= 0 ||
+                    summary->opencl_residual != summary->cache_pairs ||
+                    summary->htp_dense != 0 || summary->htp_sparse != 0 ||
+                    summary->opencl_sparse != 0 || summary->cpu_residual != 0) {
+                    return fail("fused anchor ownership does not match the requested route");
+                }
+                break;
+            case GGML_HTP_ROUTE_OPENCL_ANCHOR:
+                if (summary->fused_anchor != 0 || summary->htp_dense <= 0 ||
+                    summary->opencl_sparse <= 0 ||
+                    summary->opencl_residual != summary->cache_pairs ||
+                    summary->htp_sparse != 0 || summary->cpu_residual != 0) {
+                    return fail("OpenCL anchor ownership does not match the requested route");
+                }
+                break;
+            case GGML_HTP_ROUTE_HTP_CPU:
+                if (summary->fused_anchor != 0 || summary->htp_dense <= 0 ||
+                    summary->htp_sparse <= 0 ||
+                    summary->cpu_residual != summary->cache_pairs ||
+                    summary->opencl_sparse != 0 || summary->opencl_residual != 0) {
+                    return fail("HTP/CPU anchor ownership does not match the requested route");
+                }
+                break;
+            default:
+                return fail("unsupported route mode");
+        }
+    } else if (summary->htp_sparse <= 0 || summary->opencl_sparse != 0 ||
+               summary->fused_anchor != 0 || summary->htp_dense != 0 ||
+               summary->opencl_residual != 0 || summary->cpu_residual != 0 ||
+               summary->cache_pairs != 0) {
+        return fail("sparse apply graph is not exclusively HTP sparse owned");
+    }
+    if (reason != nullptr && reason_capacity > 0) {
+        std::snprintf(reason, reason_capacity, "ok");
+    }
+    return true;
+}
+
+bool ggml_backend_htp_get_last_route_summary(
+        ggml_backend_t backend,
+        struct ggml_htp_route_summary * summary) {
+    if (backend == nullptr || summary == nullptr || !ggml_backend_is_htp(backend)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    if (ctx == nullptr || !ctx->has_last_route_summary) {
+        return false;
+    }
+    *summary = ctx->last_route_summary;
+    return true;
+}
+
+static const ggml_tensor * ggml_backend_htp_producer_through_views(
+        const ggml_tensor * tensor) {
+    for (size_t depth = 0; tensor != nullptr && depth < 64; ++depth) {
+        if (!ggml_backend_htp_is_view_only(tensor)) {
+            return tensor;
+        }
+        tensor = tensor->src[0] != nullptr ? tensor->src[0] : tensor->view_src;
+    }
+    return nullptr;
+}
+
+static bool ggml_backend_htp_is_sparse_attention(const ggml_tensor * tensor) {
+    return tensor != nullptr && tensor->op == GGML_OP_FLASH_ATTN_EXT &&
+           tensor->src[3] != nullptr && tensor->src[3]->type == GGML_TYPE_I32;
+}
+
+static bool ggml_backend_htp_is_residual_cache_output(
+        const ggml_tensor * tensor) {
+    static constexpr char prefix[] = "htp_block_sparse_residual_b";
+    return tensor != nullptr &&
+           std::strncmp(tensor->name, prefix, sizeof(prefix) - 1) == 0;
+}
+
+static void ggml_backend_htp_collect_attention_ancestors(
+        const ggml_tensor * tensor,
+        std::unordered_set<const ggml_tensor *> * attention,
+        std::unordered_set<const ggml_tensor *> * visited) {
+    const ggml_tensor * producer =
+        ggml_backend_htp_producer_through_views(tensor);
+    if (producer == nullptr || !visited->insert(producer).second) {
+        return;
+    }
+    if (producer->op == GGML_OP_FLASH_ATTN_EXT ||
+        (producer->op == GGML_OP_CUSTOM &&
+         std::strcmp(producer->name, "htp_fused_anchor_attention") == 0)) {
+        attention->insert(producer);
+        return;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (producer->src[i] != nullptr) {
+            ggml_backend_htp_collect_attention_ancestors(
+                producer->src[i], attention, visited);
+        }
+    }
+}
+
+static bool ggml_backend_htp_collect_route_summary_impl(
+        ggml_backend_htp_context * ctx,
+        const ggml_cgraph * cgraph,
+        struct ggml_htp_route_summary * summary) {
+    *summary = {};
+    summary->mode = ggml_backend_htp_requested_route_mode();
+    if (summary->mode == GGML_HTP_ROUTE_DISABLED) {
+        return false;
+    }
+
+    std::unordered_set<const ggml_tensor *> anchor_attention;
+    std::unordered_set<const ggml_tensor *> fused_producers;
+    std::vector<const ggml_tensor *> sparse_attention;
+    bool has_attention = false;
+    const int node_count = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
+    for (int i = 0; i < node_count; ++i) {
+        const ggml_tensor * node =
+            ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), i);
+        if (node == nullptr) {
+            continue;
+        }
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            has_attention = true;
+            if (ggml_backend_htp_is_sparse_attention(node)) {
+                sparse_attention.push_back(node);
+            }
+        }
+        if (node->op == GGML_OP_CUSTOM &&
+            std::strcmp(node->name, "htp_fused_anchor_attention") == 0) {
+            has_attention = true;
+        }
+        if (!ggml_backend_htp_is_residual_cache_output(node)) {
+            continue;
+        }
+        std::unordered_set<const ggml_tensor *> cache_attention;
+        std::unordered_set<const ggml_tensor *> visited;
+        ggml_backend_htp_collect_attention_ancestors(
+            node, &cache_attention, &visited);
+        if (cache_attention.empty()) {
+            continue;
+        }
+        ++summary->cache_pairs;
+        anchor_attention.insert(cache_attention.begin(), cache_attention.end());
+#ifdef GGML_HTP_OPENCL_SIDECAR
+        const bool residual_opencl =
+            ctx != nullptr && node->op == GGML_OP_CUSTOM &&
+            ctx->sparse_opencl_routed_nodes.find(node) !=
+                ctx->sparse_opencl_routed_nodes.end() &&
+            node->src[2] != nullptr &&
+            ctx->sparse_opencl_routed_nodes.find(node->src[2]) !=
+                ctx->sparse_opencl_routed_nodes.end();
+#else
+        const bool residual_opencl = false;
+#endif
+        if (residual_opencl) {
+            ++summary->opencl_residual;
+        } else {
+            ++summary->cpu_residual;
+        }
+    }
+
+    summary->anchor = summary->cache_pairs > 0 || sparse_attention.empty();
+    if (!has_attention && summary->cache_pairs == 0) {
+        return false;
+    }
+    const auto count_attention = [&](const ggml_tensor * attention) {
+        const ggml_tensor * producer =
+            ggml_backend_htp_producer_through_views(attention);
+        if (producer != nullptr && producer->op == GGML_OP_CUSTOM &&
+            std::strcmp(producer->name, "htp_fused_anchor_attention") == 0) {
+            if (fused_producers.insert(producer).second) {
+                if (htp_ops_support_op_runtime(producer)) {
+                    ++summary->fused_anchor;
+                } else {
+                    ++summary->cpu_attention_fallback;
+                }
+            }
+            return;
+        }
+#ifdef GGML_HTP_OPENCL_SIDECAR
+        const bool opencl = ctx != nullptr &&
+                            ctx->sparse_opencl_routed_nodes.find(attention) !=
+                            ctx->sparse_opencl_routed_nodes.end();
+#else
+        const bool opencl = false;
+#endif
+        if (opencl) {
+            if (ggml_backend_htp_is_sparse_attention(attention)) {
+                ++summary->opencl_sparse;
+            }
+        } else if (htp_ops_support_op_runtime(attention)) {
+            if (ggml_backend_htp_is_sparse_attention(attention)) {
+                ++summary->htp_sparse;
+            } else {
+                ++summary->htp_dense;
+            }
+        } else {
+            ++summary->cpu_attention_fallback;
+        }
+    };
+    if (summary->anchor) {
+        for (const ggml_tensor * attention : anchor_attention) {
+            count_attention(attention);
+        }
+    } else {
+        for (const ggml_tensor * attention : sparse_attention) {
+            count_attention(attention);
+        }
+    }
+    return true;
+}
+
+bool ggml_backend_htp_collect_route_summary(
+        ggml_backend_t backend,
+        const struct ggml_cgraph * cgraph,
+        struct ggml_htp_route_summary * summary) {
+    if (cgraph == nullptr || summary == nullptr) {
+        return false;
+    }
+    ggml_backend_htp_context * ctx = nullptr;
+    if (backend != nullptr && ggml_backend_is_htp(backend)) {
+        ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    }
+    return ggml_backend_htp_collect_route_summary_impl(ctx, cgraph, summary);
+}
+
+static void ggml_backend_htp_print_route_summary(
+        const struct ggml_htp_route_summary & summary) {
+    std::fprintf(
+        stderr,
+        "htp_route_summary mode=%s anchor=%d fused=%d htp_dense=%d "
+        "htp_sparse=%d opencl_sparse=%d opencl_residual=%d cpu_residual=%d "
+        "cache_pairs=%d cpu_attention_fallback=%d status=%s\n",
+        ggml_backend_htp_route_mode_name(summary.mode), summary.anchor,
+        summary.fused_anchor, summary.htp_dense, summary.htp_sparse,
+        summary.opencl_sparse, summary.opencl_residual, summary.cpu_residual,
+        summary.cache_pairs, summary.cpu_attention_fallback,
+        summary.status_ok ? "ok" : "error");
+}
+
 // 部分设备的 fastrpc 可用映射窗口明显小于 3 GiB，这里给一个保守默认值，并允许用环境变量按 MiB 覆盖。
 static size_t ggml_backend_htp_get_max_active_map_size() {
     const char * env = std::getenv("GGML_HTP_MAX_ACTIVE_MAP_MB");
@@ -241,7 +543,8 @@ ggml_backend_htp_context::ggml_backend_htp_context() : mapper(ggml_backend_htp_g
     ops_backend_initialized = true;
 
 #ifdef GGML_HTP_OPENCL_SIDECAR
-    if (ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL")) {
+    if (ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL") ||
+        ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL")) {
         ggml_opencl_qcom_requirements requirements = {};
         char reason[512] = {};
         sparse_opencl_sidecar =
@@ -1121,6 +1424,9 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
             return GGML_STATUS_FAILED;
         }
         cplan.work_data = ctx->work_data;
+        ggml_htp_route_summary route_summary = {};
+        bool has_route_summary = false;
+        bool route_summary_valid = true;
 #ifdef GGML_HTP_OPENCL_SIDECAR
         char preflight_reason[1024] = {};
         const ggml_opencl_htp_result preflight = ggml_backend_htp_opencl_preflight(
@@ -1134,10 +1440,17 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
                 ctx->sparse_opencl_routed_nodes.size(),
                 preflight_reason[0] != '\0' ? preflight_reason : "unknown");
         }
+        const enum ggml_htp_route_mode requested_route =
+            ggml_backend_htp_requested_route_mode();
+        const bool route_requires_opencl =
+            requested_route == GGML_HTP_ROUTE_FUSED_OPENCL_RESIDUAL ||
+            requested_route == GGML_HTP_ROUTE_OPENCL_ANCHOR;
         if (preflight == GGML_OPENCL_HTP_ERROR ||
             (preflight != GGML_OPENCL_HTP_OK &&
              preflight != GGML_OPENCL_HTP_NO_WORK &&
-             ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_STRICT"))) {
+             (ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_STRICT") ||
+              (route_requires_opencl &&
+               ggml_backend_htp_env_enabled("SD_HTP_ROUTE_STRICT"))))) {
             std::fprintf(
                 stderr,
                 "ggml-htp: OpenCL sidecar preflight rejected in %s mode: %s\n",
@@ -1145,7 +1458,28 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
                 preflight_reason[0] != '\0' ? preflight_reason : "unknown error");
             return GGML_STATUS_FAILED;
         }
+        has_route_summary = ggml_backend_htp_collect_route_summary_impl(
+            ctx, cgraph, &route_summary);
+        if (has_route_summary) {
+            char route_reason[512] = {};
+            route_summary_valid = ggml_backend_htp_route_summary_validate(
+                &route_summary, route_reason, sizeof(route_reason));
+            route_summary.status_ok = route_summary_valid ? 1 : 0;
+            ctx->last_route_summary = route_summary;
+            ctx->has_last_route_summary = true;
+            if (!route_summary_valid &&
+                ggml_backend_htp_env_enabled("SD_HTP_ROUTE_STRICT")) {
+                if (ctx->sparse_opencl_graph != nullptr) {
+                    ggml_backend_htp_opencl_finish(ctx);
+                }
+                ggml_backend_htp_print_route_summary(route_summary);
+                std::fprintf(stderr, "ggml-htp: route strict validation failed: %s\n",
+                             route_reason[0] != '\0' ? route_reason : "unknown");
+                return GGML_STATUS_FAILED;
+            }
+        }
         if (preflight == GGML_OPENCL_HTP_OK &&
+            ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL") &&
             ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_ASYNC") &&
             ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT") &&
             ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD")) {
@@ -1214,6 +1548,15 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
             status = GGML_STATUS_FAILED;
         }
 #endif
+        if (has_route_summary) {
+            route_summary.status_ok =
+                route_summary_valid && status == GGML_STATUS_SUCCESS ? 1 : 0;
+            ctx->last_route_summary = route_summary;
+            ctx->has_last_route_summary = true;
+            if (ggml_backend_htp_env_enabled("SD_HTP_ROUTE_TRACE")) {
+                ggml_backend_htp_print_route_summary(route_summary);
+            }
+        }
         return status;
     }
 

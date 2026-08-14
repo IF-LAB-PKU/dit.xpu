@@ -84,7 +84,11 @@ namespace ZImage {
             return {ZImageAttentionRoute::DENSE, "ref_latents"};
         }
         if (residual_anchor) {
-            return {ZImageAttentionRoute::DENSE, "residual_anchor"};
+            return geometry_supported && sparse_enabled
+                       ? ZImageAttentionRouteDecision{ZImageAttentionRoute::REORDERED,
+                                                      "residual_anchor_non_packed"}
+                       : ZImageAttentionRouteDecision{ZImageAttentionRoute::DENSE,
+                                                      "residual_anchor_geometry"};
         }
         if (!sparse_enabled) {
             return {ZImageAttentionRoute::DENSE, "sparse_disabled"};
@@ -275,7 +279,9 @@ namespace ZImage {
                              bool block_sparse_attn       = false,
                              int protected_start          = 0,
                              int protected_len            = 0,
-                             bool block_sparse_force_full_keep = false) {
+                             bool block_sparse_force_full_keep = false,
+                             const char* residual_kind    = nullptr,
+                             bool residual_eligible       = false) {
             // x: [N, n_token, hidden_size]
             int64_t n_token = x->ne[1];
             int64_t N       = x->ne[2];
@@ -286,15 +292,22 @@ namespace ZImage {
                 out_proj->set_scale(1.f / 16.f);
             }
 
-            const bool single_stream_sparse = block_sparse_attn && protected_start == 0 && protected_len == 0;
-            const int image_tokens = block_sparse_attn && !single_stream_sparse ? protected_start : static_cast<int>(n_token);
-            const int text_tokens  = block_sparse_attn && !single_stream_sparse ? protected_len : 0;
+            const bool block_sparse_step = ctx != nullptr && ctx->block_sparse_attn_enabled;
+            const auto attention_policy = sd_htp_attention_policy_for(
+                block_sparse_step,
+                ctx != nullptr ? ctx->block_sparse_residual_mode : SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
+                residual_eligible);
+            const bool sparse_policy_active = block_sparse_attn && attention_policy.sparse_policy_active;
+            const bool single_stream_sparse = sparse_policy_active && protected_start == 0 && protected_len == 0;
+            const int image_tokens = sparse_policy_active && !single_stream_sparse ? protected_start : static_cast<int>(n_token);
+            const int text_tokens  = sparse_policy_active && !single_stream_sparse ? protected_len : 0;
             const bool htp_enabled = ctx != nullptr && ctx->htp_attention_enabled &&
                                      sd_env_flag_enabled("SD_HTP_COMPUTE");
             const bool geometry_supported = z_image_static_halo_eligible(
                 image_tokens, ctx != nullptr ? ctx->block_sparse_token_h : 0,
                 ctx != nullptr ? ctx->block_sparse_token_w : 0, text_tokens);
-            const bool packed_requested = sd_env_flag_enabled("SD_HTP_PACKED_Z_IMAGE") &&
+            const bool packed_requested = attention_policy.packed_qkv_allowed &&
+                                          sd_env_flag_enabled("SD_HTP_PACKED_Z_IMAGE") &&
                                           sd_env_flag_enabled_default("SD_HTP_PACKED_ATTENTION", true);
             auto qkv_proj_weight = qkv_proj->get_param("weight");
             auto q_norm_block    = std::dynamic_pointer_cast<RMSNorm>(blocks["q_norm"]);
@@ -307,13 +320,20 @@ namespace ZImage {
                                                                                    q_gamma, k_gamma);
             auto decision = z_image_select_attention_route(
                 htp_enabled,
-                block_sparse_attn && ctx != nullptr && ctx->block_sparse_attn_enabled,
+                sparse_policy_active,
                 packed_requested,
                 geometry_supported,
                 packed_shape_supported,
                 packed_weights_available,
                 ctx != nullptr && ctx->z_image_has_ref_latents,
                 ctx != nullptr && ctx->block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR);
+            if (ctx != nullptr &&
+                ctx->block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
+                residual_eligible &&
+                decision.route == ZImageAttentionRoute::DENSE &&
+                sd_env_flag_enabled("SD_HTP_ROUTE_STRICT")) {
+                GGML_ABORT("Z-Image residual anchor route failed: %s", decision.fallback_reason);
+            }
             if (sd_env_flag_enabled("SD_HTP_Z_IMAGE_TRACE") ||
                 sd_env_flag_enabled("SD_HTP_PACKED_Z_IMAGE_TRACE")) {
                 LOG_INFO("z_image_attention route=%s fallback=%s heads=%lld kv_heads=%lld head_dim=%lld image_tokens=%d text_tokens=%d token_h=%d token_w=%d",
@@ -329,6 +349,8 @@ namespace ZImage {
             ggml_tensor* k = nullptr;
             ggml_tensor* v = nullptr;
             bool use_packed = false;
+            const auto residual_binding = sd_htp_prepare_residual_binding(
+                ctx, residual_kind, residual_eligible);
 
             if (decision.route == ZImageAttentionRoute::PACKED) {
                 auto packed = make_packed_z_image_qkv(ctx, x, qkv_proj_weight, q_gamma, k_gamma,
@@ -396,13 +418,15 @@ namespace ZImage {
                     k = k_norm->forward(ctx, k);
                 }
 
-                if (decision.route == ZImageAttentionRoute::REORDERED && ctx->block_sparse_attn_enabled) {
+                if (decision.route == ZImageAttentionRoute::REORDERED && sparse_policy_active) {
                     x = Rope::attention_ext(ctx, q, k, v, pe, mask,
                                             1.f / 128.f,              // kv_scale
                                             true,                      // rope_interleaved
                                             true,                      // block_sparse_attn
                                             protected_start,
-                                            protected_len);
+                                            protected_len,
+                                            &residual_binding,
+                                            block_sparse_force_full_keep);
                 } else {
                     x = Rope::attention(ctx, q, k, v, pe, mask, 1.f / 128.f);
                 }
@@ -423,7 +447,11 @@ namespace ZImage {
                                             ctx->block_sparse_residual_scale,
                                             ctx->block_sparse_residual_rho,
                                             ctx->block_sparse_residual_exact_rho,
-                                            nullptr, nullptr, nullptr, nullptr, nullptr,
+                                            residual_binding.residual_key.empty() ? nullptr : residual_binding.residual_key.c_str(),
+                                            residual_binding.cached_residual,
+                                            residual_binding.rho_key.empty() ? nullptr : residual_binding.rho_key.c_str(),
+                                            residual_binding.cached_rho,
+                                            &ctx->cache_tensor,
                                             ctx->block_sparse_token_h,
                                             ctx->block_sparse_token_w,
                                             block_sparse_force_full_keep);
@@ -518,7 +546,9 @@ namespace ZImage {
                              bool block_sparse_attn        = false,
                              int protected_start           = 0,
                              int protected_len             = 0,
-                             bool block_sparse_force_full_keep = false) {
+                             bool block_sparse_force_full_keep = false,
+                             const char* residual_kind     = nullptr,
+                             bool residual_eligible        = false) {
             auto attention       = std::dynamic_pointer_cast<JointAttention>(blocks["attention"]);
             auto feed_forward    = std::dynamic_pointer_cast<FeedForward>(blocks["feed_forward"]);
             auto attention_norm1 = std::dynamic_pointer_cast<RMSNorm>(blocks["attention_norm1"]);
@@ -540,7 +570,7 @@ namespace ZImage {
                 auto residual = x;
                 x             = modulate(ctx->ggml_ctx, attention_norm1->forward(ctx, x), scale_msa);
                 x             = attention->forward(ctx, x, pe, mask, block_sparse_attn, protected_start, protected_len,
-                                                   block_sparse_force_full_keep);
+                                                   block_sparse_force_full_keep, residual_kind, residual_eligible);
                 x             = attention_norm2->forward(ctx, x);
                 x             = ggml_mul(ctx->ggml_ctx, x, ggml_tanh(ctx->ggml_ctx, gate_msa));
                 x             = ggml_add(ctx->ggml_ctx, x, residual);
@@ -557,7 +587,7 @@ namespace ZImage {
                 auto residual = x;
                 x             = attention_norm1->forward(ctx, x);
                 x             = attention->forward(ctx, x, pe, mask, block_sparse_attn, protected_start, protected_len,
-                                                   block_sparse_force_full_keep);
+                                                   block_sparse_force_full_keep, residual_kind, residual_eligible);
                 x             = attention_norm2->forward(ctx, x);
                 x             = ggml_add(ctx->ggml_ctx, x, residual);
 
@@ -736,12 +766,17 @@ namespace ZImage {
             int token_w           = ctx->block_sparse_token_w;
             int image_tokens      = token_h * token_w;
             bool htp_enabled      = ctx->htp_attention_enabled && sd_env_flag_enabled("SD_HTP_COMPUTE");
-            bool sparse_eligible  = htp_enabled && ctx->block_sparse_attn_enabled &&
+            const bool sparse_policy_active =
+                ctx->block_sparse_attn_enabled ||
+                ctx->block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR;
+            bool sparse_eligible  = htp_enabled && sparse_policy_active &&
                                     z_image_sparse_layout_eligible(image_tokens, token_h, token_w,
                                                                     static_cast<int>(n_txt_token), has_ref_latents);
 
             // Trace layout mode
             const bool packed_requested = sparse_eligible &&
+                                          ctx->block_sparse_attn_enabled &&
+                                          ctx->block_sparse_residual_mode != SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
                                           sd_env_flag_enabled("SD_HTP_PACKED_Z_IMAGE") &&
                                           sd_env_flag_enabled_default("SD_HTP_PACKED_ATTENTION", true);
             const char* layout_mode = sparse_eligible ? (packed_requested ? "packed" : "reordered") : "dense";
@@ -770,13 +805,13 @@ namespace ZImage {
             // Context refiner is text-only full attention. Keep it on the dense
             // HTP route; there is no block pruning to exploit here.
             const bool single_stream_htp = ctx->htp_attention_enabled &&
-                                            ctx->block_sparse_attn_enabled &&
+                                            sparse_policy_active &&
                                             sd_env_flag_enabled("SD_HTP_COMPUTE");
             for (int i = 0; i < z_image_params.num_refiner_layers; i++) {
                 auto block = std::dynamic_pointer_cast<JointTransformerBlock>(blocks["context_refiner." + std::to_string(i)]);
 
                 txt = block->forward(ctx, txt, txt_pe, nullptr, nullptr,
-                                     false, 0, 0, false);
+                                     false, 0, 0, false, nullptr, false);
                 sd::ggml_graph_cut::mark_graph_cut(txt, "z_image.context_refiner." + std::to_string(i), "txt");
             }
 
@@ -789,7 +824,7 @@ namespace ZImage {
                 auto block = std::dynamic_pointer_cast<JointTransformerBlock>(blocks["noise_refiner." + std::to_string(i)]);
 
                 img = block->forward(ctx, img, img_pe, nullptr, t_emb,
-                                     noise_stream_sparse, 0, 0, false);
+                                     noise_stream_sparse, 0, 0, false, "noise", true);
                 sd::ggml_graph_cut::mark_graph_cut(img, "z_image.noise_refiner." + std::to_string(i), "img");
             }
 
@@ -844,9 +879,12 @@ namespace ZImage {
                 auto block = std::dynamic_pointer_cast<JointTransformerBlock>(blocks["layers." + std::to_string(i)]);
 
                 txt_img = block->forward(ctx, txt_img, joint_pe, nullptr, t_emb,
-                                         /*block_sparse_attn=*/ctx->block_sparse_attn_enabled,
+                                         /*block_sparse_attn=*/sparse_eligible,
                                          block_sparse_protected_start,
-                                         block_sparse_protected_len);
+                                         block_sparse_protected_len,
+                                         false,
+                                         "joint",
+                                         true);
                 sd::ggml_graph_cut::mark_graph_cut(txt_img, "z_image.layers." + std::to_string(i), "txt_img");
             }
 
@@ -918,7 +956,7 @@ namespace ZImage {
             }
 
             auto out = forward_core(ctx, img, timestep, context, pe,
-                                    !ref_latents.empty() || increase_ref_index);
+                                    !ref_latents.empty());
 
             out = ggml_ext_slice(ctx->ggml_ctx, out, 1, 0, n_img_token);                              // [N, n_img_token, ph*pw*C]
             out = DiT::unpatchify_and_crop(ctx->ggml_ctx, out, H, W, patch_size, patch_size, false);  // [N, C, H, W]
@@ -992,7 +1030,7 @@ namespace ZImage {
             bool sparse_pe_image_first = is_block_sparse_attention_enabled() &&
                                          z_image_sparse_layout_eligible(image_tokens, token_h, token_w,
                                                                          static_cast<int>(context->ne[1]),
-                                                                         ref_latents.size() > 0 || increase_ref_index);
+                                                                         !ref_latents.empty());
 
             pe_vec      = Rope::gen_z_image_pe(static_cast<int>(x->ne[1]),
                                                static_cast<int>(x->ne[0]),
@@ -1018,7 +1056,7 @@ namespace ZImage {
             runner_ctx.block_sparse_residual_exact_rho       = block_sparse_residual_exact_rho;
             runner_ctx.block_sparse_residual_branch_index    = block_sparse_residual_branch_index;
             runner_ctx.block_sparse_residual_attention_index = 0;
-            runner_ctx.z_image_has_ref_latents                = !ref_latents.empty() || increase_ref_index;
+            runner_ctx.z_image_has_ref_latents                = !ref_latents.empty();
 
             // Set and restore image geometry for block-sparse attention
             const int previous_token_h = runner_ctx.block_sparse_token_h;

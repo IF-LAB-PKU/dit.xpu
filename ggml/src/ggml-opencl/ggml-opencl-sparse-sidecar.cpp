@@ -150,6 +150,9 @@ struct ggml_opencl_htp_sparse_dispatch {
     cl_int batch = 0;
     cl_int mask_format = 0;
     cl_int max_kept_blocks = 0;
+    size_t v_token_stride = 0;
+    size_t v_head_stride = 0;
+    size_t v_batch_stride = 0;
     int graph_index = -1;
 };
 
@@ -1403,9 +1406,13 @@ ggml_opencl_htp_result validate_block_sparse_node(
         return unsupported_sparse_node(
             reason, reason_capacity, "head and batch product exceeds cl_int range");
     }
-    if (k->ne[3] != batch || v->ne[1] != lk || v->ne[2] != kv_heads || v->ne[3] != batch) {
+    const bool v_token_head = v->ne[1] == lk && v->ne[2] == kv_heads;
+    const bool v_head_token = v->ne[1] == kv_heads && v->ne[2] == lk;
+    if (k->ne[3] != batch || v->ne[3] != batch || v_token_head == v_head_token) {
         return unsupported_sparse_node(
-            reason, reason_capacity, "K and V shapes or batch dimensions do not match");
+            reason, reason_capacity,
+            "V must have exactly one legal layout [D,Lk,Hkv,B] or [D,Hkv,Lk,B] "
+            "and K/V batch dimensions must match Q");
     }
     if (node->ne[1] != heads || node->ne[2] != lq || node->ne[3] != batch) {
         return unsupported_sparse_node(
@@ -1505,6 +1512,9 @@ ggml_opencl_htp_result validate_block_sparse_node(
     dispatch->mask_format = static_cast<cl_int>(mask_format);
     dispatch->max_kept_blocks = mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX ?
         static_cast<cl_int>(mask->ne[0]) : 0;
+    dispatch->v_token_stride = v_token_head ? v->nb[1] : v->nb[2];
+    dispatch->v_head_stride = v_token_head ? v->nb[2] : v->nb[1];
+    dispatch->v_batch_stride = v->nb[3];
     set_reason(reason, reason_capacity, "ok");
     return GGML_OPENCL_HTP_OK;
 }
@@ -1627,6 +1637,20 @@ bool same_tensor_shape(const ggml_tensor * lhs, const ggml_tensor * rhs) {
            std::memcmp(lhs->ne, rhs->ne, sizeof(lhs->ne)) == 0;
 }
 
+const ggml_tensor * producer_through_views(const ggml_tensor * tensor) {
+    for (size_t depth = 0; tensor != nullptr && depth < 64; ++depth) {
+        const bool view_only = tensor->op == GGML_OP_VIEW ||
+                               tensor->op == GGML_OP_RESHAPE ||
+                               tensor->op == GGML_OP_PERMUTE ||
+                               tensor->op == GGML_OP_TRANSPOSE;
+        if (!view_only) {
+            return tensor;
+        }
+        tensor = tensor->src[0] != nullptr ? tensor->src[0] : tensor->view_src;
+    }
+    return nullptr;
+}
+
 ggml_opencl_htp_result validate_residual_dispatch(
         ggml_opencl_htp_graph * graph,
         const ggml_opencl_htp_residual_dispatch * dispatch,
@@ -1722,6 +1746,36 @@ ggml_opencl_htp_result validate_residual_dispatch(
         if (request.binding->offset % alignment != 0) {
             return unsupported_sparse_node(
                 reason, reason_capacity, "%s offset is not correctly aligned", request.name);
+        }
+    }
+    if (prepared->dense.backing == prepared->sparse.backing) {
+        const ggml_tensor * dense_producer =
+            producer_through_views(dispatch->dense_packed);
+        const ggml_tensor * sparse_producer =
+            producer_through_views(dispatch->sparse_packed_producer);
+        if (bindings_overlap(prepared->dense, prepared->sparse)) {
+            return unsupported_sparse_node(
+                reason, reason_capacity,
+                "dense and sparse packed input spans overlap");
+        }
+        if (dense_producer == sparse_producer) {
+            if (dense_producer == nullptr ||
+                dense_producer->op != GGML_OP_CUSTOM ||
+                std::strcmp(dense_producer->name,
+                            "htp_fused_anchor_attention") != 0 ||
+                prepared->dense.offset + prepared->dense.span !=
+                    prepared->sparse.offset) {
+                return unsupported_sparse_node(
+                    reason, reason_capacity,
+                    "shared fused dense/sparse input spans must be adjacent and "
+                    "come from htp_fused_anchor_attention");
+            }
+        } else if (dense_producer == nullptr || sparse_producer == nullptr ||
+                   ggml_op_is_empty(dense_producer->op) ||
+                   ggml_op_is_empty(sparse_producer->op)) {
+            return unsupported_sparse_node(
+                reason, reason_capacity,
+                "shared disjoint dense/sparse inputs require distinct live producers");
         }
     }
     if (bindings_overlap(prepared->residual, prepared->rho)) {
@@ -2224,9 +2278,17 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
         return GGML_OPENCL_HTP_ERROR;
     }
 
-    const char * enabled = std::getenv("SD_HTP_SPARSE_OPENCL");
-    if (enabled == nullptr || std::strcmp(enabled, "1") != 0) {
-        set_reason(reason, reason_capacity, "SD_HTP_SPARSE_OPENCL=1 is required");
+    auto env_enabled = [](const char * name) {
+        const char * value = std::getenv(name);
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    };
+    const bool sparse_enabled = env_enabled("SD_HTP_SPARSE_OPENCL");
+    const bool residual_enabled = env_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL");
+    const bool sparse_anchor_only =
+        env_enabled("SD_HTP_SPARSE_OPENCL_ANCHOR_ONLY");
+    if (!sparse_enabled && !residual_enabled) {
+        set_reason(reason, reason_capacity,
+                   "neither sparse attention nor residual OpenCL routing is enabled");
         return GGML_OPENCL_HTP_UNSUPPORTED;
     }
 
@@ -2245,43 +2307,55 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
     std::vector<ggml_backend_buffer_t> required_backings;
     try {
         const int node_count = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
-        for (int i = 0; i < node_count; ++i) {
-            const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), i);
-            if (!is_sparse_route_candidate(node)) {
-                continue;
-            }
-
-            ggml_opencl_htp_sparse_dispatch dispatch;
-            char validation_reason[256] = {};
-            const ggml_opencl_htp_result validation = validate_block_sparse_node(
-                node, &dispatch, validation_reason, sizeof(validation_reason));
-            if (validation != GGML_OPENCL_HTP_OK) {
-                set_reason(reason, reason_capacity, "eligible sparse node %d is unsupported: %s", i, validation_reason);
-                return validation == GGML_OPENCL_HTP_ERROR ?
-                    GGML_OPENCL_HTP_ERROR : GGML_OPENCL_HTP_UNSUPPORTED;
-            }
-            dispatch.graph_index = i;
-            dispatches.push_back(dispatch);
-            routed_nodes.push_back(node);
-
-            const ggml_tensor * tensors[] = {
-                dispatch.q, dispatch.k, dispatch.v, dispatch.mask, dispatch.output,
-            };
-            for (const ggml_tensor * tensor : tensors) {
-                ggml_backend_buffer_t backing = tensor_backing(tensor);
-                if (backing == nullptr) {
-                    set_reason(reason, reason_capacity, "sparse node %d tensor has no backing buffer", i);
-                    return GGML_OPENCL_HTP_UNSUPPORTED;
-                }
-                if (std::find(required_backings.begin(), required_backings.end(), backing) == required_backings.end()) {
-                    required_backings.push_back(backing);
+        bool graph_has_anchor_residual = false;
+        if (sparse_anchor_only) {
+            for (int i = 0; i < node_count; ++i) {
+                const ggml_tensor * node =
+                    ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), i);
+                if (node != nullptr && node->op == GGML_OP_CUSTOM &&
+                    std::strncmp(node->name,
+                                 "htp_block_sparse_residual_b", 27) == 0) {
+                    graph_has_anchor_residual = true;
+                    break;
                 }
             }
         }
-        const char * residual_enabled =
-            std::getenv("SD_HTP_SPARSE_OPENCL_RESIDUAL");
-        if (residual_enabled != nullptr && residual_enabled[0] != '\0' &&
-            std::strcmp(residual_enabled, "0") != 0) {
+        if (sparse_enabled && (!sparse_anchor_only || graph_has_anchor_residual)) {
+            for (int i = 0; i < node_count; ++i) {
+                const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), i);
+                if (!is_sparse_route_candidate(node)) {
+                    continue;
+                }
+
+                ggml_opencl_htp_sparse_dispatch dispatch;
+                char validation_reason[256] = {};
+                const ggml_opencl_htp_result validation = validate_block_sparse_node(
+                    node, &dispatch, validation_reason, sizeof(validation_reason));
+                if (validation != GGML_OPENCL_HTP_OK) {
+                    set_reason(reason, reason_capacity, "eligible sparse node %d is unsupported: %s", i, validation_reason);
+                    return validation == GGML_OPENCL_HTP_ERROR ?
+                        GGML_OPENCL_HTP_ERROR : GGML_OPENCL_HTP_UNSUPPORTED;
+                }
+                dispatch.graph_index = i;
+                dispatches.push_back(dispatch);
+                routed_nodes.push_back(node);
+
+                const ggml_tensor * tensors[] = {
+                    dispatch.q, dispatch.k, dispatch.v, dispatch.mask, dispatch.output,
+                };
+                for (const ggml_tensor * tensor : tensors) {
+                    ggml_backend_buffer_t backing = tensor_backing(tensor);
+                    if (backing == nullptr) {
+                        set_reason(reason, reason_capacity, "sparse node %d tensor has no backing buffer", i);
+                        return GGML_OPENCL_HTP_UNSUPPORTED;
+                    }
+                    if (std::find(required_backings.begin(), required_backings.end(), backing) == required_backings.end()) {
+                        required_backings.push_back(backing);
+                    }
+                }
+            }
+        }
+        if (residual_enabled) {
             for (int i = 0; i < node_count; ++i) {
                 const ggml_tensor * residual =
                     ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), i);
@@ -2350,8 +2424,9 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
         return GGML_OPENCL_HTP_ERROR;
     }
 
-    if (dispatches.empty()) {
-        set_reason(reason, reason_capacity, "graph has no eligible sparse with-LSE attention nodes");
+    if (dispatches.empty() && residual_pairs.empty()) {
+        set_reason(reason, reason_capacity,
+                   "graph has no eligible sparse attention or residual nodes");
         return GGML_OPENCL_HTP_NO_WORK;
     }
 
@@ -3404,9 +3479,9 @@ static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
     const cl_ulong k_nb1 = static_cast<cl_ulong>(dispatch.k->nb[1]);
     const cl_ulong k_nb2 = static_cast<cl_ulong>(dispatch.k->nb[2]);
     const cl_ulong k_nb3 = static_cast<cl_ulong>(dispatch.k->nb[3]);
-    const cl_ulong v_nb1 = static_cast<cl_ulong>(dispatch.v->nb[1]);
-    const cl_ulong v_nb2 = static_cast<cl_ulong>(dispatch.v->nb[2]);
-    const cl_ulong v_nb3 = static_cast<cl_ulong>(dispatch.v->nb[3]);
+    const cl_ulong v_token_stride = static_cast<cl_ulong>(dispatch.v_token_stride);
+    const cl_ulong v_head_stride = static_cast<cl_ulong>(dispatch.v_head_stride);
+    const cl_ulong v_batch_stride = static_cast<cl_ulong>(dispatch.v_batch_stride);
     const cl_ulong output_nb1 = static_cast<cl_ulong>(dispatch.output->nb[1]);
     const cl_ulong output_nb2 = static_cast<cl_ulong>(dispatch.output->nb[2]);
     const cl_ulong output_nb3 = static_cast<cl_ulong>(dispatch.output->nb[3]);
@@ -3483,9 +3558,9 @@ static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
         { sizeof(k_nb1), &k_nb1 },
         { sizeof(k_nb2), &k_nb2 },
         { sizeof(k_nb3), &k_nb3 },
-        { sizeof(v_nb1), &v_nb1 },
-        { sizeof(v_nb2), &v_nb2 },
-        { sizeof(v_nb3), &v_nb3 },
+        { sizeof(v_token_stride), &v_token_stride },
+        { sizeof(v_head_stride), &v_head_stride },
+        { sizeof(v_batch_stride), &v_batch_stride },
         { sizeof(output_nb1), &output_nb1 },
         { sizeof(output_nb2), &output_nb2 },
         { sizeof(output_nb3), &output_nb3 },

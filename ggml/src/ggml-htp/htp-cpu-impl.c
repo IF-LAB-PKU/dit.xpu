@@ -2270,9 +2270,25 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                     break;
                 }
                 if (htp_ops_support_op_runtime(tensor)) {
+                    const bool fused_anchor = htp_ops_is_fused_anchor_attention(tensor);
+                    const char * fused_trace_env = getenv("SD_HTP_BLOCK_SPARSE_MASK_TRACE");
+                    const char * fused_sidecar_trace_env = getenv("SD_HTP_SPARSE_OPENCL_TRACE");
+                    const bool trace_fused_anchor = params->ith == 0 && fused_anchor &&
+                        ((fused_trace_env != NULL && fused_trace_env[0] != '\0' && strcmp(fused_trace_env, "0") != 0) ||
+                         (fused_sidecar_trace_env != NULL && fused_sidecar_trace_env[0] != '\0' && strcmp(fused_sidecar_trace_env, "0") != 0));
+                    const int64_t fused_trace_begin = trace_fused_anchor ? ggml_time_ms() : 0;
                     const int err = htp_ops_compute_op(params, tensor);
                     if (err != 0) {
                         ggml_htp_mark_op_failed(params, tensor, err);
+                    }
+                    if (trace_fused_anchor) {
+                        fprintf(stderr,
+                                "attention_timing route=htp kind=fused_anchor total=%lldms qo=%lld kv=%lld heads=%lld d=%lld with_lse=1 block_sparse=1\n",
+                                (long long) (ggml_time_ms() - fused_trace_begin),
+                                (long long) tensor->src[0]->ne[1],
+                                (long long) tensor->src[1]->ne[1],
+                                (long long) tensor->src[0]->ne[2],
+                                (long long) tensor->src[0]->ne[0]);
                     }
                 } else {
                     ggml_compute_forward_custom(params, tensor);

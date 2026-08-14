@@ -40,9 +40,9 @@ __kernel void flash_attn_block_sparse_f32_f16(
         ulong k_nb1,
         ulong k_nb2,
         ulong k_nb3,
-        ulong v_nb1,
-        ulong v_nb2,
-        ulong v_nb3,
+        ulong v_token_stride,
+        ulong v_head_stride,
+        ulong v_batch_stride,
         ulong o_nb1,
         ulong o_nb2,
         ulong o_nb3,
@@ -115,7 +115,8 @@ __kernel void flash_attn_block_sparse_f32_f16(
                 __global const uchar * k_row =
                     k_base + k_offset + (ulong)kt * k_nb1 + (ulong)kvh * k_nb2 + (ulong)b * k_nb3;
                 __global const uchar * v_row =
-                    v_base + v_offset + (ulong)kt * v_nb1 + (ulong)kvh * v_nb2 + (ulong)b * v_nb3;
+                    v_base + v_offset + (ulong)kt * v_token_stride +
+                    (ulong)kvh * v_head_stride + (ulong)b * v_batch_stride;
                 k_tile[row][column] = vload4(
                     0, (__global const half *)(k_row + (ulong)(column * 4 * sizeof(half))));
                 v_tile[row][column] = vload4(
