@@ -239,27 +239,7 @@ __STATIC_INLINE__ ggml_tensor* mmdit_residual_attention(GGMLRunnerContext* ctx,
                                                         const char* residual_kind,
                                                         int protected_start = 0,
                                                         int protected_len   = 0) {
-    const int residual_attention_slot = ctx->block_sparse_residual_attention_index++;
-    std::string residual_cache_name;
-    std::string rho_cache_name;
-    ggml_tensor* cached_residual = nullptr;
-    ggml_tensor* cached_rho = nullptr;
-    if (ctx->block_sparse_residual_mode != SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF) {
-        residual_cache_name = sd_htp_block_sparse_residual_cache_key(ctx->block_sparse_residual_branch_index,
-                                                                     residual_kind,
-                                                                     residual_attention_slot);
-        if (ctx->block_sparse_residual_exact_rho) {
-            rho_cache_name = sd_htp_block_sparse_residual_rho_cache_key(ctx->block_sparse_residual_branch_index,
-                                                                        residual_kind,
-                                                                        residual_attention_slot);
-        }
-        if (ctx->block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY) {
-            cached_residual = ctx->cache_tensor_as_graph_input(residual_cache_name);
-            if (!rho_cache_name.empty()) {
-                cached_rho = ctx->cache_tensor_as_graph_input(rho_cache_name);
-            }
-        }
-    }
+    const auto binding = sd_htp_prepare_residual_binding(ctx, residual_kind, true);
 
     return ggml_ext_attention_ext(ctx->ggml_ctx,
                                   ctx->backend,
@@ -279,10 +259,10 @@ __STATIC_INLINE__ ggml_tensor* mmdit_residual_attention(GGMLRunnerContext* ctx,
                                   ctx->block_sparse_residual_scale,
                                   ctx->block_sparse_residual_rho,
                                   ctx->block_sparse_residual_exact_rho,
-                                  residual_cache_name.empty() ? nullptr : residual_cache_name.c_str(),
-                                  cached_residual,
-                                  rho_cache_name.empty() ? nullptr : rho_cache_name.c_str(),
-                                  cached_rho,
+                                  binding.residual_key.empty() ? nullptr : binding.residual_key.c_str(),
+                                  binding.cached_residual,
+                                  binding.rho_key.empty() ? nullptr : binding.rho_key.c_str(),
+                                  binding.cached_rho,
                                   &ctx->cache_tensor,
                                   ctx->block_sparse_token_h,
                                   ctx->block_sparse_token_w);
@@ -1267,13 +1247,12 @@ struct MMDiTRunner : public GGMLRunner {
                                block_sparse_residual_branch_index);
         };
 
-        const bool opencl_residual_route_enabled =
-            sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL") &&
-            sd_htp_opencl_residual_route_prerequisites();
+        const bool has_deferred_residual_job =
+            sd_htp_opencl_residual_route_has_deferred_job();
         const bool free_compute_buffer_immediately =
             sd_htp_release_compute_buffer_after_residual_anchor(
                 block_sparse_residual_mode,
-                opencl_residual_route_enabled);
+                has_deferred_residual_job);
         return restore_trailing_singleton_dims(
             GGMLRunner::compute<float>(
                 get_graph, n_threads, free_compute_buffer_immediately),

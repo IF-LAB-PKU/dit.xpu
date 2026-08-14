@@ -142,6 +142,56 @@ enum sd_htp_block_sparse_residual_mode {
     SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR = 2,
 };
 
+enum sd_htp_route_mode {
+    SD_HTP_ROUTE_DISABLED = 0,
+    SD_HTP_ROUTE_FUSED_OPENCL_RESIDUAL,
+    SD_HTP_ROUTE_OPENCL_ANCHOR,
+    SD_HTP_ROUTE_HTP_CPU,
+    SD_HTP_ROUTE_INVALID,
+};
+
+struct sd_htp_attention_policy {
+    bool sparse_policy_active = false;
+    bool packed_qkv_allowed   = false;
+    bool residual_eligible    = false;
+};
+
+struct sd_htp_residual_binding {
+    std::string residual_key;
+    std::string rho_key;
+    ggml_tensor* cached_residual = nullptr;
+    ggml_tensor* cached_rho      = nullptr;
+    int slot                     = -1;
+};
+
+__STATIC_INLINE__ sd_htp_route_mode sd_htp_route_mode_from_flags(bool fused,
+                                                                  bool opencl_sparse,
+                                                                  bool opencl_residual) {
+    if (fused && !opencl_sparse && opencl_residual) {
+        return SD_HTP_ROUTE_FUSED_OPENCL_RESIDUAL;
+    }
+    if (!fused && opencl_sparse && opencl_residual) {
+        return SD_HTP_ROUTE_OPENCL_ANCHOR;
+    }
+    if (!fused && !opencl_sparse && !opencl_residual) {
+        return SD_HTP_ROUTE_HTP_CPU;
+    }
+    return SD_HTP_ROUTE_INVALID;
+}
+
+__STATIC_INLINE__ sd_htp_attention_policy sd_htp_attention_policy_for(
+    bool block_sparse_step,
+    int residual_mode,
+    bool has_image_region) {
+    const bool anchor = residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR;
+    const bool apply  = residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY;
+    return {
+        has_image_region && (block_sparse_step || anchor),
+        has_image_region && block_sparse_step && apply,
+        has_image_region && (anchor || apply),
+    };
+}
+
 __STATIC_INLINE__ bool sd_htp_patch_major_layout_enabled(bool sparse_attn_enabled,
                                                           int residual_mode) {
     return sparse_attn_enabled || residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR;
@@ -2295,12 +2345,27 @@ __STATIC_INLINE__ void sd_htp_exact_residual_cache_cpu(
     }
 }
 
+__STATIC_INLINE__ void sd_htp_fused_anchor_attention_cpu(
+        ggml_tensor* dst, int ith, int nth, void* userdata) {
+    SD_UNUSED(dst);
+    SD_UNUSED(ith);
+    SD_UNUSED(nth);
+    SD_UNUSED(userdata);
+    GGML_ABORT("htp_fused_anchor_attention was routed to the CPU");
+}
+
 __STATIC_INLINE__ bool sd_htp_opencl_residual_route_prerequisites() {
-    return sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL") &&
+    const bool cache_prerequisites =
+        sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE") &&
+        sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO");
+    if (sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR")) {
+        return cache_prerequisites &&
+               sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL");
+    }
+    return cache_prerequisites &&
+           sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL") &&
            sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_ASYNC") &&
-           sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT") &&
-           sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE") &&
-           sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO");
+           sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT");
 }
 
 __STATIC_INLINE__ bool sd_htp_opencl_deferred_residual_enabled() {
@@ -2309,11 +2374,18 @@ __STATIC_INLINE__ bool sd_htp_opencl_deferred_residual_enabled() {
                "SD_HTP_SPARSE_OPENCL_DEFER_RESIDUAL", true);
 }
 
+__STATIC_INLINE__ bool sd_htp_opencl_residual_route_has_deferred_job() {
+    return !sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR") &&
+           sd_htp_opencl_residual_route_prerequisites() &&
+           sd_htp_opencl_deferred_residual_enabled() &&
+           sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD");
+}
+
 __STATIC_INLINE__ bool sd_htp_release_compute_buffer_after_residual_anchor(
     int block_sparse_residual_mode,
-    bool opencl_residual_route_enabled) {
+    bool has_deferred_residual_job) {
     return block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
-           !opencl_residual_route_enabled;
+           !has_deferred_residual_job;
 }
 
 enum sd_cache_storage_update_mode {
@@ -2400,6 +2472,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         return nullptr;
     };
     ggml_tensor* packed_qkv = packed_qkv_storage(q);
+    const bool has_packed_qkv_ancestor = packed_qkv != nullptr ||
+                                         packed_qkv_storage(k) != nullptr ||
+                                         packed_qkv_storage(v) != nullptr;
     const bool packed_layout = packed_qkv != nullptr && packed_qkv_storage(k) == packed_qkv &&
                                packed_qkv_storage(v) == packed_qkv &&
                                sd_env_flag_enabled_default("SD_HTP_PACKED_ATTENTION", true);
@@ -2450,23 +2525,66 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
 
         v = v_seq_major;
     } else {
-        L_q       = q->ne[1];
-        L_k       = k->ne[1];
-        d_head    = v->ne[0];
-        N         = v->ne[3];
-        n_kv_head = k->ne[2] / N;
+        bool scalar_layout_resolved = false;
+        if (!packed_layout && q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1 &&
+            q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0]) {
+            const bool q_seq_head = q->ne[2] == n_head && q->ne[1] != n_head;
+            const bool q_head_seq = q->ne[1] == n_head && q->ne[2] != n_head;
+            if (q_seq_head != q_head_seq) {
+                const int64_t q_tokens = q_seq_head ? q->ne[1] : q->ne[2];
+                struct kv_layout_candidate {
+                    int64_t tokens;
+                    int64_t heads;
+                };
+                const kv_layout_candidate k_candidates[] = {
+                    {k->ne[1], k->ne[2]},
+                    {k->ne[2], k->ne[1]},
+                };
+                const kv_layout_candidate v_candidates[] = {
+                    {v->ne[1], v->ne[2]},
+                    {v->ne[2], v->ne[1]},
+                };
+                int matches = 0;
+                kv_layout_candidate match = {};
+                for (const auto& k_candidate : k_candidates) {
+                    for (const auto& v_candidate : v_candidates) {
+                        if (k_candidate.tokens == v_candidate.tokens &&
+                            k_candidate.heads == v_candidate.heads &&
+                            k_candidate.tokens > 0 && k_candidate.heads > 0 &&
+                            k_candidate.heads <= n_head &&
+                            n_head % k_candidate.heads == 0) {
+                            if (matches == 0 || match.tokens != k_candidate.tokens ||
+                                match.heads != k_candidate.heads) {
+                                match = k_candidate;
+                                ++matches;
+                            }
+                        }
+                    }
+                }
+                if (matches == 1) {
+                    L_q = q_tokens;
+                    L_k = match.tokens;
+                    d_head = q->ne[0];
+                    N = 1;
+                    n_kv_head = match.heads;
+                    scalar_layout_resolved = true;
+                }
+            }
+        }
+        if (!scalar_layout_resolved) {
+            L_q       = q->ne[1];
+            L_k       = k->ne[1];
+            d_head    = v->ne[0];
+            N         = v->ne[3];
+            n_kv_head = k->ne[2] / N;
+        }
         C         = d_head * n_head;
 
-        // RoPE returns contiguous [d, token, head] tensors, whose backing memory is
-        // head-major. The DSP dense attention ABI reads Q/K/V linearly as
-        // [token, head, d], so give it token-major backing views just like the
-        // non-skip path above.
         if (skip_reshape && !packed_layout && N == 1 && keep_for_htp_hybrid &&
             sd_env_flag_enabled("SD_HTP_ATTENTION")) {
-            ggml_tensor* q_token_major = ggml_ext_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
-            q_htp_flash = ggml_permute(ctx, q_token_major, 0, 2, 1, 3);
-            k_htp_flash_base = ggml_ext_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
-            v_htp_flash_base = ggml_ext_cont(ctx, v);
+            q_htp_flash = q;
+            k_htp_flash_base = k;
+            v_htp_flash_base = v;
         }
     }
 
@@ -2570,15 +2688,59 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         return out;
     };
 
-    auto build_htp_kqv = [&](ggml_tensor* mask_in, bool with_lse = false) -> ggml_tensor* {
-        const bool block_sparse_mask = mask_in != nullptr && mask_in->type == GGML_TYPE_I32;
-        if (!use_htp_flash_layout) {
+    struct htp_attention_inputs {
+        ggml_tensor* q = nullptr;
+        ggml_tensor* k = nullptr;
+        ggml_tensor* v = nullptr;
+        ggml_tensor* dense_mask = nullptr;
+    };
+
+    auto canonical_htp_token_major_base = [&](ggml_tensor* tensor,
+                                               int64_t tokens,
+                                               int64_t heads,
+                                               ggml_type type) -> ggml_tensor* {
+        if (tensor == nullptr || tensor->type != type || tensor->ne[3] != 1 ||
+            tensor->ne[0] != d_head || tokens <= 0 || heads <= 0) {
             return nullptr;
         }
-
-        ggml_tensor* q_in = q_htp_flash;
-        if (q_in->type != GGML_TYPE_F32) {
+        const bool seq_head = tensor->ne[1] == tokens && tensor->ne[2] == heads;
+        const bool head_seq = tensor->ne[1] == heads && tensor->ne[2] == tokens;
+        if (seq_head == head_seq) {
             return nullptr;
+        }
+        if (head_seq) {
+            return ggml_ext_cont(ctx, tensor);
+        }
+        return ggml_ext_cont(ctx, ggml_permute(ctx, tensor, 0, 2, 1, 3));
+    };
+
+    auto canonical_htp_qk = [&](ggml_tensor* tensor,
+                                 int64_t tokens,
+                                 int64_t heads,
+                                 ggml_type type) -> ggml_tensor* {
+        ggml_tensor* base = canonical_htp_token_major_base(tensor, tokens, heads, type);
+        return base != nullptr ? ggml_permute(ctx, base, 0, 2, 1, 3) : nullptr;
+    };
+
+    auto canonical_htp_v = [&](ggml_tensor* tensor,
+                                int64_t tokens,
+                                int64_t heads,
+                                ggml_type type) -> ggml_tensor* {
+        return canonical_htp_token_major_base(tensor, tokens, heads, type);
+    };
+
+    auto prepare_htp_attention_inputs = [&](ggml_tensor* dense_mask_in,
+                                            bool prepare_dense_mask,
+                                            bool scale_v_for_legacy_output = true) -> htp_attention_inputs {
+        htp_attention_inputs inputs;
+        if (!use_htp_flash_layout) {
+            return inputs;
+        }
+
+        ggml_tensor* q_in = canonical_htp_qk(
+            q_htp_flash, L_q, n_head, GGML_TYPE_F32);
+        if (q_in == nullptr) {
+            return inputs;
         }
         if (kv_scale != 1.0f) {
             // The HTP dense kernel always applies 1/sqrt(head_dim) internally.
@@ -2599,7 +2761,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         }
         if (kv_scale != 1.0f) {
             k_base = ggml_ext_scale(ctx, k_base, kv_scale);
-            v_base = ggml_ext_scale(ctx, v_base, kv_scale);
+            if (scale_v_for_legacy_output) {
+                v_base = ggml_ext_scale(ctx, v_base, kv_scale);
+            }
         }
         if (k_base->type != GGML_TYPE_F16) {
             k_base = ggml_cast(ctx, k_base, GGML_TYPE_F16);
@@ -2608,30 +2772,53 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             v_base = ggml_cast(ctx, v_base, GGML_TYPE_F16);
         }
 
-        ggml_tensor* k_in = ggml_permute(ctx, k_base, 0, 2, 1, 3);
-        ggml_tensor* v_in = ggml_permute(ctx, v_base, 0, 2, 1, 3);
+        ggml_tensor* k_in = canonical_htp_qk(
+            k_base, L_k, n_kv_head, GGML_TYPE_F16);
+        ggml_tensor* v_in = canonical_htp_v(
+            v_base, L_k, n_kv_head, GGML_TYPE_F16);
+        if (k_in == nullptr || v_in == nullptr) {
+            return inputs;
+        }
 
-        if (!block_sparse_mask) {
+        if (prepare_dense_mask) {
             const int htp_dense_mask_pad =
                 kv_pad == 0 ? (GGML_PAD(L_k, 64) - static_cast<int>(L_k)) : 0;
-            if (mask_in != nullptr) {
-                mask_in = dense_mask_to_kq_layout(mask_in);
+            if (dense_mask_in != nullptr) {
+                dense_mask_in = dense_mask_to_kq_layout(dense_mask_in);
             }
-            if (mask_in == nullptr && (kv_pad > 0 || htp_dense_mask_pad > 0 || keep_for_htp_hybrid)) {
-                mask_in = ggml_ext_zeros(ctx, L_k, L_q, 1, 1);
+            if (dense_mask_in == nullptr &&
+                (kv_pad > 0 || htp_dense_mask_pad > 0 || keep_for_htp_hybrid)) {
+                dense_mask_in = ggml_ext_zeros(ctx, L_k, L_q, 1, 1);
             }
             const int mask_pad = kv_pad > 0 ? kv_pad : htp_dense_mask_pad;
-            if (mask_in != nullptr && mask_pad > 0) {
+            if (dense_mask_in != nullptr && mask_pad > 0) {
                 auto pad_tensor = ggml_ext_full(ctx, -INFINITY, mask_pad, L_q, 1, 1);
-                mask_in         = ggml_concat(ctx, mask_in, pad_tensor, 0);
+                dense_mask_in   = ggml_concat(ctx, dense_mask_in, pad_tensor, 0);
             }
-            if (mask_in != nullptr && mask_in->type != GGML_TYPE_F16) {
-                mask_in = ggml_cast(ctx, mask_in, GGML_TYPE_F16);
+            if (dense_mask_in != nullptr && dense_mask_in->type != GGML_TYPE_F16) {
+                dense_mask_in = ggml_cast(ctx, dense_mask_in, GGML_TYPE_F16);
             }
         }
 
-        auto out = with_lse ? ggml_flash_attn_ext_with_lse(ctx, q_in, k_in, v_in, mask_in, scale, 0, 0)
-                            : ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale, 0, 0);
+        inputs.q = q_in;
+        inputs.k = k_in;
+        inputs.v = v_in;
+        inputs.dense_mask = dense_mask_in;
+        return inputs;
+    };
+
+    auto build_htp_kqv = [&](ggml_tensor* mask_in, bool with_lse = false) -> ggml_tensor* {
+        const bool block_sparse_mask = mask_in != nullptr && mask_in->type == GGML_TYPE_I32;
+        const htp_attention_inputs inputs =
+            prepare_htp_attention_inputs(block_sparse_mask ? nullptr : mask_in,
+                                         !block_sparse_mask);
+        if (inputs.q == nullptr || inputs.k == nullptr || inputs.v == nullptr) {
+            return nullptr;
+        }
+        ggml_tensor* attention_mask = block_sparse_mask ? mask_in : inputs.dense_mask;
+
+        auto out = with_lse ? ggml_flash_attn_ext_with_lse(ctx, inputs.q, inputs.k, inputs.v, attention_mask, scale, 0, 0)
+                            : ggml_flash_attn_ext(ctx, inputs.q, inputs.k, inputs.v, attention_mask, scale, 0, 0);
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
         if (!with_lse && kv_scale != 1.0f) {
             out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
@@ -2639,13 +2826,16 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         return out;
     };
 
-    auto flash_attn_o_view = [&](ggml_tensor* packed, bool with_lse = false) -> ggml_tensor* {
+    auto flash_attn_o_view = [&](ggml_tensor* packed,
+                                 bool with_lse = false,
+                                 bool output_already_final_scale = false) -> ggml_tensor* {
         GGML_ASSERT(packed != nullptr);
         GGML_ASSERT(!with_lse || packed->ne[0] == d_head + 1);
         ggml_tensor* out = ggml_view_3d(ctx, packed, d_head, n_head, L_q, packed->nb[1], packed->nb[2], 0);
         // Packed QKV producers emit unscaled K/V, so their attention output
         // must not receive the non-packed path's inverse V-scale compensation.
-        if (with_lse && kv_scale != 1.0f && !packed_layout) {
+        if (with_lse && kv_scale != 1.0f && !packed_layout &&
+            !output_already_final_scale) {
             out = ggml_ext_scale(ctx, ggml_cont(ctx, out), 1.0f / kv_scale);
         }
         return out;
@@ -2780,13 +2970,153 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             ggml_tensor* dense_candidate = nullptr;
             ggml_tensor* dense_lse = nullptr;
             bool candidate_is_htp_layout = false;
+            bool fused_anchor_used = false;
+            ggml_tensor* candidate = nullptr;
 
-            // An exact-rho anchor needs two attention operators with identical
-            // Q/K/V. Reusing the dense operator's prepared inputs keeps those
-            // copies on the main graph path, so the sparse sidecar can launch
-            // while HTP computes the dense operator instead of after cache-tail
-            // Q/K/V preparation has completed.
-            if (anchor_can_cache_residual && can_cache_exact_rho) {
+            const bool fused_anchor_requested =
+                block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
+                sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR");
+            if (fused_anchor_requested) {
+                const char* fused_reject_reason = nullptr;
+                htp_attention_inputs fused_inputs;
+                auto qk_layout = [](const ggml_tensor* tensor,
+                                    ggml_type type,
+                                    int64_t token_count,
+                                    int64_t head_count,
+                                    int64_t dim) {
+                    return tensor != nullptr && tensor->type == type &&
+                           tensor->ne[0] == dim && tensor->ne[1] == token_count &&
+                           tensor->ne[2] == head_count && tensor->ne[3] == 1;
+                };
+                auto v_layout = [](const ggml_tensor* tensor,
+                                   ggml_type type,
+                                   int64_t token_count,
+                                   int64_t head_count,
+                                   int64_t dim) {
+                    return tensor != nullptr && tensor->type == type &&
+                           tensor->ne[0] == dim && tensor->ne[1] == head_count &&
+                           tensor->ne[2] == token_count && tensor->ne[3] == 1;
+                };
+                if (!anchor_can_cache_residual) {
+                    fused_reject_reason = "residual cache output is unavailable";
+                } else if (!can_cache_exact_rho) {
+                    fused_reject_reason = "exact-rho cache output is unavailable";
+                } else if (has_packed_qkv_ancestor || packed_layout) {
+                    fused_reject_reason = "anchor Q/K/V has a packed producer ancestor";
+                } else if (!use_htp_flash_layout) {
+                    fused_reject_reason = "row-major HTP Q/K/V layout is unavailable";
+                } else if (L_q != L_k) {
+                    fused_reject_reason = "fused anchor requires self-attention";
+                } else if (N != 1 || n_head != n_kv_head) {
+                    fused_reject_reason = "batch or GQA is unsupported";
+                } else if (d_head != 64 && d_head != 128) {
+                    fused_reject_reason = "head dimension is unsupported";
+                } else if (block_q != 32 || block_k != 32 ||
+                           block_mask_format != GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX) {
+                    fused_reject_reason = "block-index 32x32 mask is required";
+                } else if (!block_sparse_static_halo) {
+                    fused_reject_reason = "static-halo sparse policy is required";
+                } else {
+                    // The fused op returns final-scale O directly. K still uses
+                    // kv_scale with compensating Q scale, while V remains at
+                    // model scale so neither output slab needs a post-op scale.
+                    fused_inputs = prepare_htp_attention_inputs(nullptr, true, false);
+                    if (fused_inputs.q == nullptr || fused_inputs.k == nullptr ||
+                        fused_inputs.v == nullptr || fused_inputs.dense_mask == nullptr) {
+                        fused_reject_reason = "failed to prepare fused HTP inputs";
+                    } else if (!qk_layout(fused_inputs.q, GGML_TYPE_F32,
+                                          L_q, n_head, d_head) ||
+                               !qk_layout(fused_inputs.k, GGML_TYPE_F16,
+                                          L_k, n_kv_head, d_head) ||
+                               !v_layout(fused_inputs.v, GGML_TYPE_F16,
+                                         L_k, n_kv_head, d_head)) {
+                        fused_reject_reason = "Q/K/V dense HTP layouts are unsupported";
+                    } else if (!ggml_is_contiguous(fused_inputs.dense_mask) ||
+                               fused_inputs.dense_mask->type != GGML_TYPE_F16 ||
+                               fused_inputs.dense_mask->ne[0] != GGML_PAD(L_k, 64) ||
+                               fused_inputs.dense_mask->ne[1] != L_q) {
+                        fused_reject_reason = "dense mask is not contiguous F16";
+                    } else if (!ggml_is_contiguous(block_mask) ||
+                               block_mask->type != GGML_TYPE_I32 ||
+                               block_mask->ne[0] != (L_k + block_k - 1) / block_k ||
+                               block_mask->ne[1] != n_q_blocks) {
+                        fused_reject_reason = "block mask is not contiguous I32";
+                    }
+                }
+
+                if (fused_reject_reason == nullptr) {
+                    const int64_t slab_elements =
+                        (d_head + 1) * n_head * L_q;
+                    ggml_tensor* fused_args[] = {
+                        fused_inputs.q,
+                        fused_inputs.k,
+                        fused_inputs.v,
+                        fused_inputs.dense_mask,
+                        block_mask,
+                    };
+                    auto* metadata = static_cast<ggml_htp_fused_anchor_metadata*>(
+                        ggml_new_buffer(ctx, sizeof(ggml_htp_fused_anchor_metadata)));
+                    metadata->qo_len = static_cast<int32_t>(L_q);
+                    metadata->kv_len = static_cast<int32_t>(L_k);
+                    metadata->n_heads = static_cast<int32_t>(n_head);
+                    metadata->n_kv_heads = static_cast<int32_t>(n_kv_head);
+                    metadata->head_dim = static_cast<int32_t>(d_head);
+                    metadata->block_q = block_q;
+                    metadata->block_k = block_k;
+                    metadata->n_q_blocks = n_q_blocks;
+                    metadata->n_k_blocks = n_k_blocks;
+                    metadata->max_kept_blocks = static_cast<int32_t>(block_mask->ne[0]);
+                    metadata->mask_format = 1;
+                    metadata->sparse_policy = 1;
+                    metadata->image_tokens = block_sparse_token_h * block_sparse_token_w;
+                    metadata->text_tokens = protected_len > 0 ? protected_len : 0;
+                    metadata->image_block_rows = block_sparse_token_h / 4;
+                    metadata->image_block_cols = block_sparse_token_w / 8;
+
+                    ggml_tensor* fused = ggml_custom_4d(
+                        ctx, GGML_TYPE_F32, 2 * slab_elements, 1, 1, 1,
+                        fused_args, 5, sd_htp_fused_anchor_attention_cpu,
+                        1, metadata);
+                    ggml_set_name(fused, "htp_fused_anchor_attention");
+                    if (backend != nullptr && ggml_backend_is_htp(backend) &&
+                        !ggml_backend_supports_op(backend, fused)) {
+                        fused_reject_reason = "HTP backend rejected the fused custom op";
+                    } else {
+                        const size_t row_bytes =
+                            static_cast<size_t>(d_head + 1) * sizeof(float);
+                        const size_t token_bytes =
+                            static_cast<size_t>(n_head) * row_bytes;
+                        const size_t slab_bytes =
+                            static_cast<size_t>(L_q) * token_bytes;
+                        dense_candidate = ggml_view_4d(
+                            ctx, fused, d_head + 1, n_head, L_q, 1,
+                            row_bytes, token_bytes, slab_bytes, 0);
+                        candidate = ggml_view_4d(
+                            ctx, fused, d_head + 1, n_head, L_q, 1,
+                            row_bytes, token_bytes, slab_bytes, slab_bytes);
+                        ggml_set_name(dense_candidate, "htp_fused_anchor_dense_o_lse");
+                        ggml_set_name(candidate, "htp_fused_anchor_sparse_o_lse");
+                        candidate_is_htp_layout = true;
+                        fused_anchor_used = true;
+                    }
+                }
+
+                if (!fused_anchor_used) {
+                    if (sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_STRICT")) {
+                        GGML_ABORT("fused anchor admission failed: %s",
+                                   fused_reject_reason != nullptr ? fused_reject_reason : "unknown reason");
+                    }
+                    static std::atomic<bool> fused_fallback_reported{false};
+                    if (!fused_fallback_reported.exchange(true)) {
+                        std::fprintf(stderr, "fused anchor fallback: %s\n",
+                                     fused_reject_reason != nullptr ? fused_reject_reason : "unknown reason");
+                    }
+                }
+            }
+
+            // The legacy exact-rho anchor keeps two independent attention
+            // producers and is used whenever fused admission is not selected.
+            if (!fused_anchor_used && anchor_can_cache_residual && can_cache_exact_rho) {
                 dense_candidate = build_htp_kqv(nullptr, true);
                 candidate_is_htp_layout = dense_candidate != nullptr;
                 if (dense_candidate == nullptr) {
@@ -2794,8 +3124,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                 }
             }
 
-            ggml_tensor* candidate = nullptr;
-            if (packed_layout) {
+            if (fused_anchor_used) {
+                // The fused views already carry the HTP output contract.
+            } else if (packed_layout) {
                 candidate = build_packed_kqv(block_mask, sparse_with_lse);
                 // Packed Q/K/V are already in the HMX layout consumed by the
                 // HTP packed attention kernel. Treat this candidate as an HTP
@@ -2820,18 +3151,21 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                     candidate = build_kqv(q, k, v, block_mask, sparse_with_lse);
                 }
             }
-            GGML_ASSERT(block_mask_format != GGML_FLASH_ATTN_EXT_MASK_DEFAULT);
-            ggml_flash_attn_ext_set_block_sparse(candidate, block_q, block_k, block_mask_format);
-            if (block_sparse_static_halo) {
-                const int image_tokens = block_sparse_token_h * block_sparse_token_w;
-                ggml_flash_attn_ext_set_static_halo_2d(candidate,
-                                                       image_tokens,
-                                                       protected_len > 0 ? protected_len : 0,
-                                                       block_sparse_token_h / 4,
-                                                       block_sparse_token_w / 8);
+            if (!fused_anchor_used) {
+                GGML_ASSERT(block_mask_format != GGML_FLASH_ATTN_EXT_MASK_DEFAULT);
+                ggml_flash_attn_ext_set_block_sparse(candidate, block_q, block_k, block_mask_format);
+                if (block_sparse_static_halo) {
+                    const int image_tokens = block_sparse_token_h * block_sparse_token_w;
+                    ggml_flash_attn_ext_set_static_halo_2d(candidate,
+                                                           image_tokens,
+                                                           protected_len > 0 ? protected_len : 0,
+                                                           block_sparse_token_h / 4,
+                                                           block_sparse_token_w / 8);
+                }
             }
             if ((candidate_is_htp_layout && keep_for_htp_hybrid) || backend == nullptr || ggml_backend_supports_op(backend, candidate)) {
-                ggml_tensor* sparse_out = flash_attn_o_view(candidate, sparse_with_lse);
+                ggml_tensor* sparse_out = flash_attn_o_view(
+                    candidate, sparse_with_lse, fused_anchor_used);
                 ggml_tensor* sparse_lse = sparse_with_lse ? flash_attn_lse_view(candidate) : nullptr;
                 ggml_tensor* sparse_reshape_out = sparse_out;
                 const bool cached_exact_rho_valid =
@@ -2858,7 +3192,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                             dense_candidate = build_kqv(q, k, v, nullptr);
                         }
                     }
-                    ggml_tensor* dense_out = flash_attn_o_view(dense_candidate, can_cache_exact_rho);
+                    ggml_tensor* dense_out = flash_attn_o_view(
+                        dense_candidate, can_cache_exact_rho, fused_anchor_used);
                     if (can_cache_exact_rho) {
                         dense_lse = flash_attn_lse_view(dense_candidate);
                     }
@@ -2874,8 +3209,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                         if (residual_route_requested && !residual_route_enabled &&
                             sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_STRICT")) {
                             GGML_ABORT(
-                                "SD_HTP_SPARSE_OPENCL_RESIDUAL requires OpenCL sparse, "
-                                "async, early-submit, residual cache, and exact-rho");
+                                "SD_HTP_SPARSE_OPENCL_RESIDUAL prerequisites are not met for "
+                                "the selected sparse or fused-anchor route");
                         }
                         if (residual_route_enabled) {
                             ggml_tensor* rho_args[] = { dense_candidate, candidate };
@@ -5002,6 +5337,39 @@ struct GGMLRunnerContext {
     }
 };
 
+__STATIC_INLINE__ sd_htp_residual_binding sd_htp_prepare_residual_binding(
+    GGMLRunnerContext* ctx,
+    const char* attention_kind,
+    bool residual_eligible) {
+    sd_htp_residual_binding binding;
+    if (ctx == nullptr || !residual_eligible) {
+        return binding;
+    }
+
+    binding.slot = ctx->block_sparse_residual_attention_index++;
+    if (ctx->block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF) {
+        return binding;
+    }
+
+    binding.residual_key = sd_htp_block_sparse_residual_cache_key(
+        ctx->block_sparse_residual_branch_index,
+        attention_kind,
+        binding.slot);
+    if (ctx->block_sparse_residual_exact_rho) {
+        binding.rho_key = sd_htp_block_sparse_residual_rho_cache_key(
+            ctx->block_sparse_residual_branch_index,
+            attention_kind,
+            binding.slot);
+    }
+    if (ctx->block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY) {
+        binding.cached_residual = ctx->cache_tensor_as_graph_input(binding.residual_key);
+        if (!binding.rho_key.empty()) {
+            binding.cached_rho = ctx->cache_tensor_as_graph_input(binding.rho_key);
+        }
+    }
+    return binding;
+}
+
 struct GGMLRunner {
 protected:
     typedef std::function<ggml_cgraph*()> get_graph_cb_t;
@@ -6052,9 +6420,17 @@ protected:
                 if (j == 0 && node->op == GGML_OP_MUL_MAT) {
                     continue;
                 }
-                // FLASH_ATTN_EXT 的 HTP 输入通常是 PERMUTE/RESHAPE view；allocator 不会给 view
-                // 单独分配 buffer，必须把真正持有 data 的 backing root 放进 RPCMEM。
-                if (node->op == GGML_OP_FLASH_ATTN_EXT && src != nullptr && tensor == get_htp_tensor_backing_root(src)) {
+                // HTP attention inputs are commonly PERMUTE/RESHAPE views. The
+                // allocator cannot assign a buffer to the view itself, so the
+                // backing root must use the same RPCMEM placement as the
+                // attention node. Fused anchor follows the original dense
+                // FLASH_ATTN_EXT input contract.
+                const bool htp_attention_input =
+                    node->op == GGML_OP_FLASH_ATTN_EXT ||
+                    (node->op == GGML_OP_CUSTOM &&
+                     std::strcmp(node->name, "htp_fused_anchor_attention") == 0);
+                if (htp_attention_input && src != nullptr &&
+                    tensor == get_htp_tensor_backing_root(src)) {
                     return true;
                 }
                 if (src != nullptr && ggml_is_contiguous(src) && tensor == get_htp_tensor_backing_root(src)) {

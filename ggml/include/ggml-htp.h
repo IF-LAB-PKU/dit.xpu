@@ -7,6 +7,61 @@
 extern "C" {
 #endif
 
+struct ggml_htp_fused_anchor_metadata {
+    int32_t qo_len;
+    int32_t kv_len;
+    int32_t n_heads;
+    int32_t n_kv_heads;
+    int32_t head_dim;
+    int32_t block_q;
+    int32_t block_k;
+    int32_t n_q_blocks;
+    int32_t n_k_blocks;
+    int32_t max_kept_blocks;
+    int32_t mask_format;
+    int32_t sparse_policy;
+    int32_t image_tokens;
+    int32_t text_tokens;
+    int32_t image_block_rows;
+    int32_t image_block_cols;
+};
+
+enum ggml_htp_route_mode {
+    GGML_HTP_ROUTE_DISABLED = 0,
+    GGML_HTP_ROUTE_FUSED_OPENCL_RESIDUAL,
+    GGML_HTP_ROUTE_OPENCL_ANCHOR,
+    GGML_HTP_ROUTE_HTP_CPU,
+    GGML_HTP_ROUTE_INVALID,
+};
+
+struct ggml_htp_route_summary {
+    enum ggml_htp_route_mode mode;
+    int32_t anchor;
+    int32_t fused_anchor;
+    int32_t htp_dense;
+    int32_t htp_sparse;
+    int32_t opencl_sparse;
+    int32_t opencl_residual;
+    int32_t cpu_residual;
+    int32_t cache_pairs;
+    int32_t cpu_attention_fallback;
+    int32_t status_ok;
+};
+
+GGML_BACKEND_API bool ggml_backend_htp_route_summary_validate(
+    const struct ggml_htp_route_summary * summary,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API bool ggml_backend_htp_get_last_route_summary(
+    ggml_backend_t backend,
+    struct ggml_htp_route_summary * summary);
+
+GGML_BACKEND_API bool ggml_backend_htp_collect_route_summary(
+    ggml_backend_t backend,
+    const struct ggml_cgraph * cgraph,
+    struct ggml_htp_route_summary * summary);
+
 GGML_BACKEND_API ggml_backend_t ggml_backend_htp_init(void);
 
 GGML_BACKEND_API bool ggml_backend_is_htp(ggml_backend_t backend);

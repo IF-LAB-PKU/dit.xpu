@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <tuple>
 #include <unordered_set>
@@ -248,6 +249,157 @@ uint64_t htp_hash_tensor_bytes(const ggml_tensor * tensor) {
 std::atomic<int> htp_debug_hash_counter{0};
 std::atomic<bool> htp_opencl_residual_job_just_queued{false};
 
+bool htp_checked_mul_size(size_t lhs, size_t rhs, size_t * result) {
+    if (result == nullptr || (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs)) {
+        return false;
+    }
+    *result = lhs * rhs;
+    return true;
+}
+
+const ggml_htp_fused_anchor_metadata * fused_anchor_metadata(const ggml_tensor * dst) {
+    if (dst == nullptr || dst->op != GGML_OP_CUSTOM) {
+        return nullptr;
+    }
+    ggml_custom_op_params custom = {};
+    std::memcpy(&custom, dst->op_params, sizeof(custom));
+    return static_cast<const ggml_htp_fused_anchor_metadata *>(custom.userdata);
+}
+
+bool fused_anchor_qk_layout(
+        const ggml_tensor * tensor, ggml_type type,
+        int32_t tokens, int32_t heads, int32_t head_dim) {
+    return tensor != nullptr && tensor->type == type && tokens > 0 && heads > 0 && head_dim > 0 &&
+           tensor->ne[0] == head_dim && tensor->ne[1] == tokens && tensor->ne[2] == heads &&
+           tensor->ne[3] == 1;
+}
+
+bool fused_anchor_v_layout(
+        const ggml_tensor * tensor, ggml_type type,
+        int32_t tokens, int32_t heads, int32_t head_dim) {
+    return tensor != nullptr && tensor->type == type && tokens > 0 && heads > 0 && head_dim > 0 &&
+           tensor->ne[0] == head_dim && tensor->ne[1] == heads && tensor->ne[2] == tokens &&
+           tensor->ne[3] == 1;
+}
+
+bool fused_anchor_expected_sizes(
+        const ggml_htp_fused_anchor_metadata * params,
+        size_t * output_bytes, size_t * slab_bytes, size_t * q_bytes,
+        size_t * kv_bytes, size_t * dense_mask_bytes, size_t * block_mask_bytes) {
+    if (params == nullptr || output_bytes == nullptr || slab_bytes == nullptr || q_bytes == nullptr ||
+        kv_bytes == nullptr || dense_mask_bytes == nullptr || block_mask_bytes == nullptr) {
+        return false;
+    }
+    size_t rows = 0;
+    size_t elements = 0;
+    size_t dense_stride = 0;
+    if (!htp_checked_mul_size(static_cast<size_t>(params->qo_len),
+                              static_cast<size_t>(params->n_heads), &rows) ||
+        !htp_checked_mul_size(rows, static_cast<size_t>(params->head_dim + 1), &elements) ||
+        !htp_checked_mul_size(elements, sizeof(float), slab_bytes) ||
+        !htp_checked_mul_size(*slab_bytes, 2, output_bytes) ||
+        !htp_checked_mul_size(rows, static_cast<size_t>(params->head_dim), &elements) ||
+        !htp_checked_mul_size(elements, sizeof(float), q_bytes) ||
+        !htp_checked_mul_size(static_cast<size_t>(params->kv_len),
+                              static_cast<size_t>(params->n_kv_heads), &elements) ||
+        !htp_checked_mul_size(elements, static_cast<size_t>(params->head_dim), &elements) ||
+        !htp_checked_mul_size(elements, sizeof(ggml_fp16_t), kv_bytes)) {
+        return false;
+    }
+    if (static_cast<size_t>(params->kv_len) > std::numeric_limits<size_t>::max() - 63u) {
+        return false;
+    }
+    dense_stride = (static_cast<size_t>(params->kv_len) + 63u) & ~size_t(63u);
+    return htp_checked_mul_size(static_cast<size_t>(params->qo_len), dense_stride, &elements) &&
+           htp_checked_mul_size(elements, sizeof(ggml_fp16_t), dense_mask_bytes) &&
+           htp_checked_mul_size(static_cast<size_t>(params->n_q_blocks),
+                                static_cast<size_t>(params->max_kept_blocks), &elements) &&
+           htp_checked_mul_size(elements, sizeof(int32_t), block_mask_bytes);
+}
+
+bool is_fused_anchor_attention_custom(const ggml_tensor * dst) {
+    const ggml_htp_fused_anchor_metadata * params = fused_anchor_metadata(dst);
+    if (params == nullptr || std::strcmp(dst->name, "htp_fused_anchor_attention") != 0 ||
+        dst->type != GGML_TYPE_F32 || dst->ne[1] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+        dst->src[0] == nullptr || dst->src[1] == nullptr || dst->src[2] == nullptr ||
+        dst->src[3] == nullptr || dst->src[4] == nullptr || dst->src[5] != nullptr ||
+        params->qo_len <= 0 || params->qo_len != params->kv_len || params->n_heads <= 0 ||
+        params->n_heads != params->n_kv_heads ||
+        (params->head_dim != 64 && params->head_dim != 128) ||
+        params->block_q != 32 || params->block_k != 32 || params->mask_format != 1 ||
+        params->sparse_policy != HTP_SPARSE_POLICY_STATIC_HALO ||
+        params->image_tokens <= 0 || params->text_tokens < 0 ||
+        params->image_tokens + params->text_tokens != params->qo_len ||
+        params->image_tokens % params->block_q != 0 ||
+        params->image_block_rows <= 0 || params->image_block_cols <= 0 ||
+        params->image_block_rows > std::numeric_limits<int32_t>::max() / params->image_block_cols ||
+        params->image_block_rows * params->image_block_cols != params->image_tokens / params->block_q) {
+        return false;
+    }
+    const int32_t q_blocks_per_head = (params->qo_len + params->block_q - 1) / params->block_q;
+    const int32_t k_blocks_per_head = (params->kv_len + params->block_k - 1) / params->block_k;
+    if (params->n_heads > std::numeric_limits<int32_t>::max() / q_blocks_per_head ||
+        params->n_kv_heads > std::numeric_limits<int32_t>::max() / k_blocks_per_head ||
+        params->n_q_blocks != params->n_heads * q_blocks_per_head ||
+        params->n_k_blocks != params->n_kv_heads * k_blocks_per_head ||
+        params->max_kept_blocks != k_blocks_per_head) {
+        return false;
+    }
+
+    size_t output_bytes = 0, slab_bytes = 0, q_bytes = 0, kv_bytes = 0;
+    size_t dense_mask_bytes = 0, block_mask_bytes = 0;
+    if (!fused_anchor_expected_sizes(params, &output_bytes, &slab_bytes, &q_bytes, &kv_bytes,
+                                     &dense_mask_bytes, &block_mask_bytes)) {
+        return false;
+    }
+    const size_t dense_stride = (static_cast<size_t>(params->kv_len) + 63u) & ~size_t(63u);
+    return static_cast<size_t>(dst->ne[0]) == output_bytes / sizeof(float) &&
+           fused_anchor_qk_layout(dst->src[0], GGML_TYPE_F32, params->qo_len,
+                                  params->n_heads, params->head_dim) &&
+           fused_anchor_qk_layout(dst->src[1], GGML_TYPE_F16, params->kv_len,
+                                  params->n_kv_heads, params->head_dim) &&
+           fused_anchor_v_layout(dst->src[2], GGML_TYPE_F16, params->kv_len,
+                                 params->n_kv_heads, params->head_dim) &&
+           dst->src[3]->type == GGML_TYPE_F16 && dst->src[3]->ne[0] == static_cast<int64_t>(dense_stride) &&
+           dst->src[3]->ne[1] == params->qo_len && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 &&
+           ggml_is_contiguous(dst->src[3]) &&
+           dst->src[4]->type == GGML_TYPE_I32 && dst->src[4]->ne[0] == params->max_kept_blocks &&
+           dst->src[4]->ne[1] == params->n_q_blocks && dst->src[4]->ne[2] == 1 && dst->src[4]->ne[3] == 1 &&
+           ggml_is_contiguous(dst->src[4]) && ggml_is_contiguous(dst);
+}
+
+struct htp_tensor_range {
+    ggml_backend_buffer_t backing = nullptr;
+    size_t offset = 0;
+    size_t size = 0;
+};
+
+bool htp_tensor_range_for_bytes(const ggml_tensor * tensor, size_t size, htp_tensor_range * range) {
+    const ggml_tensor * backing_tensor = get_tensor_with_backing_buffer(tensor);
+    if (tensor == nullptr || range == nullptr || backing_tensor == nullptr || backing_tensor->buffer == nullptr ||
+        tensor->data == nullptr) {
+        return false;
+    }
+    void * base = ggml_backend_buffer_get_base(backing_tensor->buffer);
+    const size_t backing_size = ggml_backend_buffer_get_size(backing_tensor->buffer);
+    const uintptr_t base_address = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t data_address = reinterpret_cast<uintptr_t>(tensor->data);
+    if (base == nullptr || data_address < base_address || data_address - base_address > backing_size) {
+        return false;
+    }
+    const size_t offset = static_cast<size_t>(data_address - base_address);
+    if (size > backing_size - offset) {
+        return false;
+    }
+    *range = {backing_tensor->buffer, offset, size};
+    return true;
+}
+
+bool htp_ranges_overlap(const htp_tensor_range & lhs, const htp_tensor_range & rhs) {
+    return lhs.backing == rhs.backing && lhs.offset < rhs.offset + rhs.size &&
+           rhs.offset < lhs.offset + lhs.size;
+}
+
 bool is_block_sparse_score_custom(const ggml_tensor * dst) {
     if (dst == nullptr || dst->op != GGML_OP_CUSTOM || std::strcmp(dst->name, "block_sparse_score") != 0) {
         return false;
@@ -358,6 +510,8 @@ const char * htp_op_index_name(int op_index) {
             return "HTP_OPS_QKV_MUL_RMS_PACKED_ROPE_W16A32";
         case HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_ROPE_W16A32:
             return "HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_ROPE_W16A32";
+        case HTP_OPS_FUSED_ANCHOR_ATTN_QO_F32_KV_F16:
+            return "HTP_OPS_FUSED_ANCHOR_ATTN_QO_F32_KV_F16";
         case HTP_OPS_MAT_MUL_PERMUTED_W4D16A32:
             return "HTP_OPS_MAT_MUL_PERMUTED_W4D16A32";
         case HTP_OPS_MAT_MUL_PERMUTED_W8D16A32:
@@ -411,6 +565,10 @@ void dump_htp_dispatch_state(const char * prefix,
 } // namespace
 
 extern "C" {
+
+bool htp_ops_is_fused_anchor_attention(const struct ggml_tensor * dst) {
+    return is_fused_anchor_attention_custom(dst);
+}
 
 int htp_ops_resolve_halo_kv_load_mode(void) {
     const char * value = std::getenv("SD_HTP_HALO_KV_LOAD");
@@ -529,6 +687,9 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                        max_bias == 0 && logit_softcap == 0;
             }
         case GGML_OP_CUSTOM:
+            if (is_fused_anchor_attention_custom(dst)) {
+                return true;
+            }
             if (is_qkv_mul_rms_packed_dual_rope_custom(dst)) {
                 const ggml_tensor * image_activation = dst->src[0];
                 const ggml_tensor * text_activation = dst->src[5];
@@ -594,8 +755,74 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
 }
 
 bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
-    if (!htp_ops_support_op(dst) || !tensor_ready_for_htp_dispatch(dst)) {
+    const bool fused_anchor_named = dst != nullptr && dst->op == GGML_OP_CUSTOM &&
+        std::strcmp(dst->name, "htp_fused_anchor_attention") == 0;
+    const char * fused_trace_env = std::getenv("SD_HTP_BLOCK_SPARSE_MASK_TRACE");
+    const bool trace_fused_anchor = fused_anchor_named && fused_trace_env != nullptr &&
+        fused_trace_env[0] != '\0' && std::strcmp(fused_trace_env, "0") != 0;
+    if (!htp_ops_support_op(dst)) {
+        if (trace_fused_anchor) {
+            std::fprintf(stderr, "fused_anchor_runtime_support rejected stage=static_support\n");
+        }
         return false;
+    }
+    if (!tensor_ready_for_htp_dispatch(dst)) {
+        if (trace_fused_anchor) {
+            std::fprintf(stderr, "fused_anchor_runtime_support rejected stage=dst_rpcmem\n");
+            dump_tensor_rpcmem_state("fused_dst", dst);
+        }
+        return false;
+    }
+
+    if (is_fused_anchor_attention_custom(dst)) {
+        const ggml_htp_fused_anchor_metadata * metadata = fused_anchor_metadata(dst);
+        size_t output_bytes = 0, slab_bytes = 0, q_bytes = 0, kv_bytes = 0;
+        size_t dense_mask_bytes = 0, block_mask_bytes = 0;
+        if (!fused_anchor_expected_sizes(metadata, &output_bytes, &slab_bytes, &q_bytes, &kv_bytes,
+                                         &dense_mask_bytes, &block_mask_bytes)) {
+            if (trace_fused_anchor) {
+                std::fprintf(stderr, "fused_anchor_runtime_support rejected stage=expected_sizes\n");
+            }
+            return false;
+        }
+        for (int i = 0; i < 5; ++i) {
+            if (!tensor_ready_for_htp_dispatch_view_backed(dst->src[i])) {
+                if (trace_fused_anchor) {
+                    std::fprintf(stderr,
+                                 "fused_anchor_runtime_support rejected stage=src_rpcmem src=%d\n", i);
+                    dump_tensor_rpcmem_state("fused_src", dst->src[i]);
+                }
+                return false;
+            }
+        }
+        htp_tensor_range ranges[6] = {};
+        const size_t sizes[6] = {output_bytes, q_bytes, kv_bytes, kv_bytes, dense_mask_bytes, block_mask_bytes};
+        const ggml_tensor * tensors[6] = {dst, dst->src[0], dst->src[1], dst->src[2], dst->src[3], dst->src[4]};
+        for (int i = 0; i < 6; ++i) {
+            if (!htp_tensor_range_for_bytes(tensors[i], sizes[i], &ranges[i]) ||
+                ranges[i].offset > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+                if (trace_fused_anchor) {
+                    std::fprintf(stderr,
+                                 "fused_anchor_runtime_support rejected stage=range tensor=%d bytes=%zu\n",
+                                 i, sizes[i]);
+                    dump_tensor_rpcmem_state("fused_range", tensors[i]);
+                }
+                return false;
+            }
+        }
+        for (int i = 1; i < 6; ++i) {
+            if (htp_ranges_overlap(ranges[0], ranges[i])) {
+                if (trace_fused_anchor) {
+                    std::fprintf(stderr,
+                                 "fused_anchor_runtime_support rejected stage=output_overlap src=%d "
+                                 "output_offset=%zu output_bytes=%zu src_offset=%zu src_bytes=%zu\n",
+                                 i, ranges[0].offset, ranges[0].size,
+                                 ranges[i].offset, ranges[i].size);
+                }
+                return false;
+            }
+        }
+        return true;
     }
 
     if (is_qkv_mul_rms_packed_custom(dst)) {
@@ -1756,6 +1983,46 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
 
         case GGML_OP_CUSTOM:
             {
+                if (is_fused_anchor_attention_custom(dst)) {
+                    prepare_tensor_rpcmem_mapping(dst);
+                    auto mappings = get_all_rpcmem_mappings(dst);
+                    if (mappings.size() != 6) {
+                        dump_missing_mapping_diagnostics(dst, mappings);
+                        return -EINVAL;
+                    }
+                    const ggml_htp_fused_anchor_metadata * metadata = fused_anchor_metadata(dst);
+                    FusedAnchorAttnParams op_params = {};
+                    op_params.output = {mappings[0].first, static_cast<int32_t>(mappings[0].second)};
+                    op_params.q = {mappings[1].first, static_cast<int32_t>(mappings[1].second)};
+                    op_params.k = {mappings[2].first, static_cast<int32_t>(mappings[2].second)};
+                    op_params.v = {mappings[3].first, static_cast<int32_t>(mappings[3].second)};
+                    op_params.dense_mask = {mappings[4].first, static_cast<int32_t>(mappings[4].second)};
+                    op_params.block_mask = {mappings[5].first, static_cast<int32_t>(mappings[5].second)};
+                    op_params.qo_len = metadata->qo_len;
+                    op_params.kv_len = metadata->kv_len;
+                    op_params.n_heads = metadata->n_heads;
+                    op_params.n_kv_heads = metadata->n_kv_heads;
+                    op_params.head_dim = metadata->head_dim;
+                    op_params.block_q = metadata->block_q;
+                    op_params.block_k = metadata->block_k;
+                    op_params.n_q_blocks = metadata->n_q_blocks;
+                    op_params.n_k_blocks = metadata->n_k_blocks;
+                    op_params.max_kept_blocks = metadata->max_kept_blocks;
+                    op_params.mask_format = metadata->mask_format;
+                    op_params.sparse_policy = metadata->sparse_policy;
+                    op_params.image_tokens = metadata->image_tokens;
+                    op_params.text_tokens = metadata->text_tokens;
+                    op_params.image_block_rows = metadata->image_block_rows;
+                    op_params.image_block_cols = metadata->image_block_cols;
+                    op_params.elapsed_us = 0;
+                    *reinterpret_cast<FusedAnchorAttnParams *>(param_buf) = op_params;
+                    op_index = HTP_OPS_FUSED_ANCHOR_ATTN_QO_F32_KV_F16;
+                    args_size = sizeof(op_params);
+                    dispatch_m = op_params.qo_len;
+                    dispatch_k = op_params.kv_len;
+                    dispatch_n = op_params.n_heads;
+                    break;
+                }
                 if (is_qkv_mul_rms_packed_dual_rope_custom(dst)) {
                     prepare_tensor_rpcmem_mapping_with_extra(dst, dst->src[0]);
                     const auto & mapper = ggml_backend_htp_context::instance()->mapper;
@@ -2114,21 +2381,27 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
          op_index == HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16)
         ? reinterpret_cast<const BlockSparseAttnParams *>(compute_request->payload)
         : nullptr;
+    const auto * fused_anchor_params = op_index == HTP_OPS_FUSED_ANCHOR_ATTN_QO_F32_KV_F16
+        ? reinterpret_cast<const FusedAnchorAttnParams *>(compute_request->payload)
+        : nullptr;
     const int32_t attention_elapsed_us = op_index == HTP_OPS_FLASH_ATTN_QO_F32_KV_F16
         ? reinterpret_cast<const FlashAttnParams *>(compute_request->payload)->elapsed_us
-        : (block_sparse_params != nullptr ? block_sparse_params->elapsed_us : -1);
+        : (block_sparse_params != nullptr ? block_sparse_params->elapsed_us
+                                          : (fused_anchor_params != nullptr ? fused_anchor_params->elapsed_us : -1));
     if (ret == 0 && attention_elapsed_us >= 0) {
         ctx->last_attention_elapsed_us.store(attention_elapsed_us, std::memory_order_release);
     }
     const char * internal_trace = std::getenv("SD_HTP_ATTN_INTERNAL_TRACE");
     if (internal_trace != nullptr && internal_trace[0] != '\0' && std::strcmp(internal_trace, "0") != 0 &&
-        (op_index == HTP_OPS_FLASH_ATTN_QO_F32_KV_F16 || block_sparse_params != nullptr)) {
+        (op_index == HTP_OPS_FLASH_ATTN_QO_F32_KV_F16 || block_sparse_params != nullptr ||
+         fused_anchor_params != nullptr)) {
         std::fprintf(
             stderr,
             "htp_attention_internal kind=%s elapsed_us=%d qo=%d kv=%d heads=%d with_lse=%d "
             "halo_exec_mode=%d image_rows=%d text_q_rows=%d text_q_block_updates=%d "
             "image_q_batches=%d image_q_segments=%d\n",
-            op_index == HTP_OPS_FLASH_ATTN_QO_F32_KV_F16 ? "dense" : "block_sparse",
+            op_index == HTP_OPS_FLASH_ATTN_QO_F32_KV_F16 ? "dense" :
+                (fused_anchor_params != nullptr ? "fused_anchor" : "block_sparse"),
             attention_elapsed_us,
             dispatch_m,
             dispatch_k,

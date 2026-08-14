@@ -5,6 +5,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <vector>
 
 #include "../../src/ggml_extend.hpp"
 
@@ -176,9 +177,19 @@ static void standard_attention_views(ggml_context * ctx, const CaseSpec & spec,
         ggml_tensor * q_base = ggml_cont(ctx, ggml_permute(ctx, q4, 0, 2, 1, 3));
         ggml_tensor * k_base = ggml_cont(ctx, ggml_permute(ctx, k4, 0, 2, 1, 3));
         ggml_tensor * v_base = ggml_cont(ctx, *v);
-        *q = ggml_permute(ctx, q_base, 0, 2, 1, 3);
-        *k = ggml_permute(ctx, ggml_cast(ctx, k_base, GGML_TYPE_F16), 0, 2, 1, 3);
-        *v = ggml_permute(ctx, ggml_cast(ctx, v_base, GGML_TYPE_F16), 0, 2, 1, 3);
+        k_base = ggml_cast(ctx, k_base, GGML_TYPE_F16);
+        v_base = ggml_cast(ctx, v_base, GGML_TYPE_F16);
+        if (spec.head_major_qkv_input) {
+            *q = q_base;
+            *k = k_base;
+            *v = v_base;
+        } else {
+            *q = ggml_permute(ctx, q_base, 0, 2, 1, 3);
+            *k = ggml_permute(ctx, k_base, 0, 2, 1, 3);
+            *v = spec.head_major_v_input
+                     ? v_base
+                     : ggml_permute(ctx, v_base, 0, 2, 1, 3);
+        }
     } else {
         const int tokens = (*q)->ne[1];
         ggml_tensor * q_base = ggml_reshape_3d(ctx, *q, spec.head_dim, spec.heads, tokens);
@@ -261,6 +272,69 @@ static void build_standard_attention(Graph & graph, const CaseSpec & spec, Route
     graph.debug_q = q;
     graph.debug_k = k;
     graph.debug_v = v;
+
+    if (route == Route::FusedAnchor) {
+        setenv("SD_HTP_OPS", "1", 1);
+        setenv("SD_HTP_COMPUTE", "1", 1);
+        setenv("SD_HTP_ATTENTION", "1", 1);
+        setenv("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR", "1", 1);
+        setenv("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", "0", 1);
+        setenv("SD_HTP_BLOCK_SPARSE_PATCH_HALO", "1", 1);
+        setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE", "1", 1);
+        setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO", "1", 1);
+        setenv("SD_HTP_SPARSE_OPENCL", "0", 1);
+        setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "1", 1);
+        unsetenv("SD_HTP_SPARSE_OPENCL_ASYNC");
+        unsetenv("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT");
+        const std::function<ggml_tensor *(const std::string &, ggml_tensor *)> cache_tensor =
+            [&](const std::string & name, ggml_tensor * tensor) {
+                if (name.find("_rho_") != std::string::npos) {
+                    graph.rho = tensor;
+                } else {
+                    graph.residual = tensor;
+                    graph.dense_packed = tensor != nullptr ? tensor->src[0] : nullptr;
+                    graph.sparse_packed = tensor != nullptr ? tensor->src[1] : nullptr;
+                    graph.fused_storage = graph.dense_packed != nullptr ? graph.dense_packed->view_src : nullptr;
+                }
+                return tensor;
+            };
+        const int protected_start = spec.text_tokens > 0 ? spec.image_tokens : 0;
+        graph.output = ggml_ext_attention_ext(
+            graph.ctx, backend, q, k, v, spec.heads, nullptr,
+            true, true, 1.0f, true,
+            protected_start, spec.text_tokens,
+            SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR,
+            1.0f, 1.0f, true,
+            "htp_block_sparse_residual_b0_fixture", nullptr,
+            "htp_block_sparse_residual_rho_b0_fixture", nullptr,
+            &cache_tensor,
+            spec.image_block_rows * 4,
+            spec.image_block_cols * 8);
+        GGML_ASSERT(graph.dense_packed != nullptr && graph.sparse_packed != nullptr);
+        graph.dense_output = ggml_view_3d(
+            graph.ctx, graph.dense_packed, spec.head_dim, spec.heads,
+            total_tokens(spec), graph.dense_packed->nb[1],
+            graph.dense_packed->nb[2], 0);
+        graph.dense_lse = ggml_view_3d(
+            graph.ctx, graph.dense_packed, 1, spec.heads,
+            total_tokens(spec), graph.dense_packed->nb[1],
+            graph.dense_packed->nb[2],
+            size_t(spec.head_dim) * graph.dense_packed->nb[0]);
+        graph.sparse_output = ggml_view_3d(
+            graph.ctx, graph.sparse_packed, spec.head_dim, spec.heads,
+            total_tokens(spec), graph.sparse_packed->nb[1],
+            graph.sparse_packed->nb[2], 0);
+        graph.sparse_lse = ggml_view_3d(
+            graph.ctx, graph.sparse_packed, 1, spec.heads,
+            total_tokens(spec), graph.sparse_packed->nb[1],
+            graph.sparse_packed->nb[2],
+            size_t(spec.head_dim) * graph.sparse_packed->nb[0]);
+        ggml_set_name(graph.dense_output, "htp_fused_anchor_dense_output");
+        ggml_set_name(graph.dense_lse, "htp_fused_anchor_dense_lse");
+        ggml_set_name(graph.sparse_output, "htp_fused_anchor_sparse_output");
+        ggml_set_name(graph.sparse_lse, "htp_fused_anchor_sparse_lse");
+        return;
+    }
 
     const int tokens = total_tokens(spec);
     const int blocks = (tokens + kBlock - 1) / kBlock;
@@ -478,12 +552,15 @@ std::vector<int32_t> make_block_index(const CaseSpec & spec) {
     return index;
 }
 
-std::vector<float> reference_attention(const CaseSpec & spec, const Reference & ref,
-                                       const std::vector<int32_t> * index) {
+AttentionReference reference_attention_with_lse(
+    const CaseSpec & spec, const Reference & ref,
+    const std::vector<int32_t> * index) {
     const int tokens = total_tokens(spec);
     const int hidden = spec.heads * spec.head_dim;
     const int blocks = (tokens + kBlock - 1) / kBlock;
-    std::vector<float> result(size_t(tokens) * spec.heads * spec.head_dim);
+    AttentionReference result;
+    result.output.resize(size_t(tokens) * spec.heads * spec.head_dim);
+    result.lse.resize(size_t(tokens) * spec.heads);
     std::vector<int> keys;
     keys.reserve(tokens);
     for (int qt = 0; qt < tokens; ++qt) {
@@ -513,6 +590,8 @@ std::vector<float> reference_attention(const CaseSpec & spec, const Reference & 
             }
             float denom = 0.0f;
             for (float score : scores) denom += std::exp(score - max_score);
+            result.lse[size_t(qt) * spec.heads + h] =
+                max_score + std::log(denom);
             const size_t base = (size_t(qt) * spec.heads + h) * spec.head_dim;
             for (int d = 0; d < spec.head_dim; ++d) {
                 float value = 0.0f;
@@ -520,11 +599,16 @@ std::vector<float> reference_attention(const CaseSpec & spec, const Reference & 
                     value += std::exp(scores[i] - max_score) *
                              ggml_fp16_to_fp32(ref.v[size_t(keys[i]) * hidden + h * spec.head_dim + d]);
                 }
-                result[base + d] = value / denom;
+                result.output[base + d] = value / denom;
             }
         }
     }
     return result;
+}
+
+std::vector<float> reference_attention(const CaseSpec & spec, const Reference & ref,
+                                       const std::vector<int32_t> * index) {
+    return reference_attention_with_lse(spec, ref, index).output;
 }
 
 Graph build_graph(const CaseSpec & spec, Route route, ggml_backend_t backend) {
@@ -533,7 +617,7 @@ Graph build_graph(const CaseSpec & spec, Route route, ggml_backend_t backend) {
     const ggml_init_params params = {128 * 1024 * 1024, nullptr, true};
     graph.ctx = ggml_init(params);
     GGML_ASSERT(graph.ctx != nullptr);
-    if (spec.dense_inference) {
+    if (spec.dense_inference || route == Route::FusedAnchor) {
         graph.built_in_one = ggml_new_tensor_1d(graph.ctx, GGML_TYPE_F32, 1);
         ggml_set_name(graph.built_in_one, "ggml_runner_build_in_tensor:one");
     }
@@ -546,6 +630,8 @@ Graph build_graph(const CaseSpec & spec, Route route, ggml_backend_t backend) {
     graph.graph = ggml_new_graph_custom(graph.ctx, 512, false);
     GGML_ASSERT(graph.graph != nullptr);
     ggml_build_forward_expand(graph.graph, graph.output);
+    if (graph.rho != nullptr) ggml_build_forward_expand(graph.graph, graph.rho);
+    if (graph.residual != nullptr) ggml_build_forward_expand(graph.graph, graph.residual);
     return graph;
 }
 
@@ -602,6 +688,7 @@ bool graph_contract(const Graph & graph, const CaseSpec & spec) {
     int attention_nodes = 0;
     int projection_nodes = 0;
     int packed_nodes = 0;
+    int fused_nodes = 0;
     bool has_activation = false;
     for (int i = 0; i < ggml_graph_n_nodes(graph.graph); ++i) {
         const ggml_tensor * node = ggml_graph_node(graph.graph, i);
@@ -616,6 +703,10 @@ bool graph_contract(const Graph & graph, const CaseSpec & spec) {
             std::strncmp(node->name, "qkv_mul_rms_packed", std::strlen("qkv_mul_rms_packed")) == 0) {
             ++packed_nodes;
         }
+        if (node->op == GGML_OP_CUSTOM &&
+            std::strcmp(node->name, "htp_fused_anchor_attention") == 0) {
+            ++fused_nodes;
+        }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             const ggml_tensor * src = node->src[j];
             if (src != nullptr && std::strncmp(src->name, "attention_input_x_", 18) == 0) {
@@ -623,7 +714,80 @@ bool graph_contract(const Graph & graph, const CaseSpec & spec) {
             }
         }
     }
-    if (attention_nodes != 1 || !has_activation) return false;
+    if (!has_activation) return false;
+    if (graph.route == Route::FusedAnchor) {
+        if (attention_nodes != 0 || fused_nodes != 1 || packed_nodes != 0 ||
+            graph.fused_storage == nullptr || graph.dense_packed == nullptr ||
+            graph.sparse_packed == nullptr || graph.dense_output == nullptr ||
+            graph.dense_lse == nullptr || graph.sparse_output == nullptr ||
+            graph.sparse_lse == nullptr || graph.rho == nullptr ||
+            graph.residual == nullptr) {
+            return false;
+        }
+        const ggml_tensor * fused_q = graph.fused_storage->src[0];
+        const ggml_tensor * fused_k = graph.fused_storage->src[1];
+        const ggml_tensor * fused_v = graph.fused_storage->src[2];
+        const int tokens = total_tokens(spec);
+        const size_t q_element = sizeof(float);
+        const size_t kv_element = sizeof(ggml_fp16_t);
+        if (fused_q == nullptr || fused_k == nullptr || fused_v == nullptr ||
+            fused_q->type != GGML_TYPE_F32 || fused_k->type != GGML_TYPE_F16 ||
+            fused_v->type != GGML_TYPE_F16 ||
+            fused_q->ne[0] != spec.head_dim || fused_q->ne[1] != tokens ||
+            fused_q->ne[2] != spec.heads || fused_q->ne[3] != 1 ||
+            fused_k->ne[0] != spec.head_dim || fused_k->ne[1] != tokens ||
+            fused_k->ne[2] != spec.heads || fused_k->ne[3] != 1 ||
+            fused_v->ne[0] != spec.head_dim || fused_v->ne[1] != spec.heads ||
+            fused_v->ne[2] != tokens || fused_v->ne[3] != 1 ||
+            fused_q->nb[0] != q_element ||
+            fused_q->nb[1] != size_t(spec.heads * spec.head_dim) * q_element ||
+            fused_q->nb[2] != size_t(spec.head_dim) * q_element ||
+            fused_k->nb[0] != kv_element ||
+            fused_k->nb[1] != size_t(spec.heads * spec.head_dim) * kv_element ||
+            fused_k->nb[2] != size_t(spec.head_dim) * kv_element ||
+            fused_v->nb[0] != kv_element ||
+            fused_v->nb[1] != size_t(spec.head_dim) * kv_element ||
+            fused_v->nb[2] != size_t(spec.heads * spec.head_dim) * kv_element) {
+            return false;
+        }
+        const size_t slab_bytes = size_t(total_tokens(spec)) * spec.heads *
+                                  size_t(spec.head_dim + 1) * sizeof(float);
+        if (graph.dense_packed->view_src != graph.fused_storage ||
+            graph.sparse_packed->view_src != graph.fused_storage ||
+            graph.dense_packed->view_offs != 0 ||
+            graph.sparse_packed->view_offs != slab_bytes ||
+            ggml_nbytes(graph.dense_packed) != slab_bytes ||
+            ggml_nbytes(graph.sparse_packed) != slab_bytes ||
+            graph.rho->src[0] != graph.dense_packed || graph.rho->src[1] != graph.sparse_packed ||
+            graph.residual->src[0] != graph.dense_packed ||
+            graph.residual->src[1] != graph.sparse_packed || graph.residual->src[2] != graph.rho) {
+            return false;
+        }
+        // ggml collapses nested views to the base allocation and stores an
+        // absolute offset, so the O/LSE views point directly at fused_storage.
+        if (graph.dense_output->view_src != graph.fused_storage ||
+            graph.dense_lse->view_src != graph.fused_storage ||
+            graph.sparse_output->view_src != graph.fused_storage ||
+            graph.sparse_lse->view_src != graph.fused_storage ||
+            graph.dense_output->view_offs != 0 ||
+            graph.dense_lse->view_offs != size_t(spec.head_dim) * sizeof(float) ||
+            graph.sparse_output->view_offs != slab_bytes ||
+            graph.sparse_lse->view_offs !=
+                slab_bytes + size_t(spec.head_dim) * sizeof(float)) {
+            return false;
+        }
+        for (int source = 0; source < 3; ++source) {
+            for (const ggml_tensor * tensor = graph.fused_storage->src[source];
+                 tensor != nullptr; tensor = tensor->view_src) {
+                if (std::strncmp(tensor->name, "qkv_mul_rms_packed",
+                                 std::strlen("qkv_mul_rms_packed")) == 0) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    if (attention_nodes != 1) return false;
     if (spec.external_inference &&
         (graph.mask != nullptr || graph.activations.size() != 1 || projection_nodes != 1)) {
         return false;
@@ -651,13 +815,106 @@ int run_fixture_contract_test() {
     Graph external = build_graph(spec, Route::ExternalSparseL2);
     Graph chunk = build_graph(spec, Route::ExternalSparseChunk);
     Graph packed = build_graph(spec, Route::PackedSparse);
+    Graph fused = build_graph(spec, Route::FusedAnchor);
+    CaseSpec mixed_v_spec = kCases[6];
+    mixed_v_spec.head_major_v_input = true;
+    Graph mixed_v_fused = build_graph(mixed_v_spec, Route::FusedAnchor);
+    CaseSpec head_major_spec = kCases[4];
+    head_major_spec.head_major_qkv_input = true;
+    Graph head_major_fused = build_graph(head_major_spec, Route::FusedAnchor);
     const bool ok = graph_contract(dense, spec) && graph_contract(external, spec) &&
-                    graph_contract(chunk, spec) && graph_contract(packed, spec);
+                    graph_contract(chunk, spec) && graph_contract(packed, spec) &&
+                    graph_contract(fused, spec) &&
+                    graph_contract(mixed_v_fused, mixed_v_spec) &&
+                    graph_contract(head_major_fused, head_major_spec);
     free_graph(dense);
     free_graph(external);
     free_graph(chunk);
     free_graph(packed);
+    free_graph(fused);
+    free_graph(mixed_v_fused);
+    free_graph(head_major_fused);
     return ok ? 0 : 1;
+}
+
+int run_hybrid_placement_contract_test(ggml_backend_t htp) {
+    class PlacementRunner final : public GGMLRunner {
+    public:
+        PlacementRunner(ggml_backend_t runtime, ggml_backend_t params)
+            : GGMLRunner(runtime, params) {}
+
+        std::string get_desc() override { return "htp-placement-test"; }
+
+        void plan(ggml_cgraph * graph,
+                  std::vector<int> * node_ids,
+                  std::vector<int> * leaf_ids) {
+            plan_compute_buffer_ids(graph, node_ids, leaf_ids);
+        }
+    };
+
+    auto root_of = [](ggml_tensor * tensor) {
+        while (tensor != nullptr && tensor->view_src != nullptr) {
+            tensor = tensor->view_src;
+        }
+        return tensor;
+    };
+    auto planned_id = [](const Graph & graph,
+                         ggml_tensor * tensor,
+                         const std::vector<int> & node_ids,
+                         const std::vector<int> & leaf_ids) {
+        for (int i = 0; i < ggml_graph_n_nodes(graph.graph); ++i) {
+            if (ggml_graph_node(graph.graph, i) == tensor) return node_ids[i];
+        }
+        for (int i = 0; i < sd::ggml_graph_cut::leaf_count(graph.graph); ++i) {
+            if (sd::ggml_graph_cut::leaf_tensor(graph.graph, i) == tensor) return leaf_ids[i];
+        }
+        return -1;
+    };
+    auto check_route = [&](Route route, const char * route_name, int expected_sources) {
+        const CaseSpec spec = make_inference_case(kImageSizes[0], kCases[0], route);
+        ggml_backend_t cpu = ggml_backend_cpu_init();
+        if (cpu == nullptr) return false;
+        bool pass = false;
+        {
+            Graph graph = build_graph(spec, route, cpu);
+            PlacementRunner runner(cpu, cpu);
+            runner.set_htp_backend(htp);
+            runner.set_htp_attention_enabled(true);
+            std::vector<int> node_ids;
+            std::vector<int> leaf_ids;
+            runner.plan(graph.graph, &node_ids, &leaf_ids);
+
+            ggml_tensor * attention = nullptr;
+            for (int i = 0; i < ggml_graph_n_nodes(graph.graph); ++i) {
+                ggml_tensor * node = ggml_graph_node(graph.graph, i);
+                if ((route == Route::Dense && node->op == GGML_OP_FLASH_ATTN_EXT) ||
+                    (route == Route::FusedAnchor && node->op == GGML_OP_CUSTOM &&
+                     std::strcmp(node->name, "htp_fused_anchor_attention") == 0)) {
+                    attention = node;
+                    break;
+                }
+            }
+
+            pass = attention != nullptr &&
+                   planned_id(graph, attention, node_ids, leaf_ids) == 1;
+            for (int source = 0; source < expected_sources && attention != nullptr; ++source) {
+                ggml_tensor * root = root_of(attention->src[source]);
+                const int id = planned_id(graph, root, node_ids, leaf_ids);
+                std::printf("placement route=%s src=%d root=%s buffer_id=%d\n",
+                            route_name, source,
+                            root != nullptr && root->name[0] != '\0' ? root->name : "<unnamed>", id);
+                pass = pass && id == 1;
+            }
+            free_graph(graph);
+        }
+        ggml_backend_free(cpu);
+        std::printf("[%s] hybrid placement route=%s\n", pass ? "PASS" : "FAIL", route_name);
+        return pass;
+    };
+
+    const bool dense_ok = check_route(Route::Dense, "dense", 4);
+    const bool fused_ok = check_route(Route::FusedAnchor, "fused-anchor", 5);
+    return dense_ok && fused_ok ? 0 : 1;
 }
 
 } // namespace htp_attention_common

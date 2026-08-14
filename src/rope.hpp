@@ -791,7 +791,9 @@ namespace Rope {
                                                   bool rope_interleaved     = true,
                                                   bool block_sparse_attn    = false,
                                                   int protected_start       = 0,
-                                                  int protected_len         = 0) {
+                                                  int protected_len         = 0,
+                                                  const sd_htp_residual_binding* residual_binding = nullptr,
+                                                  bool block_sparse_force_full_keep = false) {
         // q,k,v: [N, L, n_head, d_head]
         // pe: [L, d_head/2, 2, 2]
         // return: [N, L, n_head*d_head]
@@ -813,13 +815,18 @@ namespace Rope {
                                         ctx->block_sparse_residual_scale,
                                         ctx->block_sparse_residual_rho,
                                         ctx->block_sparse_residual_exact_rho,
-                                        nullptr,  // residual_cache_name
-                                        nullptr,  // cached_residual
-                                        nullptr,  // rho_cache_name
-                                        nullptr,  // cached_rho
-                                        nullptr,  // cache_tensor callback
+                                        residual_binding != nullptr && !residual_binding->residual_key.empty()
+                                            ? residual_binding->residual_key.c_str()
+                                            : nullptr,
+                                        residual_binding != nullptr ? residual_binding->cached_residual : nullptr,
+                                        residual_binding != nullptr && !residual_binding->rho_key.empty()
+                                            ? residual_binding->rho_key.c_str()
+                                            : nullptr,
+                                        residual_binding != nullptr ? residual_binding->cached_rho : nullptr,
+                                        residual_binding != nullptr ? &ctx->cache_tensor : nullptr,
                                         ctx->block_sparse_token_h,
-                                        ctx->block_sparse_token_w);
+                                        ctx->block_sparse_token_w,
+                                        block_sparse_force_full_keep);
         return x;
     }
 };  // namespace Rope

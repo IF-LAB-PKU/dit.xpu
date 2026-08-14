@@ -39,6 +39,8 @@ struct CaseSpec {
     bool dense_inference = false;
     bool external_inference = false;
     bool packed_inference = false;
+    bool head_major_v_input = false;
+    bool head_major_qkv_input = false;
 };
 
 enum class Route {
@@ -47,6 +49,7 @@ enum class Route {
     ExternalSparseBaseline,
     ExternalSparseChunk,
     PackedSparse,
+    FusedAnchor,
 };
 
 struct BranchData {
@@ -65,6 +68,11 @@ struct Reference {
     std::vector<ggml_fp16_t> v;
 };
 
+struct AttentionReference {
+    std::vector<float> output;
+    std::vector<float> lse;
+};
+
 struct InputData {
     std::vector<BranchData> branches;
     std::vector<float> rope;
@@ -81,6 +89,15 @@ struct Graph {
     ggml_tensor * debug_v = nullptr;
     ggml_tensor * mask = nullptr;
     ggml_tensor * packed_storage = nullptr;
+    ggml_tensor * fused_storage = nullptr;
+    ggml_tensor * dense_packed = nullptr;
+    ggml_tensor * sparse_packed = nullptr;
+    ggml_tensor * dense_output = nullptr;
+    ggml_tensor * dense_lse = nullptr;
+    ggml_tensor * sparse_output = nullptr;
+    ggml_tensor * sparse_lse = nullptr;
+    ggml_tensor * rho = nullptr;
+    ggml_tensor * residual = nullptr;
     ggml_tensor * rope = nullptr;
     ggml_tensor * built_in_one = nullptr;
     std::vector<ggml_tensor *> activations;
@@ -105,6 +122,9 @@ void append_reference_branch(const CaseSpec & spec, const BranchData & branch,
 std::vector<int32_t> make_block_index(const CaseSpec & spec);
 std::vector<float> reference_attention(const CaseSpec & spec, const Reference & ref,
                                        const std::vector<int32_t> * index);
+AttentionReference reference_attention_with_lse(
+    const CaseSpec & spec, const Reference & ref,
+    const std::vector<int32_t> * index);
 
 Graph build_graph(const CaseSpec & spec, Route route, ggml_backend_t backend = nullptr);
 bool upload_graph(Graph & graph, const InputData & data, ggml_backend_t backend);
@@ -113,5 +133,6 @@ void free_graph(Graph & graph);
 
 // Host-only RED/GREEN contract test used during fixture migration.
 int run_fixture_contract_test();
+int run_hybrid_placement_contract_test(ggml_backend_t htp);
 
 } // namespace htp_attention_common

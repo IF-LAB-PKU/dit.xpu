@@ -54,6 +54,7 @@ enum HtpOpsIndex {
   HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_W16A32,
   HTP_OPS_QKV_MUL_RMS_PACKED_ROPE_W16A32,
   HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_ROPE_W16A32,
+  HTP_OPS_FUSED_ANCHOR_ATTN_QO_F32_KV_F16,
   HTP_OPS_COUNT,
 };
 
@@ -191,6 +192,35 @@ struct FlashAttnParams {
     int32_t with_lse;
     int32_t elapsed_us;
 } __attribute__((packed));
+
+struct FusedAnchorAttnParams {
+    struct RpcmemBufAddr output;
+    struct RpcmemBufAddr q;
+    struct RpcmemBufAddr k;
+    struct RpcmemBufAddr v;
+    struct RpcmemBufAddr dense_mask;
+    struct RpcmemBufAddr block_mask;
+    int32_t qo_len;
+    int32_t kv_len;
+    int32_t n_heads;
+    int32_t n_kv_heads;
+    int32_t head_dim;
+    int32_t block_q;
+    int32_t block_k;
+    int32_t n_q_blocks;
+    int32_t n_k_blocks;
+    int32_t max_kept_blocks;
+    int32_t mask_format;
+    int32_t sparse_policy;
+    int32_t image_tokens;
+    int32_t text_tokens;
+    int32_t image_block_rows;
+    int32_t image_block_cols;
+    int32_t elapsed_us;
+} __attribute__((packed));
+
+static_assert(offsetof(FusedAnchorAttnParams, elapsed_us) == 112);
+static_assert(sizeof(FusedAnchorAttnParams) == 116);
 
 struct BlockSparseAttnParams {
     struct RpcmemBufAddr o;

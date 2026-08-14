@@ -1,5 +1,6 @@
 #include "ggml-backend.h"
 #include "ggml-htp.h"
+#include "ggml-opencl-htp.h"
 #include "ggml.h"
 #include "ggml_extend.hpp"
 
@@ -57,6 +58,8 @@ bool cache_expands_persisted_tensor() {
 }
 
 bool opencl_residual_route_requires_all_prerequisites() {
+    unsetenv("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR");
+    unsetenv("SD_HTP_SPARSE_OPENCL_RESIDUAL");
     unsetenv("SD_HTP_SPARSE_OPENCL");
     unsetenv("SD_HTP_SPARSE_OPENCL_ASYNC");
     unsetenv("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT");
@@ -76,6 +79,19 @@ bool opencl_residual_route_requires_all_prerequisites() {
 
     setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO", "1", 1);
     return sd_htp_opencl_residual_route_prerequisites();
+}
+
+bool fused_residual_only_route_avoids_sparse_async_prerequisites() {
+    setenv("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR", "1", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE", "1", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL", "0", 1);
+    unsetenv("SD_HTP_SPARSE_OPENCL_ASYNC");
+    unsetenv("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT");
+    unsetenv("SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD");
+    return sd_htp_opencl_residual_route_prerequisites() &&
+           !sd_htp_opencl_residual_route_has_deferred_job();
 }
 
 bool cache_storage_updates_avoid_rebuilding_disjoint_branches() {
@@ -251,11 +267,13 @@ int run_graph_order_test() {
                "cache expansion must use the tensor returned by persistence") ||
         !check(opencl_residual_route_requires_all_prerequisites(),
                "OpenCL residual route must require every prerequisite") ||
+        !check(fused_residual_only_route_avoids_sparse_async_prerequisites(),
+               "fused residual-only route must not require sparse async submission") ||
         !check(cache_storage_updates_avoid_rebuilding_disjoint_branches(),
                "disjoint branch caches must append without rebuilding old cache storage") ||
         !check(sd_htp_release_compute_buffer_after_residual_anchor(
                    SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR, false),
-               "CPU residual anchor must release its compute arena") ||
+               "synchronous residual anchor must release its compute arena") ||
         !check(!sd_htp_release_compute_buffer_after_residual_anchor(
                     SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR, true),
                "OpenCL residual anchor must preserve deferred arena ownership") ||
@@ -385,9 +403,247 @@ int run_lifecycle_test() {
     return 0;
 }
 
+void residual_only_noop(ggml_tensor *, int, int, void *) {}
+
+int run_residual_only_test() {
+    constexpr int64_t head_dim = 16;
+    constexpr int64_t heads = 2;
+    constexpr int64_t tokens = 4;
+    constexpr int64_t rows = heads * tokens;
+    constexpr int64_t packed_dim = head_dim + 1;
+    constexpr size_t slab_elements = size_t(rows * packed_dim);
+    constexpr uint64_t generation = 1;
+    const char * residual_key = "htp_block_sparse_residual_b0_residual_only";
+    const char * rho_key = "htp_block_sparse_residual_rho_b0_residual_only";
+
+    setenv("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR", "1", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE", "1", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL", "0", 1);
+    unsetenv("SD_HTP_SPARSE_OPENCL_ASYNC");
+    unsetenv("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT");
+    unsetenv("SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD");
+
+    if (!ggml_backend_htp_runtime_available()) {
+        std::fprintf(stderr, "SKIP: HTP runtime unavailable: %s\n",
+                     ggml_backend_htp_runtime_error());
+        return k_skip;
+    }
+    ggml_backend_t backend = ggml_backend_htp_init();
+    if (backend == nullptr) {
+        std::fprintf(stderr, "SKIP: HTP backend initialization failed: %s\n",
+                     ggml_backend_htp_runtime_error());
+        return k_skip;
+    }
+
+    ggml_init_params params = {2 * 1024 * 1024, nullptr, true};
+    ggml_context * ctx = ggml_init(params);
+    ggml_backend_buffer_t fused_buffer = nullptr;
+    ggml_opencl_htp_sidecar * sidecar = nullptr;
+    ggml_opencl_htp_graph * prepared = nullptr;
+    ggml_backend_htp_async_cache_slot * residual_slot = nullptr;
+    ggml_backend_htp_async_cache_slot * rho_slot = nullptr;
+    bool residual_imported = false;
+    bool rho_imported = false;
+    int result = 1;
+    char reason[1024] = {};
+
+    do {
+        if (!check(ctx != nullptr, "failed to create residual-only graph context")) break;
+        ggml_tensor * fused = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_F32, 2 * slab_elements);
+        fused->op = GGML_OP_CUSTOM;
+        ggml_set_name(fused, "htp_fused_anchor_attention");
+        const size_t row_bytes = size_t(packed_dim) * sizeof(float);
+        const size_t token_bytes = size_t(heads) * row_bytes;
+        const size_t slab_bytes = size_t(tokens) * token_bytes;
+        ggml_tensor * dense = ggml_view_4d(
+            ctx, fused, packed_dim, heads, tokens, 1,
+            row_bytes, token_bytes, slab_bytes, 0);
+        ggml_tensor * sparse = ggml_view_4d(
+            ctx, fused, packed_dim, heads, tokens, 1,
+            row_bytes, token_bytes, slab_bytes, slab_bytes);
+        ggml_set_name(dense, "htp_fused_anchor_dense_o_lse");
+        ggml_set_name(sparse, "htp_fused_anchor_sparse_o_lse");
+
+        fused_buffer = ggml_backend_alloc_ctx_tensors_from_buft(
+            ctx, ggml_backend_get_default_buffer_type(backend));
+        if (!check(fused_buffer != nullptr, "failed to allocate fused RPCMEM backing")) break;
+
+        std::vector<float> fused_data(2 * slab_elements);
+        std::vector<float> rho_reference(rows);
+        std::vector<float> residual_reference(size_t(rows * head_dim));
+        for (int64_t row = 0; row < rows; ++row) {
+            const float dense_lse = 1.0f + 0.03f * float(row);
+            const float sparse_lse = dense_lse - 0.15f - 0.01f * float(row);
+            const float rho = std::exp(sparse_lse - dense_lse);
+            rho_reference[row] = rho;
+            for (int64_t d = 0; d < head_dim; ++d) {
+                const float dense_o = 0.25f + 0.01f * float(row) + 0.002f * float(d);
+                const float sparse_o = -0.10f + 0.005f * float(row) - 0.001f * float(d);
+                fused_data[size_t(row * packed_dim + d)] = dense_o;
+                fused_data[slab_elements + size_t(row * packed_dim + d)] = sparse_o;
+                residual_reference[size_t(row * head_dim + d)] = dense_o - rho * sparse_o;
+            }
+            fused_data[size_t(row * packed_dim + head_dim)] = dense_lse;
+            fused_data[slab_elements + size_t(row * packed_dim + head_dim)] = sparse_lse;
+        }
+        ggml_backend_tensor_set(fused, fused_data.data(), 0,
+                                fused_data.size() * sizeof(float));
+
+        const int64_t residual_ne[GGML_MAX_DIMS] = {head_dim, heads, tokens, 1};
+        const int64_t rho_ne[GGML_MAX_DIMS] = {1, heads, tokens, 1};
+        residual_slot = ggml_backend_htp_async_cache_slot_create(
+            backend, residual_key, generation, GGML_TYPE_F16,
+            residual_ne, reason, sizeof(reason));
+        rho_slot = ggml_backend_htp_async_cache_slot_create(
+            backend, rho_key, generation, GGML_TYPE_F32,
+            rho_ne, reason, sizeof(reason));
+        if (!check(residual_slot != nullptr && rho_slot != nullptr,
+                   "failed to create residual-only cache slots")) break;
+        ggml_tensor * residual =
+            ggml_backend_htp_async_cache_slot_tensor(residual_slot);
+        ggml_tensor * rho = ggml_backend_htp_async_cache_slot_tensor(rho_slot);
+        residual->op = GGML_OP_CUSTOM;
+        residual->src[0] = dense;
+        residual->src[1] = sparse;
+        residual->src[2] = rho;
+        rho->op = GGML_OP_CUSTOM;
+        rho->src[0] = dense;
+        rho->src[1] = sparse;
+
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
+        ggml_build_forward_expand(graph, rho);
+        ggml_build_forward_expand(graph, residual);
+
+        ggml_opencl_qcom_requirements requirements = {};
+        sidecar = ggml_backend_opencl_htp_sidecar_create(
+            &requirements, reason, sizeof(reason));
+        if (sidecar == nullptr) {
+            std::fprintf(stderr, "SKIP: residual-only sidecar unavailable: %s\n", reason);
+            result = k_skip;
+            break;
+        }
+
+        ggml_backend_htp_rpcmem_info fused_info = {};
+        ggml_backend_htp_rpcmem_info residual_info = {};
+        ggml_backend_htp_rpcmem_info rho_info = {};
+        if (!check(ggml_backend_htp_get_rpcmem_info(fused->buffer, &fused_info) &&
+                   ggml_backend_htp_async_cache_slot_rpcmem_info(residual_slot, &residual_info) &&
+                   ggml_backend_htp_async_cache_slot_rpcmem_info(rho_slot, &rho_info),
+                   "failed to query residual-only RPCMEM descriptors")) break;
+        ggml_opencl_htp_import_descriptor descriptors[] = {
+            {fused->buffer, fused_info.base, fused_info.fd,
+             fused_info.logical_size, fused_info.allocation_size},
+            {residual->buffer, residual_info.base, residual_info.fd,
+             residual_info.logical_size, residual_info.allocation_size},
+            {rho->buffer, rho_info.base, rho_info.fd,
+             rho_info.logical_size, rho_info.allocation_size},
+        };
+        uint64_t import_identity = 0;
+        if (!check(ggml_backend_opencl_htp_persistent_import_acquire(
+                       sidecar, &descriptors[1], residual_key, generation,
+                       &import_identity, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK,
+                   "failed to import residual cache backing")) break;
+        residual_imported = true;
+        if (!check(ggml_backend_opencl_htp_persistent_import_acquire(
+                       sidecar, &descriptors[2], rho_key, generation,
+                       &import_identity, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK,
+                   "failed to import rho cache backing")) break;
+        rho_imported = true;
+
+        if (!check(ggml_backend_opencl_htp_graph_preflight(
+                       sidecar, graph, descriptors, 3, &prepared,
+                       reason, sizeof(reason)) == GGML_OPENCL_HTP_OK,
+                   reason)) break;
+        if (!check(!ggml_backend_opencl_htp_graph_routes_node(prepared, fused) &&
+                   ggml_backend_opencl_htp_graph_routes_node(prepared, rho) &&
+                   ggml_backend_opencl_htp_graph_routes_node(prepared, residual) &&
+                   ggml_backend_opencl_htp_graph_routed_node_count(prepared) == 2,
+                   "residual-only preflight must route one pair and zero sparse nodes")) break;
+        if (!check(ggml_backend_opencl_htp_graph_compute_exact_rho_residual_sync(
+                       prepared, rho, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK,
+                   reason)) break;
+
+        std::vector<float> rho_output(rows);
+        std::vector<ggml_fp16_t> residual_output(size_t(rows * head_dim));
+        ggml_backend_tensor_get(rho, rho_output.data(), 0,
+                                rho_output.size() * sizeof(float));
+        ggml_backend_tensor_get(residual, residual_output.data(), 0,
+                                residual_output.size() * sizeof(ggml_fp16_t));
+        float rho_max_abs = 0.0f;
+        float residual_max_abs = 0.0f;
+        double residual_mse = 0.0;
+        bool finite = true;
+        for (int64_t row = 0; row < rows; ++row) {
+            finite = finite && std::isfinite(rho_output[row]);
+            rho_max_abs = std::max(rho_max_abs,
+                                   std::fabs(rho_output[row] - rho_reference[row]));
+        }
+        for (size_t i = 0; i < residual_output.size(); ++i) {
+            const float value = ggml_fp16_to_fp32(residual_output[i]);
+            const float error = value - residual_reference[i];
+            finite = finite && std::isfinite(value);
+            residual_max_abs = std::max(residual_max_abs, std::fabs(error));
+            residual_mse += double(error) * error;
+        }
+        const float residual_rmse =
+            std::sqrt(float(residual_mse / residual_output.size()));
+        std::printf("residual-only sparse=0 residual=1 rho_max_abs=%.9g "
+                    "residual_max_abs=%.9g residual_rmse=%.9g\n",
+                    rho_max_abs, residual_max_abs, residual_rmse);
+        if (!check(finite, "residual-only output contains NaN or Inf") ||
+            !check(rho_max_abs <= 2e-3f, "residual-only rho exceeds tolerance") ||
+            !check(residual_max_abs <= 5e-3f,
+                   "residual-only FP16 max_abs exceeds tolerance") ||
+            !check(residual_rmse <= 1e-3f,
+                   "residual-only FP16 RMSE exceeds tolerance")) break;
+        result = 0;
+    } while (false);
+
+    if (prepared != nullptr) {
+        char finish_reason[512] = {};
+        ggml_backend_opencl_htp_graph_finish(
+            prepared, finish_reason, sizeof(finish_reason));
+        ggml_backend_opencl_htp_graph_free(&prepared);
+    }
+    if (rho_imported) {
+        ggml_backend_opencl_htp_persistent_import_release(
+            sidecar, rho_key, generation, reason, sizeof(reason));
+    }
+    if (residual_imported) {
+        ggml_backend_opencl_htp_persistent_import_release(
+            sidecar, residual_key, generation, reason, sizeof(reason));
+    }
+    if (sidecar != nullptr) {
+        const size_t imports =
+            ggml_backend_opencl_htp_sidecar_live_persistent_import_count(sidecar);
+        const size_t events =
+            ggml_backend_opencl_htp_sidecar_live_cache_event_count(sidecar);
+        if (result == 0 && (!check(imports == 0, "residual-only imports leaked") ||
+                            !check(events == 0, "residual-only events leaked"))) {
+            result = 1;
+        }
+        ggml_backend_opencl_htp_sidecar_free(sidecar);
+    }
+    ggml_backend_htp_async_cache_slot_free(rho_slot);
+    ggml_backend_htp_async_cache_slot_free(residual_slot);
+    if (fused_buffer != nullptr) ggml_backend_buffer_free(fused_buffer);
+    if (ctx != nullptr) ggml_free(ctx);
+    ggml_backend_free(backend);
+    if (result == 0) std::puts("PASS residual-only");
+    return result;
+}
+
 #else
 
 int run_lifecycle_test() {
+    std::puts("SKIP: test was built without HTP support");
+    return k_skip;
+}
+
+int run_residual_only_test() {
     std::puts("SKIP: test was built without HTP support");
     return k_skip;
 }
@@ -406,6 +662,9 @@ int main() {
     }
     if (std::strcmp(mode, "graph-order") == 0) {
         return run_graph_order_test();
+    }
+    if (std::strcmp(mode, "residual-only") == 0) {
+        return run_residual_only_test();
     }
     std::fprintf(stderr, "unknown HTP_RESIDUAL_CACHE_TEST mode: %s\n", mode);
     return 2;

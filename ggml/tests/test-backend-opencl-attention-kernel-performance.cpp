@@ -27,6 +27,11 @@ enum class Route {
     Sparse,
 };
 
+enum class VLayout {
+    TokenHead,
+    HeadToken,
+};
+
 struct TimingStats {
     double min_us = 0.0;
     double median_us = 0.0;
@@ -180,6 +185,10 @@ static const char * route_name(Route route) {
     return route == Route::Dense ? "opencl-dense" : "opencl-sparse";
 }
 
+static const char * v_layout_name(VLayout layout) {
+    return layout == VLayout::TokenHead ? "D,L,H,B" : "D,H,L,B";
+}
+
 static bool selected_route(Route route) {
     const char * selected = std::getenv("OPENCL_ATTN_TEST_ROUTE");
     return selected == nullptr || selected[0] == '\0' ||
@@ -203,7 +212,8 @@ static void configure_sparse_route() {
 
 static AttentionGraph build_attention_graph(
     const htp_attention_common::CaseSpec & spec,
-    Route route) {
+    Route route,
+    VLayout v_layout) {
     AttentionGraph result;
     const ggml_init_params params = {64 * 1024 * 1024, nullptr, true};
     result.ctx = ggml_init(params);
@@ -220,7 +230,9 @@ static AttentionGraph build_attention_graph(
         result.ctx, GGML_TYPE_F16, spec.head_dim, spec.heads, tokens, 1);
     ggml_tensor * q = ggml_permute(result.ctx, result.q_storage, 0, 2, 1, 3);
     ggml_tensor * k = ggml_permute(result.ctx, result.k_storage, 0, 2, 1, 3);
-    ggml_tensor * v = ggml_permute(result.ctx, result.v_storage, 0, 2, 1, 3);
+    ggml_tensor * v = v_layout == VLayout::TokenHead
+                          ? ggml_permute(result.ctx, result.v_storage, 0, 2, 1, 3)
+                          : result.v_storage;
 
     if (route == Route::Dense) {
         const int padded_tokens = ((tokens + 63) / 64) * 64;
@@ -359,6 +371,7 @@ static bool run_route(
     const htp_attention_common::ImageSize & size,
     const htp_attention_common::CaseSpec & base,
     Route route,
+    VLayout v_layout,
     int warmups,
     int samples) {
     double initial_temperature = 0.0;
@@ -379,16 +392,17 @@ static bool run_route(
         setenv("SD_HTP_SPARSE_OPENCL", "0", 1);
     }
 
-    AttentionGraph graph = build_attention_graph(spec, route);
+    AttentionGraph graph = build_attention_graph(spec, route, v_layout);
     if (graph.ctx == nullptr || graph.graph == nullptr || graph.output == nullptr ||
         !upload_attention_graph(graph, spec, route, backend)) {
         std::fprintf(
             stderr,
-            "[FAIL] graph setup model=%s family=%s resolution=%d route=%s\n",
+            "[FAIL] graph setup model=%s family=%s resolution=%d route=%s v_layout=%s\n",
             spec.model,
             spec.family,
             spec.resolution,
-            route_name(route));
+            route_name(route),
+            v_layout_name(v_layout));
         free_attention_graph(graph);
         return false;
     }
@@ -446,9 +460,57 @@ static bool run_route(
     }
     ggml_backend_opencl_set_attention_profiling_enabled(false);
 
+    if (route == Route::Sparse) {
+        const htp_attention_common::InputData data =
+            htp_attention_common::make_input(spec);
+        htp_attention_common::Reference reference;
+        for (const htp_attention_common::BranchData & branch : data.branches) {
+            htp_attention_common::append_reference_branch(spec, branch, true, reference);
+        }
+        const htp_attention_common::AttentionReference expected =
+            htp_attention_common::reference_attention_with_lse(
+                spec, reference, &data.block_index);
+        std::vector<float> packed(ggml_nelements(graph.output));
+        ggml_backend_tensor_get(
+            graph.output, packed.data(), 0, packed.size() * sizeof(float));
+        double output_mse = 0.0;
+        double lse_mse = 0.0;
+        float output_max_abs = 0.0f;
+        float lse_max_abs = 0.0f;
+        const int rows = htp_attention_common::total_tokens(spec) * spec.heads;
+        for (int row = 0; row < rows; ++row) {
+            for (int d = 0; d < spec.head_dim; ++d) {
+                const float error =
+                    packed[size_t(row) * (spec.head_dim + 1) + d] -
+                    expected.output[size_t(row) * spec.head_dim + d];
+                output_max_abs = std::max(output_max_abs, std::fabs(error));
+                output_mse += double(error) * error;
+            }
+            const float lse_error =
+                packed[size_t(row) * (spec.head_dim + 1) + spec.head_dim] -
+                expected.lse[row];
+            lse_max_abs = std::max(lse_max_abs, std::fabs(lse_error));
+            lse_mse += double(lse_error) * lse_error;
+        }
+        const float output_rmse = std::sqrt(
+            float(output_mse / expected.output.size()));
+        const float lse_rmse = std::sqrt(float(lse_mse / expected.lse.size()));
+        if (output_max_abs > 5e-3f || output_rmse > 5e-3f ||
+            lse_max_abs > 5e-3f || lse_rmse > 5e-3f) {
+            std::fprintf(
+                stderr,
+                "[FAIL] sparse correctness model=%s resolution=%d v_layout=%s "
+                "output=(%.9g,%.9g) lse=(%.9g,%.9g)\n",
+                spec.model, spec.resolution, v_layout_name(v_layout),
+                output_max_abs, output_rmse, lse_max_abs, lse_rmse);
+            free_attention_graph(graph);
+            return false;
+        }
+    }
+
     const TimingStats stats = summarize(std::move(attention_elapsed));
     std::printf(
-        "[PERF] model=%s family=%s resolution=%d image_tokens=%d route=%s "
+        "[PERF] model=%s family=%s resolution=%d image_tokens=%d route=%s v_layout=%s "
         "temp_c=%.2f samples=%d opencl_attention_min_us=%.1f "
         "opencl_attention_median_us=%.1f opencl_attention_mean_us=%.1f "
         "opencl_attention_p95_us=%.1f opencl_attention_max_us=%.1f\n",
@@ -457,6 +519,7 @@ static bool run_route(
         spec.resolution,
         spec.image_tokens,
         route_name(route),
+        v_layout_name(v_layout),
         initial_temperature,
         samples,
         stats.min_us,
@@ -510,17 +573,25 @@ int main() {
 
             for (const Route route : {Route::Dense, Route::Sparse}) {
                 if (!selected_route(route)) continue;
-                ++expected;
-                measured += run_route(
-                    dense_backend,
-                    sparse_backend,
-                    size,
-                    spec,
-                    route,
-                    warmups,
-                    samples)
-                    ? 1
-                    : 0;
+                const VLayout layouts[] = {
+                    VLayout::TokenHead,
+                    VLayout::HeadToken,
+                };
+                const int layout_count = route == Route::Sparse ? 2 : 1;
+                for (int layout_index = 0; layout_index < layout_count; ++layout_index) {
+                    ++expected;
+                    measured += run_route(
+                        dense_backend,
+                        sparse_backend,
+                        size,
+                        spec,
+                        route,
+                        layouts[layout_index],
+                        warmups,
+                        samples)
+                        ? 1
+                        : 0;
+                }
             }
         }
     }
