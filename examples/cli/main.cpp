@@ -42,6 +42,7 @@ struct SDCliParams {
     bool canny_preprocess = false;
     bool convert_name     = false;
     bool htp_pack_dit     = false;
+    bool force_f16        = false;
 
     preview_t preview_method = PREVIEW_NONE;
     int preview_interval     = 1;
@@ -100,8 +101,12 @@ struct SDCliParams {
              true, &convert_name},
             {"",
              "--htp-pack-dit",
-             "convert standalone DIT weights to HTP packed W16A32 GGUF layout; HTP-only matmul fallback is forbidden",
+            "convert standalone DIT weights to HTP packed W16A32 GGUF layout; HTP-only matmul fallback is forbidden",
              true, &htp_pack_dit},
+            {"",
+             "--force-f16",
+             "convert every BF16 tensor to F16 (convert mode only)",
+             true, &force_f16},
             {"-v",
              "--verbose",
              "print extra info",
@@ -613,7 +618,8 @@ int main(int argc, const char* argv[]) {
                                ctx_params.wtype,
                                ctx_params.tensor_type_rules.c_str(),
                                cli_params.convert_name,
-                               cli_params.htp_pack_dit);
+                               cli_params.htp_pack_dit,
+                               cli_params.force_f16);
         if (!success) {
             LOG_ERROR("convert '%s'/'%s' to '%s' failed",
                       ctx_params.model_path.c_str(),

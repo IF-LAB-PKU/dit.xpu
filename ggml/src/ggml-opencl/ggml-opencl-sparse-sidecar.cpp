@@ -1,6 +1,7 @@
 #define CL_TARGET_OPENCL_VERSION GGML_OPENCL_TARGET_VERSION
 
 #include "ggml-opencl-htp.h"
+#include "ggml-opencl.h"
 #include "ggml-opencl-qcom.h"
 #include "ggml-impl.h"
 
@@ -193,6 +194,7 @@ struct ggml_opencl_htp_pending_event {
     cl_event event = nullptr;
     cl_mem staged_output = nullptr;
     ggml_opencl_htp_tensor_binding destination;
+    int64_t attention_begin_us = 0;
 };
 
 enum class ggml_opencl_htp_submission_state {
@@ -3508,6 +3510,19 @@ static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
         static_cast<size_t>(dispatch.heads) * static_cast<size_t>(dispatch.batch),
     };
     cl_event event = nullptr;
+    const bool profile_attention =
+        ggml_backend_opencl_attention_profiling_enabled();
+    if (profile_attention) {
+        const cl_int finish_err = clFinish(graph->sidecar->sparse_queue);
+        if (finish_err != CL_SUCCESS) {
+            return fail_runtime_graph(
+                graph, reason, reason_capacity,
+                "clFinish failed before sparse attention profiling (error %d)",
+                finish_err);
+        }
+    }
+    const int64_t attention_begin_us =
+        profile_attention ? ggml_time_us() : 0;
     std::atomic_thread_fence(std::memory_order_release);
     cl_int err = clEnqueueNDRangeKernel(
         graph->sidecar->sparse_queue, block_sparse_kernel,
@@ -3536,6 +3551,7 @@ static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
         pending_event.event = event;
         pending_event.staged_output = staging_guard.memory;
         pending_event.destination = bindings.output;
+        pending_event.attention_begin_us = attention_begin_us;
         graph->pending_events.push_back(pending_event);
         staging_guard.release();
     } catch (...) {
@@ -4196,6 +4212,7 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_wait_for_tensor(
     cl_event pending_event = nullptr;
     cl_mem staged_output = nullptr;
     ggml_opencl_htp_tensor_binding destination;
+    int64_t attention_begin_us = 0;
     cl_int retain_err = CL_SUCCESS;
     bool inject_wait_failure = false;
     {
@@ -4212,6 +4229,7 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_wait_for_tensor(
         pending_event = pending->event;
         staged_output = pending->staged_output;
         destination = pending->destination;
+        attention_begin_us = pending->attention_begin_us;
         inject_wait_failure = graph->test_fail_next_sparse_wait;
         graph->test_fail_next_sparse_wait = false;
         if (!inject_wait_failure) {
@@ -4250,6 +4268,10 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_wait_for_tensor(
             "clWaitForEvents failed for sparse producer %p "
             "(error %d, retained event release error %d)",
             static_cast<const void *>(producer), wait_err, release_err);
+    }
+    if (attention_begin_us > 0) {
+        ggml_backend_opencl_record_attention_elapsed_us(
+            ggml_time_us() - attention_begin_us);
     }
 
     cl_event publish_event = nullptr;

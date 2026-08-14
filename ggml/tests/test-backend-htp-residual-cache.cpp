@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "ggml-htp.h"
 #include "ggml.h"
+#include "ggml_extend.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -12,6 +13,173 @@
 namespace {
 
 constexpr int k_skip = 77;
+
+struct graph_order_result {
+    size_t buffer_size = 0;
+    int cache_count = 0;
+};
+
+bool graph_contains(ggml_cgraph * graph, const ggml_tensor * tensor) {
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        if (ggml_graph_node(graph, i) == tensor) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool cache_expands_persisted_tensor() {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 4 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
+    ggml_tensor * source = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, 16);
+    ggml_tensor * view = ggml_transpose(ctx, source);
+    ggml_tensor * persisted = nullptr;
+    const std::function<ggml_tensor *(const std::string &, ggml_tensor *)>
+        cache_tensor = [&](const std::string &, ggml_tensor * tensor) {
+            persisted = ggml_cont(ctx, tensor);
+            ggml_set_name(persisted, "graph_order_persisted_cache");
+            return persisted;
+        };
+
+    sd_cache_tensor_and_expand_graph(graph, cache_tensor, "cache", view);
+    const bool expanded = persisted != nullptr && graph_contains(graph, persisted);
+    ggml_free(ctx);
+    return expanded;
+}
+
+bool opencl_residual_route_requires_all_prerequisites() {
+    unsetenv("SD_HTP_SPARSE_OPENCL");
+    unsetenv("SD_HTP_SPARSE_OPENCL_ASYNC");
+    unsetenv("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT");
+    unsetenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE");
+    unsetenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO");
+    if (sd_htp_opencl_residual_route_prerequisites()) {
+        return false;
+    }
+
+    setenv("SD_HTP_SPARSE_OPENCL", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_ASYNC", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT", "1", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE", "1", 1);
+    if (sd_htp_opencl_residual_route_prerequisites()) {
+        return false;
+    }
+
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO", "1", 1);
+    return sd_htp_opencl_residual_route_prerequisites();
+}
+
+bool cache_storage_updates_avoid_rebuilding_disjoint_branches() {
+    const std::vector<std::unordered_set<std::string>> existing = {
+        {"residual_branch_0", "rho_branch_0"},
+    };
+
+    const auto append = sd_plan_cache_storage_update(
+        existing,
+        {"residual_branch_1", "rho_branch_1"},
+        false);
+    if (append.mode != SD_CACHE_STORAGE_APPEND ||
+        !append.replace_segment_indices.empty()) {
+        return false;
+    }
+
+    const auto replace = sd_plan_cache_storage_update(
+        existing,
+        {"residual_branch_0", "rho_branch_0"},
+        false);
+    if (replace.mode != SD_CACHE_STORAGE_REPLACE_SEGMENTS ||
+        replace.replace_segment_indices != std::vector<size_t>{0}) {
+        return false;
+    }
+
+    const auto partial = sd_plan_cache_storage_update(
+        existing,
+        {"residual_branch_0"},
+        false);
+    if (partial.mode != SD_CACHE_STORAGE_MERGE) {
+        return false;
+    }
+
+    const auto graph_cut = sd_plan_cache_storage_update(
+        existing,
+        {"residual_branch_1", "rho_branch_1"},
+        true);
+    return graph_cut.mode == SD_CACHE_STORAGE_MERGE;
+}
+
+graph_order_result build_graph_order_fixture(bool expand_cache_immediately) {
+    constexpr int k_layers = 8;
+    constexpr int64_t k_elements = 256 * 1024;
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return {};
+    }
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (backend == nullptr) {
+        ggml_free(ctx);
+        return {};
+    }
+    ggml_gallocr_t allocator =
+        ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 4 * k_layers + 16, false);
+
+    graph_order_result result;
+    std::vector<ggml_tensor *> cache_outputs;
+    ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k_elements);
+    ggml_set_name(state, "graph_order_input");
+
+    const auto cache_tensor = [&](const std::string &, ggml_tensor * tensor) {
+        ++result.cache_count;
+        cache_outputs.push_back(tensor);
+        return tensor;
+    };
+
+    for (int layer = 0; layer < k_layers; ++layer) {
+        ggml_tensor * branch = ggml_sqr(ctx, state);
+        ggml_tensor * cache = ggml_sum(ctx, branch);
+        ggml_format_name(cache, "graph_order_cache_%d", layer);
+        if (expand_cache_immediately) {
+            sd_cache_tensor_and_expand_graph(graph, cache_tensor, cache->name, cache);
+        } else {
+            cache_tensor(cache->name, cache);
+        }
+        state = ggml_neg(ctx, state);
+        ggml_format_name(state, "graph_order_main_%d", layer);
+    }
+
+    ggml_build_forward_expand(graph, state);
+    if (!expand_cache_immediately) {
+        for (ggml_tensor * cache : cache_outputs) {
+            ggml_set_output(cache);
+            ggml_build_forward_expand(graph, cache);
+        }
+    }
+
+    if (ggml_gallocr_reserve(allocator, graph)) {
+        result.buffer_size = ggml_gallocr_get_buffer_size(allocator, 0);
+    }
+
+    ggml_gallocr_free(allocator);
+    ggml_backend_free(backend);
+    ggml_free(ctx);
+    return result;
+}
 
 bool check(bool condition, const char * message) {
     if (!condition) {
@@ -67,6 +235,38 @@ int run_fp16_test() {
         return 1;
     }
     std::puts("PASS fp16");
+    return 0;
+}
+
+int run_graph_order_test() {
+    const graph_order_result tail = build_graph_order_fixture(false);
+    const graph_order_result immediate = build_graph_order_fixture(true);
+    std::printf("graph_order tail_bytes=%zu immediate_bytes=%zu caches=%d\n",
+                tail.buffer_size, immediate.buffer_size, immediate.cache_count);
+    if (!check(tail.buffer_size > 0 && immediate.buffer_size > 0,
+               "graph-order allocator fixture must reserve both graphs") ||
+        !check(tail.cache_count == 8 && immediate.cache_count == 8,
+               "graph-order fixture must register every cache output") ||
+        !check(cache_expands_persisted_tensor(),
+               "cache expansion must use the tensor returned by persistence") ||
+        !check(opencl_residual_route_requires_all_prerequisites(),
+               "OpenCL residual route must require every prerequisite") ||
+        !check(cache_storage_updates_avoid_rebuilding_disjoint_branches(),
+               "disjoint branch caches must append without rebuilding old cache storage") ||
+        !check(sd_htp_release_compute_buffer_after_residual_anchor(
+                   SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR, false),
+               "CPU residual anchor must release its compute arena") ||
+        !check(!sd_htp_release_compute_buffer_after_residual_anchor(
+                    SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR, true),
+               "OpenCL residual anchor must preserve deferred arena ownership") ||
+        !check(!sd_htp_release_compute_buffer_after_residual_anchor(
+                    SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY, false),
+               "sparse apply must keep the existing compute-buffer policy") ||
+        !check(immediate.buffer_size * 2 < tail.buffer_size,
+               "per-layer cache expansion must cut peak allocation by more than half")) {
+        return 1;
+    }
+    std::puts("PASS graph-order");
     return 0;
 }
 
@@ -203,6 +403,9 @@ int main() {
     }
     if (std::strcmp(mode, "lifecycle") == 0) {
         return run_lifecycle_test();
+    }
+    if (std::strcmp(mode, "graph-order") == 0) {
+        return run_graph_order_test();
     }
     std::fprintf(stderr, "unknown HTP_RESIDUAL_CACHE_TEST mode: %s\n", mode);
     return 2;

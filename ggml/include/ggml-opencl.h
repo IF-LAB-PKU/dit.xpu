@@ -13,6 +13,11 @@ extern "C" {
 //
 GGML_BACKEND_API ggml_backend_t ggml_backend_opencl_init(void);
 GGML_BACKEND_API bool ggml_backend_is_opencl(ggml_backend_t backend);
+GGML_BACKEND_API void ggml_backend_opencl_set_attention_profiling_enabled(bool enabled);
+GGML_BACKEND_API bool ggml_backend_opencl_attention_profiling_enabled(void);
+GGML_BACKEND_API void ggml_backend_opencl_reset_attention_profile(void);
+GGML_BACKEND_API void ggml_backend_opencl_record_attention_elapsed_us(int64_t elapsed_us);
+GGML_BACKEND_API int64_t ggml_backend_opencl_get_last_attention_elapsed_us(void);
 
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_opencl_buffer_type(void);
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_opencl_host_buffer_type(void);

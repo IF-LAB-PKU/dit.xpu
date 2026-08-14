@@ -5044,6 +5044,106 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
     return result;
 }
 
+SD_API bool denoise_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_gen_params) {
+    if (sd_ctx == nullptr || sd_img_gen_params == nullptr) {
+        return false;
+    }
+
+    sd_ctx->sd->vae_tiling_params = sd_img_gen_params->vae_tiling_params;
+    GenerationRequest request(sd_ctx, sd_img_gen_params);
+    LOG_INFO("denoise_image %dx%d", request.width, request.height);
+
+    sd_ctx->sd->rng->manual_seed(request.seed);
+    sd_ctx->sd->sampler_rng->manual_seed(request.seed);
+    sd_ctx->sd->set_flow_shift(sd_img_gen_params->sample_params.flow_shift);
+    sd_ctx->sd->apply_loras(sd_img_gen_params->loras, sd_img_gen_params->lora_count);
+
+    ImageVaeAxesGuard axes_guard(sd_ctx, sd_img_gen_params, request);
+
+    SamplePlan plan(sd_ctx, sd_img_gen_params, request);
+    auto latents_opt = prepare_image_generation_latents(sd_ctx,
+                                                        sd_img_gen_params,
+                                                        &request,
+                                                        &plan);
+    if (!latents_opt.has_value()) {
+        return false;
+    }
+    ImageGenerationLatents latents = std::move(*latents_opt);
+
+    auto embeds_opt = prepare_image_generation_embeds(sd_ctx,
+                                                      sd_img_gen_params,
+                                                      &request,
+                                                      &plan,
+                                                      &latents);
+    if (!embeds_opt.has_value()) {
+        return false;
+    }
+    ImageGenerationEmbeds embeds = std::move(*embeds_opt);
+
+    if (!sd_ctx->sd->ensure_weight_stage(StableDiffusionGGML::WeightStage::DIFFUSION)) {
+        return false;
+    }
+
+    for (int b = 0; b < request.batch_count; b++) {
+        int64_t sampling_start = ggml_time_ms();
+        int64_t cur_seed       = request.seed + b;
+        LOG_INFO("denoising image: %i/%i - seed %" PRId64, b + 1, request.batch_count, cur_seed);
+
+        sd_ctx->sd->rng->manual_seed(cur_seed);
+        sd_ctx->sd->sampler_rng->manual_seed(cur_seed);
+        sd::Tensor<float> noise = sd::randn_like<float>(latents.init_latent, sd_ctx->sd->rng);
+
+        sd::Tensor<float> x_0 = sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
+                                                   true,
+                                                   latents.init_latent,
+                                                   std::move(noise),
+                                                   embeds.cond,
+                                                   embeds.uncond,
+                                                   embeds.img_cond,
+                                                   embeds.id_cond,
+                                                   latents.control_image,
+                                                   request.control_strength,
+                                                   request.guidance,
+                                                   plan.eta,
+                                                   request.shifted_timestep,
+                                                   plan.sample_method,
+                                                   sd_ctx->sd->is_flow_denoiser(),
+                                                   plan.extra_sample_args,
+                                                   plan.sigmas,
+                                                   plan.start_merge_step,
+                                                   latents.ref_latents,
+                                                   request.increase_ref_index,
+                                                   latents.denoise_mask,
+                                                   sd::Tensor<float>(),
+                                                   1.f,
+                                                   0,
+                                                   static_cast<float>(request.fps),
+                                                   request.cache_params);
+        int64_t sampling_end = ggml_time_ms();
+        if (x_0.empty()) {
+            LOG_ERROR("denoising for image %d/%d failed after %.2fs",
+                      b + 1,
+                      request.batch_count,
+                      (sampling_end - sampling_start) * 1.0f / 1000);
+            if (sd_ctx->sd->staged_params_loading) {
+                sd_ctx->sd->release_weight_stage(StableDiffusionGGML::WeightStage::DIFFUSION);
+            } else if (sd_ctx->sd->free_params_immediately) {
+                sd_ctx->sd->diffusion_model->free_params_buffer();
+            }
+            return false;
+        }
+
+        LOG_INFO("denoising completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+    }
+
+    if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->staged_params_loading) {
+        sd_ctx->sd->diffusion_model->free_params_buffer();
+    }
+
+    sd_ctx->sd->lora_stat();
+    return true;
+}
+
 static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd_ctx_t* sd_ctx,
                                                                               const sd_vid_gen_params_t* sd_vid_gen_params,
                                                                               GenerationRequest* request) {

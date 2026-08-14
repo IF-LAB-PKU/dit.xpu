@@ -1206,6 +1206,18 @@ struct MMDiTRunner : public GGMLRunner {
         ggml_tensor* y         = make_optional_input(y_tensor);
 
         auto runner_ctx = get_context();
+        const bool opencl_residual_route_enabled =
+            sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL") &&
+            sd_htp_opencl_residual_route_prerequisites();
+        if (block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
+            !opencl_residual_route_enabled) {
+            const auto cache_tensor = runner_ctx.cache_tensor;
+            runner_ctx.cache_tensor = [gf, cache_tensor](const std::string& name,
+                                                         ggml_tensor* tensor) {
+                return sd_cache_tensor_and_expand_graph(
+                    gf, cache_tensor, name, tensor);
+            };
+        }
         runner_ctx.block_sparse_residual_mode            = block_sparse_residual_mode;
         runner_ctx.block_sparse_residual_scale           = block_sparse_residual_scale;
         runner_ctx.block_sparse_residual_rho             = block_sparse_residual_rho;
@@ -1255,7 +1267,17 @@ struct MMDiTRunner : public GGMLRunner {
                                block_sparse_residual_branch_index);
         };
 
-        return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
+        const bool opencl_residual_route_enabled =
+            sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL") &&
+            sd_htp_opencl_residual_route_prerequisites();
+        const bool free_compute_buffer_immediately =
+            sd_htp_release_compute_buffer_after_residual_anchor(
+                block_sparse_residual_mode,
+                opencl_residual_route_enabled);
+        return restore_trailing_singleton_dims(
+            GGMLRunner::compute<float>(
+                get_graph, n_threads, free_compute_buffer_immediately),
+            x.dim());
     }
 
     void test() {
