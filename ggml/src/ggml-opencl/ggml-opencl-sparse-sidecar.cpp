@@ -46,8 +46,19 @@ struct ggml_opencl_htp_persistent_import {
     cl_mem memory = nullptr;
 };
 
+enum class ggml_opencl_htp_block_sparse_variant {
+    legacy32,
+    pair64,
+};
+
 struct ggml_opencl_htp_block_sparse_kernel {
     int64_t head_dim = 0;
+    ggml_opencl_htp_block_sparse_variant variant =
+        ggml_opencl_htp_block_sparse_variant::legacy32;
+    const char * variant_name = "legacy32";
+    const char * kernel_name = "flash_attn_block_sparse_f32_f16";
+    size_t work_group_size = 32;
+    int lanes_per_query = 1;
     cl_program program = nullptr;
     cl_kernel kernel = nullptr;
 };
@@ -58,14 +69,19 @@ struct ggml_opencl_htp_sidecar {
     cl_context context = nullptr;
     cl_command_queue sparse_queue = nullptr;
     cl_command_queue residual_queue = nullptr;
-    ggml_opencl_htp_block_sparse_kernel block_sparse_kernels[2] = {
-        { 64, nullptr, nullptr },
-        { 128, nullptr, nullptr },
+    ggml_opencl_htp_block_sparse_kernel block_sparse_kernels[3] = {
+        { 64, ggml_opencl_htp_block_sparse_variant::legacy32,
+          "legacy32", "flash_attn_block_sparse_f32_f16", 32, 1, nullptr, nullptr },
+        { 128, ggml_opencl_htp_block_sparse_variant::legacy32,
+          "legacy32", "flash_attn_block_sparse_f32_f16", 32, 1, nullptr, nullptr },
+        { 128, ggml_opencl_htp_block_sparse_variant::pair64,
+          "pair64", "flash_attn_block_sparse_d128_pair64_f32_f16", 64, 2, nullptr, nullptr },
     };
     cl_program residual_program = nullptr;
     cl_kernel rho_residual_kernel = nullptr;
     std::string platform_vendor;
     std::string device_name;
+    std::string driver_version;
     std::string device_extensions;
     size_t ext_mem_padding = 0;
     size_t page_size = 0;
@@ -198,6 +214,12 @@ struct ggml_opencl_htp_pending_event {
     cl_mem staged_output = nullptr;
     ggml_opencl_htp_tensor_binding destination;
     int64_t attention_begin_us = 0;
+    int64_t validation_us = 0;
+    int64_t binding_us = 0;
+    int64_t args_us = 0;
+    int64_t enqueue_us = 0;
+    int64_t flush_us = 0;
+    bool record_attention_elapsed = false;
 };
 
 enum class ggml_opencl_htp_submission_state {
@@ -314,6 +336,38 @@ void trace_sidecar_queue_event(
             producer->name : "<unnamed>");
 }
 
+bool read_sparse_event_timestamps(
+        cl_event event,
+        ggml_opencl_attention_profile * profile) {
+    if (event == nullptr || profile == nullptr) {
+        return false;
+    }
+    cl_ulong queued_ns = 0;
+    cl_ulong submit_ns = 0;
+    cl_ulong start_ns = 0;
+    cl_ulong end_ns = 0;
+    if (clGetEventProfilingInfo(
+            event, CL_PROFILING_COMMAND_QUEUED,
+            sizeof(queued_ns), &queued_ns, nullptr) != CL_SUCCESS ||
+        clGetEventProfilingInfo(
+            event, CL_PROFILING_COMMAND_SUBMIT,
+            sizeof(submit_ns), &submit_ns, nullptr) != CL_SUCCESS ||
+        clGetEventProfilingInfo(
+            event, CL_PROFILING_COMMAND_START,
+            sizeof(start_ns), &start_ns, nullptr) != CL_SUCCESS ||
+        clGetEventProfilingInfo(
+            event, CL_PROFILING_COMMAND_END,
+            sizeof(end_ns), &end_ns, nullptr) != CL_SUCCESS ||
+        queued_ns > submit_ns || submit_ns > start_ns || start_ns > end_ns) {
+        return false;
+    }
+    profile->event_queued_ns = queued_ns;
+    profile->event_submit_ns = submit_ns;
+    profile->event_start_ns = start_ns;
+    profile->event_end_ns = end_ns;
+    return true;
+}
+
 void trace_sparse_event_timing(
         const ggml_opencl_htp_sidecar * sidecar,
         cl_event event,
@@ -321,26 +375,21 @@ void trace_sparse_event_timing(
     if (sidecar == nullptr || !sidecar->profiling_enabled || event == nullptr) {
         return;
     }
-    cl_ulong start_ns = 0;
-    cl_ulong end_ns = 0;
-    if (clGetEventProfilingInfo(
-            event, CL_PROFILING_COMMAND_START,
-            sizeof(start_ns), &start_ns, nullptr) != CL_SUCCESS ||
-        clGetEventProfilingInfo(
-            event, CL_PROFILING_COMMAND_END,
-            sizeof(end_ns), &end_ns, nullptr) != CL_SUCCESS ||
-        end_ns < start_ns) {
+    ggml_opencl_attention_profile profile = {};
+    if (!read_sparse_event_timestamps(event, &profile)) {
         return;
     }
     std::fprintf(
         stderr,
-        "htp_opencl_sparse_timing producer=%s gpu_start_ns=%llu "
-        "gpu_end_ns=%llu gpu_us=%.3f\n",
+        "htp_opencl_sparse_timing producer=%s gpu_queued_ns=%llu "
+        "gpu_submit_ns=%llu gpu_start_ns=%llu gpu_end_ns=%llu gpu_us=%.3f\n",
         producer != nullptr && producer->name[0] != '\0' ?
             producer->name : "<unnamed>",
-        static_cast<unsigned long long>(start_ns),
-        static_cast<unsigned long long>(end_ns),
-        static_cast<double>(end_ns - start_ns) / 1000.0);
+        static_cast<unsigned long long>(profile.event_queued_ns),
+        static_cast<unsigned long long>(profile.event_submit_ns),
+        static_cast<unsigned long long>(profile.event_start_ns),
+        static_cast<unsigned long long>(profile.event_end_ns),
+        static_cast<double>(profile.event_end_ns - profile.event_start_ns) / 1000.0);
 }
 
 void trace_submission_scheduler_timing(
@@ -432,33 +481,223 @@ std::string get_program_build_log(cl_program program, cl_device_id device) {
     return storage.data();
 }
 
-ggml_opencl_htp_result ensure_block_sparse_kernel(
-    ggml_opencl_htp_sidecar * sidecar,
-    int64_t head_dim,
-    char * reason,
-    size_t reason_capacity) {
-    ggml_opencl_htp_block_sparse_kernel * variant = nullptr;
-    for (ggml_opencl_htp_block_sparse_kernel & candidate : sidecar->block_sparse_kernels) {
-        if (candidate.head_dim == head_dim) {
-            variant = &candidate;
-            break;
+std::string profiling_token(std::string value) {
+    if (value.empty()) {
+        return "unknown";
+    }
+    for (char & character : value) {
+        if (std::isspace(static_cast<unsigned char>(character)) || character == '=') {
+            character = '_';
         }
     }
-    if (variant == nullptr) {
+    return value;
+}
+
+struct subgroup_resource_info {
+    size_t max_size = 0;
+    size_t count = 0;
+    bool max_size_known = false;
+    bool count_known = false;
+};
+
+subgroup_resource_info query_subgroup_resources(
+        cl_kernel kernel,
+        cl_device_id device,
+        size_t work_group_size) {
+    subgroup_resource_info result;
+#if defined(CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE) && \
+    defined(CL_KERNEL_SUB_GROUP_COUNT_FOR_NDRANGE)
+    const size_t local_work_size[] = { work_group_size, 1, 1 };
+    result.max_size_known = clGetKernelSubGroupInfo(
+        kernel, device, CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE,
+        sizeof(local_work_size), local_work_size,
+        sizeof(result.max_size), &result.max_size, nullptr) == CL_SUCCESS;
+    result.count_known = clGetKernelSubGroupInfo(
+        kernel, device, CL_KERNEL_SUB_GROUP_COUNT_FOR_NDRANGE,
+        sizeof(local_work_size), local_work_size,
+        sizeof(result.count), &result.count, nullptr) == CL_SUCCESS;
+#else
+    (void) kernel;
+    (void) device;
+    (void) work_group_size;
+#endif
+    return result;
+}
+
+void trace_block_sparse_kernel_resources(
+        const ggml_opencl_htp_sidecar * sidecar,
+        const ggml_opencl_htp_block_sparse_kernel & variant,
+        size_t work_group_size) {
+    if (sidecar == nullptr || !sidecar->profiling_enabled || variant.kernel == nullptr) {
+        return;
+    }
+
+    size_t preferred_multiple = 0;
+    size_t kernel_wg_max = 0;
+    size_t compile_wg[3] = {};
+    cl_ulong kernel_local_mem = 0;
+    cl_ulong kernel_private_mem = 0;
+    cl_ulong device_local_mem = 0;
+    cl_uint compute_units = 0;
+    clGetKernelWorkGroupInfo(
+        variant.kernel, sidecar->device, CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
+        sizeof(preferred_multiple), &preferred_multiple, nullptr);
+    clGetKernelWorkGroupInfo(
+        variant.kernel, sidecar->device, CL_KERNEL_WORK_GROUP_SIZE,
+        sizeof(kernel_wg_max), &kernel_wg_max, nullptr);
+    clGetKernelWorkGroupInfo(
+        variant.kernel, sidecar->device, CL_KERNEL_COMPILE_WORK_GROUP_SIZE,
+        sizeof(compile_wg), compile_wg, nullptr);
+    clGetKernelWorkGroupInfo(
+        variant.kernel, sidecar->device, CL_KERNEL_LOCAL_MEM_SIZE,
+        sizeof(kernel_local_mem), &kernel_local_mem, nullptr);
+    clGetKernelWorkGroupInfo(
+        variant.kernel, sidecar->device, CL_KERNEL_PRIVATE_MEM_SIZE,
+        sizeof(kernel_private_mem), &kernel_private_mem, nullptr);
+    clGetDeviceInfo(
+        sidecar->device, CL_DEVICE_LOCAL_MEM_SIZE,
+        sizeof(device_local_mem), &device_local_mem, nullptr);
+    clGetDeviceInfo(
+        sidecar->device, CL_DEVICE_MAX_COMPUTE_UNITS,
+        sizeof(compute_units), &compute_units, nullptr);
+
+    std::string driver;
+    std::string compiler;
+    get_device_string(sidecar->device, CL_DRIVER_VERSION, &driver);
+    get_device_string(sidecar->device, CL_DEVICE_OPENCL_C_VERSION, &compiler);
+    const subgroup_resource_info subgroup32 =
+        query_subgroup_resources(variant.kernel, sidecar->device, 32);
+    const subgroup_resource_info subgroup64 =
+        query_subgroup_resources(variant.kernel, sidecar->device, 64);
+    const subgroup_resource_info subgroup128 =
+        query_subgroup_resources(variant.kernel, sidecar->device, 128);
+    const subgroup_resource_info & selected_subgroup = work_group_size == 128
+        ? subgroup128 : work_group_size == 64 ? subgroup64 : subgroup32;
+
+    std::fprintf(
+        stderr,
+        "[OCL_ATTN_RESOURCE] variant=%s device=%s driver=%s compiler=%s "
+        "d=%lld wg=%zu lanes_per_query=%d preferred_wg_multiple=%zu "
+        "kernel_wg_max=%zu compile_wg=%zu,%zu,%zu local_mem_bytes=%llu "
+        "private_mem_bytes=%llu device_local_mem_bytes=%llu compute_units=%u "
+        "max_subgroup_size=%zu subgroup_count=%zu subgroup_known=%d "
+        "sg32_max=%zu sg32_count=%zu sg32_known=%d "
+        "sg64_max=%zu sg64_count=%zu sg64_known=%d "
+        "sg128_max=%zu sg128_count=%zu sg128_known=%d "
+        "ext_khr_subgroups=%d ext_shuffle=%d ext_shuffle_relative=%d ext_qcom_reqd=%d\n",
+        variant.variant_name,
+        profiling_token(sidecar->device_name).c_str(),
+        profiling_token(driver).c_str(), profiling_token(compiler).c_str(),
+        static_cast<long long>(variant.head_dim), work_group_size,
+        variant.lanes_per_query,
+        preferred_multiple, kernel_wg_max,
+        compile_wg[0], compile_wg[1], compile_wg[2],
+        static_cast<unsigned long long>(kernel_local_mem),
+        static_cast<unsigned long long>(kernel_private_mem),
+        static_cast<unsigned long long>(device_local_mem), compute_units,
+        selected_subgroup.max_size, selected_subgroup.count,
+        selected_subgroup.max_size_known && selected_subgroup.count_known ? 1 : 0,
+        subgroup32.max_size, subgroup32.count,
+        subgroup32.max_size_known && subgroup32.count_known ? 1 : 0,
+        subgroup64.max_size, subgroup64.count,
+        subgroup64.max_size_known && subgroup64.count_known ? 1 : 0,
+        subgroup128.max_size, subgroup128.count,
+        subgroup128.max_size_known && subgroup128.count_known ? 1 : 0,
+        has_extension_token(sidecar->device_extensions, "cl_khr_subgroups") ? 1 : 0,
+        has_extension_token(sidecar->device_extensions, "cl_khr_subgroup_shuffle") ? 1 : 0,
+        has_extension_token(sidecar->device_extensions, "cl_khr_subgroup_shuffle_relative") ? 1 : 0,
+        has_extension_token(sidecar->device_extensions, "cl_qcom_reqd_sub_group_size") ? 1 : 0);
+}
+
+ggml_opencl_htp_result select_block_sparse_kernel(
+        ggml_opencl_htp_sidecar * sidecar,
+        int64_t head_dim,
+        int mask_format,
+        ggml_opencl_htp_block_sparse_kernel ** selected,
+        char * reason,
+        size_t reason_capacity) {
+    if (selected == nullptr) {
+        set_reason(reason, reason_capacity, "block-sparse kernel output must not be null");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    *selected = nullptr;
+
+    ggml_opencl_htp_block_sparse_variant requested =
+        ggml_opencl_htp_block_sparse_variant::legacy32;
+    if (head_dim == 128) {
+        const bool pair64_eligible =
+            mask_format == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX &&
+            has_extension_token(
+                sidecar->device_extensions,
+                "cl_khr_subgroup_shuffle_relative");
+        requested = pair64_eligible ?
+            ggml_opencl_htp_block_sparse_variant::pair64 :
+            ggml_opencl_htp_block_sparse_variant::legacy32;
+    }
+
+    if (requested == ggml_opencl_htp_block_sparse_variant::pair64) {
+        if (mask_format != GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX) {
+            set_reason(
+                reason, reason_capacity,
+                "pair64 requires BLOCK_INDEX mask format");
+            return GGML_OPENCL_HTP_UNSUPPORTED;
+        }
+        if (!has_extension_token(
+                sidecar->device_extensions,
+                "cl_khr_subgroup_shuffle_relative")) {
+            set_reason(
+                reason, reason_capacity,
+                "pair64 requires cl_khr_subgroup_shuffle_relative");
+            return GGML_OPENCL_HTP_UNSUPPORTED;
+        }
+    }
+
+    for (ggml_opencl_htp_block_sparse_kernel & candidate :
+         sidecar->block_sparse_kernels) {
+        if (candidate.head_dim == head_dim && candidate.variant == requested) {
+            *selected = &candidate;
+            set_reason(reason, reason_capacity, "ok");
+            return GGML_OPENCL_HTP_OK;
+        }
+    }
+
+    if (requested == ggml_opencl_htp_block_sparse_variant::legacy32) {
         set_reason(
             reason, reason_capacity,
             "unsupported block-sparse head dimension %lld",
             (long long) head_dim);
-        return GGML_OPENCL_HTP_UNSUPPORTED;
+    } else {
+        set_reason(
+            reason, reason_capacity,
+            "pair64 is unavailable for block-sparse head dimension %lld",
+            (long long) head_dim);
+    }
+    return GGML_OPENCL_HTP_UNSUPPORTED;
+}
+
+ggml_opencl_htp_result ensure_block_sparse_kernel(
+        ggml_opencl_htp_sidecar * sidecar,
+        ggml_opencl_htp_block_sparse_kernel * variant,
+        char * reason,
+        size_t reason_capacity) {
+    if (variant == nullptr) {
+        set_reason(reason, reason_capacity, "block-sparse kernel variant must not be null");
+        return GGML_OPENCL_HTP_ERROR;
     }
     if (variant->kernel != nullptr) {
         return GGML_OPENCL_HTP_OK;
     }
 
 #ifdef GGML_OPENCL_EMBED_KERNELS
-    const std::string kernel_source {
+    const std::string legacy_kernel_source {
 #include "flash_attn_block_sparse_f32_f16.cl.h"
     };
+    const std::string pair64_kernel_source {
+#include "flash_attn_block_sparse_d128_f32_f16.cl.h"
+    };
+    const std::string & kernel_source =
+        variant->variant == ggml_opencl_htp_block_sparse_variant::legacy32
+            ? legacy_kernel_source : pair64_kernel_source;
 #else
     set_reason(
         reason, reason_capacity,
@@ -477,36 +716,68 @@ ggml_opencl_htp_result ensure_block_sparse_kernel(
     }
 
     char build_options[320] = {};
-    std::snprintf(
-        build_options, sizeof(build_options),
-        "-cl-std=CL3.0 -cl-mad-enable "
-        "-cl-unsafe-math-optimizations -cl-finite-math-only "
-        "-cl-fast-relaxed-math -DBLOCK_M=32 -DBLOCK_N=32 "
-        "-DHEAD_DIM=%lld -DVEC_COUNT=%lld",
-        (long long) head_dim, (long long) (head_dim / 4));
+    if (variant->variant == ggml_opencl_htp_block_sparse_variant::pair64) {
+        std::snprintf(
+            build_options, sizeof(build_options),
+            "-cl-std=CL3.0 -cl-mad-enable "
+            "-cl-unsafe-math-optimizations -cl-finite-math-only "
+            "-cl-fast-relaxed-math");
+    } else {
+        std::snprintf(
+            build_options, sizeof(build_options),
+            "-cl-std=CL3.0 -cl-mad-enable "
+            "-cl-unsafe-math-optimizations -cl-finite-math-only "
+            "-cl-fast-relaxed-math -DBLOCK_M=32 -DBLOCK_N=32 "
+            "-DHEAD_DIM=%lld -DVEC_COUNT=%lld",
+            (long long) variant->head_dim,
+            (long long) (variant->head_dim / 4));
+    }
     err = clBuildProgram(program, 1, &sidecar->device, build_options, nullptr, nullptr);
     if (err != CL_SUCCESS) {
         const std::string build_log = get_program_build_log(program, sidecar->device);
         const cl_int release_err = clReleaseProgram(program);
         set_reason(
             reason, reason_capacity,
-            "clBuildProgram failed (error %d, release error %d): %s",
-            err, release_err, build_log.c_str());
+            "clBuildProgram failed for %s (error %d, release error %d): %s",
+            variant->variant_name, err, release_err, build_log.c_str());
         return GGML_OPENCL_HTP_ERROR;
     }
 
-    cl_kernel kernel = clCreateKernel(program, "flash_attn_block_sparse_f32_f16", &err);
+    cl_kernel kernel = clCreateKernel(program, variant->kernel_name, &err);
     if (err != CL_SUCCESS || kernel == nullptr) {
         const cl_int release_err = clReleaseProgram(program);
         set_reason(
             reason, reason_capacity,
-            "clCreateKernel failed (error %d, program release error %d)",
-            err, release_err);
+            "clCreateKernel failed for %s (error %d, program release error %d)",
+            variant->variant_name, err, release_err);
         return GGML_OPENCL_HTP_ERROR;
+    }
+
+    if (variant->variant == ggml_opencl_htp_block_sparse_variant::pair64) {
+        const subgroup_resource_info subgroup =
+            query_subgroup_resources(kernel, sidecar->device, variant->work_group_size);
+        const size_t required_count = 1;
+        const bool wrong_size = subgroup.max_size_known && subgroup.max_size != 64;
+        const bool wrong_count = subgroup.count_known && subgroup.count != required_count;
+        if (wrong_size || wrong_count) {
+            const cl_int kernel_release_err = clReleaseKernel(kernel);
+            const cl_int program_release_err = clReleaseProgram(program);
+            set_reason(
+                reason, reason_capacity,
+                "%s requires %zu 64-lane subgroup(s) (max=%zu count=%zu known=%d/%d, "
+                "kernel release error %d, program release error %d)",
+                variant->variant_name, required_count,
+                subgroup.max_size, subgroup.count,
+                subgroup.max_size_known ? 1 : 0, subgroup.count_known ? 1 : 0,
+                kernel_release_err, program_release_err);
+            return GGML_OPENCL_HTP_UNSUPPORTED;
+        }
     }
 
     variant->program = program;
     variant->kernel = kernel;
+    trace_block_sparse_kernel_resources(sidecar, *variant, variant->work_group_size);
+    set_reason(reason, reason_capacity, "ok");
     return GGML_OPENCL_HTP_OK;
 #endif
 }
@@ -736,6 +1007,10 @@ ggml_opencl_htp_sidecar * ggml_backend_opencl_htp_sidecar_create(
 
     if (!get_device_string(sidecar->device, CL_DEVICE_EXTENSIONS, &sidecar->device_extensions)) {
         set_reason(reason, reason_capacity, "failed to query OpenCL device extensions");
+        return nullptr;
+    }
+    if (!get_device_string(sidecar->device, CL_DRIVER_VERSION, &sidecar->driver_version)) {
+        set_reason(reason, reason_capacity, "failed to query OpenCL driver version");
         return nullptr;
     }
 
@@ -2624,8 +2899,15 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
         for (const ggml_opencl_htp_prepared_sparse_dispatch & sparse :
              prepared->prepared_sparse_dispatches) {
             char kernel_reason[1024] = {};
+            ggml_opencl_htp_block_sparse_kernel * selected_kernel = nullptr;
+            const ggml_opencl_htp_result selection_result = select_block_sparse_kernel(
+                sidecar, sparse.dispatch.q->ne[0], sparse.dispatch.mask_format,
+                &selected_kernel, kernel_reason, sizeof(kernel_reason));
+            if (selection_result != GGML_OPENCL_HTP_OK) {
+                return reject_preflight(GGML_OPENCL_HTP_UNSUPPORTED, kernel_reason);
+            }
             const ggml_opencl_htp_result kernel_result = ensure_block_sparse_kernel(
-                sidecar, sparse.dispatch.q->ne[0], kernel_reason, sizeof(kernel_reason));
+                sidecar, selected_kernel, kernel_reason, sizeof(kernel_reason));
             if (kernel_result != GGML_OPENCL_HTP_OK) {
                 return reject_preflight(GGML_OPENCL_HTP_UNSUPPORTED, kernel_reason);
             }
@@ -3381,7 +3663,8 @@ static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
     }
 
     const bool trace_timing = sidecar_trace_enabled();
-    const int64_t timing_begin_us = trace_timing ? ggml_time_us() : 0;
+    const bool diagnostic_timing = trace_timing || graph->sidecar->profiling_enabled;
+    const int64_t timing_begin_us = diagnostic_timing ? ggml_time_us() : 0;
     bool cached_dispatch = false;
     cl_mem staged_mask = nullptr;
     ggml_opencl_htp_sparse_dispatch dispatch;
@@ -3410,7 +3693,7 @@ static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
             return validation;
         }
     }
-    const int64_t validation_end_us = trace_timing ? ggml_time_us() : 0;
+    const int64_t validation_end_us = diagnostic_timing ? ggml_time_us() : 0;
 
     if (!cached_dispatch) {
         const ggml_opencl_htp_result binding_result = resolve_sparse_bindings(
@@ -3419,7 +3702,7 @@ static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
             return binding_result;
         }
     }
-    const int64_t binding_end_us = trace_timing ? ggml_time_us() : 0;
+    const int64_t binding_end_us = diagnostic_timing ? ggml_time_us() : 0;
 
     static_assert(sizeof(size_t) <= sizeof(cl_ulong), "OpenCL offsets must hold host size_t values");
     const cl_mem q_memory = bindings.q.memory;
@@ -3503,8 +3786,21 @@ static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
 
     char kernel_reason[1024] = {};
     const int64_t head_dim = dispatch.q->ne[0];
+    ggml_opencl_htp_block_sparse_kernel * selected_kernel = nullptr;
+    const ggml_opencl_htp_result selection_result = select_block_sparse_kernel(
+        graph->sidecar, head_dim, dispatch.mask_format, &selected_kernel,
+        kernel_reason, sizeof(kernel_reason));
+    if (selection_result == GGML_OPENCL_HTP_UNSUPPORTED) {
+        set_reason(reason, reason_capacity, "%s", kernel_reason);
+        return selection_result;
+    }
+    if (selection_result != GGML_OPENCL_HTP_OK) {
+        return fail_runtime_graph(
+            graph, reason, reason_capacity,
+            "block-sparse kernel selection failed: %s", kernel_reason);
+    }
     const ggml_opencl_htp_result kernel_result = ensure_block_sparse_kernel(
-        graph->sidecar, head_dim, kernel_reason, sizeof(kernel_reason));
+        graph->sidecar, selected_kernel, kernel_reason, sizeof(kernel_reason));
     if (kernel_result == GGML_OPENCL_HTP_UNSUPPORTED) {
         set_reason(reason, reason_capacity, "%s", kernel_reason);
         return kernel_result;
@@ -3515,14 +3811,7 @@ static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
             "block-sparse kernel creation failed: %s", kernel_reason);
     }
 
-    cl_kernel block_sparse_kernel = nullptr;
-    for (const ggml_opencl_htp_block_sparse_kernel & variant :
-         graph->sidecar->block_sparse_kernels) {
-        if (variant.head_dim == head_dim) {
-            block_sparse_kernel = variant.kernel;
-            break;
-        }
-    }
+    cl_kernel block_sparse_kernel = selected_kernel->kernel;
     if (block_sparse_kernel == nullptr) {
         return fail_runtime_graph(
             graph, reason, reason_capacity,
@@ -3569,19 +3858,20 @@ static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
     };
     static_assert(sizeof(args) / sizeof(args[0]) == 31, "block-sparse kernel ABI changed");
     for (cl_uint index = 0; index < sizeof(args) / sizeof(args[0]); ++index) {
-        const cl_int err = clSetKernelArg(
+        const cl_int arg_err = clSetKernelArg(
             block_sparse_kernel, index, args[index].size, args[index].value);
-        if (err != CL_SUCCESS) {
+        if (arg_err != CL_SUCCESS) {
             return fail_runtime_graph(
                 graph, reason, reason_capacity,
-                "clSetKernelArg(%u) failed (error %d)", index, err);
+                "clSetKernelArg(%u) failed (error %d)", index, arg_err);
         }
     }
-    const int64_t kernel_args_end_us = trace_timing ? ggml_time_us() : 0;
+    const int64_t kernel_args_end_us = diagnostic_timing ? ggml_time_us() : 0;
 
-    const size_t local_work_size[] = { 32, 1 };
+    const size_t local_work_size[] = { selected_kernel->work_group_size, 1 };
     const size_t global_work_size[] = {
-        static_cast<size_t>(1 + (dispatch.lq - 1) / 32) * 32,
+        static_cast<size_t>(1 + (dispatch.lq - 1) / 32) *
+            selected_kernel->work_group_size,
         static_cast<size_t>(dispatch.heads) * static_cast<size_t>(dispatch.batch),
     };
     cl_event event = nullptr;
@@ -3597,7 +3887,7 @@ static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
         }
     }
     const int64_t attention_begin_us =
-        profile_attention ? ggml_time_us() : 0;
+        (profile_attention || graph->sidecar->profiling_enabled) ? ggml_time_us() : 0;
     std::atomic_thread_fence(std::memory_order_release);
     cl_int err = clEnqueueNDRangeKernel(
         graph->sidecar->sparse_queue, block_sparse_kernel,
@@ -3611,7 +3901,7 @@ static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
             graph, reason, reason_capacity,
             "clEnqueueNDRangeKernel failed (error %d, no event)", err);
     }
-    const int64_t enqueue_end_us = trace_timing ? ggml_time_us() : 0;
+    const int64_t enqueue_end_us = diagnostic_timing ? ggml_time_us() : 0;
 
     if (graph->test_fail_next_sparse_enqueue) {
         graph->test_fail_next_sparse_enqueue = false;
@@ -3627,6 +3917,11 @@ static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
         pending_event.staged_output = staging_guard.memory;
         pending_event.destination = bindings.output;
         pending_event.attention_begin_us = attention_begin_us;
+        pending_event.validation_us = validation_end_us - timing_begin_us;
+        pending_event.binding_us = binding_end_us - validation_end_us;
+        pending_event.args_us = kernel_args_end_us - binding_end_us;
+        pending_event.enqueue_us = enqueue_end_us - kernel_args_end_us;
+        pending_event.record_attention_elapsed = profile_attention;
         graph->pending_events.push_back(pending_event);
         staging_guard.release();
     } catch (...) {
@@ -3643,8 +3938,13 @@ static ggml_opencl_htp_result compute_block_sparse_attn_async_impl(
             "clFlush failed after sparse enqueue (error %d)", err);
     }
     trace_sidecar_event("gpu_sparse_flush", node);
-    if (trace_timing) {
+    if (diagnostic_timing) {
         const int64_t flush_end_us = ggml_time_us();
+        graph->pending_events.back().flush_us = flush_end_us - enqueue_end_us;
+        if (!trace_timing) {
+            set_reason(reason, reason_capacity, "ok");
+            return GGML_OPENCL_HTP_OK;
+        }
         std::fprintf(
             stderr,
             "htp_opencl_submit_timing producer=%s head_dim=%lld cached=%d validation_us=%lld "
@@ -4288,6 +4588,12 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_wait_for_tensor(
     cl_mem staged_output = nullptr;
     ggml_opencl_htp_tensor_binding destination;
     int64_t attention_begin_us = 0;
+    int64_t validation_us = 0;
+    int64_t binding_us = 0;
+    int64_t args_us = 0;
+    int64_t enqueue_us = 0;
+    int64_t flush_us = 0;
+    bool record_attention_elapsed = false;
     cl_int retain_err = CL_SUCCESS;
     bool inject_wait_failure = false;
     {
@@ -4305,6 +4611,12 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_wait_for_tensor(
         staged_output = pending->staged_output;
         destination = pending->destination;
         attention_begin_us = pending->attention_begin_us;
+        validation_us = pending->validation_us;
+        binding_us = pending->binding_us;
+        args_us = pending->args_us;
+        enqueue_us = pending->enqueue_us;
+        flush_us = pending->flush_us;
+        record_attention_elapsed = pending->record_attention_elapsed;
         inject_wait_failure = graph->test_fail_next_sparse_wait;
         graph->test_fail_next_sparse_wait = false;
         if (!inject_wait_failure) {
@@ -4335,7 +4647,9 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_wait_for_tensor(
     }
 
     trace_sidecar_event("gpu_sparse_wait_begin", producer);
+    const int64_t wait_begin_us = graph->sidecar->profiling_enabled ? ggml_time_us() : 0;
     const cl_int wait_err = clWaitForEvents(1, &pending_event);
+    const int64_t wait_end_us = graph->sidecar->profiling_enabled ? ggml_time_us() : 0;
     if (wait_err != CL_SUCCESS) {
         const cl_int release_err = clReleaseEvent(pending_event);
         return fail_runtime_graph(
@@ -4344,9 +4658,28 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_wait_for_tensor(
             "(error %d, retained event release error %d)",
             static_cast<const void *>(producer), wait_err, release_err);
     }
-    if (attention_begin_us > 0) {
+    if (record_attention_elapsed && attention_begin_us > 0) {
         ggml_backend_opencl_record_attention_elapsed_us(
-            ggml_time_us() - attention_begin_us);
+            wait_end_us > 0 ? wait_end_us - attention_begin_us : ggml_time_us() - attention_begin_us);
+    }
+    if (graph->sidecar->profiling_enabled) {
+        ggml_opencl_attention_profile profile = {};
+        profile.host_total_us = attention_begin_us > 0 ? wait_end_us - attention_begin_us : 0;
+        profile.validation_us = validation_us;
+        profile.binding_us = binding_us;
+        profile.args_us = args_us;
+        profile.enqueue_us = enqueue_us;
+        profile.flush_us = flush_us;
+        profile.wait_us = wait_end_us - wait_begin_us;
+        if (!read_sparse_event_timestamps(pending_event, &profile)) {
+            const cl_int release_err = clReleaseEvent(pending_event);
+            return fail_runtime_graph(
+                graph, reason, reason_capacity,
+                "failed to read sparse event profiling timestamps for producer %p "
+                "(retained event release error %d)",
+                static_cast<const void *>(producer), release_err);
+        }
+        ggml_backend_opencl_record_attention_profile(&profile);
     }
 
     cl_event publish_event = nullptr;

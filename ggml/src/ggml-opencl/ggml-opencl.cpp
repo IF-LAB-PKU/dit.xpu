@@ -41,6 +41,9 @@
 
 static std::atomic<bool> g_opencl_attention_profiling_enabled{false};
 static std::atomic<int64_t> g_opencl_last_attention_elapsed_us{-1};
+static std::mutex g_opencl_attention_profile_mutex;
+static ggml_opencl_attention_profile g_opencl_last_attention_profile = {};
+static bool g_opencl_last_attention_profile_valid = false;
 
 #define CL_CHECK(err)                                               \
     do {                                                            \
@@ -4869,6 +4872,9 @@ bool ggml_backend_opencl_attention_profiling_enabled(void) {
 
 void ggml_backend_opencl_reset_attention_profile(void) {
     g_opencl_last_attention_elapsed_us.store(-1, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(g_opencl_attention_profile_mutex);
+    g_opencl_last_attention_profile = {};
+    g_opencl_last_attention_profile_valid = false;
 }
 
 void ggml_backend_opencl_record_attention_elapsed_us(int64_t elapsed_us) {
@@ -4877,6 +4883,29 @@ void ggml_backend_opencl_record_attention_elapsed_us(int64_t elapsed_us) {
 
 int64_t ggml_backend_opencl_get_last_attention_elapsed_us(void) {
     return g_opencl_last_attention_elapsed_us.load(std::memory_order_acquire);
+}
+
+void ggml_backend_opencl_record_attention_profile(
+        const ggml_opencl_attention_profile * profile) {
+    if (profile == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_opencl_attention_profile_mutex);
+    g_opencl_last_attention_profile = *profile;
+    g_opencl_last_attention_profile_valid = true;
+}
+
+bool ggml_backend_opencl_get_last_attention_profile(
+        ggml_opencl_attention_profile * profile) {
+    if (profile == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_opencl_attention_profile_mutex);
+    if (!g_opencl_last_attention_profile_valid) {
+        return false;
+    }
+    *profile = g_opencl_last_attention_profile;
+    return true;
 }
 
 //

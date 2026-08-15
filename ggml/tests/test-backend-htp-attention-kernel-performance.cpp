@@ -163,6 +163,12 @@ static const char * route_name(htp_attention_common::Route route, const char * l
     return "sparse-l2-unpacked";
 }
 
+static bool selected_route(const char * route) {
+    const char * selected = std::getenv("HTP_ATTN_KERNEL_ROUTE");
+    return selected == nullptr || selected[0] == '\0' ||
+           std::strcmp(selected, route) == 0;
+}
+
 static bool run_route(ggml_backend_t backend,
                       const htp_attention_common::ImageSize & size,
                       const htp_attention_common::CaseSpec & base,
@@ -262,19 +268,25 @@ int main() {
             if (!htp_attention_common::selected(size, spec)) continue;
             if (!spec.sparse) continue;
 
-            expected += 6;
-            measured += run_route(backend, size, spec, htp_attention_common::Route::Dense,
-                                  "baseline", warmups, samples) ? 1 : 0;
-            measured += run_route(backend, size, spec, htp_attention_common::Route::ExternalSparseBaseline,
-                                  "baseline", warmups, samples) ? 1 : 0;
-            measured += run_route(backend, size, spec, htp_attention_common::Route::ExternalSparseChunk,
-                                  "chunked", warmups, samples) ? 1 : 0;
-            measured += run_route(backend, size, spec, htp_attention_common::Route::PackedSparse,
-                                  "chunked", warmups, samples) ? 1 : 0;
-            measured += run_route(backend, size, spec, htp_attention_common::Route::PackedSparse,
-                                  "l2fetch", warmups, samples) ? 1 : 0;
-            measured += run_route(backend, size, spec, htp_attention_common::Route::ExternalSparseL2,
-                                  "l2fetch", warmups, samples) ? 1 : 0;
+            const auto measure = [&](const char * name,
+                                     htp_attention_common::Route route,
+                                     const char * loader) {
+                if (!selected_route(name)) return;
+                ++expected;
+                measured += run_route(
+                    backend, size, spec, route, loader, warmups, samples) ? 1 : 0;
+            };
+            measure("dense", htp_attention_common::Route::Dense, "baseline");
+            measure("sparse-baseline-unpacked",
+                    htp_attention_common::Route::ExternalSparseBaseline, "baseline");
+            measure("sparse-chunk-unpacked",
+                    htp_attention_common::Route::ExternalSparseChunk, "chunked");
+            measure("sparse-chunk-packed",
+                    htp_attention_common::Route::PackedSparse, "chunked");
+            measure("sparse-l2-packed",
+                    htp_attention_common::Route::PackedSparse, "l2fetch");
+            measure("sparse-l2-unpacked",
+                    htp_attention_common::Route::ExternalSparseL2, "l2fetch");
         }
     }
     ggml_backend_free(backend);
