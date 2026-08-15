@@ -72,6 +72,11 @@ static double env_double(const char * name, double fallback) {
         : fallback;
 }
 
+static bool env_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
 static bool parse_temperature(const std::string & dump, const char * sensor, double * value) {
     const std::string name = std::string("mName=") + sensor;
     for (size_t line_begin = 0; line_begin < dump.size();) {
@@ -187,6 +192,13 @@ static const char * route_name(Route route) {
 
 static const char * v_layout_name(VLayout layout) {
     return layout == VLayout::TokenHead ? "D,L,H,B" : "D,H,L,B";
+}
+
+static bool selected_v_layout(VLayout layout) {
+    const char * selected = std::getenv("OPENCL_ATTN_TEST_V_LAYOUT");
+    if (selected == nullptr || selected[0] == '\0') return true;
+    return std::strcmp(
+        selected, layout == VLayout::TokenHead ? "token-head" : "head-token") == 0;
 }
 
 static bool selected_route(Route route) {
@@ -427,6 +439,8 @@ static bool run_route(
 
     std::vector<int64_t> attention_elapsed;
     attention_elapsed.reserve(static_cast<size_t>(samples));
+    const bool diagnostic_profile =
+        route == Route::Sparse && env_enabled("SD_HTP_SPARSE_OPENCL_PROFILE");
     for (int i = 0; i < samples; ++i) {
         ggml_backend_opencl_reset_attention_profile();
         if (ggml_backend_graph_compute(backend, graph.graph) != GGML_STATUS_SUCCESS) {
@@ -457,6 +471,56 @@ static bool run_route(
             return false;
         }
         attention_elapsed.push_back(elapsed);
+        if (diagnostic_profile) {
+            ggml_opencl_attention_profile profile = {};
+            if (!ggml_backend_opencl_get_last_attention_profile(&profile) ||
+                profile.event_queued_ns > profile.event_submit_ns ||
+                profile.event_submit_ns > profile.event_start_ns ||
+                profile.event_start_ns > profile.event_end_ns) {
+                std::fprintf(
+                    stderr,
+                    "[FAIL] invalid OpenCL event profile model=%s family=%s "
+                    "resolution=%d sample=%d\n",
+                    spec.model, spec.family, spec.resolution, i);
+                ggml_backend_opencl_set_attention_profiling_enabled(false);
+                free_attention_graph(graph);
+                return false;
+            }
+            const double queued_submit_us =
+                static_cast<double>(profile.event_submit_ns - profile.event_queued_ns) / 1000.0;
+            const double submit_start_us =
+                static_cast<double>(profile.event_start_ns - profile.event_submit_ns) / 1000.0;
+            const double kernel_us =
+                static_cast<double>(profile.event_end_ns - profile.event_start_ns) / 1000.0;
+            const double queued_end_us =
+                static_cast<double>(profile.event_end_ns - profile.event_queued_ns) / 1000.0;
+            if (kernel_us > queued_end_us) {
+                std::fprintf(
+                    stderr,
+                    "[FAIL] inconsistent OpenCL event duration model=%s family=%s "
+                    "resolution=%d sample=%d\n",
+                    spec.model, spec.family, spec.resolution, i);
+                ggml_backend_opencl_set_attention_profiling_enabled(false);
+                free_attention_graph(graph);
+                return false;
+            }
+            std::printf(
+                "[OCL_ATTN_SAMPLE] model=%s family=%s resolution=%d sample=%d "
+                "host_total_us=%lld validation_us=%lld binding_us=%lld args_us=%lld "
+                "enqueue_us=%lld flush_us=%lld wait_us=%lld "
+                "event_queued_submit_us=%.3f event_submit_start_us=%.3f "
+                "event_kernel_us=%.3f event_queued_end_us=%.3f\n",
+                spec.model, spec.family, spec.resolution, i,
+                static_cast<long long>(profile.host_total_us),
+                static_cast<long long>(profile.validation_us),
+                static_cast<long long>(profile.binding_us),
+                static_cast<long long>(profile.args_us),
+                static_cast<long long>(profile.enqueue_us),
+                static_cast<long long>(profile.flush_us),
+                static_cast<long long>(profile.wait_us),
+                queued_submit_us, submit_start_us, kernel_us, queued_end_us);
+            std::fflush(stdout);
+        }
     }
     ggml_backend_opencl_set_attention_profiling_enabled(false);
 
@@ -579,6 +643,7 @@ int main() {
                 };
                 const int layout_count = route == Route::Sparse ? 2 : 1;
                 for (int layout_index = 0; layout_index < layout_count; ++layout_index) {
+                    if (!selected_v_layout(layouts[layout_index])) continue;
                     ++expected;
                     measured += run_route(
                         dense_backend,
