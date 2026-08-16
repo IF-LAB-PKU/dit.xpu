@@ -248,6 +248,7 @@ uint64_t htp_hash_tensor_bytes(const ggml_tensor * tensor) {
 
 std::atomic<int> htp_debug_hash_counter{0};
 std::atomic<bool> htp_opencl_residual_job_just_queued{false};
+std::atomic<bool> htp_opencl_next_node_attempt_traced{false};
 
 bool htp_checked_mul_size(size_t lhs, size_t rhs, size_t * result) {
     if (result == nullptr || (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs)) {
@@ -1014,6 +1015,26 @@ static int htp_ops_opencl_early_submit_ready_candidates(const ggml_tensor * comp
         if (candidate.submitted || !htp_ops_opencl_early_submit_candidate_ready(candidate)) {
             continue;
         }
+        const ggml_htp_opencl_lifetime_mode lifetime_mode =
+            ggml_htp_opencl_lifetime_mode_parse(
+                std::getenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE"));
+        if (lifetime_mode == GGML_HTP_OPENCL_LIFETIME_REUSE ||
+            lifetime_mode == GGML_HTP_OPENCL_LIFETIME_STRICT) {
+            auto * ctx = ggml_backend_htp_context::instance();
+            char stage_reason[512] = {};
+            const ggml_opencl_htp_result stage_result =
+                ggml_backend_opencl_htp_graph_stage_block_sparse_attn_mask(
+                    ctx->sparse_opencl_graph, candidate.node,
+                    stage_reason, sizeof(stage_reason));
+            if (stage_result != GGML_OPENCL_HTP_OK) {
+                std::fprintf(
+                    stderr,
+                    "ggml-htp: failed to stage local OpenCL sparse mask result=%d reason=%s\n",
+                    (int) stage_result,
+                    stage_reason[0] != '\0' ? stage_reason : "unknown error");
+                return -EIO;
+            }
+        }
         htp_ops_opencl_trace_early_submit(candidate.node, completed_node);
         if (htp_ops_opencl_submission_thread_active()) {
             auto * ctx = ggml_backend_htp_context::instance();
@@ -1043,6 +1064,18 @@ static int htp_ops_opencl_early_submit_ready_candidates(const ggml_tensor * comp
                     stderr,
                     "ggml-htp: failed to queue OpenCL sparse attention result=%d reason=%s\n",
                     (int) result, reason[0] != '\0' ? reason : "unknown error");
+                return -EIO;
+            }
+            const ggml_opencl_htp_result committed =
+                ggml_backend_opencl_htp_graph_wait_for_sparse_submission(
+                    ctx->sparse_opencl_graph, candidate.node,
+                    reason, sizeof(reason));
+            if (committed != GGML_OPENCL_HTP_OK) {
+                std::fprintf(
+                    stderr,
+                    "ggml-htp: OpenCL sparse submission commit failed result=%d reason=%s\n",
+                    (int) committed,
+                    reason[0] != '\0' ? reason : "unknown error");
                 return -EIO;
             }
         } else {
@@ -1519,6 +1552,83 @@ int htp_ops_opencl_wait_sparse_input_lifetime(
 #endif
 }
 
+int htp_ops_opencl_wait_sparse_input_lifetime_after_dense(
+        const struct ggml_tensor * dense) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    auto * ctx = ggml_backend_htp_context::instance();
+    if (ctx->sparse_opencl_graph == nullptr || dense == nullptr) {
+        return -EINVAL;
+    }
+    bool waited = false;
+    char reason[1024] = {};
+    const ggml_opencl_htp_result result =
+        ggml_backend_opencl_htp_graph_wait_for_sparse_input_lifetime_after_dense(
+            ctx->sparse_opencl_graph, dense, &waited,
+            reason, sizeof(reason));
+    if (result == GGML_OPENCL_HTP_UNSUPPORTED) {
+        return 0;
+    }
+    if (result != GGML_OPENCL_HTP_OK) {
+        std::fprintf(
+            stderr,
+            "ggml-htp: OpenCL strict sparse wait failed result=%d reason=%s\n",
+            (int) result, reason[0] != '\0' ? reason : "unknown error");
+        return -EIO;
+    }
+    return 0;
+#else
+    GGML_UNUSED(dense);
+    return -ENOSYS;
+#endif
+}
+
+int htp_ops_opencl_wait_overlapping_output_leases(
+        const struct ggml_tensor * writer) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    const ggml_htp_opencl_lifetime_mode mode =
+        ggml_htp_opencl_lifetime_mode_parse(
+            std::getenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE"));
+    if ((mode != GGML_HTP_OPENCL_LIFETIME_REUSE &&
+         mode != GGML_HTP_OPENCL_LIFETIME_STRICT) || writer == nullptr) {
+        return 0;
+    }
+    auto * ctx = ggml_backend_htp_context::instance();
+    if (ctx->sparse_opencl_graph == nullptr) {
+        return 0;
+    }
+    bool waited = false;
+    char reason[1024] = {};
+    const ggml_opencl_htp_result result =
+        ggml_backend_opencl_htp_graph_wait_for_overlapping_output_leases(
+            ctx->sparse_opencl_graph, writer, &waited,
+            reason, sizeof(reason));
+    if (result != GGML_OPENCL_HTP_OK) {
+        std::fprintf(
+            stderr,
+            "ggml-htp: OpenCL output lease guard failed result=%d reason=%s\n",
+            (int) result, reason[0] != '\0' ? reason : "unknown error");
+        return -EIO;
+    }
+    return 0;
+#else
+    GGML_UNUSED(writer);
+    return 0;
+#endif
+}
+
+uint64_t htp_ops_opencl_pair_id_for_tensor(const struct ggml_tensor * tensor) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    auto * ctx = ggml_backend_htp_context::instance();
+    return ctx->sparse_opencl_graph != nullptr
+        ? ggml_backend_opencl_htp_graph_pair_id_for_tensor(
+              ctx->sparse_opencl_graph, tensor)
+        : 0;
+#else
+    GGML_UNUSED(tensor);
+    return 0;
+#endif
+}
+
 static int htp_ops_opencl_compute_node_impl(struct ggml_tensor * dst, bool early_submit) {
 #ifdef GGML_HTP_OPENCL_SIDECAR
     auto * ctx = ggml_backend_htp_context::instance();
@@ -1638,11 +1748,35 @@ void htp_ops_opencl_trace_next_node_begin(const struct ggml_tensor * node) {
             false, std::memory_order_acq_rel)) {
         return;
     }
+    htp_opencl_next_node_attempt_traced.store(true, std::memory_order_release);
     const char * trace = std::getenv("SD_HTP_SPARSE_OPENCL_TRACE");
     if (trace != nullptr && trace[0] != '\0' && std::strcmp(trace, "0") != 0) {
+        const uint64_t pair_id = htp_ops_opencl_pair_id_for_tensor(node);
         std::fprintf(
             stderr,
-            "htp_opencl_event name=next_htp_node_begin ts_us=%lld producer=%s\n",
+            "htp_opencl_event name=next_htp_node_attempt pair=%llu ts_us=%lld producer=%s\n",
+            static_cast<unsigned long long>(pair_id),
+            (long long) ggml_time_us(),
+            node != nullptr && node->name[0] != '\0' ? node->name : "<unnamed>");
+    }
+#else
+    GGML_UNUSED(node);
+#endif
+}
+
+void htp_ops_opencl_trace_next_node_admitted(const struct ggml_tensor * node) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (!htp_opencl_next_node_attempt_traced.exchange(
+            false, std::memory_order_acq_rel)) {
+        return;
+    }
+    const char * trace = std::getenv("SD_HTP_SPARSE_OPENCL_TRACE");
+    if (trace != nullptr && trace[0] != '\0' && std::strcmp(trace, "0") != 0) {
+        const uint64_t pair_id = htp_ops_opencl_pair_id_for_tensor(node);
+        std::fprintf(
+            stderr,
+            "htp_opencl_event name=next_htp_node_admitted pair=%llu ts_us=%lld producer=%s\n",
+            static_cast<unsigned long long>(pair_id),
             (long long) ggml_time_us(),
             node != nullptr && node->name[0] != '\0' ? node->name : "<unnamed>");
     }

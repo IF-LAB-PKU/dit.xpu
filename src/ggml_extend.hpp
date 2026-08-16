@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -883,6 +884,16 @@ __STATIC_INLINE__ ggml_tensor* sd_backend_htp_async_cache_slot_tensor(
 #else
     SD_UNUSED(slot);
     return nullptr;
+#endif
+}
+
+__STATIC_INLINE__ uint64_t sd_backend_htp_async_cache_slot_opencl_import_identity(
+        const ggml_backend_htp_async_cache_slot* slot) {
+#ifdef GGML_USE_HTP
+    return ggml_backend_htp_async_cache_slot_opencl_import_identity(slot);
+#else
+    SD_UNUSED(slot);
+    return 0;
 #endif
 }
 
@@ -2374,11 +2385,155 @@ __STATIC_INLINE__ bool sd_htp_opencl_deferred_residual_enabled() {
                "SD_HTP_SPARSE_OPENCL_DEFER_RESIDUAL", true);
 }
 
-__STATIC_INLINE__ bool sd_htp_opencl_residual_route_has_deferred_job() {
-    return !sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR") &&
+__STATIC_INLINE__ ggml_htp_opencl_lifetime_mode
+sd_htp_opencl_lifetime_mode() {
+    return ggml_htp_opencl_lifetime_mode_parse(
+        std::getenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE"));
+}
+
+__STATIC_INLINE__ bool sd_htp_opencl_staging_slots(int* slots) {
+    return ggml_htp_opencl_staging_slots_parse(
+        std::getenv("SD_HTP_SPARSE_OPENCL_STAGING_SLOTS"), slots);
+}
+
+__STATIC_INLINE__ bool sd_htp_opencl_lifetime_mode_is_local() {
+    const auto mode = sd_htp_opencl_lifetime_mode();
+    return mode == GGML_HTP_OPENCL_LIFETIME_REUSE ||
+           mode == GGML_HTP_OPENCL_LIFETIME_STRICT;
+}
+
+// OpenCL sparse is the only route whose sparse attention destination is
+// produced externally.  Keep this predicate separate from the shared cache
+// lifetime predicate so fused/CPU outputs remain real graph allocations.
+__STATIC_INLINE__ bool sd_htp_opencl_sparse_local_lifetime_prerequisites() {
+    int staging_slots = 0;
+    return sd_htp_opencl_lifetime_mode_is_local() &&
+           !sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR") &&
            sd_htp_opencl_residual_route_prerequisites() &&
-           sd_htp_opencl_deferred_residual_enabled() &&
-           sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD");
+           sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL") &&
+           sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL") &&
+           sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD") &&
+           sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_DEFER_RESIDUAL") &&
+           sd_htp_opencl_staging_slots(&staging_slots);
+}
+
+// All three anchor routes can use graph-order cache outputs and persistent
+// cache bindings.  Only the route-specific producer ownership differs.
+__STATIC_INLINE__ bool sd_htp_opencl_local_lifetime_prerequisites() {
+    if (!sd_htp_opencl_lifetime_mode_is_local() ||
+        !sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE") ||
+        !sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO")) {
+        return false;
+    }
+    if (sd_htp_opencl_sparse_local_lifetime_prerequisites()) {
+        return true;
+    }
+    const bool fused = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR");
+    const bool opencl_sparse = sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL");
+    const bool opencl_residual = sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL");
+    if (fused) {
+        return !opencl_sparse && opencl_residual;
+    }
+    return !opencl_sparse && !opencl_residual;
+}
+
+__STATIC_INLINE__ bool sd_htp_opencl_background_residual_job_enabled() {
+    const auto mode = sd_htp_opencl_lifetime_mode();
+    if (mode == GGML_HTP_OPENCL_LIFETIME_INVALID ||
+        !sd_htp_opencl_residual_route_prerequisites() ||
+        !sd_htp_opencl_deferred_residual_enabled() ||
+        !sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD")) {
+        return false;
+    }
+    if (mode == GGML_HTP_OPENCL_LIFETIME_DEFERRED) {
+        return true;
+    }
+    return sd_htp_opencl_local_lifetime_prerequisites();
+}
+
+__STATIC_INLINE__ bool sd_htp_opencl_whole_arena_deferred_ownership() {
+    if (!sd_htp_opencl_background_residual_job_enabled()) {
+        return false;
+    }
+    // A fused anchor owns one shared dense+sparse slab.  It must stay alive
+    // until the residual-only OpenCL job consumes both views, even in local
+    // reuse/strict modes.  The ordinary OpenCL sparse route keeps its
+    // per-pair QKV/output leases instead.
+    return sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR") ||
+           sd_htp_opencl_lifetime_mode() ==
+               GGML_HTP_OPENCL_LIFETIME_DEFERRED;
+}
+
+__STATIC_INLINE__ bool sd_htp_opencl_bind_cache_outputs_before_reserve() {
+    return sd_htp_opencl_local_lifetime_prerequisites();
+}
+
+struct sd_htp_opencl_memory_plan {
+    ggml_htp_opencl_lifetime_mode mode =
+        GGML_HTP_OPENCL_LIFETIME_INVALID;
+    size_t temporary_runtime_bytes = 0;
+    size_t temporary_htp_bytes = 0;
+    size_t temporary_qkv_bytes = 0;
+    size_t persistent_cache_bytes = 0;
+    size_t sparse_destinations_in_gallocr = 0;
+    size_t cache_outputs_in_gallocr = 0;
+    size_t retained_roots = 0;
+};
+
+__STATIC_INLINE__ sd_htp_opencl_memory_plan sd_make_htp_opencl_memory_plan(
+    ggml_htp_opencl_lifetime_mode mode,
+    size_t temporary_runtime_bytes,
+    size_t temporary_htp_bytes,
+    size_t temporary_qkv_bytes,
+    size_t persistent_cache_bytes,
+    size_t sparse_destination_count,
+    size_t metadata_only_sparse_count,
+    size_t cache_output_count,
+    bool cache_outputs_prebound,
+    size_t retained_roots) {
+    sd_htp_opencl_memory_plan plan;
+    plan.mode = mode;
+    plan.temporary_runtime_bytes = temporary_runtime_bytes;
+    plan.temporary_htp_bytes = temporary_htp_bytes;
+    plan.temporary_qkv_bytes = temporary_qkv_bytes;
+    plan.persistent_cache_bytes = persistent_cache_bytes;
+    plan.sparse_destinations_in_gallocr =
+        sparse_destination_count > metadata_only_sparse_count
+            ? sparse_destination_count - metadata_only_sparse_count
+            : 0;
+    plan.cache_outputs_in_gallocr =
+        cache_outputs_prebound ? 0 : cache_output_count;
+    plan.retained_roots = retained_roots;
+    return plan;
+}
+
+__STATIC_INLINE__ int sd_format_htp_opencl_memory_plan(
+    char* buffer,
+    size_t capacity,
+    const sd_htp_opencl_memory_plan& plan) {
+    if (buffer == nullptr || capacity == 0) {
+        return -1;
+    }
+    return std::snprintf(
+        buffer,
+        capacity,
+        "htp_opencl_memory_plan mode=%s "
+        "temporary_runtime_bytes=%zu temporary_htp_bytes=%zu "
+        "temporary_qkv_bytes=%zu persistent_cache_bytes=%zu "
+        "sparse_destinations_in_gallocr=%zu "
+        "cache_outputs_in_gallocr=%zu retained_roots=%zu",
+        ggml_htp_opencl_lifetime_mode_name(plan.mode),
+        plan.temporary_runtime_bytes,
+        plan.temporary_htp_bytes,
+        plan.temporary_qkv_bytes,
+        plan.persistent_cache_bytes,
+        plan.sparse_destinations_in_gallocr,
+        plan.cache_outputs_in_gallocr,
+        plan.retained_roots);
+}
+
+__STATIC_INLINE__ bool sd_htp_opencl_residual_route_has_deferred_job() {
+    return sd_htp_opencl_background_residual_job_enabled();
 }
 
 __STATIC_INLINE__ bool sd_htp_release_compute_buffer_after_residual_anchor(
@@ -5276,6 +5431,98 @@ __STATIC_INLINE__ ggml_tensor* sd_cache_tensor_and_expand_graph(
     return persisted;
 }
 
+__STATIC_INLINE__ ggml_tensor*
+sd_cache_tensor_and_expand_local_residual_graph(
+    ggml_cgraph* graph,
+    const std::function<ggml_tensor*(const std::string&, ggml_tensor*)>& cache_tensor,
+    const std::string& name,
+    ggml_tensor* tensor) {
+    if (!cache_tensor || tensor == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor* persisted = cache_tensor(name, tensor);
+    if (graph == nullptr || persisted == nullptr) {
+        return persisted;
+    }
+
+    ggml_tensor* sparse = persisted->src[1];
+    if (sparse != nullptr && sparse->src[3] != nullptr) {
+        ggml_build_forward_expand(graph, sparse->src[3]);
+    }
+    ggml_build_forward_expand(graph, persisted);
+    return persisted;
+}
+
+__STATIC_INLINE__ bool sd_htp_tensor_reaches_through_views(
+    const ggml_tensor* tensor,
+    const ggml_tensor* target) {
+    for (size_t depth = 0; tensor != nullptr && depth < 64; ++depth) {
+        if (tensor == target) {
+            return true;
+        }
+        if (tensor->op != GGML_OP_VIEW &&
+            tensor->op != GGML_OP_RESHAPE &&
+            tensor->op != GGML_OP_PERMUTE &&
+            tensor->op != GGML_OP_TRANSPOSE) {
+            return false;
+        }
+        tensor = tensor->src[0] != nullptr ? tensor->src[0] : tensor->view_src;
+    }
+    return false;
+}
+
+__STATIC_INLINE__ std::vector<const ggml_tensor*>
+sd_collect_local_residual_owned_sparse_producers(ggml_cgraph* graph) {
+    std::vector<const ggml_tensor*> producers;
+    if (graph == nullptr) {
+        return producers;
+    }
+
+    const int node_count = ggml_graph_n_nodes(graph);
+    for (int i = 0; i < node_count; ++i) {
+        const ggml_tensor* residual = ggml_graph_node(graph, i);
+        if (residual == nullptr || residual->op != GGML_OP_CUSTOM ||
+            std::strncmp(residual->name,
+                         "htp_block_sparse_residual_b", 27) != 0) {
+            continue;
+        }
+        const ggml_tensor* dense = residual->src[0];
+        const ggml_tensor* sparse = residual->src[1];
+        const ggml_tensor* rho = residual->src[2];
+        if (dense == nullptr || sparse == nullptr || rho == nullptr ||
+            rho->op != GGML_OP_CUSTOM ||
+            std::strncmp(rho->name,
+                         "htp_block_sparse_residual_rho_b", 31) != 0 ||
+            rho->src[0] != dense || rho->src[1] != sparse) {
+            continue;
+        }
+
+        bool has_ordinary_consumer = false;
+        for (int consumer_index = 0;
+             consumer_index < node_count && !has_ordinary_consumer;
+             ++consumer_index) {
+            const ggml_tensor* consumer =
+                ggml_graph_node(graph, consumer_index);
+            if (consumer == nullptr || consumer == rho || consumer == residual) {
+                continue;
+            }
+            for (int source = 0; source < GGML_MAX_SRC; ++source) {
+                if (sd_htp_tensor_reaches_through_views(
+                        consumer->src[source], sparse)) {
+                    has_ordinary_consumer = true;
+                    break;
+                }
+            }
+        }
+        if (!has_ordinary_consumer &&
+            std::find(producers.begin(), producers.end(), sparse) ==
+                producers.end()) {
+            producers.push_back(sparse);
+        }
+    }
+    return producers;
+}
+
 struct GGMLRunnerContext {
     ggml_backend_t backend                                           = nullptr;
     ggml_context* ggml_ctx                                           = nullptr;
@@ -5336,6 +5583,24 @@ struct GGMLRunnerContext {
         return graph_tensor;
     }
 };
+
+__STATIC_INLINE__ void sd_install_local_opencl_residual_graph_expansion(
+    ggml_cgraph* graph,
+    int block_sparse_residual_mode,
+    GGMLRunnerContext* runner_ctx) {
+    if (graph == nullptr || runner_ctx == nullptr ||
+        block_sparse_residual_mode != SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR ||
+        !sd_htp_opencl_local_lifetime_prerequisites()) {
+        return;
+    }
+    const auto cache_tensor = runner_ctx->cache_tensor;
+    runner_ctx->cache_tensor = [graph, cache_tensor](
+                                   const std::string& name,
+                                   ggml_tensor* tensor) {
+        return sd_cache_tensor_and_expand_local_residual_graph(
+            graph, cache_tensor, name, tensor);
+    };
+}
 
 __STATIC_INLINE__ sd_htp_residual_binding sd_htp_prepare_residual_binding(
     GGMLRunnerContext* ctx,
@@ -5413,6 +5678,19 @@ protected:
     std::map<ggml_tensor*, uint64_t> cache_backed_tensor_generation_map_;
     std::vector<std::pair<std::string, uint64_t>> active_async_cache_consumers_;
     uint64_t next_async_residual_cache_generation_ = 1;
+
+    struct AsyncResidualCacheOutputBinding {
+        ggml_tensor* tensor = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        void* data = nullptr;
+        void* extra = nullptr;
+    };
+
+    struct AsyncResidualCacheOutputTransaction {
+        uint64_t generation = 0;
+        std::vector<AsyncResidualCacheOutputBinding> bindings;
+        bool active = false;
+    };
 
     ggml_context* compute_ctx    = nullptr;
     ggml_gallocr* compute_allocr = nullptr;
@@ -5678,9 +5956,14 @@ protected:
             return false;
         }
         for (const auto& old : old_slots) {
+            AsyncResidualCacheGeneration* old_generation =
+                find_async_residual_cache_slot(old.first, old.second);
+            const bool has_opencl_import = old_generation != nullptr &&
+                sd_backend_htp_async_cache_slot_opencl_import_identity(
+                    old_generation->slot) != 0;
             bool waited = false;
             char reason[512] = {};
-            if (!sd_backend_htp_opencl_cache_wait(
+            if (has_opencl_import && !sd_backend_htp_opencl_cache_wait(
                     htp_backend, old.first.c_str(), old.second,
                     &waited, reason, sizeof(reason))) {
                 LOG_ERROR("%s residual cache wait failed: key=%s generation=%" PRIu64 " reason=%s",
@@ -5904,13 +6187,20 @@ protected:
                 ggml_build_forward_expand(gf, entry.first);
             }
         }
+        const bool local_opencl_lifetime =
+            sd_htp_opencl_local_lifetime_prerequisites();
         for (const auto& entry : cache_tensor_map) {
             if (entry.second != nullptr) {
-                ggml_set_output(entry.second);
+                const bool local_residual_cache = local_opencl_lifetime &&
+                    entry.first.rfind("htp_block_sparse_residual_", 0) == 0;
+                if (!local_residual_cache) {
+                    ggml_set_output(entry.second);
+                }
                 ggml_build_forward_expand(gf, entry.second);
             }
         }
-        if (htp_backend != nullptr) {
+        if (htp_backend != nullptr &&
+            sd_htp_opencl_whole_arena_deferred_ownership()) {
             sd_backend_htp_opencl_retain_deferred_residual_inputs(gf);
         }
         prepare_build_in_tensor_after(gf);
@@ -5955,6 +6245,19 @@ protected:
             }
         }
 
+        const std::vector<const ggml_tensor*> no_alloc_tensors =
+            sd_htp_opencl_sparse_local_lifetime_prerequisites()
+                ? sd_collect_local_residual_owned_sparse_producers(gf)
+                : std::vector<const ggml_tensor*>{};
+        if (!ggml_gallocr_set_no_alloc_tensors(
+                compute_allocr,
+                no_alloc_tensors.empty() ? nullptr : no_alloc_tensors.data(),
+                no_alloc_tensors.size())) {
+            LOG_ERROR("%s: failed to configure metadata-only graph tensors\n",
+                      get_desc().c_str());
+            return false;
+        }
+
         bool reserve_ok = false;
         if (!compute_node_buffer_ids_.empty() || !compute_leaf_buffer_ids_.empty()) {
             reserve_ok = ggml_gallocr_reserve_n(compute_allocr,
@@ -5988,6 +6291,52 @@ protected:
             const size_t qkv_buffer_size = ggml_gallocr_get_buffer_size(compute_allocr, 2);
             LOG_DEBUG("%s sparse QKV buffer size: %.2f MB",
                       get_desc().c_str(), qkv_buffer_size / 1024.0 / 1024.0);
+        }
+        if (sd_htp_opencl_local_lifetime_prerequisites()) {
+            size_t persistent_cache_bytes = 0;
+            for (const CacheStorageSegment& segment : cache_storage_segments_) {
+                if (segment.buffer != nullptr) {
+                    persistent_cache_bytes +=
+                        ggml_backend_buffer_get_size(segment.buffer);
+                }
+            }
+            size_t cache_output_count = 0;
+            for (const auto& entry : cache_tensor_map) {
+                if (entry.first.rfind("htp_block_sparse_residual_", 0) == 0) {
+                    ++cache_output_count;
+                }
+            }
+            for (const auto& entry : async_residual_cache_slots_) {
+                ggml_tensor* tensor = entry.second.slot != nullptr
+                    ? sd_backend_htp_async_cache_slot_tensor(entry.second.slot)
+                    : nullptr;
+                if (tensor != nullptr && tensor->buffer != nullptr) {
+                    persistent_cache_bytes +=
+                        ggml_backend_buffer_get_size(tensor->buffer);
+                }
+            }
+
+            const sd_htp_opencl_memory_plan memory_plan =
+                sd_make_htp_opencl_memory_plan(
+                    sd_htp_opencl_lifetime_mode(),
+                    ggml_gallocr_get_buffer_size(compute_allocr, 0),
+                    compute_node_buffer_ids_.empty()
+                        ? 0
+                        : ggml_gallocr_get_buffer_size(compute_allocr, 1),
+                    compute_node_buffer_ids_.empty() || qkv_buft == nullptr
+                        ? 0
+                        : ggml_gallocr_get_buffer_size(compute_allocr, 2),
+                    persistent_cache_bytes,
+                    no_alloc_tensors.size(),
+                    no_alloc_tensors.size(),
+                    cache_output_count,
+                    sd_htp_opencl_bind_cache_outputs_before_reserve(),
+                    0);
+            char summary[512] = {};
+            if (sd_format_htp_opencl_memory_plan(
+                    summary, sizeof(summary), memory_plan) > 0) {
+                std::fprintf(stderr, "%s\n", summary);
+            }
         }
         return true;
     }
@@ -7040,8 +7389,46 @@ protected:
         return true;
     }
 
-    bool bind_async_residual_cache_outputs() {
-        if (!sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL")) {
+    void rollback_async_residual_cache_outputs(
+            AsyncResidualCacheOutputTransaction* transaction) {
+        if (transaction == nullptr || !transaction->active) {
+            return;
+        }
+        for (const AsyncResidualCacheOutputBinding& binding :
+             transaction->bindings) {
+            binding.tensor->buffer = binding.buffer;
+            binding.tensor->data = binding.data;
+            binding.tensor->extra = binding.extra;
+        }
+        for (auto it = async_residual_cache_slots_.begin();
+             it != async_residual_cache_slots_.end();) {
+            if (it->second.generation != transaction->generation) {
+                ++it;
+                continue;
+            }
+            sd_backend_htp_async_cache_slot_free(it->second.slot);
+            it = async_residual_cache_slots_.erase(it);
+        }
+        transaction->bindings.clear();
+        transaction->generation = 0;
+        transaction->active = false;
+    }
+
+    void commit_async_residual_cache_outputs(
+            AsyncResidualCacheOutputTransaction* transaction) {
+        if (transaction == nullptr) {
+            return;
+        }
+        transaction->bindings.clear();
+        transaction->generation = 0;
+        transaction->active = false;
+    }
+
+    bool prepare_async_residual_cache_outputs(
+            AsyncResidualCacheOutputTransaction* transaction) {
+        GGML_ASSERT(transaction != nullptr);
+        GGML_ASSERT(!transaction->active);
+        if (!sd_htp_opencl_local_lifetime_prerequisites()) {
             return true;
         }
         std::vector<std::pair<std::string, ggml_tensor*>> outputs;
@@ -7064,14 +7451,9 @@ protected:
         const uint64_t generation = next_async_residual_cache_generation_++;
         const bool trace = sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_TRACE");
         bool allocation_failed = false;
-        struct BoundCacheOutput {
-            ggml_tensor* tensor;
-            ggml_backend_buffer_t buffer;
-            void* data;
-            void* extra;
-        };
-        std::vector<BoundCacheOutput> bound_outputs;
-        bound_outputs.reserve(outputs.size());
+        transaction->generation = generation;
+        transaction->bindings.reserve(outputs.size());
+        transaction->active = true;
         for (const auto& output : outputs) {
             AsyncResidualCacheGeneration* cached =
                 allocate_async_residual_cache_slot(
@@ -7083,7 +7465,7 @@ protected:
             ggml_tensor* slot_tensor =
                 sd_backend_htp_async_cache_slot_tensor(cached->slot);
             GGML_ASSERT(slot_tensor != nullptr);
-            bound_outputs.push_back({
+            transaction->bindings.push_back({
                 output.second,
                 output.second->buffer,
                 output.second->data,
@@ -7101,21 +7483,9 @@ protected:
             }
         }
         if (allocation_failed) {
-            for (const BoundCacheOutput& output : bound_outputs) {
-                output.tensor->buffer = output.buffer;
-                output.tensor->data = output.data;
-                output.tensor->extra = output.extra;
-            }
-            for (auto it = async_residual_cache_slots_.begin();
-                 it != async_residual_cache_slots_.end();) {
-                if (it->second.generation != generation) {
-                    ++it;
-                    continue;
-                }
-                sd_backend_htp_async_cache_slot_free(it->second.slot);
-                it = async_residual_cache_slots_.erase(it);
-            }
-            return !sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_STRICT");
+            rollback_async_residual_cache_outputs(transaction);
+            return !sd_htp_opencl_bind_cache_outputs_before_reserve() &&
+                   !sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_STRICT");
         }
         return true;
     }
@@ -7460,6 +7830,27 @@ protected:
             return std::nullopt;
         }
 
+        AsyncResidualCacheOutputTransaction cache_output_transaction;
+        auto cache_output_rollback = std::unique_ptr<
+            AsyncResidualCacheOutputTransaction,
+            std::function<void(AsyncResidualCacheOutputTransaction*)>>(
+                &cache_output_transaction,
+                [this](AsyncResidualCacheOutputTransaction* transaction) {
+                    rollback_async_residual_cache_outputs(transaction);
+                });
+        const bool bind_cache_outputs_before_reserve =
+            sd_htp_opencl_bind_cache_outputs_before_reserve();
+        if (bind_cache_outputs_before_reserve &&
+            !prepare_async_residual_cache_outputs(
+                &cache_output_transaction)) {
+            LOG_ERROR("%s prepare async residual cache outputs failed",
+                      get_desc().c_str());
+            if (use_partial_param_offload) {
+                restore_partial_params();
+            }
+            return std::nullopt;
+        }
+
         int64_t t_alloc_begin = ggml_time_ms();
         if (!alloc_compute_buffer(gf)) {
             LOG_ERROR("%s alloc compute buffer failed", get_desc().c_str());
@@ -7492,8 +7883,10 @@ protected:
         int64_t t_alloc_end = ggml_time_ms();
 
         int64_t t_copy_begin = ggml_time_ms();
-        if (!bind_async_residual_cache_outputs()) {
-            LOG_ERROR("%s bind async residual cache outputs failed", get_desc().c_str());
+        if (!bind_cache_outputs_before_reserve &&
+            !prepare_async_residual_cache_outputs(
+                &cache_output_transaction)) {
+            LOG_ERROR("%s prepare async residual cache outputs failed", get_desc().c_str());
             if (free_compute_buffer_immediately) {
                 free_compute_buffer();
             } else if (use_partial_param_offload) {
@@ -7522,7 +7915,8 @@ protected:
             sd_backend_htp_set_hybrid_enabled(true);
         }
         uint64_t arena_generation = 0;
-        if (use_htp_compute && sd_htp_opencl_deferred_residual_enabled()) {
+        if (use_htp_compute &&
+            sd_htp_opencl_whole_arena_deferred_ownership()) {
             arena_generation = next_compute_arena_generation_++;
             active_compute_arena_generation_ = arena_generation;
             sd_backend_htp_opencl_set_compute_arena_generation(
@@ -7557,6 +7951,8 @@ protected:
             }
             return std::nullopt;
         }
+        commit_async_residual_cache_outputs(&cache_output_transaction);
+        cache_output_rollback.release();
 
         std::unordered_set<const ggml_tensor*> debug_graph_tensor_set;
         const int n_debug_leafs = sd::ggml_graph_cut::leaf_count(gf);
@@ -7768,13 +8164,14 @@ public:
         runner_ctx.bind_cache_tensor = [this](const std::string& name, ggml_tensor* tensor) {
             if (tensor != nullptr) {
                 this->cache_backed_tensor_name_map[tensor] = name;
-                if (sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL")) {
-                    AsyncResidualCacheGeneration* generation =
-                        this->latest_async_residual_cache_slot(name);
-                    if (generation != nullptr) {
-                        this->cache_backed_tensor_generation_map_[tensor] =
-                            generation->generation;
-                    }
+                AsyncResidualCacheGeneration* generation =
+                    this->latest_async_residual_cache_slot(name);
+                if (sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL") &&
+                    generation != nullptr && generation->slot != nullptr &&
+                    sd_backend_htp_async_cache_slot_opencl_import_identity(
+                        generation->slot) != 0) {
+                    this->cache_backed_tensor_generation_map_[tensor] =
+                        generation->generation;
                 }
             }
         };
@@ -7933,12 +8330,10 @@ public:
     }
 
     ggml_tensor* get_cache_tensor_by_name(const std::string& name) {
-        if (sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL")) {
-            AsyncResidualCacheGeneration* generation =
-                latest_async_residual_cache_slot(name);
-            if (generation != nullptr && generation->slot != nullptr) {
-                return sd_backend_htp_async_cache_slot_tensor(generation->slot);
-            }
+        AsyncResidualCacheGeneration* generation =
+            latest_async_residual_cache_slot(name);
+        if (generation != nullptr && generation->slot != nullptr) {
+            return sd_backend_htp_async_cache_slot_tensor(generation->slot);
         }
         for (auto it = cache_storage_segments_.rbegin();
              it != cache_storage_segments_.rend(); ++it) {
@@ -7990,10 +8385,6 @@ public:
                                                   free_compute_buffer_immediately,
                                                   no_return);
             }
-        }
-        if (!alloc_compute_buffer(gf)) {
-            LOG_ERROR("%s alloc compute buffer failed", get_desc().c_str());
-            return std::nullopt;
         }
         return execute_graph<T>(gf,
                                 n_threads,

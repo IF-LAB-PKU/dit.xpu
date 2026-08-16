@@ -963,55 +963,46 @@ ggml_backend_htp_async_cache_slot * ggml_backend_htp_async_cache_slot_create(
     slot->cache_key = cache_key;
     slot->generation = generation;
 #ifdef GGML_HTP_OPENCL_SIDECAR
-    if (slot->owner->sparse_opencl_sidecar == nullptr) {
-        ggml_backend_buffer_free(slot->buffer);
-        ggml_free(slot->metadata_ctx);
-        slot->buffer = nullptr;
-        slot->metadata_ctx = nullptr;
-        set_slot_reason("OpenCL sidecar is unavailable for async cache import");
-        return nullptr;
-    }
-    ggml_backend_htp_rpcmem_info info = {};
-    GGML_ASSERT(ggml_backend_htp_get_rpcmem_info(slot->buffer, &info));
-    const ggml_opencl_htp_import_descriptor descriptor = {
-        slot->buffer,
-        info.base,
-        info.fd,
-        info.logical_size,
-        info.allocation_size,
-    };
-    if (ggml_backend_htp_env_enabled(
-            "SD_HTP_SPARSE_OPENCL_TEST_FAIL_CACHE_IMPORT")) {
-        ggml_backend_buffer_free(slot->buffer);
-        ggml_free(slot->metadata_ctx);
-        slot->buffer = nullptr;
-        slot->metadata_ctx = nullptr;
-        set_slot_reason("injected cache import failure");
-        return nullptr;
-    }
-    const ggml_opencl_htp_result import_result =
-        ggml_backend_opencl_htp_persistent_import_acquire(
-            slot->owner->sparse_opencl_sidecar,
-            &descriptor,
-            cache_key,
-            generation,
-            &slot->opencl_import_identity,
-            reason,
-            reason_capacity);
-    if (import_result != GGML_OPENCL_HTP_OK) {
-        ggml_backend_buffer_free(slot->buffer);
-        ggml_free(slot->metadata_ctx);
-        slot->buffer = nullptr;
-        slot->metadata_ctx = nullptr;
-        return nullptr;
+    if (slot->owner->sparse_opencl_sidecar != nullptr) {
+        ggml_backend_htp_rpcmem_info info = {};
+        GGML_ASSERT(ggml_backend_htp_get_rpcmem_info(slot->buffer, &info));
+        const ggml_opencl_htp_import_descriptor descriptor = {
+            slot->buffer,
+            info.base,
+            info.fd,
+            info.logical_size,
+            info.allocation_size,
+        };
+        if (ggml_backend_htp_env_enabled(
+                "SD_HTP_SPARSE_OPENCL_TEST_FAIL_CACHE_IMPORT")) {
+            ggml_backend_buffer_free(slot->buffer);
+            ggml_free(slot->metadata_ctx);
+            slot->buffer = nullptr;
+            slot->metadata_ctx = nullptr;
+            set_slot_reason("injected cache import failure");
+            return nullptr;
+        }
+        const ggml_opencl_htp_result import_result =
+            ggml_backend_opencl_htp_persistent_import_acquire(
+                slot->owner->sparse_opencl_sidecar,
+                &descriptor,
+                cache_key,
+                generation,
+                &slot->opencl_import_identity,
+                reason,
+                reason_capacity);
+        if (import_result != GGML_OPENCL_HTP_OK) {
+            ggml_backend_buffer_free(slot->buffer);
+            ggml_free(slot->metadata_ctx);
+            slot->buffer = nullptr;
+            slot->metadata_ctx = nullptr;
+            return nullptr;
+        }
     }
 #else
-    ggml_backend_buffer_free(slot->buffer);
-    ggml_free(slot->metadata_ctx);
-    slot->buffer = nullptr;
-    slot->metadata_ctx = nullptr;
-    set_slot_reason("HTP OpenCL sidecar support is not compiled in");
-    return nullptr;
+    // Without the sidecar this is still a valid persistent HTP buffer.  The
+    // CPU residual route uses it as a cross-step cache and never imports it
+    // into OpenCL.
 #endif
     set_slot_reason("ok");
     return slot.release();

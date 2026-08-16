@@ -6,6 +6,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml.h"
@@ -27,10 +28,14 @@ void htp_ops_opencl_wait_node_completed(const struct ggml_tensor * dst);
 int  htp_ops_opencl_wait_producer(const struct ggml_tensor * producer);
 bool htp_ops_opencl_sparse_is_residual_owned(const struct ggml_tensor * producer);
 int  htp_ops_opencl_wait_sparse_input_lifetime(const struct ggml_tensor * producer);
+int  htp_ops_opencl_wait_sparse_input_lifetime_after_dense(const struct ggml_tensor * dense);
+int  htp_ops_opencl_wait_overlapping_output_leases(const struct ggml_tensor * writer);
+uint64_t htp_ops_opencl_pair_id_for_tensor(const struct ggml_tensor * tensor);
 int  htp_ops_opencl_compute_node(struct ggml_tensor * dst);
 int  htp_ops_opencl_compute_residual_node(struct ggml_tensor * dst);
 int  htp_ops_opencl_queue_residual_after_dense(struct ggml_tensor * dense);
 void htp_ops_opencl_trace_next_node_begin(const struct ggml_tensor * node);
+void htp_ops_opencl_trace_next_node_admitted(const struct ggml_tensor * node);
 int  htp_ops_opencl_early_submit_begin(const struct ggml_cgraph * graph);
 void htp_ops_opencl_early_submit_end(void);
 bool htp_ops_opencl_early_submit_tracks_node(const struct ggml_tensor * node);

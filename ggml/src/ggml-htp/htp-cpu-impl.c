@@ -15,6 +15,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
+#include "ggml-htp-lifetime.h"
 #include "ggml-impl.h"
 #include "ggml-threading.h"
 #include "ggml.h"
@@ -2095,18 +2096,22 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                     htp_ops_opencl_async_enabled() && tensor->src[3] != NULL &&
                     tensor->src[3]->type == GGML_TYPE_F16;
                 const bool trace_async_dense = trace_attn && is_async_dense;
+                const uint64_t trace_pair_id = is_async_dense
+                    ? htp_ops_opencl_pair_id_for_tensor(tensor) : 0;
                 const int64_t trace_begin = trace_attn ? ggml_time_ms() : 0;
                 if (htp_ops_support_op_runtime(tensor)) {
                     if (trace_async_dense) {
                         fprintf(stderr,
-                                "htp_opencl_event name=htp_dense_begin ts_us=%lld producer=%s\n",
+                                "htp_opencl_event name=htp_dense_begin pair=%llu ts_us=%lld producer=%s\n",
+                                (unsigned long long) trace_pair_id,
                                 (long long) ggml_time_us(),
                                 tensor->name[0] != '\0' ? tensor->name : "<unnamed>");
                     }
                     const int err = htp_ops_compute_op(params, tensor);
                     if (trace_async_dense) {
                         fprintf(stderr,
-                                "htp_opencl_event name=htp_dense_end ts_us=%lld producer=%s\n",
+                                "htp_opencl_event name=htp_dense_end pair=%llu ts_us=%lld producer=%s\n",
+                                (unsigned long long) trace_pair_id,
                                 (long long) ggml_time_us(),
                                 tensor->name[0] != '\0' ? tensor->name : "<unnamed>");
                     }
@@ -2118,6 +2123,36 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                             htp_ops_opencl_queue_residual_after_dense(tensor);
                         if (residual_err != 0) {
                             ggml_htp_mark_op_failed(params, tensor, residual_err);
+                        }
+                        const enum ggml_htp_opencl_lifetime_mode lifetime_mode =
+                            ggml_htp_opencl_lifetime_mode_parse(
+                                getenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE"));
+                        if (residual_err == 0 &&
+                            lifetime_mode == GGML_HTP_OPENCL_LIFETIME_STRICT) {
+                            const char * trace = getenv("SD_HTP_SPARSE_OPENCL_TRACE");
+                            const bool trace_enabled = trace != NULL &&
+                                trace[0] != '\0' && strcmp(trace, "0") != 0;
+                            if (trace_enabled) {
+                                fprintf(stderr,
+                                        "htp_opencl_event name=gpu_sparse_strict_wait_begin "
+                                        "pair=%llu ts_us=%lld producer=%s\n",
+                                        (unsigned long long) trace_pair_id,
+                                        (long long) ggml_time_us(),
+                                        tensor->name[0] != '\0' ? tensor->name : "<unnamed>");
+                            }
+                            const int wait_err =
+                                htp_ops_opencl_wait_sparse_input_lifetime_after_dense(tensor);
+                            if (wait_err != 0) {
+                                ggml_htp_mark_op_failed(params, tensor, wait_err);
+                            }
+                            if (trace_enabled) {
+                                fprintf(stderr,
+                                        "htp_opencl_event name=gpu_sparse_strict_wait_end "
+                                        "pair=%llu ts_us=%lld producer=%s\n",
+                                        (unsigned long long) trace_pair_id,
+                                        (long long) ggml_time_us(),
+                                        tensor->name[0] != '\0' ? tensor->name : "<unnamed>");
+                            }
                         }
                     }
                     if (trace_attn) {
@@ -3383,27 +3418,36 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
-    // Halo masks are input-less, single-task custom nodes. They otherwise live
-    // in the cache side branch and would defer every GPU sparse submit until
-    // after the dense main graph. Compute only these self-contained masks now.
-    for (int node_n = 0; node_n < cgraph->n_nodes; ++node_n) {
-        struct ggml_tensor * node = cgraph->nodes[node_n];
-        if (!htp_ops_opencl_early_submit_is_prerequisite(node)) {
-            continue;
-        }
-        if (state->ith == 0) {
-            ggml_compute_forward(&params, node);
-        }
-        ggml_barrier(state->threadpool);
-        if (state->ith == 0) {
-            const int err = htp_ops_opencl_early_submit_node_completed(node);
-            if (err != 0) {
-                ggml_htp_mark_op_failed(&params, node, err);
+    const enum ggml_htp_opencl_lifetime_mode opencl_lifetime_mode =
+        ggml_htp_opencl_lifetime_mode_parse(
+            getenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE"));
+    const bool use_global_mask_sweep =
+        ggml_htp_opencl_lifetime_uses_global_mask_sweep(
+            opencl_lifetime_mode);
+
+    if (use_global_mask_sweep) {
+        // Legacy deferred graphs place input-less masks in a cache tail branch.
+        // Local lifetime graphs expand masks next to their attention pair and
+        // execute them in the normal graph loop.
+        for (int node_n = 0; node_n < cgraph->n_nodes; ++node_n) {
+            struct ggml_tensor * node = cgraph->nodes[node_n];
+            if (!htp_ops_opencl_early_submit_is_prerequisite(node)) {
+                continue;
             }
-        }
-        ggml_barrier(state->threadpool);
-        if (tp->ec != GGML_STATUS_SUCCESS) {
-            break;
+            if (state->ith == 0) {
+                ggml_compute_forward(&params, node);
+            }
+            ggml_barrier(state->threadpool);
+            if (state->ith == 0) {
+                const int err = htp_ops_opencl_early_submit_node_completed(node);
+                if (err != 0) {
+                    ggml_htp_mark_op_failed(&params, node, err);
+                }
+            }
+            ggml_barrier(state->threadpool);
+            if (tp->ec != GGML_STATUS_SUCCESS) {
+                break;
+            }
         }
     }
 
@@ -3425,7 +3469,23 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             htp_ops_opencl_trace_next_node_begin(node);
         }
 
-        if (htp_ops_opencl_early_submit_is_prerequisite(node)) {
+        if (state->ith == 0) {
+            const int lease_err =
+                htp_ops_opencl_wait_overlapping_output_leases(node);
+            if (lease_err != 0) {
+                ggml_htp_mark_op_failed(&params, node, lease_err);
+            }
+        }
+        ggml_barrier(state->threadpool);
+        if (state->ith == 0) {
+            htp_ops_opencl_trace_next_node_admitted(node);
+        }
+        if (tp->ec != GGML_STATUS_SUCCESS) {
+            break;
+        }
+
+        if (use_global_mask_sweep &&
+            htp_ops_opencl_early_submit_is_prerequisite(node)) {
             continue;
         }
 
