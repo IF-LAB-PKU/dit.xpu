@@ -237,6 +237,13 @@ ggml_backend_opencl_htp_graph_queue_block_sparse_attn(
     size_t reason_capacity);
 
 GGML_BACKEND_API enum ggml_opencl_htp_result
+ggml_backend_opencl_htp_graph_wait_for_sparse_submission(
+    ggml_opencl_htp_graph * graph,
+    const struct ggml_tensor * sparse_producer,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API enum ggml_opencl_htp_result
 ggml_backend_opencl_htp_graph_stop_submission_thread(
     ggml_opencl_htp_graph * graph,
     char * reason,
@@ -265,6 +272,22 @@ GGML_BACKEND_API enum ggml_opencl_htp_result
 ggml_backend_opencl_htp_graph_wait_for_sparse_input_lifetime(
     ggml_opencl_htp_graph * graph,
     const struct ggml_tensor * sparse_producer,
+    bool * waited,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API enum ggml_opencl_htp_result
+ggml_backend_opencl_htp_graph_wait_for_sparse_input_lifetime_after_dense(
+    ggml_opencl_htp_graph * graph,
+    const struct ggml_tensor * dense_producer,
+    bool * waited,
+    char * reason,
+    size_t reason_capacity);
+
+GGML_BACKEND_API enum ggml_opencl_htp_result
+ggml_backend_opencl_htp_graph_wait_for_overlapping_output_leases(
+    ggml_opencl_htp_graph * graph,
+    const struct ggml_tensor * writer,
     bool * waited,
     char * reason,
     size_t reason_capacity);
@@ -340,6 +363,10 @@ GGML_BACKEND_API size_t ggml_backend_opencl_htp_graph_pending_residual_submissio
 
 GGML_BACKEND_API size_t ggml_backend_opencl_htp_graph_pending_residual_event_count(
     const ggml_opencl_htp_graph * graph);
+
+GGML_BACKEND_API uint64_t ggml_backend_opencl_htp_graph_pair_id_for_tensor(
+    const ggml_opencl_htp_graph * graph,
+    const struct ggml_tensor * tensor);
 
 // Diagnostic fault injection used by the shared-memory lifecycle test.
 GGML_BACKEND_API void ggml_backend_opencl_htp_graph_test_fail_next_event_cache(

@@ -29,6 +29,300 @@ bool graph_contains(ggml_cgraph * graph, const ggml_tensor * tensor) {
     return false;
 }
 
+int graph_node_index(ggml_cgraph * graph, const ggml_tensor * tensor) {
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        if (ggml_graph_node(graph, i) == tensor) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+struct local_attention_pair_fixture {
+    ggml_tensor * mask = nullptr;
+    ggml_tensor * q = nullptr;
+    ggml_tensor * k = nullptr;
+    ggml_tensor * v = nullptr;
+    ggml_tensor * dense = nullptr;
+    ggml_tensor * sparse = nullptr;
+    ggml_tensor * rho = nullptr;
+    ggml_tensor * residual = nullptr;
+};
+
+ggml_tensor * graph_order_custom(
+        ggml_context * ctx,
+        const char * name,
+        std::initializer_list<ggml_tensor *> sources) {
+    ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+    tensor->op = GGML_OP_CUSTOM;
+    int source_index = 0;
+    for (ggml_tensor * source : sources) {
+        tensor->src[source_index++] = source;
+    }
+    ggml_set_name(tensor, name);
+    return tensor;
+}
+
+local_attention_pair_fixture build_local_attention_pair(
+        ggml_context * ctx,
+        ggml_cgraph * graph,
+        int pair_index) {
+    local_attention_pair_fixture pair;
+    ggml_tensor * q_input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+    ggml_tensor * k_input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+    ggml_tensor * v_input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+    ggml_tensor * mask_input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+    pair.mask = graph_order_custom(ctx, "local_mask", {mask_input});
+    pair.q = graph_order_custom(ctx, "local_q", {q_input});
+    pair.k = graph_order_custom(ctx, "local_k", {k_input});
+    pair.v = graph_order_custom(ctx, "local_v", {v_input});
+    pair.dense = graph_order_custom(ctx, "local_dense", {pair.q, pair.k, pair.v});
+    pair.sparse = graph_order_custom(
+        ctx, "local_sparse", {pair.q, pair.k, pair.v, pair.mask});
+    pair.rho = graph_order_custom(ctx, "local_rho", {pair.dense, pair.sparse});
+    pair.residual = graph_order_custom(
+        ctx, "local_residual", {pair.dense, pair.sparse, pair.rho});
+
+    const auto persist = [](const std::string &, ggml_tensor * tensor) {
+        return tensor;
+    };
+    sd_cache_tensor_and_expand_local_residual_graph(
+        graph, persist,
+        "htp_block_sparse_residual_rho_b0_pair_s" +
+            std::to_string(pair_index),
+        pair.rho);
+    sd_cache_tensor_and_expand_local_residual_graph(
+        graph, persist,
+        "htp_block_sparse_residual_b0_pair_s" +
+            std::to_string(pair_index),
+        pair.residual);
+    return pair;
+}
+
+bool local_residual_graph_expands_pairs_in_attention_order() {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 4 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return false;
+    }
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
+    const auto first = build_local_attention_pair(ctx, graph, 0);
+    const auto second = build_local_attention_pair(ctx, graph, 1);
+    ggml_tensor * continuation = graph_order_custom(
+        ctx, "local_continuation", {second.dense});
+    ggml_build_forward_expand(graph, continuation);
+
+    const int first_mask = graph_node_index(graph, first.mask);
+    const int first_q = graph_node_index(graph, first.q);
+    const int first_k = graph_node_index(graph, first.k);
+    const int first_v = graph_node_index(graph, first.v);
+    const int first_dense = graph_node_index(graph, first.dense);
+    const int first_sparse = graph_node_index(graph, first.sparse);
+    const int first_residual = graph_node_index(graph, first.residual);
+    const int second_mask = graph_node_index(graph, second.mask);
+    const int second_q = graph_node_index(graph, second.q);
+    const int second_residual = graph_node_index(graph, second.residual);
+    const bool ordered =
+        first_mask >= 0 && first_mask < first_q && first_mask < first_k &&
+        first_mask < first_v && first_q < first_dense && first_k < first_dense &&
+        first_v < first_dense && first_dense < first_sparse &&
+        first_sparse < first_residual && first_residual < second_mask &&
+        second_mask < second_q && second_q < second_residual;
+    const bool local_outputs =
+        (first.rho->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+        (first.residual->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+        (second.rho->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+        (second.residual->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
+    ggml_free(ctx);
+    return ordered && local_outputs;
+}
+
+bool no_allocation_tensor_avoids_sparse_destination_storage() {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (ctx == nullptr || backend == nullptr) {
+        if (backend != nullptr) ggml_backend_free(backend);
+        if (ctx != nullptr) ggml_free(ctx);
+        return false;
+    }
+
+    ggml_tensor * dense = graph_order_custom(ctx, "no_alloc_dense", {});
+    ggml_tensor * sparse = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_F32, 1024 * 1024);
+    sparse->op = GGML_OP_CUSTOM;
+    ggml_set_name(sparse, "no_alloc_sparse_destination");
+    ggml_tensor * residual = graph_order_custom(
+        ctx, "no_alloc_residual", {dense, sparse});
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(graph, residual);
+
+    ggml_gallocr_t allocator = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    const ggml_tensor * no_alloc[] = {sparse};
+    const bool configured = ggml_gallocr_set_no_alloc_tensors(
+        allocator, no_alloc, 1);
+    const bool allocated = configured &&
+        ggml_gallocr_reserve(allocator, graph) &&
+        ggml_gallocr_alloc_graph(allocator, graph);
+    const size_t buffer_size = allocated ?
+        ggml_gallocr_get_buffer_size(allocator, 0) : SIZE_MAX;
+    const bool result = allocated && sparse->data == nullptr &&
+        sparse->buffer == nullptr && buffer_size < ggml_nbytes(sparse);
+
+    ggml_gallocr_free(allocator);
+    ggml_backend_free(backend);
+    ggml_free(ctx);
+    return result;
+}
+
+bool local_residual_owned_sparse_requires_exact_pair_without_other_consumers() {
+    auto build_case = [](bool add_consumer, bool break_pair) {
+        ggml_init_params params = {
+            /*.mem_size   =*/ 2 * 1024 * 1024,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        if (ctx == nullptr) {
+            return false;
+        }
+
+        ggml_tensor * dense = graph_order_custom(ctx, "local_owned_dense", {});
+        ggml_tensor * sparse = graph_order_custom(ctx, "local_owned_sparse", {});
+        ggml_tensor * rho = graph_order_custom(ctx, "local_owned_rho", {dense, sparse});
+        ggml_set_name(rho, "htp_block_sparse_residual_rho_b0_pair_s0");
+        ggml_tensor * residual = graph_order_custom(
+            ctx, "local_owned_residual", {dense, sparse, rho});
+        ggml_set_name(residual, "htp_block_sparse_residual_b0_pair_s0");
+        if (break_pair) {
+            rho->src[1] = dense;
+        }
+
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
+        ggml_build_forward_expand(graph, residual);
+        if (add_consumer) {
+            ggml_tensor * consumer = graph_order_custom(
+                ctx, "local_owned_ordinary_consumer", {sparse});
+            ggml_build_forward_expand(graph, consumer);
+        }
+
+        const auto producers =
+            sd_collect_local_residual_owned_sparse_producers(graph);
+        const bool result = producers.size() ==
+                (add_consumer || break_pair ? 0u : 1u) &&
+            (producers.empty() || producers.front() == sparse);
+        ggml_free(ctx);
+        return result;
+    };
+
+    return build_case(false, false) &&
+        build_case(true, false) &&
+        build_case(false, true);
+}
+
+bool local_lifetime_pair_state_and_pool_reuse_are_monotonic() {
+    ggml_htp_opencl_pair_lifetime_state pair = {};
+    if (!ggml_htp_opencl_pair_mark_sparse_committed(&pair) ||
+        !ggml_htp_opencl_pair_mark_residual_submitted(&pair) ||
+        !ggml_htp_opencl_pair_mark_sparse_complete(&pair) ||
+        !ggml_htp_opencl_pair_mark_sparse_complete(&pair) ||
+        !ggml_htp_opencl_pair_mark_residual_complete(&pair) ||
+        !ggml_htp_opencl_pair_mark_reaped(&pair) ||
+        ggml_htp_opencl_pair_mark_residual_submitted(&pair)) {
+        return false;
+    }
+
+    size_t capacities[2] = {};
+    bool in_use[2] = {};
+    size_t slot_count = 0;
+    bool resize = false;
+    int slot = ggml_htp_opencl_staging_pool_select_slot(
+        capacities, in_use, slot_count, 2, 1024, &resize);
+    if (slot != 0 || !resize) {
+        return false;
+    }
+    slot_count = 1;
+    capacities[0] = 1024;
+    in_use[0] = true;
+
+    slot = ggml_htp_opencl_staging_pool_select_slot(
+        capacities, in_use, slot_count, 2, 512, &resize);
+    if (slot != 1 || !resize) {
+        return false;
+    }
+    slot_count = 2;
+    capacities[1] = 512;
+    in_use[1] = true;
+
+    slot = ggml_htp_opencl_staging_pool_select_slot(
+        capacities, in_use, slot_count, 2, 256, &resize);
+    if (slot != -1) {
+        return false;
+    }
+
+    in_use[0] = false;
+    slot = ggml_htp_opencl_staging_pool_select_slot(
+        capacities, in_use, slot_count, 2, 768, &resize);
+    if (slot != 0 || resize) {
+        return false;
+    }
+    in_use[0] = true;
+    in_use[1] = false;
+    slot = ggml_htp_opencl_staging_pool_select_slot(
+        capacities, in_use, slot_count, 2, 2048, &resize);
+    return slot == 1 && resize;
+}
+
+bool staging_pressure_waits_for_residual_publication_before_cache_wait() {
+    ggml_htp_opencl_pair_lifetime_state pair = {};
+    if (!ggml_htp_opencl_pair_mark_sparse_committed(&pair) ||
+        !ggml_htp_opencl_pair_mark_sparse_complete(&pair)) {
+        return false;
+    }
+
+    return ggml_htp_opencl_pair_reap_requires_residual_submission_wait(
+               &pair, true) &&
+        !ggml_htp_opencl_pair_reap_requires_residual_submission_wait(
+               &pair, false) &&
+        ggml_htp_opencl_pair_mark_residual_submitted(&pair) &&
+        !ggml_htp_opencl_pair_reap_requires_residual_submission_wait(
+               &pair, true);
+}
+
+bool local_memory_plan_reports_allocator_ownership() {
+    const sd_htp_opencl_memory_plan plan = sd_make_htp_opencl_memory_plan(
+        GGML_HTP_OPENCL_LIFETIME_REUSE,
+        1024,
+        2048,
+        4096,
+        8192,
+        37,
+        37,
+        74,
+        true,
+        0);
+    char summary[512] = {};
+    const int written = sd_format_htp_opencl_memory_plan(
+        summary, sizeof(summary), plan);
+    return written > 0 &&
+        std::strcmp(
+            summary,
+            "htp_opencl_memory_plan mode=reuse "
+            "temporary_runtime_bytes=1024 temporary_htp_bytes=2048 "
+            "temporary_qkv_bytes=4096 persistent_cache_bytes=8192 "
+            "sparse_destinations_in_gallocr=0 "
+            "cache_outputs_in_gallocr=0 retained_roots=0") == 0;
+}
+
 bool cache_expands_persisted_tensor() {
     ggml_init_params params = {
         /*.mem_size   =*/ 4 * 1024 * 1024,
@@ -271,6 +565,18 @@ int run_graph_order_test() {
                "fused residual-only route must not require sparse async submission") ||
         !check(cache_storage_updates_avoid_rebuilding_disjoint_branches(),
                "disjoint branch caches must append without rebuilding old cache storage") ||
+        !check(local_residual_graph_expands_pairs_in_attention_order(),
+               "local residual pairs must expand mask-first without graph outputs") ||
+        !check(no_allocation_tensor_avoids_sparse_destination_storage(),
+               "metadata-only sparse outputs must not consume gallocr storage") ||
+        !check(local_residual_owned_sparse_requires_exact_pair_without_other_consumers(),
+               "local metadata-only sparse outputs require an exact residual pair and no ordinary consumer") ||
+        !check(local_lifetime_pair_state_and_pool_reuse_are_monotonic(),
+               "local pair state and staging slots must complete monotonically and reuse bounded storage") ||
+        !check(staging_pressure_waits_for_residual_publication_before_cache_wait(),
+               "staging pressure must wait for residual publication before cache completion") ||
+        !check(local_memory_plan_reports_allocator_ownership(),
+               "local memory plan must report temporary and persistent ownership") ||
         !check(sd_htp_release_compute_buffer_after_residual_anchor(
                    SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR, false),
                "synchronous residual anchor must release its compute arena") ||

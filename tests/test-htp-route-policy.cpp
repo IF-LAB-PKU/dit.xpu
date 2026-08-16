@@ -169,6 +169,162 @@ void test_z_image_binding_sequences() {
     test_stable_binding_sequence(z_image_kinds, 3);
 }
 
+void set_opencl_lifetime_route_env(const char* mode) {
+    setenv("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR", "0", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE", "1", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_ASYNC", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_DEFER_RESIDUAL", "1", 1);
+    if (mode != nullptr) {
+        setenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE", mode, 1);
+    } else {
+        unsetenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE");
+    }
+}
+
+void test_opencl_lifetime_mode_parser() {
+    struct ModeCase {
+        const char* value;
+        ggml_htp_opencl_lifetime_mode expected;
+    };
+    const ModeCase valid[] = {
+        {nullptr, GGML_HTP_OPENCL_LIFETIME_DEFERRED},
+        {"deferred", GGML_HTP_OPENCL_LIFETIME_DEFERRED},
+        {"reuse", GGML_HTP_OPENCL_LIFETIME_REUSE},
+        {"strict", GGML_HTP_OPENCL_LIFETIME_STRICT},
+    };
+    for (const auto& test_case : valid) {
+        const auto mode = ggml_htp_opencl_lifetime_mode_parse(test_case.value);
+        require(mode == test_case.expected,
+                "valid OpenCL lifetime modes must parse exactly");
+        require(std::string(ggml_htp_opencl_lifetime_mode_name(mode)) ==
+                    (test_case.value == nullptr ? "deferred" : test_case.value),
+                "OpenCL lifetime mode names must round-trip");
+    }
+    require(ggml_htp_opencl_lifetime_uses_global_mask_sweep(
+                GGML_HTP_OPENCL_LIFETIME_DEFERRED),
+            "legacy deferred mode must keep the global mask sweep");
+    require(!ggml_htp_opencl_lifetime_uses_global_mask_sweep(
+                 GGML_HTP_OPENCL_LIFETIME_REUSE) &&
+                !ggml_htp_opencl_lifetime_uses_global_mask_sweep(
+                    GGML_HTP_OPENCL_LIFETIME_STRICT),
+            "local lifetime modes must execute masks in graph order");
+
+    const char* invalid[] = {"", "auto", "sync", "REUSE", "Strict", " reuse"};
+    for (const char* value : invalid) {
+        require(ggml_htp_opencl_lifetime_mode_parse(value) ==
+                    GGML_HTP_OPENCL_LIFETIME_INVALID,
+                "unknown OpenCL lifetime modes must fail closed");
+    }
+}
+
+void test_opencl_staging_slot_parser() {
+    int slots = 0;
+    require(ggml_htp_opencl_staging_slots_parse(nullptr, &slots) && slots == 2,
+            "unset staging slots must default to two");
+    for (int expected = 1; expected <= 8; ++expected) {
+        const std::string value = std::to_string(expected);
+        slots = 0;
+        require(ggml_htp_opencl_staging_slots_parse(value.c_str(), &slots) &&
+                    slots == expected,
+                "staging slots in the supported range must parse");
+    }
+    const char* invalid[] = {"", "0", "9", "-1", "+1", "1x", " 2"};
+    for (const char* value : invalid) {
+        slots = 99;
+        require(!ggml_htp_opencl_staging_slots_parse(value, &slots),
+                "invalid staging slot values must fail closed");
+    }
+}
+
+void test_opencl_lifetime_route_contract() {
+    set_opencl_lifetime_route_env(nullptr);
+    require(sd_htp_opencl_background_residual_job_enabled(),
+            "legacy deferred mode must keep the background residual job");
+    require(sd_htp_opencl_whole_arena_deferred_ownership(),
+            "legacy deferred mode must keep whole-arena retirement");
+    require(!sd_htp_opencl_bind_cache_outputs_before_reserve(),
+            "legacy deferred mode must preserve post-allocation cache binding");
+
+    for (const char* mode : {"reuse", "strict"}) {
+        set_opencl_lifetime_route_env(mode);
+        require(sd_htp_opencl_local_lifetime_prerequisites(),
+                "local lifetime modes must accept the complete OpenCL route");
+        require(sd_htp_opencl_background_residual_job_enabled(),
+                "local lifetime modes must keep the background residual job");
+        require(!sd_htp_opencl_whole_arena_deferred_ownership(),
+                "local lifetime modes must disable whole-arena retirement");
+        require(sd_htp_opencl_bind_cache_outputs_before_reserve(),
+                "local lifetime modes must bind persistent outputs before reserve");
+    }
+
+    set_opencl_lifetime_route_env("reuse");
+    const char* required[] = {
+        "SD_HTP_SPARSE_OPENCL",
+        "SD_HTP_SPARSE_OPENCL_RESIDUAL",
+        "SD_HTP_SPARSE_OPENCL_ASYNC",
+        "SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT",
+        "SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD",
+        "SD_HTP_SPARSE_OPENCL_DEFER_RESIDUAL",
+    };
+    for (const char* name : required) {
+        setenv(name, "0", 1);
+        require(!sd_htp_opencl_local_lifetime_prerequisites(),
+                "local lifetime modes must reject missing route prerequisites");
+        setenv(name, "1", 1);
+    }
+
+    setenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE", "auto", 1);
+    require(!sd_htp_opencl_local_lifetime_prerequisites(),
+            "an invalid local lifetime mode must fail closed");
+}
+
+void set_local_cache_route_env(bool fused, bool opencl_sparse,
+                               bool opencl_residual, const char* mode) {
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE", "1", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO", "1", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR", fused ? "1" : "0", 1);
+    setenv("SD_HTP_SPARSE_OPENCL", opencl_sparse ? "1" : "0", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", opencl_residual ? "1" : "0", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_ASYNC", opencl_sparse ? "1" : "0", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT", opencl_sparse ? "1" : "0", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD", opencl_sparse ? "1" : "0", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_DEFER_RESIDUAL", opencl_sparse ? "1" : "0", 1);
+    if (mode != nullptr) {
+        setenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE", mode, 1);
+    } else {
+        unsetenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE");
+    }
+}
+
+void test_local_cache_lifetime_route_matrix() {
+    set_local_cache_route_env(true, false, true, "reuse");
+    require(sd_htp_opencl_local_lifetime_prerequisites(),
+            "fused residual-only route must use local cache lifetime");
+    require(!sd_htp_opencl_sparse_local_lifetime_prerequisites(),
+            "fused route must keep fused HTP output allocated");
+
+    set_local_cache_route_env(false, false, false, "strict");
+    require(sd_htp_opencl_local_lifetime_prerequisites(),
+            "HTP/CPU route must use local cache lifetime");
+    require(!sd_htp_opencl_sparse_local_lifetime_prerequisites(),
+            "HTP/CPU sparse output must not become metadata-only");
+
+    set_opencl_lifetime_route_env("reuse");
+    require(sd_htp_opencl_local_lifetime_prerequisites(),
+            "OpenCL route must use local cache lifetime");
+    require(sd_htp_opencl_sparse_local_lifetime_prerequisites(),
+            "only OpenCL sparse route may use sparse metadata-only outputs");
+
+    set_local_cache_route_env(false, false, false, nullptr);
+    require(!sd_htp_opencl_local_lifetime_prerequisites(),
+            "local cache lifetime must remain opt-in outside reuse/strict");
+}
+
 #if defined(GGML_USE_HTP)
 void require_valid_summary(ggml_htp_route_summary summary, const char* message) {
     char reason[256] = {};
@@ -309,6 +465,10 @@ int main() {
     test_model_binding_sequences();
     test_z_image_route_selection();
     test_z_image_binding_sequences();
+    test_opencl_lifetime_mode_parser();
+    test_opencl_staging_slot_parser();
+    test_opencl_lifetime_route_contract();
+    test_local_cache_lifetime_route_matrix();
 #if defined(GGML_USE_HTP)
     test_route_summaries();
     test_cpu_residual_graph_summary();

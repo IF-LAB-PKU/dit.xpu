@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-htp-lifetime.h"
 
 #ifdef __cplusplus
 extern "C" {

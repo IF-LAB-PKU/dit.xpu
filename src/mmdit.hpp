@@ -1186,11 +1186,10 @@ struct MMDiTRunner : public GGMLRunner {
         ggml_tensor* y         = make_optional_input(y_tensor);
 
         auto runner_ctx = get_context();
-        const bool opencl_residual_route_enabled =
-            sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL") &&
-            sd_htp_opencl_residual_route_prerequisites();
+        sd_install_local_opencl_residual_graph_expansion(
+            gf, block_sparse_residual_mode, &runner_ctx);
         if (block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
-            !opencl_residual_route_enabled) {
+            !sd_htp_opencl_local_lifetime_prerequisites()) {
             const auto cache_tensor = runner_ctx.cache_tensor;
             runner_ctx.cache_tensor = [gf, cache_tensor](const std::string& name,
                                                          ggml_tensor* tensor) {
