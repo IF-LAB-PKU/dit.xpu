@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef __cplusplus
@@ -14,6 +15,14 @@ typedef enum ggml_htp_opencl_lifetime_mode {
     GGML_HTP_OPENCL_LIFETIME_REUSE = 1,
     GGML_HTP_OPENCL_LIFETIME_STRICT = 2,
 } ggml_htp_opencl_lifetime_mode;
+
+typedef enum ggml_htp_opencl_lifetime_route {
+    GGML_HTP_OPENCL_LIFETIME_ROUTE_NONE = 0,
+    GGML_HTP_OPENCL_LIFETIME_ROUTE_FUSED,
+    GGML_HTP_OPENCL_LIFETIME_ROUTE_OPENCL_SPARSE,
+    GGML_HTP_OPENCL_LIFETIME_ROUTE_HTP_CPU,
+    GGML_HTP_OPENCL_LIFETIME_ROUTE_INVALID,
+} ggml_htp_opencl_lifetime_route;
 
 static inline ggml_htp_opencl_lifetime_mode
 ggml_htp_opencl_lifetime_mode_parse(const char * value) {
@@ -30,6 +39,66 @@ ggml_htp_opencl_lifetime_mode_parse(const char * value) {
         return GGML_HTP_OPENCL_LIFETIME_STRICT;
     }
     return GGML_HTP_OPENCL_LIFETIME_INVALID;
+}
+
+static inline bool ggml_htp_lifetime_env_enabled(const char * name) {
+    const char * value = name != NULL ? getenv(name) : NULL;
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static inline ggml_htp_opencl_lifetime_route
+ggml_htp_opencl_lifetime_route_from_flags(
+        bool cache_enabled,
+        bool exact_rho_enabled,
+        bool fused_anchor,
+        bool opencl_sparse,
+        bool opencl_residual) {
+    if (!cache_enabled || !exact_rho_enabled) {
+        return GGML_HTP_OPENCL_LIFETIME_ROUTE_NONE;
+    }
+    if (fused_anchor && !opencl_sparse && opencl_residual) {
+        return GGML_HTP_OPENCL_LIFETIME_ROUTE_FUSED;
+    }
+    if (!fused_anchor && opencl_sparse && opencl_residual) {
+        return GGML_HTP_OPENCL_LIFETIME_ROUTE_OPENCL_SPARSE;
+    }
+    if (!fused_anchor && !opencl_sparse && !opencl_residual) {
+        return GGML_HTP_OPENCL_LIFETIME_ROUTE_HTP_CPU;
+    }
+    return GGML_HTP_OPENCL_LIFETIME_ROUTE_INVALID;
+}
+
+static inline ggml_htp_opencl_lifetime_route
+ggml_htp_opencl_lifetime_route_from_env(void) {
+    return ggml_htp_opencl_lifetime_route_from_flags(
+        ggml_htp_lifetime_env_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE"),
+        ggml_htp_lifetime_env_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO"),
+        ggml_htp_lifetime_env_enabled("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR"),
+        ggml_htp_lifetime_env_enabled("SD_HTP_SPARSE_OPENCL"),
+        ggml_htp_lifetime_env_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL"));
+}
+
+static inline ggml_htp_opencl_lifetime_mode
+ggml_htp_opencl_lifetime_mode_default_for_route(
+        ggml_htp_opencl_lifetime_route route) {
+    return route == GGML_HTP_OPENCL_LIFETIME_ROUTE_FUSED ||
+               route == GGML_HTP_OPENCL_LIFETIME_ROUTE_HTP_CPU
+        ? GGML_HTP_OPENCL_LIFETIME_REUSE
+        : GGML_HTP_OPENCL_LIFETIME_DEFERRED;
+}
+
+static inline ggml_htp_opencl_lifetime_mode
+ggml_htp_opencl_lifetime_mode_effective(void) {
+    const char * value = getenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE");
+    if (value != NULL) {
+        return ggml_htp_opencl_lifetime_mode_parse(value);
+    }
+    const ggml_htp_opencl_lifetime_route route =
+        ggml_htp_opencl_lifetime_route_from_env();
+    if (route == GGML_HTP_OPENCL_LIFETIME_ROUTE_INVALID) {
+        return GGML_HTP_OPENCL_LIFETIME_INVALID;
+    }
+    return ggml_htp_opencl_lifetime_mode_default_for_route(route);
 }
 
 static inline const char *
@@ -50,6 +119,20 @@ ggml_htp_opencl_lifetime_mode_name(ggml_htp_opencl_lifetime_mode mode) {
 static inline bool ggml_htp_opencl_lifetime_uses_global_mask_sweep(
         ggml_htp_opencl_lifetime_mode mode) {
     return mode == GGML_HTP_OPENCL_LIFETIME_DEFERRED;
+}
+
+static inline bool
+ggml_htp_opencl_can_release_transient_buffers_post_compute(
+        ggml_htp_opencl_lifetime_mode mode,
+        bool htp_compute,
+        bool free_compute_buffer_immediately,
+        bool all_cache_outputs_async_backed,
+        bool has_debug_tensor_reads) {
+    const bool local_lifetime =
+        mode == GGML_HTP_OPENCL_LIFETIME_REUSE ||
+        mode == GGML_HTP_OPENCL_LIFETIME_STRICT;
+    return local_lifetime && htp_compute && free_compute_buffer_immediately &&
+        all_cache_outputs_async_backed && !has_debug_tensor_reads;
 }
 
 static inline bool
@@ -75,6 +158,18 @@ typedef struct ggml_htp_opencl_pair_lifetime_state {
     bool residual_complete;
     bool reaped;
 } ggml_htp_opencl_pair_lifetime_state;
+
+// A fused HTP anchor has already produced both dense and sparse views
+// synchronously. It therefore owns no independent OpenCL sparse event.
+static inline bool ggml_htp_opencl_pair_mark_fused_anchor_produced(
+        ggml_htp_opencl_pair_lifetime_state * state) {
+    if (state == NULL || state->reaped) {
+        return false;
+    }
+    state->sparse_committed = true;
+    state->sparse_complete = true;
+    return true;
+}
 
 static inline bool ggml_htp_opencl_pair_mark_sparse_committed(
         ggml_htp_opencl_pair_lifetime_state * state) {

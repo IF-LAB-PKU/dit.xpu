@@ -247,6 +247,8 @@ void test_opencl_lifetime_route_contract() {
             "legacy deferred mode must keep the background residual job");
     require(sd_htp_opencl_whole_arena_deferred_ownership(),
             "legacy deferred mode must keep whole-arena retirement");
+    require(sd_htp_opencl_persistent_cache_outputs_enabled(),
+            "legacy deferred mode must still use persistent residual outputs");
     require(!sd_htp_opencl_bind_cache_outputs_before_reserve(),
             "legacy deferred mode must preserve post-allocation cache binding");
 
@@ -258,6 +260,8 @@ void test_opencl_lifetime_route_contract() {
                 "local lifetime modes must keep the background residual job");
         require(!sd_htp_opencl_whole_arena_deferred_ownership(),
                 "local lifetime modes must disable whole-arena retirement");
+        require(sd_htp_opencl_persistent_cache_outputs_enabled(),
+                "local lifetime modes must use persistent residual outputs");
         require(sd_htp_opencl_bind_cache_outputs_before_reserve(),
                 "local lifetime modes must bind persistent outputs before reserve");
     }
@@ -281,6 +285,8 @@ void test_opencl_lifetime_route_contract() {
     setenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE", "auto", 1);
     require(!sd_htp_opencl_local_lifetime_prerequisites(),
             "an invalid local lifetime mode must fail closed");
+    require(!sd_htp_opencl_persistent_cache_outputs_enabled(),
+            "an invalid lifetime mode must not allocate persistent outputs");
 }
 
 void set_local_cache_route_env(bool fused, bool opencl_sparse,
@@ -321,8 +327,122 @@ void test_local_cache_lifetime_route_matrix() {
             "only OpenCL sparse route may use sparse metadata-only outputs");
 
     set_local_cache_route_env(false, false, false, nullptr);
-    require(!sd_htp_opencl_local_lifetime_prerequisites(),
-            "local cache lifetime must remain opt-in outside reuse/strict");
+    require(sd_htp_opencl_local_lifetime_prerequisites(),
+            "unset HTP/CPU route must enable local cache lifetime by default");
+}
+
+void test_opencl_lifetime_effective_defaults() {
+    set_local_cache_route_env(true, false, true, nullptr);
+    require(ggml_htp_opencl_lifetime_mode_effective() ==
+                GGML_HTP_OPENCL_LIFETIME_REUSE,
+            "unset fused route must default to reuse");
+
+    set_local_cache_route_env(false, false, false, nullptr);
+    require(ggml_htp_opencl_lifetime_mode_effective() ==
+                GGML_HTP_OPENCL_LIFETIME_REUSE,
+            "unset HTP/CPU route must default to reuse");
+
+    set_opencl_lifetime_route_env(nullptr);
+    require(ggml_htp_opencl_lifetime_mode_effective() ==
+                GGML_HTP_OPENCL_LIFETIME_DEFERRED,
+            "unset OpenCL sparse route must preserve deferred default");
+
+    for (const char* mode : {"deferred", "reuse", "strict"}) {
+        set_local_cache_route_env(true, false, true, mode);
+        const auto expected = ggml_htp_opencl_lifetime_mode_parse(mode);
+        require(ggml_htp_opencl_lifetime_mode_effective() == expected,
+                "explicit lifetime mode must override fused default");
+
+        set_local_cache_route_env(false, false, false, mode);
+        require(ggml_htp_opencl_lifetime_mode_effective() == expected,
+                "explicit lifetime mode must override HTP/CPU default");
+
+        set_opencl_lifetime_route_env(mode);
+        require(ggml_htp_opencl_lifetime_mode_effective() == expected,
+                "explicit lifetime mode must override OpenCL default");
+    }
+
+    set_local_cache_route_env(true, false, true, "auto");
+    require(ggml_htp_opencl_lifetime_mode_effective() ==
+                GGML_HTP_OPENCL_LIFETIME_INVALID,
+            "invalid explicit lifetime mode must fail closed");
+}
+
+#if defined(GGML_USE_HTP)
+void test_opencl_persistent_import_route_policy() {
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE", "1", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO", "1", 1);
+
+    setenv("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL", "0", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "1", 1);
+    require(!ggml_backend_htp_opencl_persistent_import_required(),
+            "fused HTP cache must not create an OpenCL persistent import");
+
+    setenv("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR", "0", 1);
+    setenv("SD_HTP_SPARSE_OPENCL", "0", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "0", 1);
+    require(!ggml_backend_htp_opencl_persistent_import_required(),
+            "HTP+CPU cache must not create an OpenCL persistent import");
+
+    setenv("SD_HTP_SPARSE_OPENCL", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "1", 1);
+    require(ggml_backend_htp_opencl_persistent_import_required(),
+            "OpenCL sparse cache must create an OpenCL persistent import");
+}
+#endif
+
+void test_post_compute_transient_buffer_release_policy() {
+    require(ggml_htp_opencl_can_release_transient_buffers_post_compute(
+                GGML_HTP_OPENCL_LIFETIME_REUSE,
+                true,
+                true,
+                true,
+                false),
+            "local fused graphs may release transient HTP buffers after compute");
+    require(ggml_htp_opencl_can_release_transient_buffers_post_compute(
+                GGML_HTP_OPENCL_LIFETIME_STRICT,
+                true,
+                true,
+                true,
+                false),
+            "strict local graphs use the same post-compute release policy");
+
+    require(!ggml_htp_opencl_can_release_transient_buffers_post_compute(
+                 GGML_HTP_OPENCL_LIFETIME_DEFERRED,
+                 true,
+                 true,
+                 true,
+                 false),
+            "deferred ownership must retain its transient buffers");
+    require(!ggml_htp_opencl_can_release_transient_buffers_post_compute(
+                 GGML_HTP_OPENCL_LIFETIME_REUSE,
+                 true,
+                 false,
+                 true,
+                 false),
+            "background residual work must retain transient buffers");
+    require(!ggml_htp_opencl_can_release_transient_buffers_post_compute(
+                 GGML_HTP_OPENCL_LIFETIME_REUSE,
+                 true,
+                 true,
+                 false,
+                 false),
+            "ordinary cache copies may still need transient HTP tensors");
+    require(!ggml_htp_opencl_can_release_transient_buffers_post_compute(
+                 GGML_HTP_OPENCL_LIFETIME_REUSE,
+                 true,
+                 true,
+                 true,
+                 true),
+            "debug tensor reads must retain transient HTP tensors");
+    require(!ggml_htp_opencl_can_release_transient_buffers_post_compute(
+                 GGML_HTP_OPENCL_LIFETIME_REUSE,
+                 false,
+                 true,
+                 true,
+                 false),
+            "non-HTP graphs have no HTP transient buffer to release");
 }
 
 #if defined(GGML_USE_HTP)
@@ -469,6 +589,11 @@ int main() {
     test_opencl_staging_slot_parser();
     test_opencl_lifetime_route_contract();
     test_local_cache_lifetime_route_matrix();
+    test_opencl_lifetime_effective_defaults();
+#if defined(GGML_USE_HTP)
+    test_opencl_persistent_import_route_policy();
+#endif
+    test_post_compute_transient_buffer_release_policy();
 #if defined(GGML_USE_HTP)
     test_route_summaries();
     test_cpu_residual_graph_summary();

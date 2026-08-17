@@ -1186,7 +1186,7 @@ struct MMDiTRunner : public GGMLRunner {
         ggml_tensor* y         = make_optional_input(y_tensor);
 
         auto runner_ctx = get_context();
-        sd_install_local_opencl_residual_graph_expansion(
+        sd_install_local_residual_graph_expansion(
             gf, block_sparse_residual_mode, &runner_ctx);
         if (block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
             !sd_htp_opencl_local_lifetime_prerequisites()) {

@@ -2387,8 +2387,7 @@ __STATIC_INLINE__ bool sd_htp_opencl_deferred_residual_enabled() {
 
 __STATIC_INLINE__ ggml_htp_opencl_lifetime_mode
 sd_htp_opencl_lifetime_mode() {
-    return ggml_htp_opencl_lifetime_mode_parse(
-        std::getenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE"));
+    return ggml_htp_opencl_lifetime_mode_effective();
 }
 
 __STATIC_INLINE__ bool sd_htp_opencl_staging_slots(int* slots) {
@@ -2455,13 +2454,13 @@ __STATIC_INLINE__ bool sd_htp_opencl_whole_arena_deferred_ownership() {
     if (!sd_htp_opencl_background_residual_job_enabled()) {
         return false;
     }
-    // A fused anchor owns one shared dense+sparse slab.  It must stay alive
-    // until the residual-only OpenCL job consumes both views, even in local
-    // reuse/strict modes.  The ordinary OpenCL sparse route keeps its
-    // per-pair QKV/output leases instead.
-    return sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR") ||
-           sd_htp_opencl_lifetime_mode() ==
-               GGML_HTP_OPENCL_LIFETIME_DEFERRED;
+    return sd_htp_opencl_lifetime_mode() ==
+           GGML_HTP_OPENCL_LIFETIME_DEFERRED;
+}
+
+__STATIC_INLINE__ bool sd_htp_opencl_persistent_cache_outputs_enabled() {
+    return sd_htp_opencl_local_lifetime_prerequisites() ||
+           sd_htp_opencl_whole_arena_deferred_ownership();
 }
 
 __STATIC_INLINE__ bool sd_htp_opencl_bind_cache_outputs_before_reserve() {
@@ -5523,6 +5522,405 @@ sd_collect_local_residual_owned_sparse_producers(ggml_cgraph* graph) {
     return producers;
 }
 
+enum sd_htp_residual_pair_role {
+    SD_HTP_RESIDUAL_PAIR_DENSE = 0,
+    SD_HTP_RESIDUAL_PAIR_SPARSE,
+    SD_HTP_RESIDUAL_PAIR_RHO,
+    SD_HTP_RESIDUAL_PAIR_RESIDUAL,
+};
+
+enum sd_htp_graph_tensor_location {
+    SD_HTP_GRAPH_TENSOR_NODE = 0,
+    SD_HTP_GRAPH_TENSOR_LEAF,
+    SD_HTP_GRAPH_TENSOR_SOURCE_ONLY,
+    SD_HTP_GRAPH_TENSOR_MISSING,
+};
+
+enum sd_htp_buffer_class {
+    SD_HTP_BUFFER_NONE = 0,
+    SD_HTP_BUFFER_RUNTIME,
+    SD_HTP_BUFFER_HTP,
+    SD_HTP_BUFFER_QKV,
+    SD_HTP_BUFFER_PERSISTENT,
+    SD_HTP_BUFFER_UNKNOWN,
+};
+
+struct sd_htp_residual_pair_allocation_record {
+    size_t pair_id = 0;
+    sd_htp_residual_pair_role role = SD_HTP_RESIDUAL_PAIR_DENSE;
+    const ggml_tensor* tensor = nullptr;
+    const ggml_tensor* view_root = nullptr;
+    sd_htp_graph_tensor_location graph_location = SD_HTP_GRAPH_TENSOR_MISSING;
+    int graph_index = -1;
+    int planned_buffer_id = -1;
+    int root_planned_buffer_id = -1;
+    size_t ordinary_consumer_count = 0;
+    bool no_alloc_direct = false;
+    bool no_alloc_root = false;
+    sd_htp_buffer_class actual_buffer_class = SD_HTP_BUFFER_NONE;
+    void* data = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_backend_buffer_t resolved_backing = nullptr;
+};
+
+struct sd_htp_residual_pair_allocation_summary {
+    size_t dense_outputs_expected = 0;
+    size_t dense_outputs_with_backing = 0;
+    size_t dense_outputs_no_alloc = 0;
+    size_t metadata_only_sparse_without_backing = 0;
+    size_t allocated_sparse_with_backing = 0;
+    size_t persistent_outputs_expected = 0;
+    size_t persistent_outputs_with_backing = 0;
+};
+
+__STATIC_INLINE__ const ggml_tensor* sd_htp_allocation_root(
+    const ggml_tensor* tensor) {
+    for (size_t depth = 0; tensor != nullptr && depth < 64; ++depth) {
+        if (tensor->view_src != nullptr) {
+            tensor = tensor->view_src;
+            continue;
+        }
+        const bool view_only = tensor->op == GGML_OP_VIEW ||
+                               tensor->op == GGML_OP_RESHAPE ||
+                               tensor->op == GGML_OP_PERMUTE ||
+                               tensor->op == GGML_OP_TRANSPOSE;
+        if (view_only && tensor->src[0] != nullptr) {
+            tensor = tensor->src[0];
+            continue;
+        }
+        return tensor;
+    }
+    return tensor;
+}
+
+__STATIC_INLINE__ ggml_backend_buffer_t sd_htp_resolved_backing(
+    const ggml_tensor* tensor) {
+    for (size_t depth = 0; tensor != nullptr && depth < 64; ++depth) {
+        if (tensor->buffer != nullptr) {
+            return tensor->buffer;
+        }
+        if (tensor->view_src != nullptr) {
+            tensor = tensor->view_src;
+            continue;
+        }
+        const bool view_only = tensor->op == GGML_OP_VIEW ||
+                               tensor->op == GGML_OP_RESHAPE ||
+                               tensor->op == GGML_OP_PERMUTE ||
+                               tensor->op == GGML_OP_TRANSPOSE;
+        tensor = view_only ? tensor->src[0] : nullptr;
+    }
+    return nullptr;
+}
+
+__STATIC_INLINE__ sd_htp_graph_tensor_location
+sd_htp_graph_tensor_location_of(
+    ggml_cgraph* graph,
+    const ggml_tensor* tensor,
+    int* graph_index) {
+    if (graph_index != nullptr) {
+        *graph_index = -1;
+    }
+    if (graph == nullptr || tensor == nullptr) {
+        return SD_HTP_GRAPH_TENSOR_MISSING;
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        if (ggml_graph_node(graph, i) == tensor) {
+            if (graph_index != nullptr) *graph_index = i;
+            return SD_HTP_GRAPH_TENSOR_NODE;
+        }
+    }
+    for (int i = 0; i < sd::ggml_graph_cut::leaf_count(graph); ++i) {
+        if (sd::ggml_graph_cut::leaf_tensor(graph, i) == tensor) {
+            if (graph_index != nullptr) *graph_index = i;
+            return SD_HTP_GRAPH_TENSOR_LEAF;
+        }
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        const ggml_tensor* node = ggml_graph_node(graph, i);
+        for (int source = 0; node != nullptr && source < GGML_MAX_SRC; ++source) {
+            if (sd_htp_tensor_reaches_through_views(node->src[source], tensor)) {
+                if (graph_index != nullptr) *graph_index = i;
+                return SD_HTP_GRAPH_TENSOR_SOURCE_ONLY;
+            }
+        }
+    }
+    return SD_HTP_GRAPH_TENSOR_MISSING;
+}
+
+__STATIC_INLINE__ int sd_htp_planned_buffer_id(
+    ggml_cgraph* graph,
+    const ggml_tensor* tensor,
+    const std::vector<int>& node_buffer_ids,
+    const std::vector<int>& leaf_buffer_ids) {
+    int index = -1;
+    const sd_htp_graph_tensor_location location =
+        sd_htp_graph_tensor_location_of(graph, tensor, &index);
+    if (location == SD_HTP_GRAPH_TENSOR_NODE && index >= 0 &&
+        static_cast<size_t>(index) < node_buffer_ids.size()) {
+        return node_buffer_ids[index];
+    }
+    if (location == SD_HTP_GRAPH_TENSOR_LEAF && index >= 0 &&
+        static_cast<size_t>(index) < leaf_buffer_ids.size()) {
+        return leaf_buffer_ids[index];
+    }
+    return -1;
+}
+
+__STATIC_INLINE__ size_t sd_htp_ordinary_consumer_count(
+    ggml_cgraph* graph,
+    const ggml_tensor* tensor,
+    const ggml_tensor* rho,
+    const ggml_tensor* residual) {
+    size_t count = 0;
+    if (graph == nullptr || tensor == nullptr) {
+        return count;
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        const ggml_tensor* consumer = ggml_graph_node(graph, i);
+        if (consumer == nullptr || consumer == rho || consumer == residual) {
+            continue;
+        }
+        for (int source = 0; source < GGML_MAX_SRC; ++source) {
+            if (sd_htp_tensor_reaches_through_views(
+                    consumer->src[source], tensor)) {
+                ++count;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
+__STATIC_INLINE__ sd_htp_buffer_class sd_htp_classify_buffer(
+    ggml_backend_buffer_t backing,
+    ggml_backend_buffer_type_t runtime_buft,
+    ggml_backend_buffer_type_t htp_buft,
+    ggml_backend_buffer_type_t qkv_buft,
+    const std::unordered_set<ggml_backend_buffer_t>& persistent_backings) {
+    if (backing == nullptr) {
+        return SD_HTP_BUFFER_NONE;
+    }
+    if (persistent_backings.find(backing) != persistent_backings.end()) {
+        return SD_HTP_BUFFER_PERSISTENT;
+    }
+    const ggml_backend_buffer_type_t buft =
+        ggml_backend_buffer_get_type(backing);
+    if (qkv_buft != nullptr && buft == qkv_buft) {
+        return SD_HTP_BUFFER_QKV;
+    }
+    if (htp_buft != nullptr && buft == htp_buft) {
+        return SD_HTP_BUFFER_HTP;
+    }
+    if (runtime_buft != nullptr && buft == runtime_buft) {
+        return SD_HTP_BUFFER_RUNTIME;
+    }
+    return SD_HTP_BUFFER_UNKNOWN;
+}
+
+__STATIC_INLINE__ std::vector<sd_htp_residual_pair_allocation_record>
+sd_collect_htp_residual_pair_allocation_records(
+    ggml_cgraph* graph,
+    const std::vector<const ggml_tensor*>& no_alloc_tensors,
+    const std::vector<int>& node_buffer_ids,
+    const std::vector<int>& leaf_buffer_ids,
+    ggml_backend_buffer_type_t runtime_buft,
+    ggml_backend_buffer_type_t htp_buft,
+    ggml_backend_buffer_type_t qkv_buft,
+    const std::unordered_set<ggml_backend_buffer_t>& persistent_backings) {
+    std::vector<sd_htp_residual_pair_allocation_record> records;
+    if (graph == nullptr) {
+        return records;
+    }
+    size_t pair_id = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        const ggml_tensor* residual = ggml_graph_node(graph, i);
+        if (residual == nullptr || residual->op != GGML_OP_CUSTOM ||
+            std::strncmp(residual->name,
+                         "htp_block_sparse_residual_b", 27) != 0) {
+            continue;
+        }
+        const ggml_tensor* dense = residual->src[0];
+        const ggml_tensor* sparse = residual->src[1];
+        const ggml_tensor* rho = residual->src[2];
+        if (dense == nullptr || sparse == nullptr || rho == nullptr ||
+            rho->op != GGML_OP_CUSTOM ||
+            std::strncmp(rho->name,
+                         "htp_block_sparse_residual_rho_b", 31) != 0 ||
+            rho->src[0] != dense || rho->src[1] != sparse) {
+            continue;
+        }
+        ++pair_id;
+        const std::pair<sd_htp_residual_pair_role, const ggml_tensor*> roles[] = {
+            {SD_HTP_RESIDUAL_PAIR_DENSE, dense},
+            {SD_HTP_RESIDUAL_PAIR_SPARSE, sparse},
+            {SD_HTP_RESIDUAL_PAIR_RHO, rho},
+            {SD_HTP_RESIDUAL_PAIR_RESIDUAL, residual},
+        };
+        for (const auto& role : roles) {
+            sd_htp_residual_pair_allocation_record record;
+            record.pair_id = pair_id;
+            record.role = role.first;
+            record.tensor = role.second;
+            record.view_root = sd_htp_allocation_root(role.second);
+            record.graph_location = sd_htp_graph_tensor_location_of(
+                graph, role.second, &record.graph_index);
+            record.planned_buffer_id = sd_htp_planned_buffer_id(
+                graph, role.second, node_buffer_ids, leaf_buffer_ids);
+            record.root_planned_buffer_id = sd_htp_planned_buffer_id(
+                graph, record.view_root, node_buffer_ids, leaf_buffer_ids);
+            record.ordinary_consumer_count = sd_htp_ordinary_consumer_count(
+                graph, role.second, rho, residual);
+            record.no_alloc_direct = std::find(
+                no_alloc_tensors.begin(), no_alloc_tensors.end(), role.second) !=
+                no_alloc_tensors.end();
+            record.no_alloc_root = std::find(
+                no_alloc_tensors.begin(), no_alloc_tensors.end(), record.view_root) !=
+                no_alloc_tensors.end();
+            record.data = role.second->data;
+            record.buffer = role.second->buffer;
+            record.resolved_backing = sd_htp_resolved_backing(role.second);
+            record.actual_buffer_class = sd_htp_classify_buffer(
+                record.resolved_backing, runtime_buft, htp_buft, qkv_buft,
+                persistent_backings);
+            records.push_back(record);
+        }
+    }
+    return records;
+}
+
+__STATIC_INLINE__ sd_htp_residual_pair_allocation_summary
+sd_summarize_htp_residual_pair_allocation_records(
+    const std::vector<sd_htp_residual_pair_allocation_record>& records) {
+    sd_htp_residual_pair_allocation_summary summary;
+    for (const auto& record : records) {
+        switch (record.role) {
+            case SD_HTP_RESIDUAL_PAIR_DENSE:
+                ++summary.dense_outputs_expected;
+                summary.dense_outputs_with_backing +=
+                    record.resolved_backing != nullptr ? 1 : 0;
+                summary.dense_outputs_no_alloc +=
+                    record.no_alloc_direct || record.no_alloc_root ? 1 : 0;
+                break;
+            case SD_HTP_RESIDUAL_PAIR_SPARSE:
+                summary.metadata_only_sparse_without_backing +=
+                    (record.no_alloc_direct || record.no_alloc_root) &&
+                            record.resolved_backing == nullptr
+                        ? 1 : 0;
+                summary.allocated_sparse_with_backing +=
+                    record.resolved_backing != nullptr ? 1 : 0;
+                break;
+            case SD_HTP_RESIDUAL_PAIR_RHO:
+            case SD_HTP_RESIDUAL_PAIR_RESIDUAL:
+                ++summary.persistent_outputs_expected;
+                summary.persistent_outputs_with_backing +=
+                    record.actual_buffer_class == SD_HTP_BUFFER_PERSISTENT
+                        ? 1 : 0;
+                break;
+        }
+    }
+    return summary;
+}
+
+__STATIC_INLINE__ const char* sd_htp_residual_pair_role_name(
+    sd_htp_residual_pair_role role) {
+    switch (role) {
+        case SD_HTP_RESIDUAL_PAIR_DENSE: return "dense";
+        case SD_HTP_RESIDUAL_PAIR_SPARSE: return "sparse";
+        case SD_HTP_RESIDUAL_PAIR_RHO: return "rho";
+        case SD_HTP_RESIDUAL_PAIR_RESIDUAL: return "residual";
+    }
+    return "unknown";
+}
+
+__STATIC_INLINE__ const char* sd_htp_graph_tensor_location_name(
+    sd_htp_graph_tensor_location location) {
+    switch (location) {
+        case SD_HTP_GRAPH_TENSOR_NODE: return "node";
+        case SD_HTP_GRAPH_TENSOR_LEAF: return "leaf";
+        case SD_HTP_GRAPH_TENSOR_SOURCE_ONLY: return "source-only";
+        case SD_HTP_GRAPH_TENSOR_MISSING: return "missing";
+    }
+    return "missing";
+}
+
+__STATIC_INLINE__ const char* sd_htp_buffer_class_name(
+    sd_htp_buffer_class buffer_class) {
+    switch (buffer_class) {
+        case SD_HTP_BUFFER_NONE: return "none";
+        case SD_HTP_BUFFER_RUNTIME: return "runtime";
+        case SD_HTP_BUFFER_HTP: return "htp";
+        case SD_HTP_BUFFER_QKV: return "qkv";
+        case SD_HTP_BUFFER_PERSISTENT: return "persistent";
+        case SD_HTP_BUFFER_UNKNOWN: return "unknown";
+    }
+    return "unknown";
+}
+
+__STATIC_INLINE__ int sd_format_htp_residual_pair_allocation_record(
+    char* buffer,
+    size_t capacity,
+    const char* checkpoint,
+    const sd_htp_residual_pair_allocation_record& record) {
+    if (buffer == nullptr || capacity == 0) {
+        return -1;
+    }
+    return std::snprintf(
+        buffer, capacity,
+        "htp_opencl_pair_allocation checkpoint=%s pair_id=%zu role=%s "
+        "tensor=%p name=%s op=%s graph_location=%s graph_index=%d "
+        "view_src=%p view_root=%p ordinary_consumers=%zu "
+        "no_alloc_direct=%d no_alloc_root=%d planned_buffer_id=%d "
+        "root_planned_buffer_id=%d actual_buffer_class=%s data=%p "
+        "buffer=%p resolved_backing=%p",
+        checkpoint != nullptr ? checkpoint : "unknown", record.pair_id,
+        sd_htp_residual_pair_role_name(record.role),
+        static_cast<const void*>(record.tensor),
+        record.tensor != nullptr && record.tensor->name[0] != '\0'
+            ? record.tensor->name : "<unnamed>",
+        record.tensor != nullptr ? ggml_op_name(record.tensor->op) : "<null>",
+        sd_htp_graph_tensor_location_name(record.graph_location),
+        record.graph_index,
+        record.tensor != nullptr
+            ? static_cast<const void*>(record.tensor->view_src) : nullptr,
+        static_cast<const void*>(record.view_root),
+        record.ordinary_consumer_count,
+        record.no_alloc_direct ? 1 : 0,
+        record.no_alloc_root ? 1 : 0,
+        record.planned_buffer_id,
+        record.root_planned_buffer_id,
+        sd_htp_buffer_class_name(record.actual_buffer_class),
+        record.data,
+        static_cast<void*>(record.buffer),
+        static_cast<void*>(record.resolved_backing));
+}
+
+__STATIC_INLINE__ int sd_format_htp_residual_pair_allocation_summary(
+    char* buffer,
+    size_t capacity,
+    const char* checkpoint,
+    const sd_htp_residual_pair_allocation_summary& summary) {
+    if (buffer == nullptr || capacity == 0) {
+        return -1;
+    }
+    return std::snprintf(
+        buffer, capacity,
+        "htp_opencl_memory_plan_contract checkpoint=%s "
+        "dense_outputs_expected=%zu dense_outputs_with_backing=%zu "
+        "dense_outputs_no_alloc=%zu "
+        "metadata_only_sparse_without_backing=%zu "
+        "allocated_sparse_with_backing=%zu "
+        "persistent_outputs_expected=%zu "
+        "persistent_outputs_with_backing=%zu",
+        checkpoint != nullptr ? checkpoint : "unknown",
+        summary.dense_outputs_expected,
+        summary.dense_outputs_with_backing,
+        summary.dense_outputs_no_alloc,
+        summary.metadata_only_sparse_without_backing,
+        summary.allocated_sparse_with_backing,
+        summary.persistent_outputs_expected,
+        summary.persistent_outputs_with_backing);
+}
+
 struct GGMLRunnerContext {
     ggml_backend_t backend                                           = nullptr;
     ggml_context* ggml_ctx                                           = nullptr;
@@ -5584,7 +5982,10 @@ struct GGMLRunnerContext {
     }
 };
 
-__STATIC_INLINE__ void sd_install_local_opencl_residual_graph_expansion(
+// Local residual expansion is shared by fused, OpenCL sparse, and HTP/CPU
+// anchor routes.  The route-specific producer ownership is handled later by
+// the allocator/sidecar; graph ordering must stay common here.
+__STATIC_INLINE__ void sd_install_local_residual_graph_expansion(
     ggml_cgraph* graph,
     int block_sparse_residual_mode,
     GGMLRunnerContext* runner_ctx) {
@@ -5736,6 +6137,7 @@ protected:
     // 记录每个 node/leaf 应该落在哪个 buffer，0=默认 runtime buffer，1=HTP RPCMEM buffer。
     std::vector<int> compute_node_buffer_ids_;
     std::vector<int> compute_leaf_buffer_ids_;
+    std::vector<const ggml_tensor*> compute_no_alloc_tensors_;
 
     template <typename T>
     static sd::Tensor<T> take_or_empty(std::optional<sd::Tensor<T>> tensor) {
@@ -5856,6 +6258,18 @@ protected:
         const auto found = async_residual_cache_slots_.find(key);
         return found != async_residual_cache_slots_.end() &&
                found->second.slot != nullptr;
+    }
+
+    bool all_cache_outputs_async_residual_backed() const {
+        if (cache_tensor_map.empty()) {
+            return false;
+        }
+        for (const auto& entry : cache_tensor_map) {
+            if (!async_residual_cache_backed(entry.first)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     void release_active_async_cache_consumers() {
@@ -6046,11 +6460,13 @@ protected:
                         return false;
                     }
                     it->qkv_released = true;
-                    std::fprintf(
-                        stderr,
-                        "htp_opencl_event name=gpu_qkv_release ts_us=%lld "
-                        "generation=%" PRIu64 " bytes=%zu\n",
-                        (long long) ggml_time_us(), it->generation, qkv_bytes);
+                    if (sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_TRACE")) {
+                        std::fprintf(
+                            stderr,
+                            "htp_opencl_event name=gpu_qkv_release ts_us=%lld "
+                            "generation=%" PRIu64 " bytes=%zu\n",
+                            (long long) ggml_time_us(), it->generation, qkv_bytes);
+                    }
                 }
             }
             bool released = false;
@@ -6084,11 +6500,14 @@ protected:
         while (retired_compute_arenas_.size() >= 2) {
             RetiredComputeArenaGeneration& oldest = retired_compute_arenas_.front();
             const int64_t wait_begin = ggml_time_us();
-            std::fprintf(
-                stderr,
-                "htp_opencl_event name=gpu_residual_arena_pressure_wait_begin "
-                "ts_us=%lld generation=%" PRIu64 " bytes=%zu\n",
-                (long long) wait_begin, oldest.generation, oldest.bytes);
+            const bool trace = sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_TRACE");
+            if (trace) {
+                std::fprintf(
+                    stderr,
+                    "htp_opencl_event name=gpu_residual_arena_pressure_wait_begin "
+                    "ts_us=%lld generation=%" PRIu64 " bytes=%zu\n",
+                    (long long) wait_begin, oldest.generation, oldest.bytes);
+            }
             bool released = false;
             char reason[512] = {};
             if (!sd_backend_htp_opencl_release_arena_generation(
@@ -6101,11 +6520,13 @@ protected:
                     reason[0] != '\0' ? reason : "unknown error");
                 return false;
             }
-            std::fprintf(
-                stderr,
-                "htp_opencl_event name=gpu_residual_arena_pressure_wait_end "
-                "ts_us=%lld generation=%" PRIu64 "\n",
-                (long long) ggml_time_us(), oldest.generation);
+            if (trace) {
+                std::fprintf(
+                    stderr,
+                    "htp_opencl_event name=gpu_residual_arena_pressure_wait_end "
+                    "ts_us=%lld generation=%" PRIu64 "\n",
+                    (long long) ggml_time_us(), oldest.generation);
+            }
             ggml_gallocr_free(oldest.allocator);
             retired_compute_arenas_.pop_front();
         }
@@ -6126,6 +6547,7 @@ protected:
         compute_allocr = nullptr;
         compute_node_buffer_ids_.clear();
         compute_leaf_buffer_ids_.clear();
+        compute_no_alloc_tensors_.clear();
         // Do not probe the just-computed generation here. HTP dense has
         // returned, but its deferred OpenCL sparse work may still own QKV.
         // The next arena poll releases QKV after sparse completion.
@@ -6222,6 +6644,57 @@ protected:
         return true;
     }
 
+    void trace_residual_pair_allocation(
+            const char* checkpoint,
+            ggml_cgraph* gf) const {
+        if (!sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_TRACE") ||
+            gf == nullptr) {
+            return;
+        }
+        std::unordered_set<ggml_backend_buffer_t> persistent_backings;
+        for (const CacheStorageSegment& segment : cache_storage_segments_) {
+            if (segment.buffer != nullptr) {
+                persistent_backings.insert(segment.buffer);
+            }
+        }
+        for (const auto& entry : async_residual_cache_slots_) {
+            ggml_tensor* tensor = entry.second.slot != nullptr
+                ? sd_backend_htp_async_cache_slot_tensor(entry.second.slot)
+                : nullptr;
+            if (tensor != nullptr && tensor->buffer != nullptr) {
+                persistent_backings.insert(tensor->buffer);
+            }
+        }
+
+        const ggml_backend_buffer_type_t runtime_buft =
+            ggml_backend_get_default_buffer_type(runtime_backend);
+        const ggml_backend_buffer_type_t htp_buft = htp_backend != nullptr
+            ? ggml_backend_get_default_buffer_type(htp_backend) : nullptr;
+        const ggml_backend_buffer_type_t qkv_buft = htp_backend != nullptr
+            ? ggml_backend_htp_qkv_buffer_type() : nullptr;
+        const auto records =
+            sd_collect_htp_residual_pair_allocation_records(
+                gf, compute_no_alloc_tensors_, compute_node_buffer_ids_,
+                compute_leaf_buffer_ids_, runtime_buft, htp_buft, qkv_buft,
+                persistent_backings);
+        if (records.empty()) {
+            return;
+        }
+        for (const auto& record : records) {
+            char line[1024] = {};
+            if (sd_format_htp_residual_pair_allocation_record(
+                    line, sizeof(line), checkpoint, record) > 0) {
+                std::fprintf(stderr, "%s\n", line);
+            }
+        }
+        char summary_line[512] = {};
+        if (sd_format_htp_residual_pair_allocation_summary(
+                summary_line, sizeof(summary_line), checkpoint,
+                sd_summarize_htp_residual_pair_allocation_records(records)) > 0) {
+            std::fprintf(stderr, "%s\n", summary_line);
+        }
+    }
+
     bool alloc_compute_buffer(ggml_cgraph* gf) {
         if (!reap_retired_compute_arenas(false)) {
             return false;
@@ -6230,6 +6703,7 @@ protected:
         ggml_backend_buffer_type_t htp_buft     = htp_backend != nullptr ? ggml_backend_get_default_buffer_type(htp_backend) : nullptr;
         compute_node_buffer_ids_.clear();
         compute_leaf_buffer_ids_.clear();
+        compute_no_alloc_tensors_.clear();
 
         ggml_backend_buffer_type_t qkv_buft = htp_backend != nullptr ? ggml_backend_htp_qkv_buffer_type() : nullptr;
         if (htp_op_routing_enabled() && htp_buft != nullptr) {
@@ -6245,14 +6719,15 @@ protected:
             }
         }
 
-        const std::vector<const ggml_tensor*> no_alloc_tensors =
+        compute_no_alloc_tensors_ =
             sd_htp_opencl_sparse_local_lifetime_prerequisites()
                 ? sd_collect_local_residual_owned_sparse_producers(gf)
                 : std::vector<const ggml_tensor*>{};
         if (!ggml_gallocr_set_no_alloc_tensors(
                 compute_allocr,
-                no_alloc_tensors.empty() ? nullptr : no_alloc_tensors.data(),
-                no_alloc_tensors.size())) {
+                compute_no_alloc_tensors_.empty()
+                    ? nullptr : compute_no_alloc_tensors_.data(),
+                compute_no_alloc_tensors_.size())) {
             LOG_ERROR("%s: failed to configure metadata-only graph tensors\n",
                       get_desc().c_str());
             return false;
@@ -6327,13 +6802,14 @@ protected:
                         ? 0
                         : ggml_gallocr_get_buffer_size(compute_allocr, 2),
                     persistent_cache_bytes,
-                    no_alloc_tensors.size(),
-                    no_alloc_tensors.size(),
+                    compute_no_alloc_tensors_.size(),
+                    compute_no_alloc_tensors_.size(),
                     cache_output_count,
                     sd_htp_opencl_bind_cache_outputs_before_reserve(),
                     0);
             char summary[512] = {};
-            if (sd_format_htp_opencl_memory_plan(
+            if (sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_TRACE") &&
+                sd_format_htp_opencl_memory_plan(
                     summary, sizeof(summary), memory_plan) > 0) {
                 std::fprintf(stderr, "%s\n", summary);
             }
@@ -7171,7 +7647,7 @@ protected:
             const size_t new_segment_bytes =
                 ggml_backend_buffer_get_size(new_segment.buffer);
             cache_storage_segments_.push_back(std::move(new_segment));
-            if (sd_env_flag_enabled("SD_HTP_DENOISE_STEP_TRACE")) {
+            if (sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_TRACE")) {
                 LOG_INFO("cache_storage_update mode=%s segments_before=%zu replaced=%zu segments_after=%zu new_bytes=%zu",
                          update_plan.mode == SD_CACHE_STORAGE_APPEND ? "append" : "replace",
                          segments_before,
@@ -7428,7 +7904,7 @@ protected:
             AsyncResidualCacheOutputTransaction* transaction) {
         GGML_ASSERT(transaction != nullptr);
         GGML_ASSERT(!transaction->active);
-        if (!sd_htp_opencl_local_lifetime_prerequisites()) {
+        if (!sd_htp_opencl_persistent_cache_outputs_enabled()) {
             return true;
         }
         std::vector<std::pair<std::string, ggml_tensor*>> outputs;
@@ -7880,6 +8356,7 @@ protected:
             }
             return std::nullopt;
         }
+        trace_residual_pair_allocation("post_gallocr", gf);
         int64_t t_alloc_end = ggml_time_ms();
 
         int64_t t_copy_begin = ggml_time_ms();
@@ -7903,6 +8380,7 @@ protected:
             return std::nullopt;
         }
         copy_data_to_backend_tensor(gf, !preserve_backend_tensor_data_map);
+        trace_residual_pair_allocation("pre_htp_compute", gf);
         int64_t t_copy_end = ggml_time_ms();
         if (ggml_backend_is_cpu(runtime_backend)) {
             ggml_backend_cpu_set_n_threads(runtime_backend, n_threads);
@@ -7953,6 +8431,21 @@ protected:
         }
         commit_async_residual_cache_outputs(&cache_output_transaction);
         cache_output_rollback.release();
+
+        if (ggml_htp_opencl_can_release_transient_buffers_post_compute(
+                sd_htp_opencl_lifetime_mode(),
+                use_htp_compute,
+                free_compute_buffer_immediately,
+                all_cache_outputs_async_residual_backed(),
+                !debug_tensors.empty())) {
+            if (!ggml_gallocr_free_buffer(compute_allocr, 2, nullptr) ||
+                !ggml_gallocr_free_buffer(compute_allocr, 1, nullptr)) {
+                LOG_ERROR("%s release post-compute HTP buffers failed",
+                          get_desc().c_str());
+                free_compute_buffer();
+                return std::nullopt;
+            }
+        }
 
         std::unordered_set<const ggml_tensor*> debug_graph_tensor_set;
         const int n_debug_leafs = sd::ggml_graph_cut::leaf_count(gf);
@@ -8272,6 +8765,7 @@ public:
         }
         compute_node_buffer_ids_.clear();
         compute_leaf_buffer_ids_.clear();
+        compute_no_alloc_tensors_.clear();
         restore_partial_params();
         restore_all_params();
     }

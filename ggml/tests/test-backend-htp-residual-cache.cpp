@@ -29,6 +29,18 @@ bool graph_contains(ggml_cgraph * graph, const ggml_tensor * tensor) {
     return false;
 }
 
+const ggml_tensor * backing_root(const ggml_tensor * tensor) {
+    while (tensor != nullptr && tensor->view_src != nullptr) {
+        tensor = tensor->view_src;
+    }
+    return tensor;
+}
+
+bool tensor_has_resolved_backing(const ggml_tensor * tensor) {
+    const ggml_tensor * root = backing_root(tensor);
+    return root != nullptr && root->buffer != nullptr && root->data != nullptr;
+}
+
 int graph_node_index(ggml_cgraph * graph, const ggml_tensor * tensor) {
     for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
         if (ggml_graph_node(graph, i) == tensor) {
@@ -66,7 +78,8 @@ ggml_tensor * graph_order_custom(
 local_attention_pair_fixture build_local_attention_pair(
         ggml_context * ctx,
         ggml_cgraph * graph,
-        int pair_index) {
+        int pair_index,
+        bool view_backed_dense = false) {
     local_attention_pair_fixture pair;
     ggml_tensor * q_input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
     ggml_tensor * k_input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
@@ -76,7 +89,16 @@ local_attention_pair_fixture build_local_attention_pair(
     pair.q = graph_order_custom(ctx, "local_q", {q_input});
     pair.k = graph_order_custom(ctx, "local_k", {k_input});
     pair.v = graph_order_custom(ctx, "local_v", {v_input});
-    pair.dense = graph_order_custom(ctx, "local_dense", {pair.q, pair.k, pair.v});
+    ggml_tensor * dense_storage = graph_order_custom(
+        ctx, "local_dense_storage", {pair.q, pair.k, pair.v});
+    pair.dense = dense_storage;
+    if (view_backed_dense) {
+        ggml_tensor * reshaped = ggml_reshape_2d(ctx, dense_storage, 8, 8);
+        pair.dense = ggml_permute(ctx, reshaped, 1, 0, 2, 3);
+        ggml_set_name(pair.dense, "local_dense_view");
+    } else {
+        ggml_set_name(pair.dense, "local_dense");
+    }
     pair.sparse = graph_order_custom(
         ctx, "local_sparse", {pair.q, pair.k, pair.v, pair.mask});
     pair.rho = graph_order_custom(ctx, "local_rho", {pair.dense, pair.sparse});
@@ -141,7 +163,30 @@ bool local_residual_graph_expands_pairs_in_attention_order() {
     return ordered && local_outputs;
 }
 
-bool no_allocation_tensor_avoids_sparse_destination_storage() {
+enum class no_alloc_role {
+    sparse,
+    dense,
+    rho,
+    residual,
+};
+
+struct allocator_pair_contract_result {
+    bool allocated = false;
+    bool dense_backed = false;
+    bool sparse_backed = false;
+    bool rho_backed = false;
+    bool residual_backed = false;
+    bool continuation_backed = false;
+    bool sparse_collected = false;
+    size_t buffer_size = SIZE_MAX;
+    size_t sparse_size = 0;
+};
+
+allocator_pair_contract_result run_allocator_pair_contract(
+        bool view_backed_dense,
+        no_alloc_role role,
+        bool add_sparse_consumer = false,
+        bool break_pair = false) {
     ggml_init_params params = {
         /*.mem_size   =*/ 2 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -149,39 +194,286 @@ bool no_allocation_tensor_avoids_sparse_destination_storage() {
     };
     ggml_context * ctx = ggml_init(params);
     ggml_backend_t backend = ggml_backend_cpu_init();
+    allocator_pair_contract_result result;
     if (ctx == nullptr || backend == nullptr) {
         if (backend != nullptr) ggml_backend_free(backend);
         if (ctx != nullptr) ggml_free(ctx);
-        return false;
+        return result;
     }
 
-    ggml_tensor * dense = graph_order_custom(ctx, "no_alloc_dense", {});
+    ggml_tensor * dense_storage = graph_order_custom(
+        ctx, "no_alloc_dense_storage", {});
+    ggml_tensor * dense = dense_storage;
+    if (view_backed_dense) {
+        ggml_tensor * reshaped = ggml_reshape_2d(ctx, dense_storage, 8, 8);
+        dense = ggml_permute(ctx, reshaped, 1, 0, 2, 3);
+        ggml_set_name(dense, "no_alloc_dense_view");
+    } else {
+        ggml_set_name(dense, "no_alloc_dense");
+    }
     ggml_tensor * sparse = ggml_new_tensor_1d(
         ctx, GGML_TYPE_F32, 1024 * 1024);
     sparse->op = GGML_OP_CUSTOM;
     ggml_set_name(sparse, "no_alloc_sparse_destination");
+    ggml_tensor * rho = graph_order_custom(
+        ctx, "htp_block_sparse_residual_rho_b0_allocator_s0",
+        {dense, sparse});
     ggml_tensor * residual = graph_order_custom(
-        ctx, "no_alloc_residual", {dense, sparse});
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
-    ggml_build_forward_expand(graph, residual);
+        ctx, "htp_block_sparse_residual_b0_allocator_s0",
+        {dense, sparse, rho});
+    if (break_pair) {
+        rho->src[1] = dense;
+    }
+    ggml_tensor * continuation = graph_order_custom(
+        ctx, "no_alloc_dense_continuation", {dense, residual});
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
+    ggml_build_forward_expand(graph, continuation);
+    if (add_sparse_consumer) {
+        ggml_tensor * sparse_consumer = graph_order_custom(
+            ctx, "no_alloc_sparse_consumer", {sparse});
+        ggml_build_forward_expand(graph, sparse_consumer);
+    }
 
     ggml_gallocr_t allocator = ggml_gallocr_new(
         ggml_backend_get_default_buffer_type(backend));
-    const ggml_tensor * no_alloc[] = {sparse};
+    const ggml_tensor * no_alloc_tensor = sparse;
+    switch (role) {
+        case no_alloc_role::sparse:   no_alloc_tensor = sparse;   break;
+        case no_alloc_role::dense:    no_alloc_tensor = dense;    break;
+        case no_alloc_role::rho:      no_alloc_tensor = rho;      break;
+        case no_alloc_role::residual: no_alloc_tensor = residual; break;
+    }
+    const ggml_tensor * no_alloc[] = {no_alloc_tensor};
     const bool configured = ggml_gallocr_set_no_alloc_tensors(
         allocator, no_alloc, 1);
-    const bool allocated = configured &&
+    result.allocated = configured &&
         ggml_gallocr_reserve(allocator, graph) &&
         ggml_gallocr_alloc_graph(allocator, graph);
-    const size_t buffer_size = allocated ?
+    result.buffer_size = result.allocated ?
         ggml_gallocr_get_buffer_size(allocator, 0) : SIZE_MAX;
-    const bool result = allocated && sparse->data == nullptr &&
-        sparse->buffer == nullptr && buffer_size < ggml_nbytes(sparse);
+    result.sparse_size = ggml_nbytes(sparse);
+    result.dense_backed = tensor_has_resolved_backing(dense);
+    result.sparse_backed = tensor_has_resolved_backing(sparse);
+    result.rho_backed = tensor_has_resolved_backing(rho);
+    result.residual_backed = tensor_has_resolved_backing(residual);
+    result.continuation_backed = tensor_has_resolved_backing(continuation);
+    const auto collected =
+        sd_collect_local_residual_owned_sparse_producers(graph);
+    result.sparse_collected =
+        collected.size() == 1 && collected.front() == sparse;
 
     ggml_gallocr_free(allocator);
     ggml_backend_free(backend);
     ggml_free(ctx);
     return result;
+}
+
+bool no_allocation_tensor_avoids_sparse_destination_storage() {
+    const allocator_pair_contract_result direct =
+        run_allocator_pair_contract(false, no_alloc_role::sparse);
+    const allocator_pair_contract_result view =
+        run_allocator_pair_contract(true, no_alloc_role::sparse);
+    return direct.allocated && direct.dense_backed && !direct.sparse_backed &&
+        direct.rho_backed && direct.residual_backed &&
+        direct.continuation_backed && direct.sparse_collected &&
+        direct.buffer_size < direct.sparse_size &&
+        view.allocated && view.dense_backed && !view.sparse_backed &&
+        view.rho_backed && view.residual_backed &&
+        view.continuation_backed && view.sparse_collected &&
+        view.buffer_size < view.sparse_size;
+}
+
+bool no_allocation_scope_is_limited_to_local_sparse_output() {
+    const allocator_pair_contract_result dense =
+        run_allocator_pair_contract(false, no_alloc_role::dense);
+    const allocator_pair_contract_result rho =
+        run_allocator_pair_contract(false, no_alloc_role::rho);
+    const allocator_pair_contract_result residual =
+        run_allocator_pair_contract(false, no_alloc_role::residual);
+    const allocator_pair_contract_result ordinary_consumer =
+        run_allocator_pair_contract(
+            false, no_alloc_role::sparse, true, false);
+    const allocator_pair_contract_result broken_pair =
+        run_allocator_pair_contract(
+            false, no_alloc_role::sparse, false, true);
+    return dense.allocated && !dense.dense_backed && dense.sparse_backed &&
+        dense.rho_backed && dense.residual_backed &&
+        rho.allocated && rho.dense_backed && rho.sparse_backed &&
+        !rho.rho_backed && rho.residual_backed &&
+        residual.allocated && residual.dense_backed && residual.sparse_backed &&
+        residual.rho_backed && !residual.residual_backed &&
+        ordinary_consumer.allocated && !ordinary_consumer.sparse_backed &&
+        !ordinary_consumer.sparse_collected &&
+        broken_pair.allocated && !broken_pair.sparse_backed &&
+        !broken_pair.sparse_collected;
+}
+
+bool allocation_record_collector_preserves_pair_roles() {
+    auto run_case = [](int pair_count) {
+        ggml_init_params params = {
+            /*.mem_size   =*/ 8 * 1024 * 1024,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        ggml_backend_t backend = ggml_backend_cpu_init();
+        if (ctx == nullptr || backend == nullptr) {
+            if (backend != nullptr) ggml_backend_free(backend);
+            if (ctx != nullptr) ggml_free(ctx);
+            return false;
+        }
+
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 256, false);
+        std::vector<local_attention_pair_fixture> pairs;
+        pairs.reserve(pair_count);
+        for (int i = 0; i < pair_count; ++i) {
+            pairs.push_back(build_local_attention_pair(
+                ctx, graph, i, (i % 2) != 0));
+            const std::string rho_name =
+                "htp_block_sparse_residual_rho_b0_records_s" +
+                std::to_string(i);
+            const std::string residual_name =
+                "htp_block_sparse_residual_b0_records_s" +
+                std::to_string(i);
+            ggml_set_name(pairs.back().rho, rho_name.c_str());
+            ggml_set_name(pairs.back().residual, residual_name.c_str());
+        }
+        ggml_tensor * continuation = graph_order_custom(
+            ctx, "allocation_record_continuation",
+            {pairs.back().dense, pairs.back().residual});
+        ggml_build_forward_expand(graph, continuation);
+        if (pair_count >= 2) {
+            ggml_tensor * ordinary_consumer = graph_order_custom(
+                ctx, "allocation_record_sparse_consumer",
+                {pairs.back().sparse});
+            ggml_build_forward_expand(graph, ordinary_consumer);
+        }
+
+        ggml_backend_buffer_t persistent_buffer =
+            ggml_backend_alloc_buffer(backend, 1024 * 1024);
+        if (persistent_buffer == nullptr) {
+            ggml_backend_free(backend);
+            ggml_free(ctx);
+            return false;
+        }
+        const size_t alignment = ggml_backend_get_alignment(backend);
+        size_t persistent_offset = 0;
+        for (const local_attention_pair_fixture & pair : pairs) {
+            for (ggml_tensor * tensor : {pair.rho, pair.residual}) {
+                persistent_offset =
+                    (persistent_offset + alignment - 1) / alignment * alignment;
+                if (ggml_backend_tensor_alloc(
+                        persistent_buffer, tensor,
+                        static_cast<char *>(
+                            ggml_backend_buffer_get_base(persistent_buffer)) +
+                            persistent_offset) != GGML_STATUS_SUCCESS) {
+                    ggml_backend_buffer_free(persistent_buffer);
+                    ggml_backend_free(backend);
+                    ggml_free(ctx);
+                    return false;
+                }
+                persistent_offset += ggml_nbytes(tensor);
+            }
+        }
+
+        std::vector<const ggml_tensor *> no_alloc_tensors;
+        for (int i = 0; i < pair_count; ++i) {
+            if ((i % 2) == 0) {
+                no_alloc_tensors.push_back(pairs[i].sparse);
+            }
+        }
+        ggml_gallocr_t allocator = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+        const bool allocated =
+            ggml_gallocr_set_no_alloc_tensors(
+                allocator,
+                no_alloc_tensors.empty() ? nullptr : no_alloc_tensors.data(),
+                no_alloc_tensors.size()) &&
+            ggml_gallocr_reserve(allocator, graph) &&
+            ggml_gallocr_alloc_graph(allocator, graph);
+
+        std::vector<int> node_buffer_ids(ggml_graph_n_nodes(graph), 0);
+        std::vector<int> leaf_buffer_ids(
+            sd::ggml_graph_cut::leaf_count(graph), 0);
+        for (int i = 0; i < pair_count; ++i) {
+            const int dense_index = graph_node_index(graph, pairs[i].dense);
+            const int sparse_index = graph_node_index(graph, pairs[i].sparse);
+            if (dense_index >= 0) node_buffer_ids[dense_index] = 1;
+            if (sparse_index >= 0) node_buffer_ids[sparse_index] = 2;
+        }
+        const std::unordered_set<ggml_backend_buffer_t> persistent_backings = {
+            persistent_buffer,
+        };
+        const auto records =
+            sd_collect_htp_residual_pair_allocation_records(
+                graph, no_alloc_tensors, node_buffer_ids, leaf_buffer_ids,
+                ggml_backend_get_default_buffer_type(backend), nullptr, nullptr,
+                persistent_backings);
+        const auto summary =
+            sd_summarize_htp_residual_pair_allocation_records(records);
+
+        bool valid = allocated &&
+            records.size() == static_cast<size_t>(4 * pair_count) &&
+            summary.dense_outputs_expected == static_cast<size_t>(pair_count) &&
+            summary.dense_outputs_with_backing == static_cast<size_t>(pair_count) &&
+            summary.dense_outputs_no_alloc == 0 &&
+            summary.metadata_only_sparse_without_backing ==
+                static_cast<size_t>((pair_count + 1) / 2) &&
+            summary.allocated_sparse_with_backing ==
+                static_cast<size_t>(pair_count / 2) &&
+            summary.persistent_outputs_expected ==
+                static_cast<size_t>(2 * pair_count) &&
+            summary.persistent_outputs_with_backing ==
+                static_cast<size_t>(2 * pair_count);
+        for (int i = 0; i < pair_count && valid; ++i) {
+            const auto & dense = records[4 * i + 0];
+            const auto & sparse = records[4 * i + 1];
+            const auto & rho = records[4 * i + 2];
+            const auto & residual = records[4 * i + 3];
+            valid = dense.pair_id == static_cast<size_t>(i + 1) &&
+                dense.role == SD_HTP_RESIDUAL_PAIR_DENSE &&
+                dense.tensor == pairs[i].dense && dense.resolved_backing != nullptr &&
+                sparse.role == SD_HTP_RESIDUAL_PAIR_SPARSE &&
+                sparse.tensor == pairs[i].sparse &&
+                sparse.planned_buffer_id == 2 &&
+                sparse.no_alloc_direct == ((i % 2) == 0) &&
+                (i % 2 == 0 ? sparse.resolved_backing == nullptr
+                            : sparse.resolved_backing != nullptr) &&
+                rho.role == SD_HTP_RESIDUAL_PAIR_RHO &&
+                rho.tensor == pairs[i].rho &&
+                rho.actual_buffer_class == SD_HTP_BUFFER_PERSISTENT &&
+                residual.role == SD_HTP_RESIDUAL_PAIR_RESIDUAL &&
+                residual.tensor == pairs[i].residual &&
+                residual.actual_buffer_class == SD_HTP_BUFFER_PERSISTENT;
+            if (i == pair_count - 1 && pair_count >= 2) {
+                valid = valid && sparse.ordinary_consumer_count == 1;
+            }
+            if ((i % 2) != 0) {
+                valid = valid && dense.view_root != dense.tensor &&
+                    dense.root_planned_buffer_id >= 0;
+            }
+        }
+        if (!valid) {
+            char summary_line[512] = {};
+            sd_format_htp_residual_pair_allocation_summary(
+                summary_line, sizeof(summary_line), "host_fixture", summary);
+            std::fprintf(stderr, "pair_count=%d %s\n", pair_count, summary_line);
+            for (const auto & record : records) {
+                char record_line[1024] = {};
+                sd_format_htp_residual_pair_allocation_record(
+                    record_line, sizeof(record_line), "host_fixture", record);
+                std::fprintf(stderr, "%s\n", record_line);
+            }
+        }
+
+        ggml_gallocr_free(allocator);
+        ggml_backend_buffer_free(persistent_buffer);
+        ggml_backend_free(backend);
+        ggml_free(ctx);
+        return valid;
+    };
+
+    return run_case(1) && run_case(2) && run_case(8);
 }
 
 bool local_residual_owned_sparse_requires_exact_pair_without_other_consumers() {
@@ -280,6 +572,23 @@ bool local_lifetime_pair_state_and_pool_reuse_are_monotonic() {
     slot = ggml_htp_opencl_staging_pool_select_slot(
         capacities, in_use, slot_count, 2, 2048, &resize);
     return slot == 1 && resize;
+}
+
+bool fused_pair_state_skips_sparse_event() {
+    ggml_htp_opencl_pair_lifetime_state pair = {};
+    if (!ggml_htp_opencl_pair_mark_fused_anchor_produced(&pair)) {
+        return false;
+    }
+    if (!pair.sparse_committed || !pair.sparse_complete ||
+        pair.residual_submitted || pair.residual_complete || pair.reaped) {
+        return false;
+    }
+    if (!ggml_htp_opencl_pair_mark_residual_submitted(&pair) ||
+        !ggml_htp_opencl_pair_mark_residual_complete(&pair) ||
+        !ggml_htp_opencl_pair_mark_reaped(&pair)) {
+        return false;
+    }
+    return pair.reaped;
 }
 
 bool staging_pressure_waits_for_residual_publication_before_cache_wait() {
@@ -568,11 +877,17 @@ int run_graph_order_test() {
         !check(local_residual_graph_expands_pairs_in_attention_order(),
                "local residual pairs must expand mask-first without graph outputs") ||
         !check(no_allocation_tensor_avoids_sparse_destination_storage(),
-               "metadata-only sparse outputs must not consume gallocr storage") ||
+               "residual pair allocation must back dense/cache roles but not metadata-only sparse") ||
+        !check(no_allocation_scope_is_limited_to_local_sparse_output(),
+               "no-allocation scope must detect dense/cache mistakes and reject invalid sparse ownership") ||
+        !check(allocation_record_collector_preserves_pair_roles(),
+               "pair allocation records must preserve role, graph, plan, and backing ownership") ||
         !check(local_residual_owned_sparse_requires_exact_pair_without_other_consumers(),
                "local metadata-only sparse outputs require an exact residual pair and no ordinary consumer") ||
         !check(local_lifetime_pair_state_and_pool_reuse_are_monotonic(),
                "local pair state and staging slots must complete monotonically and reuse bounded storage") ||
+        !check(fused_pair_state_skips_sparse_event(),
+               "fused pairs must enter residual ownership without a sparse event") ||
         !check(staging_pressure_waits_for_residual_publication_before_cache_wait(),
                "staging pressure must wait for residual publication before cache completion") ||
         !check(local_memory_plan_reports_allocator_ownership(),
@@ -630,7 +945,11 @@ cache_pair create_cache_pair(ggml_backend_t backend, uint64_t generation) {
 }
 
 int run_lifecycle_test() {
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE", "1", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO", "1", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR", "0", 1);
     setenv("SD_HTP_SPARSE_OPENCL", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "1", 1);
     setenv("SD_HTP_SPARSE_OPENCL_STRICT", "1", 1);
     if (!ggml_backend_htp_runtime_available()) {
         std::fprintf(stderr, "SKIP: HTP runtime unavailable: %s\n",
@@ -942,6 +1261,297 @@ int run_residual_only_test() {
     return result;
 }
 
+enum class sparse_preflight_case {
+    metadata_only_sparse,
+    dense_no_alloc,
+    ordinary_sparse_consumer,
+    deferred_stage_noop,
+};
+
+int run_sparse_residual_preflight_case(sparse_preflight_case test_case) {
+    constexpr int64_t head_dim = 64;
+    constexpr int64_t heads = 1;
+    constexpr int64_t tokens = 32;
+    constexpr uint64_t generation = 1;
+    const char * residual_key =
+        "htp_block_sparse_residual_b0_preflight_s0";
+    const char * rho_key =
+        "htp_block_sparse_residual_rho_b0_preflight_s0";
+    const bool deferred_stage_noop =
+        test_case == sparse_preflight_case::deferred_stage_noop;
+    setenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE",
+           deferred_stage_noop ? "deferred" : "reuse", 1);
+
+    ggml_backend_t backend = ggml_backend_htp_init();
+    if (backend == nullptr) {
+        std::fprintf(stderr, "SKIP: HTP backend initialization failed: %s\n",
+                     ggml_backend_htp_runtime_error());
+        return k_skip;
+    }
+
+    ggml_init_params params = {4 * 1024 * 1024, nullptr, true};
+    ggml_context * ctx = ggml_init(params);
+    ggml_gallocr_t allocator = nullptr;
+    ggml_opencl_htp_sidecar * sidecar = nullptr;
+    ggml_opencl_htp_graph * prepared = nullptr;
+    ggml_backend_htp_async_cache_slot * residual_slot = nullptr;
+    ggml_backend_htp_async_cache_slot * rho_slot = nullptr;
+    bool residual_imported = false;
+    bool rho_imported = false;
+    int result = 1;
+    char reason[1024] = {};
+
+    do {
+        if (!check(ctx != nullptr, "failed to create sparse preflight context")) break;
+
+        ggml_tensor * q = ggml_new_tensor_4d(
+            ctx, GGML_TYPE_F32, head_dim, tokens, heads, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(
+            ctx, GGML_TYPE_F16, head_dim, tokens, heads, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(
+            ctx, GGML_TYPE_F16, head_dim, tokens, heads, 1);
+        ggml_tensor * mask = ggml_new_tensor_4d(
+            ctx, GGML_TYPE_I32, 1, heads, 1, 1);
+        ggml_set_name(q, "preflight_q");
+        ggml_set_name(k, "preflight_k");
+        ggml_set_name(v, "preflight_v");
+        ggml_set_name(mask, "preflight_block_index");
+
+        ggml_tensor * sparse = ggml_flash_attn_ext_with_lse(
+            ctx, q, k, v, mask, 1.0f / std::sqrt(float(head_dim)),
+            0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(sparse, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_block_sparse(
+            sparse, 32, 32, GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
+        ggml_set_name(sparse, "preflight_sparse_o_lse");
+
+        ggml_tensor * dense = ggml_new_tensor_4d(
+            ctx, GGML_TYPE_F32, head_dim + 1, heads, tokens, 1);
+        dense->op = GGML_OP_CUSTOM;
+        dense->src[0] = q;
+        dense->src[1] = k;
+        dense->src[2] = v;
+        ggml_set_name(dense, "preflight_dense_o_lse");
+
+        const int64_t residual_ne[GGML_MAX_DIMS] = {
+            head_dim, heads, tokens, 1,
+        };
+        const int64_t rho_ne[GGML_MAX_DIMS] = {1, heads, tokens, 1};
+        residual_slot = ggml_backend_htp_async_cache_slot_create(
+            backend, residual_key, generation, GGML_TYPE_F16,
+            residual_ne, reason, sizeof(reason));
+        rho_slot = ggml_backend_htp_async_cache_slot_create(
+            backend, rho_key, generation, GGML_TYPE_F32,
+            rho_ne, reason, sizeof(reason));
+        if (!check(residual_slot != nullptr && rho_slot != nullptr,
+                   "failed to create sparse preflight cache slots")) break;
+
+        ggml_tensor * residual =
+            ggml_backend_htp_async_cache_slot_tensor(residual_slot);
+        ggml_tensor * rho =
+            ggml_backend_htp_async_cache_slot_tensor(rho_slot);
+        residual->op = GGML_OP_CUSTOM;
+        residual->src[0] = dense;
+        residual->src[1] = sparse;
+        residual->src[2] = rho;
+        rho->op = GGML_OP_CUSTOM;
+        rho->src[0] = dense;
+        rho->src[1] = sparse;
+
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
+        ggml_build_forward_expand(graph, rho);
+        ggml_build_forward_expand(graph, residual);
+        if (test_case == sparse_preflight_case::ordinary_sparse_consumer) {
+            ggml_tensor * consumer = ggml_new_tensor_1d(
+                ctx, GGML_TYPE_F32, 1);
+            consumer->op = GGML_OP_CUSTOM;
+            consumer->src[0] = sparse;
+            ggml_set_name(consumer, "preflight_sparse_ordinary_consumer");
+            ggml_build_forward_expand(graph, consumer);
+        }
+
+        allocator = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+        const ggml_tensor * no_alloc[] = {sparse, dense};
+        const size_t no_alloc_count = deferred_stage_noop ? 0 :
+            (test_case == sparse_preflight_case::dense_no_alloc ? 2 : 1);
+        if (!check(allocator != nullptr &&
+                   ggml_gallocr_set_no_alloc_tensors(
+                       allocator, no_alloc_count > 0 ? no_alloc : nullptr,
+                       no_alloc_count) &&
+                   ggml_gallocr_reserve(allocator, graph) &&
+                   ggml_gallocr_alloc_graph(allocator, graph),
+                   "failed to allocate sparse preflight graph")) break;
+        if (deferred_stage_noop) {
+            if (!check(tensor_has_resolved_backing(sparse),
+                       "deferred sparse output must have backing")) break;
+        } else if (!check(sparse->buffer == nullptr && sparse->data == nullptr,
+                          "sparse preflight output must remain metadata-only")) {
+            break;
+        }
+        if (test_case != sparse_preflight_case::dense_no_alloc &&
+            !check(tensor_has_resolved_backing(dense),
+                   "sparse preflight dense output must have backing")) break;
+
+        ggml_opencl_qcom_requirements requirements = {};
+        sidecar = ggml_backend_opencl_htp_sidecar_create(
+            &requirements, reason, sizeof(reason));
+        if (sidecar == nullptr) {
+            std::fprintf(stderr, "SKIP: sparse preflight sidecar unavailable: %s\n",
+                         reason);
+            result = k_skip;
+            break;
+        }
+
+        ggml_backend_htp_rpcmem_info compute_info = {};
+        ggml_backend_htp_rpcmem_info residual_info = {};
+        ggml_backend_htp_rpcmem_info rho_info = {};
+        const bool compute_rpcmem = ggml_backend_htp_get_rpcmem_info(
+            q->buffer, &compute_info);
+        const bool residual_rpcmem =
+            ggml_backend_htp_async_cache_slot_rpcmem_info(
+                residual_slot, &residual_info);
+        const bool rho_rpcmem = ggml_backend_htp_async_cache_slot_rpcmem_info(
+            rho_slot, &rho_info);
+        if (!compute_rpcmem || !residual_rpcmem || !rho_rpcmem) {
+            std::fprintf(
+                stderr,
+                "FAIL: sparse preflight RPCMEM descriptors "
+                "compute=%d residual=%d rho=%d dense_buffer=%p\n",
+                compute_rpcmem, residual_rpcmem, rho_rpcmem,
+                static_cast<void *>(q->buffer));
+            break;
+        }
+        ggml_opencl_htp_import_descriptor descriptors[] = {
+            {q->buffer, compute_info.base, compute_info.fd,
+             compute_info.logical_size, compute_info.allocation_size},
+            {residual->buffer, residual_info.base, residual_info.fd,
+             residual_info.logical_size, residual_info.allocation_size},
+            {rho->buffer, rho_info.base, rho_info.fd,
+             rho_info.logical_size, rho_info.allocation_size},
+        };
+        uint64_t import_identity = 0;
+        if (!check(ggml_backend_opencl_htp_persistent_import_acquire(
+                       sidecar, &descriptors[1], residual_key, generation,
+                       &import_identity, reason, sizeof(reason)) ==
+                       GGML_OPENCL_HTP_OK,
+                   "failed to import sparse preflight residual backing")) break;
+        residual_imported = true;
+        if (!check(ggml_backend_opencl_htp_persistent_import_acquire(
+                       sidecar, &descriptors[2], rho_key, generation,
+                       &import_identity, reason, sizeof(reason)) ==
+                       GGML_OPENCL_HTP_OK,
+                   "failed to import sparse preflight rho backing")) break;
+        rho_imported = true;
+
+        const ggml_opencl_htp_result preflight =
+            ggml_backend_opencl_htp_graph_preflight(
+                sidecar, graph, descriptors, 3, &prepared,
+                reason, sizeof(reason));
+        if (test_case == sparse_preflight_case::metadata_only_sparse) {
+            if (!check(preflight == GGML_OPENCL_HTP_OK, reason) ||
+                !check(ggml_backend_opencl_htp_graph_sparse_output_is_residual_owned(
+                           prepared, sparse),
+                       "metadata-only sparse output must be residual-owned")) {
+                break;
+            }
+        } else if (deferred_stage_noop) {
+            if (!check(preflight == GGML_OPENCL_HTP_OK, reason) ||
+                !check(!ggml_backend_opencl_htp_graph_sparse_output_is_residual_owned(
+                            prepared, sparse),
+                       "deferred sparse output must keep graph-owned storage") ||
+                !check(ggml_backend_opencl_htp_graph_stage_block_sparse_attn_mask(
+                            prepared, sparse, reason, sizeof(reason)) ==
+                            GGML_OPENCL_HTP_OK,
+                       reason)) {
+                break;
+            }
+        } else {
+            const char * expected_role =
+                test_case == sparse_preflight_case::dense_no_alloc
+                    ? "dense" : "sparse";
+            if (!check(preflight == GGML_OPENCL_HTP_UNSUPPORTED,
+                       "invalid sparse preflight case must fail closed") ||
+                !check(std::strstr(reason, expected_role) != nullptr &&
+                           std::strstr(reason, "no backing buffer") != nullptr,
+                       reason)) {
+                break;
+            }
+        }
+        result = 0;
+    } while (false);
+
+    if (prepared != nullptr) {
+        char finish_reason[512] = {};
+        if (ggml_backend_opencl_htp_graph_finish(
+                prepared, finish_reason, sizeof(finish_reason)) !=
+                GGML_OPENCL_HTP_OK && result == 0) {
+            std::fprintf(stderr, "FAIL: sparse preflight finish: %s\n",
+                         finish_reason);
+            result = 1;
+        }
+        ggml_backend_opencl_htp_graph_free(&prepared);
+    }
+    if (rho_imported) {
+        ggml_backend_opencl_htp_persistent_import_release(
+            sidecar, rho_key, generation, reason, sizeof(reason));
+    }
+    if (residual_imported) {
+        ggml_backend_opencl_htp_persistent_import_release(
+            sidecar, residual_key, generation, reason, sizeof(reason));
+    }
+    if (sidecar != nullptr) {
+        const size_t imports =
+            ggml_backend_opencl_htp_sidecar_live_persistent_import_count(sidecar);
+        const size_t events =
+            ggml_backend_opencl_htp_sidecar_live_cache_event_count(sidecar);
+        if (result == 0 &&
+            (!check(imports == 0, "sparse preflight imports leaked") ||
+             !check(events == 0, "sparse preflight events leaked"))) {
+            result = 1;
+        }
+        ggml_backend_opencl_htp_sidecar_free(sidecar);
+    }
+    ggml_backend_htp_async_cache_slot_free(rho_slot);
+    ggml_backend_htp_async_cache_slot_free(residual_slot);
+    if (allocator != nullptr) ggml_gallocr_free(allocator);
+    if (ctx != nullptr) ggml_free(ctx);
+    ggml_backend_free(backend);
+    return result;
+}
+
+int run_sparse_residual_preflight_test() {
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE", "1", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO", "1", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR", "0", 1);
+    setenv("SD_HTP_SPARSE_OPENCL", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_ASYNC", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_DEFER_RESIDUAL", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE", "reuse", 1);
+
+    if (!ggml_backend_htp_runtime_available()) {
+        std::fprintf(stderr, "SKIP: HTP runtime unavailable: %s\n",
+                     ggml_backend_htp_runtime_error());
+        return k_skip;
+    }
+    for (sparse_preflight_case test_case : {
+             sparse_preflight_case::metadata_only_sparse,
+             sparse_preflight_case::dense_no_alloc,
+             sparse_preflight_case::ordinary_sparse_consumer,
+             sparse_preflight_case::deferred_stage_noop,
+         }) {
+        const int case_result = run_sparse_residual_preflight_case(test_case);
+        if (case_result != 0) {
+            return case_result;
+        }
+    }
+    std::puts("PASS sparse-residual-preflight");
+    return 0;
+}
+
 #else
 
 int run_lifecycle_test() {
@@ -950,6 +1560,11 @@ int run_lifecycle_test() {
 }
 
 int run_residual_only_test() {
+    std::puts("SKIP: test was built without HTP support");
+    return k_skip;
+}
+
+int run_sparse_residual_preflight_test() {
     std::puts("SKIP: test was built without HTP support");
     return k_skip;
 }
@@ -971,6 +1586,9 @@ int main() {
     }
     if (std::strcmp(mode, "residual-only") == 0) {
         return run_residual_only_test();
+    }
+    if (std::strcmp(mode, "sparse-residual-preflight") == 0) {
+        return run_sparse_residual_preflight_test();
     }
     std::fprintf(stderr, "unknown HTP_RESIDUAL_CACHE_TEST mode: %s\n", mode);
     return 2;

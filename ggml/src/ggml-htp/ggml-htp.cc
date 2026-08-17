@@ -360,12 +360,13 @@ static bool ggml_backend_htp_collect_route_summary_impl(
         anchor_attention.insert(cache_attention.begin(), cache_attention.end());
 #ifdef GGML_HTP_OPENCL_SIDECAR
         const bool residual_opencl =
-            ctx != nullptr && node->op == GGML_OP_CUSTOM &&
-            ctx->sparse_opencl_routed_nodes.find(node) !=
-                ctx->sparse_opencl_routed_nodes.end() &&
-            node->src[2] != nullptr &&
-            ctx->sparse_opencl_routed_nodes.find(node->src[2]) !=
-                ctx->sparse_opencl_routed_nodes.end();
+            summary->mode == GGML_HTP_ROUTE_FUSED_OPENCL_RESIDUAL ||
+            (ctx != nullptr && node->op == GGML_OP_CUSTOM &&
+             ctx->sparse_opencl_routed_nodes.find(node) !=
+                 ctx->sparse_opencl_routed_nodes.end() &&
+             node->src[2] != nullptr &&
+             ctx->sparse_opencl_routed_nodes.find(node->src[2]) !=
+                 ctx->sparse_opencl_routed_nodes.end());
 #else
         const bool residual_opencl = false;
 #endif
@@ -963,7 +964,8 @@ ggml_backend_htp_async_cache_slot * ggml_backend_htp_async_cache_slot_create(
     slot->cache_key = cache_key;
     slot->generation = generation;
 #ifdef GGML_HTP_OPENCL_SIDECAR
-    if (slot->owner->sparse_opencl_sidecar != nullptr) {
+    if (slot->owner->sparse_opencl_sidecar != nullptr &&
+        ggml_backend_htp_opencl_persistent_import_required()) {
         ggml_backend_htp_rpcmem_info info = {};
         GGML_ASSERT(ggml_backend_htp_get_rpcmem_info(slot->buffer, &info));
         const ggml_opencl_htp_import_descriptor descriptor = {
@@ -1022,6 +1024,10 @@ bool ggml_backend_htp_async_cache_slot_rpcmem_info(
 uint64_t ggml_backend_htp_async_cache_slot_opencl_import_identity(
         const ggml_backend_htp_async_cache_slot * slot) {
     return slot != nullptr ? slot->opencl_import_identity : 0;
+}
+
+bool ggml_backend_htp_opencl_persistent_import_required(void) {
+    return ggml_backend_htp_requested_route_mode() == GGML_HTP_ROUTE_OPENCL_ANCHOR;
 }
 
 void ggml_backend_htp_async_cache_slot_free(ggml_backend_htp_async_cache_slot * slot) {
@@ -1420,8 +1426,16 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
         bool route_summary_valid = true;
 #ifdef GGML_HTP_OPENCL_SIDECAR
         char preflight_reason[1024] = {};
-        const ggml_opencl_htp_result preflight = ggml_backend_htp_opencl_preflight(
-            ctx, cgraph, preflight_reason, sizeof(preflight_reason));
+        const enum ggml_htp_route_mode requested_route =
+            ggml_backend_htp_requested_route_mode();
+        // Fused attention owns both dense and sparse outputs in the HTP
+        // RPCMEM slab. It does not submit an OpenCL sparse producer, so the
+        // sidecar must not preflight or require OpenCL cache aliases.
+        ggml_opencl_htp_result preflight = GGML_OPENCL_HTP_NO_WORK;
+        if (requested_route == GGML_HTP_ROUTE_OPENCL_ANCHOR) {
+            preflight = ggml_backend_htp_opencl_preflight(
+                ctx, cgraph, preflight_reason, sizeof(preflight_reason));
+        }
         const char * trace = std::getenv("SD_HTP_SPARSE_OPENCL_TRACE");
         if (trace != nullptr && trace[0] != '\0' && std::strcmp(trace, "0") != 0) {
             std::fprintf(
@@ -1431,10 +1445,7 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
                 ctx->sparse_opencl_routed_nodes.size(),
                 preflight_reason[0] != '\0' ? preflight_reason : "unknown");
         }
-        const enum ggml_htp_route_mode requested_route =
-            ggml_backend_htp_requested_route_mode();
         const bool route_requires_opencl =
-            requested_route == GGML_HTP_ROUTE_FUSED_OPENCL_RESIDUAL ||
             requested_route == GGML_HTP_ROUTE_OPENCL_ANCHOR;
         if (preflight == GGML_OPENCL_HTP_ERROR ||
             (preflight != GGML_OPENCL_HTP_OK &&

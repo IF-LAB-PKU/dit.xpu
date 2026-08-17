@@ -1049,7 +1049,7 @@ namespace ZImage {
             auto pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, z_image_params.axes_dim_sum / 2, pos_len);
             set_backend_tensor_data(pe, pe_vec.data());
             auto runner_ctx = get_context();
-            sd_install_local_opencl_residual_graph_expansion(
+            sd_install_local_residual_graph_expansion(
                 gf, block_sparse_residual_mode, &runner_ctx);
 
             runner_ctx.block_sparse_residual_mode            = block_sparse_residual_mode;

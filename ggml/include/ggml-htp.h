@@ -107,6 +107,10 @@ GGML_BACKEND_API bool ggml_backend_htp_async_cache_slot_rpcmem_info(
 GGML_BACKEND_API uint64_t ggml_backend_htp_async_cache_slot_opencl_import_identity(
     const ggml_backend_htp_async_cache_slot * slot);
 
+// Persistent OpenCL aliases are needed only by the OpenCL sparse producer
+// route. Fused and HTP+CPU routes consume the same RPCMEM cache directly.
+GGML_BACKEND_API bool ggml_backend_htp_opencl_persistent_import_required(void);
+
 GGML_BACKEND_API void ggml_backend_htp_async_cache_slot_free(
     ggml_backend_htp_async_cache_slot * slot);
 

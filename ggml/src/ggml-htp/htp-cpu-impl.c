@@ -2125,8 +2125,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                             ggml_htp_mark_op_failed(params, tensor, residual_err);
                         }
                         const enum ggml_htp_opencl_lifetime_mode lifetime_mode =
-                            ggml_htp_opencl_lifetime_mode_parse(
-                                getenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE"));
+                            ggml_htp_opencl_lifetime_mode_effective();
                         if (residual_err == 0 &&
                             lifetime_mode == GGML_HTP_OPENCL_LIFETIME_STRICT) {
                             const char * trace = getenv("SD_HTP_SPARSE_OPENCL_TRACE");
@@ -2315,6 +2314,12 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                     const int err = htp_ops_compute_op(params, tensor);
                     if (err != 0) {
                         ggml_htp_mark_op_failed(params, tensor, err);
+                    } else if (params->ith == 0 && fused_anchor) {
+                        const int residual_err =
+                            htp_ops_opencl_queue_residual_after_dense(tensor);
+                        if (residual_err != 0) {
+                            ggml_htp_mark_op_failed(params, tensor, residual_err);
+                        }
                     }
                     if (trace_fused_anchor) {
                         fprintf(stderr,
@@ -3419,8 +3424,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     const enum ggml_htp_opencl_lifetime_mode opencl_lifetime_mode =
-        ggml_htp_opencl_lifetime_mode_parse(
-            getenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE"));
+        ggml_htp_opencl_lifetime_mode_effective();
     const bool use_global_mask_sweep =
         ggml_htp_opencl_lifetime_uses_global_mask_sweep(
             opencl_lifetime_mode);
