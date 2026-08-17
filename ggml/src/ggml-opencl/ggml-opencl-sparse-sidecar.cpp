@@ -260,6 +260,7 @@ struct ggml_opencl_htp_pair_lifetime {
     const ggml_tensor * residual = nullptr;
     const ggml_tensor * rho = nullptr;
     ggml_htp_opencl_pair_lifetime_state state = {};
+    bool fused_anchor = false;
     bool staging_reserved = false;
     int mask_slot = -1;
     int output_slot = -1;
@@ -1690,8 +1691,7 @@ ggml_opencl_htp_result finish_graph_state(
             "peak_staged_mask_bytes=%zu peak_staged_output_bytes=%zu "
             "live_leases=0 pending_jobs=%zu deferred_arenas=0 status=%s\n",
             ggml_htp_opencl_lifetime_mode_name(
-                ggml_htp_opencl_lifetime_mode_parse(
-                    std::getenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE"))),
+                ggml_htp_opencl_lifetime_mode_effective()),
             graph->pair_lifetimes.size(),
             graph->peak_live_staging_pairs,
             graph->peak_live_staging_pairs,
@@ -2512,10 +2512,15 @@ bool sparse_inputs_have_output_lifetime(const ggml_tensor * sparse) {
 
 bool local_lifetime_mode_enabled() {
     const ggml_htp_opencl_lifetime_mode mode =
-        ggml_htp_opencl_lifetime_mode_parse(
-            std::getenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE"));
+        ggml_htp_opencl_lifetime_mode_effective();
     return mode == GGML_HTP_OPENCL_LIFETIME_REUSE ||
         mode == GGML_HTP_OPENCL_LIFETIME_STRICT;
+}
+
+bool is_fused_anchor_view(const ggml_tensor * tensor) {
+    const ggml_tensor * producer = producer_through_views(tensor);
+    return producer != nullptr && producer->op == GGML_OP_CUSTOM &&
+        std::strcmp(producer->name, "htp_fused_anchor_attention") == 0;
 }
 
 bool reaches_producer_through_views(
@@ -2944,6 +2949,30 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
     std::vector<const ggml_tensor *> residual_owned_sparse_producers;
     std::vector<const ggml_tensor *> routed_nodes;
     std::vector<ggml_backend_buffer_t> required_backings;
+    auto require_backing = [&](const ggml_tensor * tensor,
+                               const char * role,
+                               const char * context) {
+        ggml_backend_buffer_t backing = tensor_backing(tensor);
+        if (backing == nullptr) {
+            set_reason(
+                reason, reason_capacity,
+                "%s role=%s tensor has no backing buffer "
+                "name=%s data=%p buffer=%p view_src=%p resolved_backing=%p",
+                context, role,
+                tensor != nullptr && tensor->name[0] != '\0'
+                    ? tensor->name : "<unnamed>",
+                tensor != nullptr ? tensor->data : nullptr,
+                tensor != nullptr ? static_cast<void *>(tensor->buffer) : nullptr,
+                tensor != nullptr ? static_cast<const void *>(tensor->view_src) : nullptr,
+                static_cast<void *>(backing));
+            return false;
+        }
+        if (std::find(required_backings.begin(), required_backings.end(),
+                      backing) == required_backings.end()) {
+            required_backings.push_back(backing);
+        }
+        return true;
+    };
     try {
         const int node_count = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
         bool graph_has_anchor_residual = false;
@@ -3041,19 +3070,15 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
                 }
                 routed_nodes.push_back(rho);
                 routed_nodes.push_back(residual);
-                const ggml_tensor * tensors[] = {
-                    residual->src[0], rho, residual,
+                const std::pair<const char *, const ggml_tensor *> tensors[] = {
+                    { "dense", residual->src[0] },
+                    { "rho", rho },
+                    { "residual", residual },
                 };
-                for (const ggml_tensor * tensor : tensors) {
-                    ggml_backend_buffer_t backing = tensor_backing(tensor);
-                    if (backing == nullptr) {
-                        set_reason(reason, reason_capacity,
-                                   "tagged residual tensor has no backing buffer");
+                for (const auto & item : tensors) {
+                    if (!require_backing(
+                            item.second, item.first, "tagged residual")) {
                         return GGML_OPENCL_HTP_UNSUPPORTED;
-                    }
-                    if (std::find(required_backings.begin(), required_backings.end(), backing) ==
-                        required_backings.end()) {
-                        required_backings.push_back(backing);
                     }
                 }
             }
@@ -3061,7 +3086,9 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
 
         const bool local_lifetime = local_lifetime_mode_enabled();
         for (const residual_pair_candidate & pair : residual_pairs) {
+            const bool fused_pair = is_fused_anchor_view(pair.sparse);
             const bool residual_owned =
+                !fused_pair &&
                 !sparse_has_ordinary_graph_consumer(
                     cgraph, pair.sparse, pair.rho, pair.residual) &&
                 (local_lifetime ||
@@ -3075,20 +3102,6 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
             }
         }
 
-        auto require_backing = [&](const ggml_tensor * tensor,
-                                   const char * description) {
-            ggml_backend_buffer_t backing = tensor_backing(tensor);
-            if (backing == nullptr) {
-                set_reason(reason, reason_capacity, "%s has no backing buffer",
-                           description);
-                return false;
-            }
-            if (std::find(required_backings.begin(), required_backings.end(),
-                          backing) == required_backings.end()) {
-                required_backings.push_back(backing);
-            }
-            return true;
-        };
         for (const ggml_opencl_htp_sparse_dispatch & dispatch : dispatches) {
             const bool metadata_only_output = local_lifetime &&
                 std::find(
@@ -3096,8 +3109,8 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
                     residual_owned_sparse_producers.end(), dispatch.output) !=
                     residual_owned_sparse_producers.end();
             if (!metadata_only_output &&
-                !require_backing(dispatch.output,
-                                 "sparse output tensor")) {
+                !require_backing(
+                    dispatch.output, "sparse", "sparse output")) {
                 return GGML_OPENCL_HTP_UNSUPPORTED;
             }
         }
@@ -3108,8 +3121,8 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
                     residual_owned_sparse_producers.end(), pair.sparse) !=
                     residual_owned_sparse_producers.end();
             if (!metadata_only_sparse &&
-                !require_backing(pair.sparse,
-                                 "tagged residual sparse tensor")) {
+                !require_backing(
+                    pair.sparse, "sparse", "tagged residual")) {
                 return GGML_OPENCL_HTP_UNSUPPORTED;
             }
         }
@@ -3280,17 +3293,26 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_preflight(
                         "failed to prepare tagged residual pair");
             }
             if (local_lifetime_mode_enabled() &&
-                std::find(
+                (is_fused_anchor_view(pair.sparse) ||
+                 std::find(
                     prepared->residual_owned_sparse_producers.begin(),
                     prepared->residual_owned_sparse_producers.end(),
                     pair.sparse) !=
-                    prepared->residual_owned_sparse_producers.end()) {
+                    prepared->residual_owned_sparse_producers.end())) {
                 ggml_opencl_htp_pair_lifetime lifetime;
                 lifetime.pair_id = prepared->pair_lifetimes.size() + 1;
                 lifetime.dense = pair.dense;
                 lifetime.sparse = pair.sparse;
                 lifetime.residual = pair.residual;
                 lifetime.rho = pair.rho;
+                lifetime.fused_anchor = is_fused_anchor_view(pair.sparse);
+                if (lifetime.fused_anchor &&
+                    !ggml_htp_opencl_pair_mark_fused_anchor_produced(
+                        &lifetime.state)) {
+                    return reject_preflight(
+                        GGML_OPENCL_HTP_ERROR,
+                        "failed to initialize fused residual pair lifetime");
+                }
                 prepared->pair_lifetimes.push_back(lifetime);
             }
         }
@@ -4151,12 +4173,22 @@ static ggml_opencl_htp_result reap_completed_pair(
     if (reaped != nullptr) {
         *reaped = false;
     }
-    bool sparse_complete = false;
-    ggml_opencl_htp_result sparse_result = observe_sparse_completion(
-        graph, residual->dispatch.sparse_packed_producer,
-        wait_for_completion, &sparse_complete, reason, reason_capacity);
-    if (sparse_result != GGML_OPENCL_HTP_OK || !sparse_complete) {
-        return sparse_result;
+    bool fused_pair = false;
+    {
+        std::lock_guard<std::mutex> lock(graph->pair_mutex);
+        const ggml_opencl_htp_pair_lifetime * pair =
+            find_pair_by_sparse_unlocked(
+                graph, residual->dispatch.sparse_packed_producer);
+        fused_pair = pair != nullptr && pair->fused_anchor;
+    }
+    bool sparse_complete = fused_pair;
+    if (!fused_pair) {
+        const ggml_opencl_htp_result sparse_result = observe_sparse_completion(
+            graph, residual->dispatch.sparse_packed_producer,
+            wait_for_completion, &sparse_complete, reason, reason_capacity);
+        if (sparse_result != GGML_OPENCL_HTP_OK || !sparse_complete) {
+            return sparse_result;
+        }
     }
 
     bool wait_for_publication = false;
@@ -4393,6 +4425,11 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_stage_block_sparse_attn_mas
     if (graph->state != ggml_opencl_htp_graph_state::active) {
         set_reason(reason, reason_capacity, "graph is already finished");
         return GGML_OPENCL_HTP_ERROR;
+    }
+    if (!local_lifetime_mode_enabled()) {
+        set_reason(reason, reason_capacity,
+                   "local sparse mask staging is not required");
+        return GGML_OPENCL_HTP_OK;
     }
 
     const ggml_opencl_htp_result slot_result = reserve_local_staging_slot(
@@ -5222,7 +5259,8 @@ ggml_backend_opencl_htp_graph_queue_exact_rho_residual_after_dense(
     size_t queued_count = 0;
     for (ggml_opencl_htp_prepared_residual_dispatch & prepared :
             graph->prepared_residual_dispatches) {
-        if (prepared.dispatch.dense_packed != dense_producer) {
+        if (prepared.dispatch.dense_packed != dense_producer &&
+            producer_through_views(prepared.dispatch.dense_packed) != dense_producer) {
             continue;
         }
         const ggml_tensor * producer = prepared.dispatch.rho_destination;
@@ -6345,7 +6383,8 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_finish(
                 const ggml_opencl_htp_pair_lifetime * pair =
                     find_pair_by_sparse_unlocked(
                         graph, prepared.dispatch.sparse_packed_producer);
-                needs_reap = pair != nullptr && pair->staging_reserved &&
+                needs_reap = pair != nullptr &&
+                    (pair->fused_anchor || pair->staging_reserved) &&
                     pair->state.residual_submitted && !pair->state.reaped;
             }
             if (!needs_reap) {

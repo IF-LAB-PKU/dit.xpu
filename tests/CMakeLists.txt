@@ -52,6 +52,11 @@ add_test(NAME ${TEST_TARGET}-residual-only COMMAND $<TARGET_FILE:${TEST_TARGET}>
 set_property(TEST ${TEST_TARGET}-residual-only PROPERTY
              ENVIRONMENT "HTP_RESIDUAL_CACHE_TEST=residual-only;LLVM_PROFILE_FILE=${TEST_TARGET}-residual-only.profraw")
 set_property(TEST ${TEST_TARGET}-residual-only PROPERTY SKIP_RETURN_CODE 77)
+add_test(NAME ${TEST_TARGET}-sparse-residual-preflight
+         COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET}-sparse-residual-preflight PROPERTY
+             ENVIRONMENT "HTP_RESIDUAL_CACHE_TEST=sparse-residual-preflight;LLVM_PROFILE_FILE=${TEST_TARGET}-sparse-residual-preflight.profraw")
+set_property(TEST ${TEST_TARGET}-sparse-residual-preflight PROPERTY SKIP_RETURN_CODE 77)
 
 set(TEST_TARGET test-backend-htp-attention-correctness)
 add_executable(${TEST_TARGET}

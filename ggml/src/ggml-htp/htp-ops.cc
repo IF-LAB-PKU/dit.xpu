@@ -1016,8 +1016,7 @@ static int htp_ops_opencl_early_submit_ready_candidates(const ggml_tensor * comp
             continue;
         }
         const ggml_htp_opencl_lifetime_mode lifetime_mode =
-            ggml_htp_opencl_lifetime_mode_parse(
-                std::getenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE"));
+            ggml_htp_opencl_lifetime_mode_effective();
         if (lifetime_mode == GGML_HTP_OPENCL_LIFETIME_REUSE ||
             lifetime_mode == GGML_HTP_OPENCL_LIFETIME_STRICT) {
             auto * ctx = ggml_backend_htp_context::instance();
@@ -1586,8 +1585,7 @@ int htp_ops_opencl_wait_overlapping_output_leases(
         const struct ggml_tensor * writer) {
 #ifdef GGML_HTP_OPENCL_SIDECAR
     const ggml_htp_opencl_lifetime_mode mode =
-        ggml_htp_opencl_lifetime_mode_parse(
-            std::getenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE"));
+        ggml_htp_opencl_lifetime_mode_effective();
     if ((mode != GGML_HTP_OPENCL_LIFETIME_REUSE &&
          mode != GGML_HTP_OPENCL_LIFETIME_STRICT) || writer == nullptr) {
         return 0;
