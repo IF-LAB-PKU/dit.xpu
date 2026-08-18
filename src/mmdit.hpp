@@ -604,7 +604,6 @@ __STATIC_INLINE__ PackedJointQkv mmdit_make_packed_single_qkv(
                      sizeof(ggml_fp16_t), head_dim * sizeof(ggml_fp16_t), head_stride, 2 * qkv_bytes),
     };
     for (ggml_tensor* tensor : result.qkv) {
-        tensor->op = GGML_OP_NONE;
         tensor->type = GGML_TYPE_F16;
     }
     return result;
@@ -690,7 +689,6 @@ __STATIC_INLINE__ PackedJointQkv mmdit_make_packed_joint_qkv(GGMLRunnerContext* 
                      sizeof(ggml_fp16_t), head_dim * sizeof(ggml_fp16_t), head_stride, 2 * qkv_bytes),
     };
     for (ggml_tensor* tensor : result.qkv) {
-        tensor->op = GGML_OP_NONE;
         tensor->type = GGML_TYPE_F16;
     }
     return result;

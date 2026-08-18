@@ -2,13 +2,16 @@
 #include "ggml-htp.h"
 #include "ggml-opencl-htp.h"
 #include "ggml.h"
+#include "common_dit.hpp"
 #include "ggml_extend.hpp"
+#include "mmdit.hpp"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -614,6 +617,8 @@ bool local_memory_plan_reports_allocator_ownership() {
         2048,
         4096,
         8192,
+        16384,
+        20480,
         37,
         37,
         74,
@@ -627,7 +632,9 @@ bool local_memory_plan_reports_allocator_ownership() {
             summary,
             "htp_opencl_memory_plan mode=reuse "
             "temporary_runtime_bytes=1024 temporary_htp_bytes=2048 "
-            "temporary_qkv_bytes=4096 persistent_cache_bytes=8192 "
+            "temporary_qkv_bytes=4096 host_cache_bytes=8192 "
+            "rpcmem_cache_logical_bytes=16384 "
+            "rpcmem_cache_allocation_bytes=20480 "
             "sparse_destinations_in_gallocr=0 "
             "cache_outputs_in_gallocr=0 retained_roots=0") == 0;
 }
@@ -800,6 +807,365 @@ graph_order_result build_graph_order_fixture(bool expand_cache_immediately) {
     return result;
 }
 
+enum class cache_input_failure_case {
+    none,
+    first_reserve,
+    second_alloc,
+    preflight,
+    compute,
+};
+
+struct cache_input_reserve_result {
+    bool executed = false;
+    int phase = 0;
+    size_t runtime_bytes = 0;
+    size_t cache_bytes = 0;
+    bool failure_observed = false;
+    bool tensor_restored = false;
+    bool consumers_released = false;
+};
+
+#if defined(GGML_USE_HTP)
+
+class cache_input_reserve_runner final : public GGMLRunner {
+public:
+    cache_input_reserve_runner(ggml_backend_t runtime, ggml_backend_t params)
+        : GGMLRunner(runtime, params) {}
+
+    std::string get_desc() override {
+        return "cache-input-reserve-fixture";
+    }
+
+    void adopt_cache_segment(
+            ggml_context * ctx,
+            ggml_backend_buffer_t buffer,
+            const std::vector<std::pair<std::string, ggml_tensor *>> & tensors) {
+        CacheStorageSegment segment;
+        segment.ctx = ctx;
+        segment.buffer = buffer;
+        for (const auto & tensor : tensors) {
+            segment.names.insert(tensor.first);
+        }
+        cache_storage_segments_.push_back(std::move(segment));
+    }
+
+    bool execute_apply(ggml_cgraph * graph, int * phase) {
+        if (phase != nullptr) *phase = 1;
+        CacheInputBindingTransaction transaction;
+        if (!allocate_compute_graph_with_cache_inputs(graph, &transaction)) {
+            rollback_cache_input_bindings(&transaction);
+            return false;
+        }
+        if (phase != nullptr) *phase = 3;
+        rollback_cache_input_bindings(&transaction);
+        if (phase != nullptr) *phase = 4;
+        return true;
+    }
+
+    bool execute_failure(
+            ggml_cgraph * graph,
+            ggml_tensor * input,
+            cache_input_failure_case failure_case,
+            cache_input_reserve_result * result) {
+        if (graph == nullptr || input == nullptr || result == nullptr ||
+            failure_case == cache_input_failure_case::none) {
+            return false;
+        }
+        const ggml_backend_buffer_t original_buffer = input->buffer;
+        void * const original_data = input->data;
+        void * const original_extra = input->extra;
+        const ggml_op original_op = input->op;
+        ggml_tensor * original_src[GGML_MAX_SRC] = {};
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            original_src[i] = input->src[i];
+        }
+
+        std::string mock_key;
+        {
+            CacheInputBindingTransaction transaction;
+            auto rollback = std::unique_ptr<
+                CacheInputBindingTransaction,
+                std::function<void(CacheInputBindingTransaction *)>>(
+                    &transaction,
+                    [this](CacheInputBindingTransaction * active) {
+                        rollback_cache_input_bindings(active);
+                    });
+            CacheInputAllocationFailurePoint allocation_failure =
+                CacheInputAllocationFailurePoint::none;
+            if (failure_case == cache_input_failure_case::first_reserve) {
+                allocation_failure =
+                    CacheInputAllocationFailurePoint::first_reserve;
+            } else if (failure_case ==
+                       cache_input_failure_case::second_alloc) {
+                allocation_failure =
+                    CacheInputAllocationFailurePoint::second_alloc;
+            }
+            const bool allocated = allocate_compute_graph_with_cache_inputs(
+                graph, &transaction, allocation_failure);
+            const bool allocation_failure_expected =
+                failure_case == cache_input_failure_case::first_reserve ||
+                failure_case == cache_input_failure_case::second_alloc;
+            result->failure_observed = allocation_failure_expected
+                ? !allocated : allocated;
+            if (!result->failure_observed) {
+                return false;
+            }
+
+            const auto key = cache_backed_tensor_name_map.find(input);
+            if (!transaction.active || key == cache_backed_tensor_name_map.end()) {
+                return false;
+            }
+            mock_key = key->second;
+            async_residual_cache_slots_[mock_key] = {
+                999, nullptr, 1, false,
+            };
+            active_async_cache_consumers_.push_back({mock_key, 999});
+
+            if (failure_case == cache_input_failure_case::compute) {
+                finalize_cache_input_bindings(
+                    &transaction, GGML_STATUS_FAILED);
+            }
+        }
+
+        result->tensor_restored =
+            input->buffer == original_buffer &&
+            input->data == original_data &&
+            input->extra == original_extra &&
+            input->op == original_op;
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            result->tensor_restored = result->tensor_restored &&
+                input->src[i] == original_src[i];
+        }
+        const auto mock = async_residual_cache_slots_.find(mock_key);
+        result->consumers_released =
+            active_async_cache_consumers_.empty() &&
+            mock != async_residual_cache_slots_.end() &&
+            mock->second.consumer_count == 0;
+        if (mock != async_residual_cache_slots_.end()) {
+            async_residual_cache_slots_.erase(mock);
+        }
+        result->executed = true;
+        return true;
+    }
+
+    size_t runtime_buffer_bytes() const {
+        return compute_allocr != nullptr
+            ? ggml_gallocr_get_buffer_size(compute_allocr, 0)
+            : 0;
+    }
+};
+
+cache_input_reserve_result build_cache_input_reserve_fixture(
+        int pair_count,
+        cache_input_failure_case failure_case =
+            cache_input_failure_case::none) {
+    constexpr int64_t k_cache_elements = 256 * 1024;
+    cache_input_reserve_result result;
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (backend == nullptr) {
+        return result;
+    }
+
+    ggml_init_params cache_params = {
+        /*.mem_size   =*/ 4 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * cache_ctx = ggml_init(cache_params);
+    if (cache_ctx == nullptr) {
+        ggml_backend_free(backend);
+        return result;
+    }
+
+    std::vector<std::pair<std::string, ggml_tensor *>> cached;
+    cached.reserve(static_cast<size_t>(2 * pair_count));
+    for (int pair = 0; pair < pair_count; ++pair) {
+        for (const char * role : {"residual", "rho"}) {
+            const std::string name =
+                "htp_block_sparse_residual_" + std::string(role) +
+                "_b0_allocator_s" + std::to_string(pair);
+            ggml_tensor * tensor = ggml_new_tensor_1d(
+                cache_ctx, GGML_TYPE_F32, k_cache_elements);
+            ggml_set_name(tensor, name.c_str());
+            result.cache_bytes += ggml_nbytes(tensor);
+            cached.push_back({name, tensor});
+        }
+    }
+    ggml_backend_buffer_t cache_buffer =
+        ggml_backend_alloc_ctx_tensors(cache_ctx, backend);
+    if (cache_buffer == nullptr) {
+        ggml_free(cache_ctx);
+        ggml_backend_free(backend);
+        return result;
+    }
+    ggml_backend_buffer_clear(cache_buffer, 0);
+
+    {
+        cache_input_reserve_runner runner(backend, backend);
+        runner.adopt_cache_segment(cache_ctx, cache_buffer, cached);
+        cache_ctx = nullptr;
+        cache_buffer = nullptr;
+        runner.reset_compute_ctx();
+        GGMLRunnerContext runner_ctx = runner.get_context();
+        ggml_cgraph * graph = ggml_new_graph_custom(
+            runner_ctx.ggml_ctx, 4 * pair_count + 16, false);
+        ggml_tensor * state = nullptr;
+        ggml_tensor * first_input = nullptr;
+        for (const auto & entry : cached) {
+            ggml_tensor * input =
+                runner_ctx.cache_tensor_as_graph_input(entry.first);
+            if (input == nullptr) {
+                state = nullptr;
+                break;
+            }
+            if (first_input == nullptr) {
+                first_input = input;
+            }
+            ggml_tensor * sum = ggml_sum(runner_ctx.ggml_ctx, input);
+            state = state == nullptr
+                ? sum
+                : ggml_add(runner_ctx.ggml_ctx, state, sum);
+        }
+        if (state != nullptr) {
+            ggml_build_forward_expand(graph, state);
+            if (failure_case == cache_input_failure_case::none) {
+                result.executed = runner.execute_apply(graph, &result.phase);
+            } else {
+                result.executed = runner.execute_failure(
+                    graph, first_input, failure_case, &result);
+            }
+            result.runtime_bytes = runner.runtime_buffer_bytes();
+        }
+    }
+
+    if (cache_buffer != nullptr) ggml_backend_buffer_free(cache_buffer);
+    if (cache_ctx != nullptr) ggml_free(cache_ctx);
+    ggml_backend_free(backend);
+    return result;
+}
+
+#endif
+
+struct packed_view_reserve_result {
+    bool reserved = false;
+    bool all_views = true;
+    bool offsets_ok = true;
+    int storage_count = 0;
+    size_t buffer_bytes = 0;
+    size_t storage_bytes = 0;
+};
+
+packed_view_reserve_result build_packed_view_reserve_fixture(int layer_count) {
+    constexpr int64_t k_num_heads = 24;
+    constexpr int64_t k_head_dim = 64;
+    constexpr int64_t k_hidden = k_num_heads * k_head_dim;
+    constexpr int64_t k_tokens = 64;
+    packed_view_reserve_result result;
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (backend == nullptr) {
+        return result;
+    }
+    ggml_init_params param_params = {
+        /*.mem_size   =*/ 2 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * param_ctx = ggml_init(param_params);
+    ggml_init_params graph_params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * graph_ctx = ggml_init(graph_params);
+    if (param_ctx == nullptr || graph_ctx == nullptr) {
+        if (graph_ctx != nullptr) ggml_free(graph_ctx);
+        if (param_ctx != nullptr) ggml_free(param_ctx);
+        ggml_backend_free(backend);
+        return result;
+    }
+
+    String2TensorStorage storage_map;
+    TensorStorage weight_storage;
+    weight_storage.expected_type = GGML_TYPE_F16;
+    weight_storage.layout = TensorDataLayout::HTP_PERMUTED_W16A32;
+    storage_map["fixture.qkv.weight"] = weight_storage;
+    auto attention = std::make_shared<SelfAttention>(
+        k_hidden, k_num_heads, "rms", false, false);
+    attention->init(param_ctx, storage_map, "fixture");
+    ggml_backend_buffer_t param_buffer =
+        ggml_backend_alloc_ctx_tensors(param_ctx, backend);
+    if (param_buffer == nullptr) {
+        ggml_free(graph_ctx);
+        ggml_free(param_ctx);
+        ggml_backend_free(backend);
+        return result;
+    }
+
+    setenv("SD_HTP_PACKED_ATTENTION", "1", 1);
+    setenv("SD_HTP_COMPUTE", "1", 1);
+    GGMLRunnerContext runner_ctx;
+    runner_ctx.backend = backend;
+    runner_ctx.ggml_ctx = graph_ctx;
+    runner_ctx.block_sparse_attn_enabled = true;
+    runner_ctx.block_sparse_residual_mode = SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY;
+
+    ggml_tensor * input = ggml_new_tensor_3d(
+        graph_ctx, GGML_TYPE_F32, k_hidden, k_tokens, 1);
+    ggml_cgraph * graph = ggml_new_graph_custom(
+        graph_ctx, 8 * layer_count + 16, false);
+    ggml_tensor * state = nullptr;
+    for (int layer = 0; layer < layer_count; ++layer) {
+        PackedJointQkv packed =
+            mmdit_make_packed_single_qkv(&runner_ctx, attention, input);
+        if (packed.storage == nullptr || packed.qkv.size() != 3) {
+            result.all_views = false;
+            break;
+        }
+        ++result.storage_count;
+        ggml_format_name(packed.storage, "packed_view_storage_%d", layer);
+        const size_t qkv_bytes = ggml_nbytes(packed.storage) / 3;
+        result.storage_bytes = ggml_nbytes(packed.storage);
+        for (size_t qkv = 0; qkv < packed.qkv.size(); ++qkv) {
+            result.all_views = result.all_views &&
+                packed.qkv[qkv]->op == GGML_OP_VIEW &&
+                packed.qkv[qkv]->view_src == packed.storage;
+            result.offsets_ok = result.offsets_ok &&
+                packed.qkv[qkv]->view_offs == qkv * qkv_bytes;
+        }
+        ggml_tensor * q_use = graph_order_custom(
+            graph_ctx, "packed_q_use", {packed.qkv[0]});
+        ggml_tensor * k_use = graph_order_custom(
+            graph_ctx, "packed_k_use", {packed.qkv[1]});
+        ggml_tensor * v_use = graph_order_custom(
+            graph_ctx, "packed_v_use", {packed.qkv[2]});
+        state = state == nullptr
+            ? graph_order_custom(
+                  graph_ctx, "packed_layer_state", {q_use, k_use, v_use})
+            : graph_order_custom(
+                  graph_ctx, "packed_layer_state", {state, q_use, k_use, v_use});
+    }
+
+    if (state != nullptr) {
+        ggml_build_forward_expand(graph, state);
+        ggml_gallocr_t allocator = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+        result.reserved = ggml_gallocr_reserve(allocator, graph);
+        if (result.reserved) {
+            result.buffer_bytes = ggml_gallocr_get_buffer_size(allocator, 0);
+        }
+        ggml_gallocr_free(allocator);
+    }
+
+    unsetenv("SD_HTP_COMPUTE");
+    unsetenv("SD_HTP_PACKED_ATTENTION");
+    ggml_backend_buffer_free(param_buffer);
+    ggml_free(graph_ctx);
+    ggml_free(param_ctx);
+    ggml_backend_free(backend);
+    return result;
+}
+
 bool check(bool condition, const char * message) {
     if (!condition) {
         std::fprintf(stderr, "FAIL: %s\n", message);
@@ -909,6 +1275,86 @@ int run_graph_order_test() {
     return 0;
 }
 
+int run_allocator_test() {
+#if !defined(GGML_USE_HTP)
+    std::puts("SKIP: allocator fixture requires an HTP-enabled build");
+    return k_skip;
+#else
+    bool ok = true;
+    for (int pair_count : {1, 2, 38}) {
+        const cache_input_reserve_result result =
+            build_cache_input_reserve_fixture(pair_count);
+        std::printf(
+            "allocator pairs=%d phase=%d runtime_bytes=%zu cache_bytes=%zu\n",
+            pair_count, result.phase, result.runtime_bytes, result.cache_bytes);
+        ok = check(result.executed,
+                   "cache-input allocator fixture must execute") && ok;
+        ok = check(result.runtime_bytes > 0,
+                   "cache-input allocator fixture must reserve runtime storage") && ok;
+        ok = check(result.runtime_bytes * 4 < result.cache_bytes,
+                   "cache inputs must be bound before first reserve") && ok;
+    }
+    for (cache_input_failure_case failure_case : {
+             cache_input_failure_case::first_reserve,
+             cache_input_failure_case::second_alloc,
+             cache_input_failure_case::preflight,
+             cache_input_failure_case::compute,
+         }) {
+        const cache_input_reserve_result result =
+            build_cache_input_reserve_fixture(1, failure_case);
+        std::printf(
+            "allocator failure=%d observed=%d restored=%d consumers=%d\n",
+            static_cast<int>(failure_case),
+            result.failure_observed ? 1 : 0,
+            result.tensor_restored ? 1 : 0,
+            result.consumers_released ? 1 : 0);
+        ok = check(result.executed,
+                   "cache-input failure fixture must execute") && ok;
+        ok = check(result.failure_observed,
+                   "cache-input failure fixture must reach its failure point") && ok;
+        ok = check(result.tensor_restored,
+                   "cache-input failure must restore tensor state") && ok;
+        ok = check(result.consumers_released,
+                   "cache-input failure must release async consumers") && ok;
+    }
+    if (!ok) {
+        return 1;
+    }
+    std::puts("PASS allocator");
+    return 0;
+#endif
+}
+
+int run_packed_view_test() {
+    const packed_view_reserve_result one =
+        build_packed_view_reserve_fixture(1);
+    const packed_view_reserve_result two =
+        build_packed_view_reserve_fixture(2);
+    const packed_view_reserve_result thirty_eight =
+        build_packed_view_reserve_fixture(38);
+    std::printf(
+        "packed_view one_bytes=%zu two_bytes=%zu thirty_eight_bytes=%zu "
+        "storage_bytes=%zu views=%d offsets=%d\n",
+        one.buffer_bytes, two.buffer_bytes, thirty_eight.buffer_bytes,
+        one.storage_bytes, thirty_eight.all_views ? 1 : 0,
+        thirty_eight.offsets_ok ? 1 : 0);
+    if (!check(one.reserved && two.reserved && thirty_eight.reserved,
+               "packed-view allocator fixtures must reserve") ||
+        !check(one.storage_count == 1 && two.storage_count == 2 &&
+                   thirty_eight.storage_count == 38,
+               "packed-view fixture must create every storage producer") ||
+        !check(one.all_views && two.all_views && thirty_eight.all_views,
+               "packed Q/K/V tensors must preserve GGML_OP_VIEW") ||
+        !check(one.offsets_ok && two.offsets_ok && thirty_eight.offsets_ok,
+               "packed Q/K/V offsets must remain unchanged") ||
+        !check(thirty_eight.buffer_bytes < one.buffer_bytes * 3,
+               "38-layer packed reserve must approach the one-layer peak")) {
+        return 1;
+    }
+    std::puts("PASS packed-view");
+    return 0;
+}
+
 #if defined(GGML_USE_HTP)
 
 struct cache_pair {
@@ -978,6 +1424,40 @@ int run_lifecycle_test() {
         return 1;
     }
 
+    ggml_htp_cache_slot_snapshot residual_snapshot = {};
+    if (!check(ggml_backend_htp_async_cache_slot_snapshot(
+                   generation_1.residual, &residual_snapshot),
+               "async cache slot must expose a read-only snapshot") ||
+        !check(std::strcmp(residual_snapshot.cache_key,
+                          "htp_block_sparse_residual_b0_self_s0") == 0,
+               "cache slot snapshot must preserve the key") ||
+        !check(residual_snapshot.branch == 0 &&
+                   residual_snapshot.generation == 1,
+               "cache slot snapshot must preserve branch and generation") ||
+        !check(residual_snapshot.fd >= 0 &&
+                   residual_snapshot.logical_size > 0 &&
+                   residual_snapshot.allocation_size >=
+                       residual_snapshot.logical_size,
+               "cache slot snapshot must expose exact RPCMEM allocation info") ||
+        !check(residual_snapshot.opencl_import_identity != 0,
+               "OpenCL cache slot snapshot must expose its import identity")) {
+        free_cache_pair(generation_1);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    ggml_htp_lifetime_snapshot lifetime = {};
+    if (!check(ggml_backend_htp_get_lifetime_snapshot(backend, &lifetime),
+               "HTP backend must expose a lifetime snapshot") ||
+        !check(lifetime.live_imports == 2 && lifetime.live_events == 0 &&
+                   lifetime.live_leases == 0 && lifetime.pending_jobs == 0 &&
+                   lifetime.retired_arenas == 0,
+               "cache-only lifetime snapshot must report imports without graph work")) {
+        free_cache_pair(generation_1);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
     char reason[512] = {};
     constexpr int64_t duplicate_ne[GGML_MAX_DIMS] = { 16, 2, 4, 1 };
     ggml_backend_htp_async_cache_slot * duplicate =
@@ -1020,8 +1500,16 @@ int run_lifecycle_test() {
     const bool clean =
         check(final_imports == 0, "all persistent imports must be released") &&
         check(final_events == 0, "all cache events must be released");
+    lifetime = {};
+    const bool lifetime_clean =
+        check(ggml_backend_htp_get_lifetime_snapshot(backend, &lifetime),
+              "final lifetime snapshot must be available") &&
+        check(lifetime.live_imports == 0 && lifetime.live_events == 0 &&
+                  lifetime.live_leases == 0 && lifetime.pending_jobs == 0 &&
+                  lifetime.retired_arenas == 0,
+              "final lifetime snapshot must be zero");
     ggml_backend_free(backend);
-    if (!clean) {
+    if (!clean || !lifetime_clean) {
         return 1;
     }
     std::puts("PASS lifecycle");
@@ -1127,6 +1615,14 @@ int run_residual_only_test() {
             rho_ne, reason, sizeof(reason));
         if (!check(residual_slot != nullptr && rho_slot != nullptr,
                    "failed to create residual-only cache slots")) break;
+        if (!check(
+                ggml_backend_htp_async_cache_slot_opencl_import_identity(
+                    residual_slot) != 0 &&
+                ggml_backend_htp_async_cache_slot_opencl_import_identity(
+                    rho_slot) != 0,
+                "fused residual-only cache slots must own persistent imports")) {
+            break;
+        }
         ggml_tensor * residual =
             ggml_backend_htp_async_cache_slot_tensor(residual_slot);
         ggml_tensor * rho = ggml_backend_htp_async_cache_slot_tensor(rho_slot);
@@ -1583,6 +2079,12 @@ int main() {
     }
     if (std::strcmp(mode, "graph-order") == 0) {
         return run_graph_order_test();
+    }
+    if (std::strcmp(mode, "allocator") == 0) {
+        return run_allocator_test();
+    }
+    if (std::strcmp(mode, "packed-view") == 0) {
+        return run_packed_view_test();
     }
     if (std::strcmp(mode, "residual-only") == 0) {
         return run_residual_only_test();

@@ -6438,6 +6438,36 @@ size_t ggml_backend_opencl_htp_graph_live_event_count(const ggml_opencl_htp_grap
     return graph != nullptr ? graph->events.size() + graph->pending_events.size() : 0;
 }
 
+bool ggml_backend_opencl_htp_graph_get_lifetime_snapshot(
+        const ggml_opencl_htp_graph * graph,
+        ggml_opencl_htp_graph_lifetime_snapshot * snapshot) {
+    if (snapshot == nullptr) {
+        return false;
+    }
+    *snapshot = {};
+    if (graph == nullptr) {
+        return true;
+    }
+    {
+        std::lock_guard<std::mutex> lock(graph->pair_mutex);
+        snapshot->live_leases = static_cast<size_t>(std::count_if(
+            graph->pair_lifetimes.begin(), graph->pair_lifetimes.end(),
+            [](const ggml_opencl_htp_pair_lifetime & pair) {
+                return !pair.state.reaped;
+            }));
+    }
+    {
+        std::lock_guard<std::mutex> lock(graph->submission_mutex);
+        snapshot->pending_jobs = static_cast<size_t>(std::count_if(
+            graph->submission_records.begin(), graph->submission_records.end(),
+            [](const ggml_opencl_htp_submission_record & item) {
+                return item.state == ggml_opencl_htp_submission_state::queued ||
+                       item.state == ggml_opencl_htp_submission_state::submitting;
+            }));
+    }
+    return true;
+}
+
 size_t ggml_backend_opencl_htp_graph_pending_sparse_event_count(
         const ggml_opencl_htp_graph * graph) {
     if (graph == nullptr) {

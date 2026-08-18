@@ -14,6 +14,11 @@ extern "C" {
 typedef struct ggml_opencl_htp_sidecar ggml_opencl_htp_sidecar;
 typedef struct ggml_opencl_htp_graph ggml_opencl_htp_graph;
 
+struct ggml_opencl_htp_graph_lifetime_snapshot {
+    size_t live_leases;
+    size_t pending_jobs;
+};
+
 struct ggml_opencl_qcom_requirements {
     size_t ext_mem_padding;
     size_t page_size;
@@ -348,6 +353,10 @@ GGML_BACKEND_API size_t ggml_backend_opencl_htp_graph_live_alias_count(
 
 GGML_BACKEND_API size_t ggml_backend_opencl_htp_graph_live_event_count(
     const ggml_opencl_htp_graph * graph);
+
+GGML_BACKEND_API bool ggml_backend_opencl_htp_graph_get_lifetime_snapshot(
+    const ggml_opencl_htp_graph * graph,
+    struct ggml_opencl_htp_graph_lifetime_snapshot * snapshot);
 
 GGML_BACKEND_API size_t ggml_backend_opencl_htp_graph_pending_sparse_event_count(
     const ggml_opencl_htp_graph * graph);

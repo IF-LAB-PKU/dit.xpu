@@ -43,6 +43,10 @@ struct ggml_backend_htp_context {
     std::atomic<int64_t> last_attention_elapsed_us{-1};
     ggml_htp_route_summary last_route_summary = {};
     bool has_last_route_summary = false;
+    ggml_htp_memory_ledger_snapshot pending_memory_ledger = {};
+    ggml_htp_memory_ledger_snapshot last_memory_ledger = {};
+    bool has_pending_memory_ledger = false;
+    bool has_last_memory_ledger = false;
     std::string runtime_error;
     std::unordered_map<const ggml_tensor *, ggml_tensor *> packed_f16_weights;
     // The HTP RPC channel, work buffer, and sidecar graph session are process singletons.
