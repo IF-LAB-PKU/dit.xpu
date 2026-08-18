@@ -897,6 +897,45 @@ __STATIC_INLINE__ uint64_t sd_backend_htp_async_cache_slot_opencl_import_identit
 #endif
 }
 
+__STATIC_INLINE__ bool sd_backend_htp_async_cache_slot_snapshot(
+        const ggml_backend_htp_async_cache_slot* slot,
+        ggml_htp_cache_slot_snapshot* snapshot) {
+#ifdef GGML_USE_HTP
+    return ggml_backend_htp_async_cache_slot_snapshot(slot, snapshot);
+#else
+    SD_UNUSED(slot);
+    if (snapshot != nullptr) {
+        *snapshot = {};
+    }
+    return false;
+#endif
+}
+
+__STATIC_INLINE__ bool sd_backend_htp_set_graph_memory_ledger(
+        ggml_backend_t backend,
+        const ggml_htp_memory_ledger_snapshot* snapshot) {
+#ifdef GGML_USE_HTP
+    return ggml_backend_htp_set_graph_memory_ledger(backend, snapshot);
+#else
+    SD_UNUSED(backend); SD_UNUSED(snapshot);
+    return false;
+#endif
+}
+
+__STATIC_INLINE__ bool sd_backend_htp_get_lifetime_snapshot(
+        ggml_backend_t backend,
+        ggml_htp_lifetime_snapshot* snapshot) {
+#ifdef GGML_USE_HTP
+    return ggml_backend_htp_get_lifetime_snapshot(backend, snapshot);
+#else
+    SD_UNUSED(backend);
+    if (snapshot != nullptr) {
+        *snapshot = {};
+    }
+    return false;
+#endif
+}
+
 __STATIC_INLINE__ size_t sd_backend_htp_opencl_retain_deferred_residual_inputs(
         ggml_cgraph* graph) {
 #ifdef GGML_USE_HTP
@@ -2473,7 +2512,9 @@ struct sd_htp_opencl_memory_plan {
     size_t temporary_runtime_bytes = 0;
     size_t temporary_htp_bytes = 0;
     size_t temporary_qkv_bytes = 0;
-    size_t persistent_cache_bytes = 0;
+    size_t host_cache_bytes = 0;
+    size_t rpcmem_cache_logical_bytes = 0;
+    size_t rpcmem_cache_allocation_bytes = 0;
     size_t sparse_destinations_in_gallocr = 0;
     size_t cache_outputs_in_gallocr = 0;
     size_t retained_roots = 0;
@@ -2484,7 +2525,9 @@ __STATIC_INLINE__ sd_htp_opencl_memory_plan sd_make_htp_opencl_memory_plan(
     size_t temporary_runtime_bytes,
     size_t temporary_htp_bytes,
     size_t temporary_qkv_bytes,
-    size_t persistent_cache_bytes,
+    size_t host_cache_bytes,
+    size_t rpcmem_cache_logical_bytes,
+    size_t rpcmem_cache_allocation_bytes,
     size_t sparse_destination_count,
     size_t metadata_only_sparse_count,
     size_t cache_output_count,
@@ -2495,7 +2538,9 @@ __STATIC_INLINE__ sd_htp_opencl_memory_plan sd_make_htp_opencl_memory_plan(
     plan.temporary_runtime_bytes = temporary_runtime_bytes;
     plan.temporary_htp_bytes = temporary_htp_bytes;
     plan.temporary_qkv_bytes = temporary_qkv_bytes;
-    plan.persistent_cache_bytes = persistent_cache_bytes;
+    plan.host_cache_bytes = host_cache_bytes;
+    plan.rpcmem_cache_logical_bytes = rpcmem_cache_logical_bytes;
+    plan.rpcmem_cache_allocation_bytes = rpcmem_cache_allocation_bytes;
     plan.sparse_destinations_in_gallocr =
         sparse_destination_count > metadata_only_sparse_count
             ? sparse_destination_count - metadata_only_sparse_count
@@ -2518,14 +2563,17 @@ __STATIC_INLINE__ int sd_format_htp_opencl_memory_plan(
         capacity,
         "htp_opencl_memory_plan mode=%s "
         "temporary_runtime_bytes=%zu temporary_htp_bytes=%zu "
-        "temporary_qkv_bytes=%zu persistent_cache_bytes=%zu "
+        "temporary_qkv_bytes=%zu host_cache_bytes=%zu "
+        "rpcmem_cache_logical_bytes=%zu rpcmem_cache_allocation_bytes=%zu "
         "sparse_destinations_in_gallocr=%zu "
         "cache_outputs_in_gallocr=%zu retained_roots=%zu",
         ggml_htp_opencl_lifetime_mode_name(plan.mode),
         plan.temporary_runtime_bytes,
         plan.temporary_htp_bytes,
         plan.temporary_qkv_bytes,
-        plan.persistent_cache_bytes,
+        plan.host_cache_bytes,
+        plan.rpcmem_cache_logical_bytes,
+        plan.rpcmem_cache_allocation_bytes,
         plan.sparse_destinations_in_gallocr,
         plan.cache_outputs_in_gallocr,
         plan.retained_roots);
@@ -6093,6 +6141,30 @@ protected:
         bool active = false;
     };
 
+    struct CacheInputBinding {
+        ggml_tensor* tensor = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        void* data = nullptr;
+        void* extra = nullptr;
+        enum ggml_op op = GGML_OP_NONE;
+        ggml_tensor* src[GGML_MAX_SRC] = {};
+        std::string key;
+        uint64_t generation = 0;
+        bool consumer_acquired = false;
+    };
+
+    struct CacheInputBindingTransaction {
+        std::vector<CacheInputBinding> bindings;
+        bool active = false;
+        bool committed = false;
+    };
+
+    enum class CacheInputAllocationFailurePoint {
+        none,
+        first_reserve,
+        second_alloc,
+    };
+
     ggml_context* compute_ctx    = nullptr;
     ggml_gallocr* compute_allocr = nullptr;
     struct RetiredComputeArenaGeneration {
@@ -6230,6 +6302,31 @@ protected:
             keyed_slots.second.slot = nullptr;
         }
         async_residual_cache_slots_.clear();
+    }
+
+    void trace_memory_ledger_teardown() const {
+        if (!ggml_backend_htp_memory_ledger_trace_enabled() ||
+            htp_backend == nullptr) {
+            return;
+        }
+        ggml_htp_lifetime_snapshot lifetime = {};
+        if (!sd_backend_htp_get_lifetime_snapshot(htp_backend, &lifetime)) {
+            return;
+        }
+        ggml_htp_memory_ledger_snapshot snapshot = {};
+        snapshot.requested_route = GGML_HTP_ROUTE_INVALID;
+        snapshot.preflight_result = -1;
+        snapshot.live_imports = lifetime.live_imports;
+        snapshot.live_events = lifetime.live_events;
+        snapshot.live_leases = lifetime.live_leases;
+        snapshot.pending_jobs = lifetime.pending_jobs;
+        snapshot.retired_arenas = std::max(
+            retired_compute_arenas_.size(), lifetime.retired_arenas);
+        char line[2048] = {};
+        if (ggml_backend_htp_format_memory_ledger(
+                line, sizeof(line), "teardown", &snapshot) > 0) {
+            std::fprintf(stderr, "%s\n", line);
+        }
     }
 
     AsyncResidualCacheGeneration* find_async_residual_cache_slot(
@@ -6768,10 +6865,17 @@ protected:
                       get_desc().c_str(), qkv_buffer_size / 1024.0 / 1024.0);
         }
         if (sd_htp_opencl_local_lifetime_prerequisites()) {
-            size_t persistent_cache_bytes = 0;
+            const size_t runtime_buffer_bytes =
+                ggml_gallocr_get_buffer_size(compute_allocr, 0);
+            const size_t htp_buffer_bytes = compute_node_buffer_ids_.empty()
+                ? 0 : ggml_gallocr_get_buffer_size(compute_allocr, 1);
+            const size_t qkv_buffer_bytes =
+                compute_node_buffer_ids_.empty() || qkv_buft == nullptr
+                    ? 0 : ggml_gallocr_get_buffer_size(compute_allocr, 2);
+            size_t host_cache_bytes = 0;
             for (const CacheStorageSegment& segment : cache_storage_segments_) {
                 if (segment.buffer != nullptr) {
-                    persistent_cache_bytes +=
+                    host_cache_bytes +=
                         ggml_backend_buffer_get_size(segment.buffer);
                 }
             }
@@ -6781,27 +6885,37 @@ protected:
                     ++cache_output_count;
                 }
             }
+
+            ggml_htp_memory_ledger_snapshot ledger = {};
+            ledger.requested_route = GGML_HTP_ROUTE_INVALID;
+            ledger.preflight_result = -1;
+            ledger.runtime_buffer_bytes = runtime_buffer_bytes;
+            ledger.htp_buffer_bytes = htp_buffer_bytes;
+            ledger.qkv_buffer_bytes = qkv_buffer_bytes;
+            ledger.host_cache_bytes = host_cache_bytes;
+            ledger.retired_arenas = retired_compute_arenas_.size();
             for (const auto& entry : async_residual_cache_slots_) {
-                ggml_tensor* tensor = entry.second.slot != nullptr
-                    ? sd_backend_htp_async_cache_slot_tensor(entry.second.slot)
-                    : nullptr;
-                if (tensor != nullptr && tensor->buffer != nullptr) {
-                    persistent_cache_bytes +=
-                        ggml_backend_buffer_get_size(tensor->buffer);
+                if (ledger.cache_slot_count >=
+                    GGML_HTP_MEMORY_LEDGER_MAX_CACHE_SLOTS) {
+                    break;
+                }
+                ggml_htp_cache_slot_snapshot slot = {};
+                if (sd_backend_htp_async_cache_slot_snapshot(
+                        entry.second.slot, &slot)) {
+                    ledger.cache_slots[ledger.cache_slot_count++] = slot;
                 }
             }
+            ggml_backend_htp_memory_ledger_recalculate(&ledger);
 
             const sd_htp_opencl_memory_plan memory_plan =
                 sd_make_htp_opencl_memory_plan(
                     sd_htp_opencl_lifetime_mode(),
-                    ggml_gallocr_get_buffer_size(compute_allocr, 0),
-                    compute_node_buffer_ids_.empty()
-                        ? 0
-                        : ggml_gallocr_get_buffer_size(compute_allocr, 1),
-                    compute_node_buffer_ids_.empty() || qkv_buft == nullptr
-                        ? 0
-                        : ggml_gallocr_get_buffer_size(compute_allocr, 2),
-                    persistent_cache_bytes,
+                    runtime_buffer_bytes,
+                    htp_buffer_bytes,
+                    qkv_buffer_bytes,
+                    host_cache_bytes,
+                    ledger.rpcmem_cache_logical_bytes,
+                    ledger.rpcmem_cache_allocation_bytes,
                     compute_no_alloc_tensors_.size(),
                     compute_no_alloc_tensors_.size(),
                     cache_output_count,
@@ -6812,6 +6926,13 @@ protected:
                 sd_format_htp_opencl_memory_plan(
                     summary, sizeof(summary), memory_plan) > 0) {
                 std::fprintf(stderr, "%s\n", summary);
+            }
+            if (htp_backend != nullptr &&
+                !sd_backend_htp_set_graph_memory_ledger(
+                    htp_backend, &ledger) &&
+                ggml_backend_htp_memory_ledger_trace_enabled()) {
+                std::fprintf(stderr,
+                             "htp_memory_ledger status=error reason=set_failed\n");
             }
         }
         return true;
@@ -7785,8 +7906,16 @@ protected:
         }
     }
 
-    bool bind_cache_backed_tensors() {
+    bool bind_cache_backed_tensors(
+            CacheInputBindingTransaction* transaction) {
+        if (transaction == nullptr || transaction->active) {
+            return false;
+        }
         GGML_ASSERT(active_async_cache_consumers_.empty());
+        transaction->bindings.clear();
+        transaction->bindings.reserve(cache_backed_tensor_name_map.size());
+        transaction->active = true;
+        transaction->committed = false;
         for (const auto& kv : cache_backed_tensor_name_map) {
             ggml_tensor* graph_tensor = kv.first;
             ggml_tensor* cache_tensor = nullptr;
@@ -7833,6 +7962,19 @@ protected:
                     return false;
                 }
             }
+            CacheInputBinding binding;
+            binding.tensor = graph_tensor;
+            binding.buffer = graph_tensor->buffer;
+            binding.data = graph_tensor->data;
+            binding.extra = graph_tensor->extra;
+            binding.op = graph_tensor->op;
+            binding.key = kv.second;
+            binding.generation = async_generation;
+            for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
+                binding.src[src_idx] = graph_tensor->src[src_idx];
+            }
+            transaction->bindings.push_back(std::move(binding));
+            CacheInputBinding& active_binding = transaction->bindings.back();
             if (async_generation != 0) {
                 char reason[512] = {};
                 if (htp_backend == nullptr ||
@@ -7844,7 +7986,6 @@ protected:
                         "generation=%" PRIu64 " reason=%s",
                         get_desc().c_str(), kv.second.c_str(), async_generation,
                         reason[0] != '\0' ? reason : "unknown error");
-                    release_active_async_cache_consumers();
                     return false;
                 }
                 AsyncResidualCacheGeneration* cached =
@@ -7853,6 +7994,7 @@ protected:
                 ++cached->consumer_count;
                 active_async_cache_consumers_.push_back(
                     { kv.second, async_generation });
+                active_binding.consumer_acquired = true;
             }
             graph_tensor->buffer = cache_tensor->buffer;
             graph_tensor->data   = cache_tensor->data;
@@ -7863,6 +8005,83 @@ protected:
             graph_tensor->op = GGML_OP_NONE;
         }
         return true;
+    }
+
+    void restore_cache_input_bindings(
+            CacheInputBindingTransaction* transaction) {
+        if (transaction == nullptr || !transaction->active) {
+            return;
+        }
+        release_active_async_cache_consumers();
+        for (auto it = transaction->bindings.rbegin();
+             it != transaction->bindings.rend(); ++it) {
+            CacheInputBinding& binding = *it;
+            binding.tensor->buffer = binding.buffer;
+            binding.tensor->data = binding.data;
+            binding.tensor->extra = binding.extra;
+            binding.tensor->op = binding.op;
+            for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
+                binding.tensor->src[src_idx] = binding.src[src_idx];
+            }
+        }
+        transaction->bindings.clear();
+        transaction->active = false;
+    }
+
+    void rollback_cache_input_bindings(
+            CacheInputBindingTransaction* transaction) {
+        if (transaction == nullptr || transaction->committed) {
+            return;
+        }
+        restore_cache_input_bindings(transaction);
+    }
+
+    void commit_cache_input_bindings(
+            CacheInputBindingTransaction* transaction) {
+        if (transaction == nullptr || !transaction->active) {
+            return;
+        }
+        restore_cache_input_bindings(transaction);
+        transaction->committed = true;
+    }
+
+    void finalize_cache_input_bindings(
+            CacheInputBindingTransaction* transaction,
+            ggml_status status) {
+        if (status == GGML_STATUS_SUCCESS) {
+            commit_cache_input_bindings(transaction);
+        } else {
+            restore_cache_input_bindings(transaction);
+        }
+    }
+
+    bool allocate_compute_graph_with_cache_inputs(
+            ggml_cgraph* gf,
+            CacheInputBindingTransaction* transaction,
+            CacheInputAllocationFailurePoint failure_point =
+                CacheInputAllocationFailurePoint::none) {
+        if (!bind_cache_backed_tensors(transaction)) {
+            return false;
+        }
+        if (failure_point ==
+            CacheInputAllocationFailurePoint::first_reserve) {
+            return false;
+        }
+        if (!alloc_compute_buffer(gf)) {
+            return false;
+        }
+        if (failure_point ==
+            CacheInputAllocationFailurePoint::second_alloc) {
+            return false;
+        }
+        if (!compute_node_buffer_ids_.empty() ||
+            !compute_leaf_buffer_ids_.empty()) {
+            return ggml_gallocr_reserve_n(
+                       compute_allocr, gf, compute_node_buffer_ids_.data(),
+                       compute_leaf_buffer_ids_.data()) &&
+                   ggml_gallocr_alloc_graph(compute_allocr, gf);
+        }
+        return ggml_gallocr_alloc_graph(compute_allocr, gf);
     }
 
     void rollback_async_residual_cache_outputs(
@@ -8314,6 +8533,14 @@ protected:
                 [this](AsyncResidualCacheOutputTransaction* transaction) {
                     rollback_async_residual_cache_outputs(transaction);
                 });
+        CacheInputBindingTransaction cache_input_transaction;
+        auto cache_input_rollback = std::unique_ptr<
+            CacheInputBindingTransaction,
+            std::function<void(CacheInputBindingTransaction*)>>(
+                &cache_input_transaction,
+                [this](CacheInputBindingTransaction* transaction) {
+                    rollback_cache_input_bindings(transaction);
+                });
         const bool bind_cache_outputs_before_reserve =
             sd_htp_opencl_bind_cache_outputs_before_reserve();
         if (bind_cache_outputs_before_reserve &&
@@ -8328,26 +8555,8 @@ protected:
         }
 
         int64_t t_alloc_begin = ggml_time_ms();
-        if (!alloc_compute_buffer(gf)) {
-            LOG_ERROR("%s alloc compute buffer failed", get_desc().c_str());
-            if (use_partial_param_offload) {
-                restore_partial_params();
-            }
-            return std::nullopt;
-        }
-
-        bool alloc_ok = false;
-        if (!compute_node_buffer_ids_.empty() || !compute_leaf_buffer_ids_.empty()) {
-            alloc_ok = ggml_gallocr_reserve_n(compute_allocr,
-                                              gf,
-                                              compute_node_buffer_ids_.data(),
-                                              compute_leaf_buffer_ids_.data()) &&
-                       ggml_gallocr_alloc_graph(compute_allocr, gf);
-        } else {
-            alloc_ok = ggml_gallocr_alloc_graph(compute_allocr, gf);
-        }
-
-        if (!alloc_ok) {
+        if (!allocate_compute_graph_with_cache_inputs(
+                gf, &cache_input_transaction)) {
             LOG_ERROR("%s alloc compute graph failed", get_desc().c_str());
             if (free_compute_buffer_immediately) {
                 free_compute_buffer();
@@ -8364,14 +8573,6 @@ protected:
             !prepare_async_residual_cache_outputs(
                 &cache_output_transaction)) {
             LOG_ERROR("%s prepare async residual cache outputs failed", get_desc().c_str());
-            if (free_compute_buffer_immediately) {
-                free_compute_buffer();
-            } else if (use_partial_param_offload) {
-                restore_partial_params();
-            }
-            return std::nullopt;
-        }
-        if (!bind_cache_backed_tensors()) {
             if (free_compute_buffer_immediately) {
                 free_compute_buffer();
             } else if (use_partial_param_offload) {
@@ -8401,7 +8602,10 @@ protected:
                 htp_backend, arena_generation);
         }
         ggml_status status      = ggml_backend_graph_compute(use_htp_compute ? htp_backend : runtime_backend, gf);
-        release_active_async_cache_consumers();
+        finalize_cache_input_bindings(&cache_input_transaction, status);
+        if (status == GGML_STATUS_SUCCESS) {
+            cache_input_rollback.release();
+        }
         if (use_htp_compute) {
             sd_backend_htp_set_hybrid_enabled(false);
         }
@@ -8634,6 +8838,7 @@ public:
         free_compute_ctx();
         free_cache_ctx_and_buffer();
         free_async_residual_cache_slots();
+        trace_memory_ledger_teardown();
     }
 
     virtual GGMLRunnerContext get_context() {

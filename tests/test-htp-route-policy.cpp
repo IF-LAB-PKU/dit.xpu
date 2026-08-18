@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <cstdio>
 #include <iostream>
 #include <string>
 
@@ -376,8 +377,8 @@ void test_opencl_persistent_import_route_policy() {
     setenv("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR", "1", 1);
     setenv("SD_HTP_SPARSE_OPENCL", "0", 1);
     setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "1", 1);
-    require(!ggml_backend_htp_opencl_persistent_import_required(),
-            "fused HTP cache must not create an OpenCL persistent import");
+    require(ggml_backend_htp_opencl_persistent_import_required(),
+            "fused residual-only cache must create an OpenCL persistent import");
 
     setenv("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR", "0", 1);
     setenv("SD_HTP_SPARSE_OPENCL", "0", 1);
@@ -507,7 +508,104 @@ void test_route_summaries() {
     cpu_fallback.cpu_attention_fallback = 1;
     require_invalid_summary(cpu_fallback, "CPU attention fallback must fail");
 }
+#endif
 
+void test_memory_ledger_snapshot() {
+    ggml_htp_memory_ledger_snapshot snapshot = {};
+    snapshot.requested_route = GGML_HTP_ROUTE_FUSED_OPENCL_RESIDUAL;
+    snapshot.preflight_result = 1;
+    snapshot.routed_sparse_count = 0;
+    snapshot.routed_rho_count = 0;
+    snapshot.routed_residual_count = 0;
+    snapshot.reported_opencl_residual = 2;
+    snapshot.runtime_buffer_bytes = 1024;
+    snapshot.htp_buffer_bytes = 2048;
+    snapshot.qkv_buffer_bytes = 4096;
+    snapshot.host_cache_bytes = 8192;
+    snapshot.live_imports = 4;
+    snapshot.live_events = 3;
+    snapshot.live_leases = 2;
+    snapshot.pending_jobs = 1;
+    snapshot.retired_arenas = 2;
+    snapshot.spilled_host_bytes = 256;
+    snapshot.hydrated_rpcmem_bytes = 512;
+    snapshot.cache_slot_count = 4;
+
+    const struct SlotCase {
+        const char * key;
+        int branch;
+        uint64_t generation;
+        int fd;
+        size_t logical_size;
+        size_t allocation_size;
+        uint64_t import_identity;
+    } slots[] = {
+        {"htp_block_sparse_residual_b0_self_s0", 0, 11, 101, 100, 128, 1001},
+        {"htp_block_sparse_residual_rho_b0_self_s0", 0, 11, 102, 200, 256, 1002},
+        {"htp_block_sparse_residual_b1_self_s0", 1, 12, 103, 300, 384, 1003},
+        {"htp_block_sparse_residual_rho_b1_self_s0", 1, 12, 104, 400, 512, 1004},
+    };
+    for (size_t i = 0; i < snapshot.cache_slot_count; ++i) {
+        std::snprintf(snapshot.cache_slots[i].cache_key,
+                      sizeof(snapshot.cache_slots[i].cache_key), "%s",
+                      slots[i].key);
+        snapshot.cache_slots[i].branch = slots[i].branch;
+        snapshot.cache_slots[i].generation = slots[i].generation;
+        snapshot.cache_slots[i].fd = slots[i].fd;
+        snapshot.cache_slots[i].logical_size = slots[i].logical_size;
+        snapshot.cache_slots[i].allocation_size = slots[i].allocation_size;
+        snapshot.cache_slots[i].opencl_import_identity = slots[i].import_identity;
+    }
+
+    require(ggml_backend_htp_memory_ledger_recalculate(&snapshot),
+            "memory ledger totals must be recalculated from cache slots");
+    require(snapshot.rpcmem_cache_logical_bytes == 1000,
+            "memory ledger logical bytes must equal the slot sum");
+    require(snapshot.rpcmem_cache_allocation_bytes == 1280,
+            "memory ledger allocation bytes must equal the slot sum");
+
+    char summary[1024] = {};
+    require(ggml_backend_htp_format_memory_ledger(
+                summary, sizeof(summary), "pre_compute", &snapshot) > 0,
+            "memory ledger summary must format");
+    const std::string summary_text(summary);
+    require(summary_text.find("requested=fused") != std::string::npos,
+            "memory ledger must report the requested route");
+    require(summary_text.find("routed_sparse=0 routed_rho=0 routed_residual=0") !=
+                std::string::npos,
+            "memory ledger must report actual routed counts");
+    require(summary_text.find("reported_opencl_residual=2") != std::string::npos,
+            "memory ledger must keep the legacy reported route separate");
+    require(summary_text.find("rpcmem_cache_logical_bytes=1000") !=
+                std::string::npos,
+            "memory ledger must report logical cache bytes");
+    require(summary_text.find("rpcmem_cache_allocation_bytes=1280") !=
+                std::string::npos,
+            "memory ledger must report allocation cache bytes");
+
+    char slot_line[512] = {};
+    require(ggml_backend_htp_format_memory_ledger_slot(
+                slot_line, sizeof(slot_line), &snapshot.cache_slots[2]) > 0,
+            "memory ledger slot must format");
+    const std::string slot_text(slot_line);
+    require(slot_text.find("branch=1") != std::string::npos &&
+                slot_text.find("generation=12") != std::string::npos &&
+                slot_text.find("fd=103") != std::string::npos &&
+                slot_text.find("import_identity=1003") != std::string::npos,
+            "memory ledger slot must preserve branch and backing identity");
+
+    unsetenv("SD_HTP_SPARSE_OPENCL_TRACE");
+    require(!ggml_backend_htp_memory_ledger_trace_enabled(),
+            "memory ledger diagnostics must be silent by default");
+    setenv("SD_HTP_SPARSE_OPENCL_TRACE", "1", 1);
+    require(ggml_backend_htp_memory_ledger_trace_enabled(),
+            "memory ledger diagnostics must use the sparse OpenCL trace gate");
+    setenv("SD_HTP_SPARSE_OPENCL_TRACE", "0", 1);
+    require(!ggml_backend_htp_memory_ledger_trace_enabled(),
+            "memory ledger diagnostics must be silent when trace is zero");
+}
+
+#if defined(GGML_USE_HTP)
 void test_cpu_residual_graph_summary() {
     setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE", "1", 1);
     setenv("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR", "0", 1);
@@ -574,6 +672,61 @@ void test_cpu_residual_graph_summary() {
 
     ggml_free(ctx);
 }
+
+void test_fused_route_summary_uses_actual_routed_set() {
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE", "1", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL", "0", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "1", 1);
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context* ctx = ggml_init(params);
+    require(ctx != nullptr, "fused route graph context must initialize");
+
+    ggml_tensor* fused = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 272);
+    fused->op = GGML_OP_CUSTOM;
+    ggml_set_name(fused, "htp_fused_anchor_attention");
+    ggml_tensor* dense = ggml_view_4d(
+        ctx, fused, 17, 2, 4, 1, 17 * sizeof(float),
+        34 * sizeof(float), 136 * sizeof(float), 0);
+    ggml_tensor* sparse = ggml_view_4d(
+        ctx, fused, 17, 2, 4, 1, 17 * sizeof(float),
+        34 * sizeof(float), 136 * sizeof(float), 136 * sizeof(float));
+
+    ggml_tensor* rho = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 2, 4, 1);
+    rho->op = GGML_OP_CUSTOM;
+    rho->src[0] = dense;
+    rho->src[1] = sparse;
+    ggml_set_name(rho, "htp_block_sparse_residual_rho_b0_route_s0");
+    ggml_tensor* residual = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F16, 16, 2, 4, 1);
+    residual->op = GGML_OP_CUSTOM;
+    residual->src[0] = dense;
+    residual->src[1] = sparse;
+    residual->src[2] = rho;
+    ggml_set_name(residual, "htp_block_sparse_residual_b0_route_s0");
+
+    ggml_cgraph* graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(graph, residual);
+
+    ggml_htp_route_summary summary = {};
+    require(ggml_backend_htp_collect_route_summary(nullptr, graph, &summary),
+            "fused residual graph must participate in route accounting");
+    require(summary.mode == GGML_HTP_ROUTE_FUSED_OPENCL_RESIDUAL &&
+                summary.cache_pairs == 1,
+            "fused residual graph must identify one requested cache pair");
+    require(summary.opencl_residual == 0 && summary.cpu_residual == 1,
+            "fused summary must not report OpenCL without a frozen routed pair");
+    require_invalid_summary(
+        summary,
+        "requested fused route without actual residual routing must fail closed");
+
+    ggml_free(ctx);
+}
 #endif
 
 }  // namespace
@@ -597,7 +750,9 @@ int main() {
 #if defined(GGML_USE_HTP)
     test_route_summaries();
     test_cpu_residual_graph_summary();
+    test_fused_route_summary_uses_actual_routed_set();
 #endif
+    test_memory_ledger_snapshot();
     std::cout << "htp route policy tests passed\n";
     return 0;
 }
