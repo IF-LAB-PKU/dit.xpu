@@ -101,7 +101,13 @@ static bool run_fused_case(
     }
 
     Graph graph = build_graph(spec, Route::FusedAnchor, htp);
-    const bool ready = graph_contract(graph, spec) && upload_graph(graph, data, htp) &&
+    if (std::getenv("HTP_ATTN_DIRECT_OPERATOR") != nullptr) {
+        setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "0", 1);
+        setenv("SD_HTP_SPARSE_OPENCL_STRICT", "0", 1);
+    }
+    const bool contract_ready = graph_contract(graph, spec);
+    const bool upload_ready = contract_ready && upload_graph(graph, data, htp);
+    const bool ready = upload_ready &&
                        graph.dense_output != nullptr && graph.dense_lse != nullptr &&
                        graph.sparse_output != nullptr && graph.sparse_lse != nullptr &&
                        graph.rho != nullptr && graph.residual != nullptr;
@@ -135,6 +141,35 @@ static bool run_fused_case(
     const Metrics sparse_lse_metrics = compare(sparse_reference.lse, sparse_lse);
     const Metrics rho_metrics = compare(rho_reference, rho);
     const Metrics residual_metrics = compare(residual_reference, residual);
+    double text_dense_sparse_max_abs = 0.0;
+    bool text_dense_sparse_finite = true;
+    if (spec.text_tokens > 0) {
+        for (int token = spec.image_tokens; token < total_tokens(spec); ++token) {
+            for (int head = 0; head < spec.heads; ++head) {
+                const size_t row = size_t(token * spec.heads + head);
+                const size_t base = row * size_t(spec.head_dim);
+                for (int d = 0; d < spec.head_dim; ++d) {
+                    const float dense = dense_output[base + d];
+                    const float sparse = sparse_output[base + d];
+                    if (!std::isfinite(dense) || !std::isfinite(sparse)) {
+                        text_dense_sparse_finite = false;
+                    } else {
+                        text_dense_sparse_max_abs = std::max(
+                            text_dense_sparse_max_abs, std::fabs(double(dense) - double(sparse)));
+                    }
+                }
+                const float dense_lse_value = dense_lse[row];
+                const float sparse_lse_value = sparse_lse[row];
+                if (!std::isfinite(dense_lse_value) || !std::isfinite(sparse_lse_value)) {
+                    text_dense_sparse_finite = false;
+                } else {
+                    text_dense_sparse_max_abs = std::max(
+                        text_dense_sparse_max_abs,
+                        std::fabs(double(dense_lse_value) - double(sparse_lse_value)));
+                }
+            }
+        }
+    }
     const bool pass = ready && status == GGML_STATUS_SUCCESS &&
                       dense_o.finite && sparse_o.finite &&
                       dense_lse_metrics.finite && sparse_lse_metrics.finite &&
@@ -145,16 +180,19 @@ static bool run_fused_case(
                       sparse_lse_metrics.max_abs <= 5e-3 &&
                       rho_metrics.max_abs <= 2e-3 &&
                       residual_metrics.max_abs <= 5e-3 &&
-                      residual_metrics.rmse <= 1e-3;
+                      residual_metrics.rmse <= 1e-3 &&
+                      text_dense_sparse_finite && text_dense_sparse_max_abs <= 1e-6;
     std::printf(
         "[%s] %s/%s/resolution=%d route=fused-anchor d=%d "
         "dense_o=(%.9g,%.9g) sparse_o=(%.9g,%.9g) "
-        "dense_lse=%.9g sparse_lse=%.9g rho=%.9g residual=(%.9g,%.9g) status=%d\n",
+        "dense_lse=%.9g sparse_lse=%.9g rho=%.9g residual=(%.9g,%.9g) "
+        "text_dense_sparse_max_abs=%.9g status=%d ready_contract=%d ready_upload=%d\n",
         pass ? "PASS" : "FAIL", spec.model, spec.family, spec.resolution,
         spec.head_dim, dense_o.max_abs, dense_o.rmse,
         sparse_o.max_abs, sparse_o.rmse, dense_lse_metrics.max_abs,
         sparse_lse_metrics.max_abs, rho_metrics.max_abs,
-        residual_metrics.max_abs, residual_metrics.rmse, int(status));
+        residual_metrics.max_abs, residual_metrics.rmse, text_dense_sparse_max_abs, int(status),
+        contract_ready ? 1 : 0, upload_ready ? 1 : 0);
     if (!pass) {
         std::printf(
             "  dense_o_worst=%zu ref=%.9g got=%.9g "
