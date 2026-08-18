@@ -150,6 +150,7 @@ static TimingStats summarize(std::vector<int64_t> samples) {
 
 static const char * route_name(htp_attention_common::Route route, const char * loader) {
     if (route == htp_attention_common::Route::Dense) return "dense";
+    if (route == htp_attention_common::Route::FusedAnchor) return "fused-anchor";
     if (route == htp_attention_common::Route::ExternalSparseBaseline) {
         return "sparse-baseline-unpacked";
     }
@@ -187,12 +188,23 @@ static bool run_route(ggml_backend_t backend,
 
     setenv("SD_HTP_BLOCK_SPARSE_ATTN", route == htp_attention_common::Route::Dense ? "0" : "1", 1);
     setenv("SD_HTP_PACKED_ATTENTION", route == htp_attention_common::Route::PackedSparse ? "1" : "0", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR",
+           route == htp_attention_common::Route::FusedAnchor ? "1" : "0", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE", "1", 1);
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO", "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL", route == htp_attention_common::Route::FusedAnchor ? "0" : "1", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "1", 1);
     setenv("SD_HTP_HALO_KV_LOAD", loader, 1);
     setenv("SD_HTP_HALO_KV_TRACE", "0", 1);
     setenv("SD_HTP_HALO_REQUIRE_USERDMA_TRACE", "0", 1);
     setenv("SD_HTP_HALO_REQUIRE_L2_TRACE", "0", 1);
 
     htp_attention_common::Graph graph = htp_attention_common::build_graph(spec, route);
+    if (std::getenv("HTP_ATTN_DIRECT_OPERATOR") != nullptr &&
+        route == htp_attention_common::Route::FusedAnchor) {
+        setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "0", 1);
+        setenv("SD_HTP_SPARSE_OPENCL_STRICT", "0", 1);
+    }
     const htp_attention_common::InputData data = htp_attention_common::make_input(spec);
     if (!htp_attention_common::graph_contract(graph, spec) ||
         !htp_attention_common::upload_graph(graph, data, backend)) {
@@ -226,11 +238,16 @@ static bool run_route(ggml_backend_t backend,
     }
 
     const TimingStats stats = summarize(std::move(attention_elapsed));
-    std::printf("[PERF] model=%s family=%s resolution=%d image_tokens=%d route=%s loader=%s temp_c=%.2f "
+    const char * impl = std::getenv("HTP_FUSED_ANCHOR_IMPL");
+    if (impl == nullptr || impl[0] == '\0') impl = "unknown";
+    const char * variant = std::getenv("HTP_FUSED_ANCHOR_VARIANT");
+    if (variant == nullptr || variant[0] == '\0') variant = "runtime";
+    std::printf("[PERF] model=%s family=%s resolution=%d image_tokens=%d route=%s loader=%s "
+                "variant=%s impl=%s temp_c=%.2f "
                 "samples=%d htp_attention_min_us=%.1f htp_attention_median_us=%.1f "
                 "htp_attention_mean_us=%.1f htp_attention_p95_us=%.1f htp_attention_max_us=%.1f\n",
                 spec.model, spec.family, spec.resolution, spec.image_tokens,
-                route_name(route, loader), loader, initial_temperature, samples,
+                route_name(route, loader), loader, variant, impl, initial_temperature, samples,
                 stats.min_us, stats.median_us, stats.mean_us, stats.p95_us, stats.max_us);
     std::fflush(stdout);
     htp_attention_common::free_graph(graph);
@@ -277,6 +294,7 @@ int main() {
                     backend, size, spec, route, loader, warmups, samples) ? 1 : 0;
             };
             measure("dense", htp_attention_common::Route::Dense, "baseline");
+            measure("fused-anchor", htp_attention_common::Route::FusedAnchor, "l2fetch");
             measure("sparse-baseline-unpacked",
                     htp_attention_common::Route::ExternalSparseBaseline, "baseline");
             measure("sparse-chunk-unpacked",

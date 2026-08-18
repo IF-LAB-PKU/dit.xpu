@@ -284,6 +284,7 @@ static void build_standard_attention(Graph & graph, const CaseSpec & spec, Route
         setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO", "1", 1);
         setenv("SD_HTP_SPARSE_OPENCL", "0", 1);
         setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "1", 1);
+        setenv("SD_HTP_SPARSE_OPENCL_STRICT", "1", 1);
         unsetenv("SD_HTP_SPARSE_OPENCL_ASYNC");
         unsetenv("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT");
         const std::function<ggml_tensor *(const std::string &, ggml_tensor *)> cache_tensor =
