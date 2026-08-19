@@ -11,8 +11,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <unordered_set>
 #include <vector>
+
+extern "C" bool htp_ops_opencl_defer_submission_wait_requested(void);
 
 namespace {
 
@@ -1173,6 +1176,43 @@ bool check(bool condition, const char * message) {
     return condition;
 }
 
+int run_sparse_submission_wait_test() {
+#if !defined(GGML_USE_HTP)
+    std::puts("SKIP: submission wait contract requires an HTP-enabled build");
+    return k_skip;
+#else
+    const char * value = std::getenv("SD_HTP_SPARSE_OPENCL_DEFER_SUBMISSION_WAIT");
+    const bool had_value = value != nullptr;
+    const std::string saved_value = value != nullptr ? value : "";
+    const auto restore = [&]() {
+        if (had_value) {
+            setenv("SD_HTP_SPARSE_OPENCL_DEFER_SUBMISSION_WAIT", saved_value.c_str(), 1);
+        } else {
+            unsetenv("SD_HTP_SPARSE_OPENCL_DEFER_SUBMISSION_WAIT");
+        }
+    };
+
+    unsetenv("SD_HTP_SPARSE_OPENCL_DEFER_SUBMISSION_WAIT");
+    const bool unset_disabled = !htp_ops_opencl_defer_submission_wait_requested();
+    setenv("SD_HTP_SPARSE_OPENCL_DEFER_SUBMISSION_WAIT", "0", 1);
+    const bool zero_disabled = !htp_ops_opencl_defer_submission_wait_requested();
+    setenv("SD_HTP_SPARSE_OPENCL_DEFER_SUBMISSION_WAIT", "1", 1);
+    const bool one_enabled = htp_ops_opencl_defer_submission_wait_requested();
+    setenv("SD_HTP_SPARSE_OPENCL_DEFER_SUBMISSION_WAIT", "yes", 1);
+    const bool nonzero_enabled = htp_ops_opencl_defer_submission_wait_requested();
+    restore();
+
+    if (!check(unset_disabled, "unset submission wait flag must be disabled") ||
+        !check(zero_disabled, "zero submission wait flag must be disabled") ||
+        !check(one_enabled, "one submission wait flag must be enabled") ||
+        !check(nonzero_enabled, "nonzero submission wait flag must be enabled")) {
+        return 1;
+    }
+    std::puts("PASS submit-wait");
+    return 0;
+#endif
+}
+
 int run_fp16_test() {
     const std::vector<float> dense = {
         0.0f, 1.0f, -1.0f, 0.0001220703125f,
@@ -1762,6 +1802,7 @@ enum class sparse_preflight_case {
     dense_no_alloc,
     ordinary_sparse_consumer,
     deferred_stage_noop,
+    submission_wait_overlap,
 };
 
 int run_sparse_residual_preflight_case(sparse_preflight_case test_case) {
@@ -1775,6 +1816,8 @@ int run_sparse_residual_preflight_case(sparse_preflight_case test_case) {
         "htp_block_sparse_residual_rho_b0_preflight_s0";
     const bool deferred_stage_noop =
         test_case == sparse_preflight_case::deferred_stage_noop;
+    const bool submission_wait_overlap =
+        test_case == sparse_preflight_case::submission_wait_overlap;
     setenv("SD_HTP_SPARSE_OPENCL_LIFETIME_MODE",
            deferred_stage_noop ? "deferred" : "reuse", 1);
 
@@ -1869,7 +1912,7 @@ int run_sparse_residual_preflight_case(sparse_preflight_case test_case) {
         allocator = ggml_gallocr_new(
             ggml_backend_get_default_buffer_type(backend));
         const ggml_tensor * no_alloc[] = {sparse, dense};
-        const size_t no_alloc_count = deferred_stage_noop ? 0 :
+        const size_t no_alloc_count = deferred_stage_noop || submission_wait_overlap ? 0 :
             (test_case == sparse_preflight_case::dense_no_alloc ? 2 : 1);
         if (!check(allocator != nullptr &&
                    ggml_gallocr_set_no_alloc_tensors(
@@ -1878,7 +1921,7 @@ int run_sparse_residual_preflight_case(sparse_preflight_case test_case) {
                    ggml_gallocr_reserve(allocator, graph) &&
                    ggml_gallocr_alloc_graph(allocator, graph),
                    "failed to allocate sparse preflight graph")) break;
-        if (deferred_stage_noop) {
+        if (deferred_stage_noop || submission_wait_overlap) {
             if (!check(tensor_has_resolved_backing(sparse),
                        "deferred sparse output must have backing")) break;
         } else if (!check(sparse->buffer == nullptr && sparse->data == nullptr,
@@ -1944,7 +1987,45 @@ int run_sparse_residual_preflight_case(sparse_preflight_case test_case) {
             ggml_backend_opencl_htp_graph_preflight(
                 sidecar, graph, descriptors, 3, &prepared,
                 reason, sizeof(reason));
-        if (test_case == sparse_preflight_case::metadata_only_sparse) {
+        if (test_case == sparse_preflight_case::submission_wait_overlap) {
+            if (!check(preflight == GGML_OPENCL_HTP_OK, reason)) break;
+
+            setenv("SD_HTP_SPARSE_OPENCL_TEST_SUBMIT_DELAY_US", "100000", 1);
+            if (!check(ggml_backend_opencl_htp_graph_start_submission_thread(
+                           prepared, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK,
+                       reason) ||
+                !check(ggml_backend_opencl_htp_graph_queue_block_sparse_attn(
+                           prepared, sparse, reason, sizeof(reason)) == GGML_OPENCL_HTP_OK,
+                       reason)) {
+                unsetenv("SD_HTP_SPARSE_OPENCL_TEST_SUBMIT_DELAY_US");
+                break;
+            }
+
+            bool waited = false;
+            const int64_t disjoint_begin = ggml_time_us();
+            const ggml_opencl_htp_result disjoint_result =
+                ggml_backend_opencl_htp_graph_wait_for_overlapping_output_leases(
+                    prepared, residual, &waited, reason, sizeof(reason));
+            const int64_t disjoint_elapsed = ggml_time_us() - disjoint_begin;
+            if (!check(disjoint_result == GGML_OPENCL_HTP_OK, reason) ||
+                !check(disjoint_elapsed < 50000,
+                       "disjoint writer must not wait for sparse publication")) {
+                unsetenv("SD_HTP_SPARSE_OPENCL_TEST_SUBMIT_DELAY_US");
+                break;
+            }
+
+            const int64_t overlap_begin = ggml_time_us();
+            const ggml_opencl_htp_result overlap_result =
+                ggml_backend_opencl_htp_graph_wait_for_overlapping_output_leases(
+                    prepared, q, &waited, reason, sizeof(reason));
+            const int64_t overlap_elapsed = ggml_time_us() - overlap_begin;
+            unsetenv("SD_HTP_SPARSE_OPENCL_TEST_SUBMIT_DELAY_US");
+            if (!check(overlap_result == GGML_OPENCL_HTP_OK, reason) ||
+                !check(overlap_elapsed >= 50000,
+                       "overlapping writer must wait for sparse publication")) {
+                break;
+            }
+        } else if (test_case == sparse_preflight_case::metadata_only_sparse) {
             if (!check(preflight == GGML_OPENCL_HTP_OK, reason) ||
                 !check(ggml_backend_opencl_htp_graph_sparse_output_is_residual_owned(
                            prepared, sparse),
@@ -2038,6 +2119,7 @@ int run_sparse_residual_preflight_test() {
              sparse_preflight_case::dense_no_alloc,
              sparse_preflight_case::ordinary_sparse_consumer,
              sparse_preflight_case::deferred_stage_noop,
+             sparse_preflight_case::submission_wait_overlap,
          }) {
         const int case_result = run_sparse_residual_preflight_case(test_case);
         if (case_result != 0) {
@@ -2091,6 +2173,9 @@ int main() {
     }
     if (std::strcmp(mode, "sparse-residual-preflight") == 0) {
         return run_sparse_residual_preflight_test();
+    }
+    if (std::strcmp(mode, "submit-wait") == 0) {
+        return run_sparse_submission_wait_test();
     }
     std::fprintf(stderr, "unknown HTP_RESIDUAL_CACHE_TEST mode: %s\n", mode);
     return 2;

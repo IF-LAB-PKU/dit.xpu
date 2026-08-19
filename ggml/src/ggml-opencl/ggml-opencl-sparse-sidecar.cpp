@@ -197,6 +197,10 @@ struct ggml_opencl_htp_prepared_sparse_dispatch {
     int32_t output_op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)] = {};
     cl_mem staged_mask = nullptr;
     int staged_mask_slot = -1;
+    // Owns the event for the host-to-device mask copy while the staged mask
+    // is live.  Writers of the original mask backing use this as a source
+    // lease; the sparse kernel event is intentionally not used for that wait.
+    cl_event staged_mask_copy_event = nullptr;
     bool metadata_only_output = false;
 };
 
@@ -351,6 +355,17 @@ void set_reason(char * reason, size_t capacity, const char * format, ...) {
 bool sidecar_trace_enabled() {
     const char * trace = std::getenv("SD_HTP_SPARSE_OPENCL_TRACE");
     return trace != nullptr && trace[0] != '\0' && std::strcmp(trace, "0") != 0;
+}
+
+// Keep the legacy staging wait as the default rollback path.  The copy-event
+// lease is opt-in while it is being validated on device; once enabled, the
+// staging function returns after enqueue/flush and source writers guard the
+// original mask with the published copy event.
+bool async_mask_copy_enabled() {
+    const char * value = std::getenv(
+        "SD_HTP_SPARSE_OPENCL_DEFER_MASK_WAIT");
+    return value != nullptr && value[0] != '\0' &&
+        std::strcmp(value, "0") != 0;
 }
 
 void trace_sidecar_event(const char * event, const ggml_tensor * producer) {
@@ -1618,6 +1633,12 @@ ggml_opencl_htp_result finish_graph_state(
     graph->residual_owned_sparse_producers.clear();
     for (ggml_opencl_htp_prepared_sparse_dispatch & prepared :
             graph->prepared_sparse_dispatches) {
+        if (prepared.staged_mask_copy_event != nullptr) {
+            record_error(
+                "clReleaseEvent(mask copy)",
+                clReleaseEvent(prepared.staged_mask_copy_event));
+            prepared.staged_mask_copy_event = nullptr;
+        }
         if (prepared.staged_mask != nullptr) {
             if (prepared.staged_mask_slot >= 0) {
                 release_staging_buffer(
@@ -4075,6 +4096,7 @@ static ggml_opencl_htp_result observe_sparse_completion(
     uint64_t pair_id = 0;
     int mask_slot = -1;
     size_t mask_bytes = 0;
+    cl_event mask_copy_event = nullptr;
     bool first_completion = false;
     {
         std::lock_guard<std::mutex> lock(graph->pair_mutex);
@@ -4104,6 +4126,17 @@ static ggml_opencl_htp_result observe_sparse_completion(
             if (prepared != graph->prepared_sparse_dispatches.end()) {
                 prepared->staged_mask = nullptr;
                 prepared->staged_mask_slot = -1;
+                mask_copy_event = prepared->staged_mask_copy_event;
+                prepared->staged_mask_copy_event = nullptr;
+            }
+        }
+        if (mask_copy_event != nullptr) {
+            const cl_int release_err = clReleaseEvent(mask_copy_event);
+            if (release_err != CL_SUCCESS) {
+                set_reason(reason, reason_capacity,
+                           "staged mask copy event release failed (error %d)",
+                           release_err);
+                return GGML_OPENCL_HTP_ERROR;
             }
         }
         release_staging_buffer(
@@ -4471,27 +4504,87 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_stage_block_sparse_attn_mas
 
     trace_sidecar_event("gpu_sparse_mask_stage_begin", node);
     cl_event copy_event = nullptr;
-    cl_int err = clEnqueueCopyBuffer(
-        graph->sidecar->sparse_queue,
-        mask_binding.memory,
-        staged_mask,
-        mask_binding.offset,
-        0,
-        mask_binding.span,
-        0,
-        nullptr,
-        &copy_event);
-    if (err == CL_SUCCESS && copy_event == nullptr) {
-        err = CL_INVALID_EVENT;
+    cl_int err = CL_SUCCESS;
+    bool already_staged = false;
+    bool wait_for_copy = false;
+    {
+        // The sparse queue is in-order.  Serialize copy publication with the
+        // subsequent kernel enqueue so the kernel can consume the staged mask
+        // without a cross-queue dependency or a host wait here.
+        std::lock_guard<std::mutex> lock(graph->sidecar->dispatch_mutex);
+        const auto prepared = std::find_if(
+            graph->prepared_sparse_dispatches.begin(),
+            graph->prepared_sparse_dispatches.end(),
+            [node](const ggml_opencl_htp_prepared_sparse_dispatch & item) {
+                return item.dispatch.output == node;
+            });
+        if (prepared == graph->prepared_sparse_dispatches.end()) {
+            set_reason(reason, reason_capacity,
+                       "sparse attention node was not prepared");
+            err = CL_INVALID_VALUE;
+        } else if (prepared->staged_mask != nullptr ||
+                   prepared->staged_mask_copy_event != nullptr) {
+            set_reason(reason, reason_capacity, "ok");
+            already_staged = true;
+        } else {
+            // Publish the staged buffer while holding dispatch_mutex so a
+            // concurrent kernel enqueue or source-writer lease cannot observe
+            // a half-registered copy.  The event is filled immediately below
+            // before the lock is released.
+            prepared->staged_mask = staged_mask;
+            prepared->staged_mask_slot = mask_slot;
+            err = clEnqueueCopyBuffer(
+                graph->sidecar->sparse_queue,
+                mask_binding.memory,
+                staged_mask,
+                mask_binding.offset,
+                0,
+                mask_binding.span,
+                0,
+                nullptr,
+                &copy_event);
+            if (err == CL_SUCCESS && copy_event == nullptr) {
+                err = CL_INVALID_EVENT;
+            }
+            if (err == CL_SUCCESS) {
+                err = clFlush(graph->sidecar->sparse_queue);
+            }
+            if (err == CL_SUCCESS) {
+                if (async_mask_copy_enabled()) {
+                    // Transfer the enqueue-owned event reference to the
+                    // prepared dispatch.  It is released exactly once by
+                    // completion or graph cleanup after the staged mask is
+                    // no longer needed.
+                    prepared->staged_mask_copy_event = copy_event;
+                    copy_event = nullptr;
+                    trace_sidecar_event("gpu_sparse_mask_copy_queued", node);
+                } else {
+                    wait_for_copy = true;
+                }
+            } else {
+                prepared->staged_mask = nullptr;
+                prepared->staged_mask_slot = -1;
+            }
+            if (err != CL_SUCCESS) {
+                prepared->staged_mask = nullptr;
+                prepared->staged_mask_slot = -1;
+                prepared->staged_mask_copy_event = nullptr;
+            }
+        }
     }
-    if (err == CL_SUCCESS) {
-        err = clFlush(graph->sidecar->sparse_queue);
-    }
-    if (err == CL_SUCCESS) {
+    if (wait_for_copy && err == CL_SUCCESS) {
+        // Preserve the legacy synchronous mode without waiting while the
+        // dispatch mutex is held.
         err = clWaitForEvents(1, &copy_event);
     }
     const cl_int event_release_err = copy_event != nullptr
         ? clReleaseEvent(copy_event) : CL_SUCCESS;
+    if (already_staged) {
+        release_staging_buffer(
+            graph, graph->staged_mask_pool,
+            mask_slot, mask_binding.span, true);
+        return GGML_OPENCL_HTP_OK;
+    }
     if (err != CL_SUCCESS || event_release_err != CL_SUCCESS) {
         release_staging_buffer(
             graph, graph->staged_mask_pool,
@@ -4505,18 +4598,6 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_stage_block_sparse_attn_mas
     }
 
     std::atomic_thread_fence(std::memory_order_acquire);
-    {
-        std::lock_guard<std::mutex> lock(graph->sidecar->dispatch_mutex);
-        const auto prepared = std::find_if(
-            graph->prepared_sparse_dispatches.begin(),
-            graph->prepared_sparse_dispatches.end(),
-            [node](const ggml_opencl_htp_prepared_sparse_dispatch & item) {
-                return item.dispatch.output == node;
-            });
-        GGML_ASSERT(prepared != graph->prepared_sparse_dispatches.end());
-        prepared->staged_mask = staged_mask;
-        prepared->staged_mask_slot = mask_slot;
-    }
     uint64_t pair_id = 0;
     {
         std::lock_guard<std::mutex> lock(graph->pair_mutex);
@@ -5185,6 +5266,78 @@ ggml_opencl_htp_result ggml_backend_opencl_htp_graph_queue_block_sparse_attn(
     return GGML_OPENCL_HTP_OK;
 }
 
+static ggml_opencl_htp_result wait_for_submission_publication(
+        ggml_opencl_htp_graph * graph,
+        ggml_opencl_htp_submission_job_kind kind,
+        const ggml_tensor * producer,
+        bool * record_found,
+        bool * waited,
+        char * reason,
+        size_t reason_capacity) {
+    if (record_found != nullptr) {
+        *record_found = false;
+    }
+    if (waited != nullptr) {
+        *waited = false;
+    }
+    if (graph == nullptr || producer == nullptr) {
+        set_reason(reason, reason_capacity,
+                   "graph and producer must not be null");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+
+    std::unique_lock<std::mutex> lock(graph->submission_mutex);
+    auto find_submission = [&]() {
+        return std::find_if(
+            graph->submission_records.begin(), graph->submission_records.end(),
+            [&](const ggml_opencl_htp_submission_record & item) {
+                return item.kind == kind && item.producer == producer;
+            });
+    };
+    auto submission = find_submission();
+    if (submission == graph->submission_records.end()) {
+        set_reason(reason, reason_capacity, "ok");
+        return GGML_OPENCL_HTP_OK;
+    }
+    if (record_found != nullptr) {
+        *record_found = true;
+    }
+
+    const bool waits_for_publication =
+        submission->state == ggml_opencl_htp_submission_state::queued ||
+        submission->state == ggml_opencl_htp_submission_state::submitting;
+    if (waits_for_publication) {
+        trace_sidecar_event("range_lease_publication_wait_begin", producer);
+    }
+    if (waits_for_publication) {
+        graph->submission_cv.wait(lock, [&]() {
+            const auto current = find_submission();
+            return current == graph->submission_records.end() ||
+                current->state == ggml_opencl_htp_submission_state::submitted ||
+                current->state == ggml_opencl_htp_submission_state::failed;
+        });
+    }
+    submission = find_submission();
+    if (waits_for_publication) {
+        trace_sidecar_event("range_lease_publication_wait_end", producer);
+        if (waited != nullptr) {
+            *waited = true;
+        }
+    }
+    if (submission == graph->submission_records.end()) {
+        set_reason(reason, reason_capacity,
+                   "sparse submission record disappeared");
+        return GGML_OPENCL_HTP_ERROR;
+    }
+    if (submission->state == ggml_opencl_htp_submission_state::failed) {
+        set_reason(reason, reason_capacity, "%s", submission->reason);
+        return submission->result == GGML_OPENCL_HTP_OK
+            ? GGML_OPENCL_HTP_ERROR : submission->result;
+    }
+    set_reason(reason, reason_capacity, "ok");
+    return GGML_OPENCL_HTP_OK;
+}
+
 ggml_opencl_htp_result
 ggml_backend_opencl_htp_graph_wait_for_sparse_submission(
         ggml_opencl_htp_graph * graph,
@@ -5196,38 +5349,17 @@ ggml_backend_opencl_htp_graph_wait_for_sparse_submission(
                    "graph and sparse producer must not be null");
         return GGML_OPENCL_HTP_ERROR;
     }
-    std::unique_lock<std::mutex> lock(graph->submission_mutex);
-    auto find_submission = [graph, sparse_producer]() {
-        return std::find_if(
-            graph->submission_records.begin(), graph->submission_records.end(),
-            [sparse_producer](const ggml_opencl_htp_submission_record & item) {
-                return item.kind ==
-                           ggml_opencl_htp_submission_job_kind::sparse_attention &&
-                    item.producer == sparse_producer;
-            });
-    };
-    auto submission = find_submission();
-    if (submission == graph->submission_records.end()) {
+    bool record_found = false;
+    const ggml_opencl_htp_result result = wait_for_submission_publication(
+        graph, ggml_opencl_htp_submission_job_kind::sparse_attention,
+        sparse_producer, &record_found, nullptr, reason, reason_capacity);
+    if (result != GGML_OPENCL_HTP_OK) {
+        return result;
+    }
+    if (!record_found) {
         set_reason(reason, reason_capacity,
                    "sparse submission record is unavailable");
         return GGML_OPENCL_HTP_UNSUPPORTED;
-    }
-    graph->submission_cv.wait(lock, [&find_submission, graph]() {
-        const auto current = find_submission();
-        return current == graph->submission_records.end() ||
-            current->state == ggml_opencl_htp_submission_state::submitted ||
-            current->state == ggml_opencl_htp_submission_state::failed;
-    });
-    submission = find_submission();
-    if (submission == graph->submission_records.end()) {
-        set_reason(reason, reason_capacity,
-                   "sparse submission record disappeared");
-        return GGML_OPENCL_HTP_ERROR;
-    }
-    if (submission->state == ggml_opencl_htp_submission_state::failed) {
-        set_reason(reason, reason_capacity, "%s", submission->reason);
-        return submission->result == GGML_OPENCL_HTP_OK
-            ? GGML_OPENCL_HTP_ERROR : submission->result;
     }
     set_reason(reason, reason_capacity, "ok");
     return GGML_OPENCL_HTP_OK;
@@ -5588,29 +5720,86 @@ ggml_backend_opencl_htp_graph_wait_for_overlapping_output_leases(
         return true;
     };
 
+    std::vector<const ggml_tensor *> sparse_qkv_candidates;
     {
         std::lock_guard<std::mutex> lock(graph->sidecar->dispatch_mutex);
-        for (const ggml_opencl_htp_pending_event & pending :
-                graph->pending_events) {
-            const auto prepared = std::find_if(
-                graph->prepared_sparse_dispatches.begin(),
-                graph->prepared_sparse_dispatches.end(),
-                [&](const ggml_opencl_htp_prepared_sparse_dispatch & item) {
-                    return item.dispatch.output == pending.producer;
-                });
-            if (prepared == graph->prepared_sparse_dispatches.end() ||
-                (!overlaps_any(prepared->bindings.q) &&
-                 !overlaps_any(prepared->bindings.k) &&
-                 !overlaps_any(prepared->bindings.v))) {
+        for (const ggml_opencl_htp_prepared_sparse_dispatch & prepared :
+                graph->prepared_sparse_dispatches) {
+            if (!overlaps_any(prepared.bindings.q) &&
+                !overlaps_any(prepared.bindings.k) &&
+                !overlaps_any(prepared.bindings.v)) {
                 continue;
             }
-            if (!retain_unique(pending.event, pending.producer, "qkv")) {
+            if (std::find(sparse_qkv_candidates.begin(),
+                          sparse_qkv_candidates.end(),
+                          prepared.dispatch.output) == sparse_qkv_candidates.end()) {
+                sparse_qkv_candidates.push_back(prepared.dispatch.output);
+            }
+            if (prepared.staged_mask_copy_event != nullptr &&
+                overlaps_any(prepared.bindings.mask)) {
+                if (!retain_unique(
+                        prepared.staged_mask_copy_event,
+                        prepared.dispatch.output, "mask")) {
+                    set_reason(reason, reason_capacity,
+                               "failed to retain staged mask copy event");
+                    return GGML_OPENCL_HTP_ERROR;
+                }
+            }
+        }
+    }
+
+    for (const ggml_tensor * producer : sparse_qkv_candidates) {
+        bool record_found = false;
+        bool publication_waited = false;
+        const ggml_opencl_htp_result publication_result =
+            wait_for_submission_publication(
+                graph, ggml_opencl_htp_submission_job_kind::sparse_attention,
+                producer, &record_found, &publication_waited,
+                reason, reason_capacity);
+        if (publication_result != GGML_OPENCL_HTP_OK) {
+            return publication_result;
+        }
+        if (!record_found) {
+            continue;
+        }
+
+        bool pending_found = false;
+        {
+            std::lock_guard<std::mutex> lock(graph->sidecar->dispatch_mutex);
+            const auto pending = std::find_if(
+                graph->pending_events.begin(), graph->pending_events.end(),
+                [producer](const ggml_opencl_htp_pending_event & item) {
+                    return item.producer == producer;
+                });
+            if (pending != graph->pending_events.end() && pending->event != nullptr) {
+                pending_found = true;
+                if (!retain_unique(pending->event, producer, "qkv")) {
+                    set_reason(reason, reason_capacity,
+                               "failed to retain overlapping sparse event");
+                    return GGML_OPENCL_HTP_ERROR;
+                }
+            }
+        }
+        if (!pending_found) {
+            bool sparse_complete = false;
+            {
+                std::lock_guard<std::mutex> lock(graph->pair_mutex);
+                const ggml_opencl_htp_pair_lifetime * pair =
+                    find_pair_by_sparse_unlocked(graph, producer);
+                sparse_complete = pair != nullptr && pair->state.sparse_complete;
+            }
+            if (!sparse_complete) {
                 set_reason(reason, reason_capacity,
-                           "failed to retain overlapping sparse event");
+                           "published sparse producer has no pending event");
                 return GGML_OPENCL_HTP_ERROR;
             }
         }
     }
+
+    // A writer of the original mask backing only needs the copy event.  The
+    // sparse kernel may still be running against the staged buffer, so using
+    // its event here would unnecessarily serialize the writer with attention.
+    // All waits happen below, outside dispatch/submission/pair locks.
 
     for (const ggml_opencl_htp_prepared_residual_dispatch & prepared :
             graph->prepared_residual_dispatches) {
@@ -5674,9 +5863,16 @@ ggml_backend_opencl_htp_graph_wait_for_overlapping_output_leases(
             lease.event, CL_EVENT_COMMAND_EXECUTION_STATUS,
             sizeof(status), &status, nullptr);
         if (err == CL_SUCCESS && status != CL_COMPLETE) {
-            trace_sidecar_event("range_lease_pressure_wait_begin", lease.producer);
+            const bool mask_copy = std::strcmp(lease.kind, "mask") == 0;
+            trace_sidecar_event(
+                mask_copy ? "range_lease_mask_copy_wait_begin" :
+                    "range_lease_pressure_wait_begin",
+                lease.producer);
             err = clWaitForEvents(1, &lease.event);
-            trace_sidecar_event("range_lease_pressure_wait_end", lease.producer);
+            trace_sidecar_event(
+                mask_copy ? "range_lease_mask_copy_wait_end" :
+                    "range_lease_pressure_wait_end",
+                lease.producer);
             if (waited != nullptr) {
                 *waited = true;
             }

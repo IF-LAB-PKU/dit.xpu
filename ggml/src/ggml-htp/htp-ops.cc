@@ -926,6 +926,13 @@ bool htp_ops_opencl_async_enabled(void) {
 #endif
 }
 
+bool htp_ops_opencl_defer_submission_wait_requested(void) {
+    const char * value = std::getenv(
+        "SD_HTP_SPARSE_OPENCL_DEFER_SUBMISSION_WAIT");
+    return value != nullptr && value[0] != '\0' &&
+           std::strcmp(value, "0") != 0;
+}
+
 #ifdef GGML_HTP_OPENCL_SIDECAR
 static int htp_ops_opencl_compute_node_impl(struct ggml_tensor * dst, bool early_submit);
 
@@ -953,6 +960,11 @@ static bool htp_ops_opencl_submission_thread_active(void) {
     const auto * ctx = ggml_backend_htp_context::instance();
     return htp_ops_opencl_early_submit_enabled() && ctx != nullptr &&
            ctx->sparse_opencl_submission_thread_active;
+}
+
+static bool htp_ops_opencl_defer_submission_wait_enabled(void) {
+    return htp_ops_opencl_submission_thread_active() &&
+           htp_ops_opencl_defer_submission_wait_requested();
 }
 
 static bool htp_ops_opencl_is_view_only(const ggml_tensor * tensor) {
@@ -1007,6 +1019,22 @@ static void htp_ops_opencl_trace_early_submit(
         node != nullptr && node->name[0] != '\0' ? node->name : "<unnamed>",
         completed_node != nullptr && completed_node->name[0] != '\0'
             ? completed_node->name : "<graph-input>");
+}
+
+static void htp_ops_opencl_trace_submit_wait_event(
+        const char * event,
+        const ggml_tensor * node) {
+    const char * trace = std::getenv("SD_HTP_SPARSE_OPENCL_TRACE");
+    if (trace == nullptr || trace[0] == '\0' || std::strcmp(trace, "0") == 0) {
+        return;
+    }
+    std::fprintf(
+        stderr,
+        "htp_opencl_event name=%s pair=%llu ts_us=%lld producer=%s\n",
+        event,
+        static_cast<unsigned long long>(htp_ops_opencl_pair_id_for_tensor(node)),
+        (long long) ggml_time_us(),
+        node != nullptr && node->name[0] != '\0' ? node->name : "<unnamed>");
 }
 
 static int htp_ops_opencl_early_submit_ready_candidates(const ggml_tensor * completed_node) {
@@ -1065,17 +1093,26 @@ static int htp_ops_opencl_early_submit_ready_candidates(const ggml_tensor * comp
                     (int) result, reason[0] != '\0' ? reason : "unknown error");
                 return -EIO;
             }
-            const ggml_opencl_htp_result committed =
-                ggml_backend_opencl_htp_graph_wait_for_sparse_submission(
-                    ctx->sparse_opencl_graph, candidate.node,
-                    reason, sizeof(reason));
-            if (committed != GGML_OPENCL_HTP_OK) {
-                std::fprintf(
-                    stderr,
-                    "ggml-htp: OpenCL sparse submission commit failed result=%d reason=%s\n",
-                    (int) committed,
-                    reason[0] != '\0' ? reason : "unknown error");
-                return -EIO;
+            if (htp_ops_opencl_defer_submission_wait_enabled()) {
+                htp_ops_opencl_trace_submit_wait_event(
+                    "gpu_sparse_submit_wait_deferred", candidate.node);
+            } else {
+                htp_ops_opencl_trace_submit_wait_event(
+                    "gpu_sparse_submit_wait_legacy_begin", candidate.node);
+                const ggml_opencl_htp_result committed =
+                    ggml_backend_opencl_htp_graph_wait_for_sparse_submission(
+                        ctx->sparse_opencl_graph, candidate.node,
+                        reason, sizeof(reason));
+                htp_ops_opencl_trace_submit_wait_event(
+                    "gpu_sparse_submit_wait_legacy_end", candidate.node);
+                if (committed != GGML_OPENCL_HTP_OK) {
+                    std::fprintf(
+                        stderr,
+                        "ggml-htp: OpenCL sparse submission commit failed result=%d reason=%s\n",
+                        (int) committed,
+                        reason[0] != '\0' ? reason : "unknown error");
+                    return -EIO;
+                }
             }
         } else {
             const int err = htp_ops_opencl_compute_node_impl(

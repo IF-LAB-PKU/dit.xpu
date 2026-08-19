@@ -22,6 +22,7 @@ int  htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor 
 int  htp_ops_resolve_halo_kv_load_mode(void);
 bool htp_ops_opencl_routes_node(const struct ggml_tensor * dst);
 bool htp_ops_opencl_async_enabled(void);
+bool htp_ops_opencl_defer_submission_wait_requested(void);
 bool htp_ops_opencl_node_needs_wait(const struct ggml_tensor * dst);
 int  htp_ops_opencl_wait_node(const struct ggml_tensor * dst);
 void htp_ops_opencl_wait_node_completed(const struct ggml_tensor * dst);
