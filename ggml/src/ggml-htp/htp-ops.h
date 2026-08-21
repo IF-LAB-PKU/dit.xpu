@@ -20,6 +20,8 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst);
 bool htp_ops_is_fused_anchor_attention(const struct ggml_tensor * dst);
 int  htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor * dst);
 int  htp_ops_resolve_halo_kv_load_mode(void);
+int  htp_ops_resolve_halo_kv_load_mode_for_node(const struct ggml_tensor * node,
+                                                bool * used_node_override);
 bool htp_ops_opencl_routes_node(const struct ggml_tensor * dst);
 bool htp_ops_opencl_async_enabled(void);
 bool htp_ops_opencl_defer_submission_wait_requested(void);

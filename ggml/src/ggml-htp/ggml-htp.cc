@@ -213,6 +213,14 @@ bool ggml_backend_htp_route_summary_validate(
     }
     if (summary->anchor) {
         if (summary->cache_pairs <= 0) {
+            // Warmup and dense-tail graphs can contain only dense attention and
+            // intentionally have no residual cache pair. They are outside the
+            // anchor ownership contract and must not be rejected as anchors.
+            if (summary->htp_dense > 0 && summary->htp_sparse == 0 &&
+                summary->opencl_sparse == 0 && summary->fused_anchor == 0 &&
+                summary->opencl_residual == 0 && summary->cpu_residual == 0) {
+                return true;
+            }
             return fail("anchor graph has no residual cache pairs");
         }
         switch (summary->mode) {
@@ -334,6 +342,7 @@ static bool ggml_backend_htp_collect_route_summary_impl(
 
     std::unordered_set<const ggml_tensor *> anchor_attention;
     std::unordered_set<const ggml_tensor *> fused_producers;
+    std::vector<const ggml_tensor *> dense_attention;
     std::vector<const ggml_tensor *> sparse_attention;
     bool has_attention = false;
     const int node_count = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
@@ -347,6 +356,8 @@ static bool ggml_backend_htp_collect_route_summary_impl(
             has_attention = true;
             if (ggml_backend_htp_is_sparse_attention(node)) {
                 sparse_attention.push_back(node);
+            } else {
+                dense_attention.push_back(node);
             }
         }
         if (node->op == GGML_OP_CUSTOM &&
@@ -423,8 +434,14 @@ static bool ggml_backend_htp_collect_route_summary_impl(
         }
     };
     if (summary->anchor) {
-        for (const ggml_tensor * attention : anchor_attention) {
-            count_attention(attention);
+        if (summary->cache_pairs > 0) {
+            for (const ggml_tensor * attention : anchor_attention) {
+                count_attention(attention);
+            }
+        } else {
+            for (const ggml_tensor * attention : dense_attention) {
+                count_attention(attention);
+            }
         }
     } else {
         for (const ggml_tensor * attention : sparse_attention) {
