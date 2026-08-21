@@ -5368,6 +5368,7 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
     ggml_set_op_params_i32(result, 10, 0);
     ggml_set_op_params_i32(result, 11, 0);
     ggml_set_op_params_i32(result, 12, 0);
+    ggml_set_op_params_i32(result, 13, GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT);
 
     result->op     = GGML_OP_FLASH_ATTN_EXT;
     result->src[0] = q;
@@ -5532,6 +5533,26 @@ int32_t ggml_flash_attn_ext_get_image_block_cols(
     GGML_ASSERT(tensor != NULL);
     GGML_ASSERT(tensor->op == GGML_OP_FLASH_ATTN_EXT);
     return ggml_get_op_params_i32(tensor, 12);
+}
+
+void ggml_flash_attn_ext_set_halo_kv_load_mode(
+        struct ggml_tensor * tensor,
+        enum ggml_flash_attn_ext_halo_kv_load_mode mode) {
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(mode >= GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT &&
+                mode <= GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_CHUNKED);
+    ggml_set_op_params_i32(tensor, 13, (int32_t) mode);
+}
+
+enum ggml_flash_attn_ext_halo_kv_load_mode ggml_flash_attn_ext_get_halo_kv_load_mode(
+        const struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_FLASH_ATTN_EXT);
+    const int32_t mode = ggml_get_op_params_i32(tensor, 13);
+    GGML_ASSERT(mode >= GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT &&
+                mode <= GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_CHUNKED);
+    return (enum ggml_flash_attn_ext_halo_kv_load_mode) mode;
 }
 
 void ggml_flash_attn_ext_add_sinks(

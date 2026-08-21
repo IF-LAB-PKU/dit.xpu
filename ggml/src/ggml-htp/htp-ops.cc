@@ -592,6 +592,28 @@ int htp_ops_resolve_halo_kv_load_mode(void) {
     return -EINVAL;
 }
 
+int htp_ops_resolve_halo_kv_load_mode_for_node(
+        const struct ggml_tensor * node, bool * used_node_override) {
+    static_assert(static_cast<int>(GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_BASELINE) == HTP_HALO_KV_LOAD_BASELINE);
+    static_assert(static_cast<int>(GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_L2_PREFETCH) == HTP_HALO_KV_LOAD_L2_PREFETCH);
+    static_assert(static_cast<int>(GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_USERDMA_AB) == HTP_HALO_KV_LOAD_USERDMA_AB);
+    static_assert(static_cast<int>(GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_CHUNKED) == HTP_HALO_KV_LOAD_CHUNKED);
+
+    if (used_node_override != nullptr) {
+        *used_node_override = false;
+    }
+    if (node != nullptr && node->op == GGML_OP_FLASH_ATTN_EXT) {
+        const auto mode = ggml_flash_attn_ext_get_halo_kv_load_mode(node);
+        if (mode != GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT) {
+            if (used_node_override != nullptr) {
+                *used_node_override = true;
+            }
+            return static_cast<int>(mode);
+        }
+    }
+    return htp_ops_resolve_halo_kv_load_mode();
+}
+
 bool htp_ops_support_op(const struct ggml_tensor * dst) {
     auto * ctx = ggml_backend_htp_context::instance();
     if (ctx->skip_htp_ops || !ctx->ops_backend_initialized) {
@@ -2056,9 +2078,11 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     int32_t image_block_rows = 0;
                     int32_t image_block_cols = 0;
                     int32_t halo_kv_load_mode = HTP_HALO_KV_LOAD_BASELINE;
+                    bool halo_kv_load_node_override = false;
                     const int32_t halo_trace = env_flag_enabled("SD_HTP_HALO_KV_TRACE") ? 1 : 0;
                     if (ggml_sparse_policy == GGML_FLASH_ATTN_EXT_SPARSE_POLICY_STATIC_HALO) {
-                        const int resolved_mode = htp_ops_resolve_halo_kv_load_mode();
+                        const int resolved_mode = htp_ops_resolve_halo_kv_load_mode_for_node(
+                            dst, &halo_kv_load_node_override);
                         if (resolved_mode < 0) {
                             return resolved_mode;
                         }
@@ -2071,13 +2095,14 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                         if (halo_trace != 0) {
                             std::fprintf(stderr,
                                          "htp_halo_kv_dispatch policy=%d image_tokens=%d text_tokens=%d "
-                                         "image_block_rows=%d image_block_cols=%d loader=%d\n",
+                                         "image_block_rows=%d image_block_cols=%d loader=%d source=%s\n",
                                          sparse_policy,
                                          image_tokens,
                                          text_tokens,
                                          image_block_rows,
                                          image_block_cols,
-                                         halo_kv_load_mode);
+                                         halo_kv_load_mode,
+                                         halo_kv_load_node_override ? "node" : "env");
                         }
                     }
 

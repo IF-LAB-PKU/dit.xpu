@@ -18,6 +18,8 @@
 #include "test-backend-htp-attention-common.hpp"
 
 extern "C" int htp_ops_resolve_halo_kv_load_mode(void);
+extern "C" int htp_ops_resolve_halo_kv_load_mode_for_node(
+    const struct ggml_tensor * node, bool * used_node_override);
 
 namespace {
 
@@ -166,6 +168,61 @@ static bool test_chunked_loader_contract() {
     return true;
 }
 
+static bool test_node_loader_override_contract() {
+    const ggml_init_params params = { 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        std::fprintf(stderr, "[FAIL] node loader resolver context init\n");
+        return false;
+    }
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 4, 2, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 16, 4, 2, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 16, 2, 4, 1);
+    ggml_tensor * node = ggml_flash_attn_ext_with_lse(ctx, q, k, v, nullptr, 1.0f, 0.0f, 0.0f);
+    if (node == nullptr) {
+        ggml_free(ctx);
+        std::fprintf(stderr, "[FAIL] node loader resolver node init\n");
+        return false;
+    }
+
+    const char * old_value = std::getenv("SD_HTP_HALO_KV_LOAD");
+    const std::string old_value_copy = old_value != nullptr ? old_value : "";
+    const struct Case {
+        const char * global_value;
+        ggml_flash_attn_ext_halo_kv_load_mode node_value;
+        int expected;
+        bool expected_override;
+    } cases[] = {
+        {"l2fetch", GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_CHUNKED, 3, true},
+        {"userdma", GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_CHUNKED, 3, true},
+        {"baseline", GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_CHUNKED, 3, true},
+        {"l2fetch", GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT, 1, false},
+        {"userdma", GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT, 2, false},
+        {"baseline", GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT, 0, false},
+    };
+    bool ok = true;
+    for (const auto & test_case : cases) {
+        setenv("SD_HTP_HALO_KV_LOAD", test_case.global_value, 1);
+        ggml_flash_attn_ext_set_halo_kv_load_mode(node, test_case.node_value);
+        bool used_override = false;
+        const int resolved = htp_ops_resolve_halo_kv_load_mode_for_node(node, &used_override);
+        if (resolved != test_case.expected || used_override != test_case.expected_override) {
+            std::fprintf(stderr, "[FAIL] node loader global=%s node=%d resolved=%d override=%d\n",
+                         test_case.global_value, static_cast<int>(test_case.node_value),
+                         resolved, used_override ? 1 : 0);
+            ok = false;
+        }
+    }
+    if (old_value != nullptr) {
+        setenv("SD_HTP_HALO_KV_LOAD", old_value_copy.c_str(), 1);
+    } else {
+        unsetenv("SD_HTP_HALO_KV_LOAD");
+    }
+    ggml_free(ctx);
+    if (ok) std::printf("[PASS] node loader override contract\n");
+    return ok;
+}
+
 static TimingStats summarize_timings(std::vector<int64_t> samples) {
     GGML_ASSERT(!samples.empty());
     std::sort(samples.begin(), samples.end());
@@ -277,6 +334,9 @@ int main() {
     }
     if (std::getenv("HTP_ATTN_CHUNKED_ROUTE_CONTRACT") != nullptr) {
         return test_chunked_loader_contract() ? 0 : 1;
+    }
+    if (std::getenv("HTP_ATTN_NODE_LOADER_CONTRACT") != nullptr) {
+        return test_node_loader_override_contract() ? 0 : 1;
     }
     if (std::getenv("HTP_ATTN_PERF_TEST_TEMPERATURE_PARSER") != nullptr) {
         return test_temperature_parser() ? 0 : 1;

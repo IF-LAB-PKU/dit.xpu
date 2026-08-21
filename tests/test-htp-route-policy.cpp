@@ -15,6 +15,63 @@ void require(bool condition, const char* message) {
     }
 }
 
+void test_flash_attention_halo_loader_metadata() {
+    const ggml_init_params params = {
+        /*.mem_size   =*/ 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context* ctx = ggml_init(params);
+    require(ctx != nullptr, "flash attention metadata context must initialize");
+
+    ggml_tensor* q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 4, 2, 1);
+    ggml_tensor* k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 16, 4, 2, 1);
+    ggml_tensor* v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 16, 2, 4, 1);
+    ggml_tensor* attn = ggml_flash_attn_ext_with_lse(ctx, q, k, v, nullptr, 1.0f, 0.0f, 0.0f);
+    require(attn != nullptr, "flash attention metadata node must initialize");
+    require(ggml_flash_attn_ext_get_halo_kv_load_mode(attn) ==
+                GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT,
+            "new flash attention nodes must inherit the global halo loader");
+
+    ggml_flash_attn_ext_set_halo_kv_load_mode(
+        attn, GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_CHUNKED);
+    require(ggml_flash_attn_ext_get_halo_kv_load_mode(attn) ==
+                GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_CHUNKED,
+            "per-node chunked override must round-trip");
+
+    ggml_tensor* q_sparse = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 32, 1, 1);
+    ggml_tensor* k_sparse = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 16, 32, 1, 1);
+    ggml_tensor* v_sparse = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 16, 1, 32, 1);
+    ggml_tensor* mask_sparse = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1);
+    ggml_tensor* sparse = ggml_flash_attn_ext(ctx, q_sparse, k_sparse, v_sparse,
+                                              mask_sparse, 1.0f, 0.0f, 0.0f);
+    require(sparse != nullptr, "sparse metadata node must initialize");
+    ggml_flash_attn_ext_set_block_sparse(
+        sparse, 32, 32, GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX);
+    ggml_flash_attn_ext_set_static_halo_2d(sparse, 32, 0, 1, 1);
+    ggml_flash_attn_ext_set_halo_kv_load_mode(
+        sparse, GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT);
+    sd_htp_apply_sparse_halo_kv_load_override(
+        sparse, SD_HTP_ROUTE_HTP_CPU, SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR);
+    require(ggml_flash_attn_ext_get_halo_kv_load_mode(sparse) ==
+                GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_CHUNKED,
+            "HTP CPU static-halo anchor node must receive chunked override");
+    ggml_flash_attn_ext_set_halo_kv_load_mode(
+        sparse, GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT);
+    sd_htp_apply_sparse_halo_kv_load_override(
+        sparse, SD_HTP_ROUTE_HTP_CPU, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY);
+    require(ggml_flash_attn_ext_get_halo_kv_load_mode(sparse) ==
+                GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT,
+            "HTP CPU apply node must inherit the global halo loader");
+    sd_htp_apply_sparse_halo_kv_load_override(
+        sparse, SD_HTP_ROUTE_OPENCL_ANCHOR, SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR);
+    require(ggml_flash_attn_ext_get_halo_kv_load_mode(sparse) ==
+                GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT,
+            "OpenCL anchor node must inherit the global halo loader");
+
+    ggml_free(ctx);
+}
+
 void test_route_mode_from_flags() {
     struct RouteCase {
         bool fused;
@@ -79,6 +136,33 @@ void test_attention_policy() {
             "text-only attention must be excluded from residual accounting");
     require(!text_only.packed_qkv_allowed,
             "text-only attention must not enter the residual packed route");
+}
+
+void test_anchor_halo_loader_policy() {
+    struct PolicyCase {
+        sd_htp_route_mode route;
+        int residual_mode;
+        ggml_flash_attn_ext_halo_kv_load_mode expected;
+    };
+    const PolicyCase cases[] = {
+        {SD_HTP_ROUTE_HTP_CPU, SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR,
+         GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_CHUNKED},
+        {SD_HTP_ROUTE_HTP_CPU, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY,
+         GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT},
+        {SD_HTP_ROUTE_HTP_CPU, SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
+         GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT},
+        {SD_HTP_ROUTE_OPENCL_ANCHOR, SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR,
+         GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT},
+        {SD_HTP_ROUTE_FUSED_OPENCL_RESIDUAL, SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR,
+         GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT},
+        {SD_HTP_ROUTE_INVALID, SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR,
+         GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT},
+    };
+    for (const auto& test_case : cases) {
+        require(sd_htp_sparse_halo_kv_load_override(
+                    test_case.route, test_case.residual_mode) == test_case.expected,
+                "only HTP CPU residual anchors may force chunked sparse loading");
+    }
 }
 
 void test_residual_binding_keys() {
@@ -500,6 +584,14 @@ void test_route_summaries() {
     zero_work.anchor = 1;
     require_invalid_summary(zero_work, "zero-work anchor must fail");
 
+    ggml_htp_route_summary warmup_dense = {};
+    warmup_dense.mode = GGML_HTP_ROUTE_OPENCL_ANCHOR;
+    warmup_dense.anchor = 1;
+    warmup_dense.htp_dense = 4;
+    require_valid_summary(
+        warmup_dense,
+        "dense-only warmup graph without residual cache pairs must pass");
+
     ggml_htp_route_summary mixed = opencl;
     mixed.htp_sparse = 1;
     require_invalid_summary(mixed, "mixed anchor ownership must fail");
@@ -732,8 +824,10 @@ void test_fused_route_summary_uses_actual_routed_set() {
 }  // namespace
 
 int main() {
+    test_flash_attention_halo_loader_metadata();
     test_route_mode_from_flags();
     test_attention_policy();
+    test_anchor_halo_loader_policy();
     test_residual_binding_keys();
     test_model_binding_sequences();
     test_z_image_route_selection();

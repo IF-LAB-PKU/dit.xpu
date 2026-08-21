@@ -2406,6 +2406,14 @@ extern "C" {
         GGML_FLASH_ATTN_EXT_SPARSE_POLICY_STATIC_HALO = 1,
     };
 
+    enum ggml_flash_attn_ext_halo_kv_load_mode {
+        GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT     = -1,
+        GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_BASELINE    = 0,
+        GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_L2_PREFETCH = 1,
+        GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_USERDMA_AB  = 2,
+        GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_CHUNKED     = 3,
+    };
+
     GGML_API struct ggml_tensor * ggml_flash_attn_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2470,6 +2478,13 @@ extern "C" {
 
     GGML_API int32_t ggml_flash_attn_ext_get_image_block_cols(
             const struct ggml_tensor * tensor);
+
+    GGML_API void ggml_flash_attn_ext_set_halo_kv_load_mode(
+            struct ggml_tensor * tensor,
+            enum ggml_flash_attn_ext_halo_kv_load_mode mode);
+
+    GGML_API enum ggml_flash_attn_ext_halo_kv_load_mode
+    ggml_flash_attn_ext_get_halo_kv_load_mode(const struct ggml_tensor * tensor);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,

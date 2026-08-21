@@ -180,6 +180,29 @@ __STATIC_INLINE__ sd_htp_route_mode sd_htp_route_mode_from_flags(bool fused,
     return SD_HTP_ROUTE_INVALID;
 }
 
+__STATIC_INLINE__ ggml_flash_attn_ext_halo_kv_load_mode
+sd_htp_sparse_halo_kv_load_override(sd_htp_route_mode route, int residual_mode) {
+    return route == SD_HTP_ROUTE_HTP_CPU &&
+                   residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR
+        ? GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_CHUNKED
+        : GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT;
+}
+
+__STATIC_INLINE__ void sd_htp_apply_sparse_halo_kv_load_override(
+    ggml_tensor* candidate, sd_htp_route_mode route, int residual_mode) {
+    if (candidate == nullptr || candidate->op != GGML_OP_FLASH_ATTN_EXT ||
+        ggml_flash_attn_ext_get_sparse_policy(candidate) !=
+            GGML_FLASH_ATTN_EXT_SPARSE_POLICY_STATIC_HALO ||
+        ggml_flash_attn_ext_get_mask_format(candidate) !=
+            GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX) {
+        return;
+    }
+    const auto override_mode = sd_htp_sparse_halo_kv_load_override(route, residual_mode);
+    if (override_mode != GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_INHERIT) {
+        ggml_flash_attn_ext_set_halo_kv_load_mode(candidate, override_mode);
+    }
+}
+
 __STATIC_INLINE__ sd_htp_attention_policy sd_htp_attention_policy_for(
     bool block_sparse_step,
     int residual_mode,
@@ -3363,6 +3386,20 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                            protected_len > 0 ? protected_len : 0,
                                                            block_sparse_token_h / 4,
                                                            block_sparse_token_w / 8);
+                }
+                const sd_htp_route_mode route = sd_htp_route_mode_from_flags(
+                    sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR"),
+                    sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL"),
+                    sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL"));
+                sd_htp_apply_sparse_halo_kv_load_override(
+                    candidate, route, block_sparse_residual_mode);
+                if (route == SD_HTP_ROUTE_HTP_CPU &&
+                    block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
+                    block_sparse_static_halo) {
+                    GGML_ASSERT(candidate != nullptr &&
+                                candidate->op == GGML_OP_FLASH_ATTN_EXT &&
+                                ggml_flash_attn_ext_get_halo_kv_load_mode(candidate) ==
+                                    GGML_FLASH_ATTN_EXT_HALO_KV_LOAD_CHUNKED);
                 }
             }
             if ((candidate_is_htp_layout && keep_for_htp_hybrid) || backend == nullptr || ggml_backend_supports_op(backend, candidate)) {
