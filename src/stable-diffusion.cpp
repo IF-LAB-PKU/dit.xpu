@@ -2320,6 +2320,8 @@ public:
             sd_htp_block_sparse_residual_rho_value(sd_env_float_value("SD_HTP_BLOCK_SPARSE_RESIDUAL_RHO", 1.0f));
         const bool htp_block_sparse_residual_exact_rho =
             sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO");
+        const bool htp_block_sparse_residual_anchor_only =
+            sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR_ONLY");
         const bool htp_block_sparse_original = work_diffusion_model != nullptr &&
                                                work_diffusion_model->is_block_sparse_attention_enabled();
         if (htp_block_sparse_original && htp_block_sparse_warmup_steps > 0) {
@@ -2409,10 +2411,12 @@ public:
             const bool htp_block_sparse_step_enabled =
                 htp_block_sparse_candidate_enabled && htp_block_sparse_step_index > 0;
             const int htp_block_sparse_residual_mode =
-                sd_htp_block_sparse_residual_mode(htp_block_sparse_original &&
-                                                      htp_block_sparse_residual_cache_enabled,
-                                                  htp_block_sparse_periodic_residual_anchor || htp_block_sparse_warmup_residual_anchor,
-                                                  htp_block_sparse_step_index);
+                htp_block_sparse_residual_anchor_only && htp_block_sparse_step_index > 0
+                    ? SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF
+                    : sd_htp_block_sparse_residual_mode(htp_block_sparse_original &&
+                                                          htp_block_sparse_residual_cache_enabled,
+                                                      htp_block_sparse_periodic_residual_anchor || htp_block_sparse_warmup_residual_anchor,
+                                                      htp_block_sparse_step_index);
             if (htp_block_sparse_original &&
                 (htp_block_sparse_warmup_steps > 0 || htp_block_sparse_dense_tail_steps > 0 ||
                  htp_block_sparse_dense_every_n_sparse_steps > 0 ||

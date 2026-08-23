@@ -700,7 +700,7 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                     return dst->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F16 &&
                            k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
                            mask->type == GGML_TYPE_I32 && (full_keep_packed || static_halo_packed) &&
-                           with_lse && q->ne[1] == k->ne[1] && k->ne[2] == q->ne[2] && q->ne[3] == 1 &&
+                           shape_ok && q->ne[1] == k->ne[1] && k->ne[2] == q->ne[2] && q->ne[3] == 1 &&
                            htp_packed_shape_supported((int) q->ne[2], (int) k->ne[2], (int) q->ne[0], 1);
                 }
 

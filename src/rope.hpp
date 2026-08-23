@@ -646,6 +646,9 @@ namespace Rope {
         return (m - (a % m)) % m;
     }
 
+    // Z-Image sparse attention groups image tokens in 4x4 blocks.
+    constexpr int Z_IMAGE_SPARSE_PATCH_SIZE = 4;
+
     __STATIC_INLINE__ std::vector<std::vector<float>> gen_z_image_ids(int h,
                                                                       int w,
                                                                       int patch_size,
@@ -654,7 +657,8 @@ namespace Rope {
                                                                       int seq_multi_of,
                                                                       const std::vector<ggml_tensor*>& ref_latents,
                                                                       bool increase_ref_index,
-                                                                      bool image_first = false) {
+                                                                      bool image_first = false,
+                                                                      bool patch_major_image = false) {
         int padded_context_len = context_len + bound_mod(context_len, seq_multi_of);
         auto txt_ids           = std::vector<std::vector<float>>(bs * padded_context_len, std::vector<float>(3, 0.0f));
         for (int i = 0; i < bs * padded_context_len; i++) {
@@ -664,6 +668,21 @@ namespace Rope {
         int axes_dim_num = 3;
         int index        = padded_context_len + 1;
         auto img_ids     = gen_flux_img_ids(h, w, patch_size, bs, axes_dim_num, index);
+
+        if (patch_major_image && bs > 0 && !img_ids.empty()) {
+            const int token_h = (h + (patch_size / 2)) / patch_size;
+            const int token_w = (w + (patch_size / 2)) / patch_size;
+            const int valid_image_tokens = token_h * token_w;
+            const auto row_major_img_ids = img_ids;
+            for (int b = 0; b < bs; ++b) {
+                for (int patch_index = 0; patch_index < valid_image_tokens; ++patch_index) {
+                    const int row_major_index = sd_row_major_index_from_patch_major(
+                        patch_index, token_h, token_w, Z_IMAGE_SPARSE_PATCH_SIZE);
+                    img_ids[b * valid_image_tokens + patch_index] =
+                        row_major_img_ids[b * valid_image_tokens + row_major_index];
+                }
+            }
+        }
 
         int img_pad_len = bound_mod(static_cast<int>(img_ids.size() / bs), seq_multi_of);
         if (img_pad_len > 0) {
@@ -691,8 +710,9 @@ namespace Rope {
                                                         bool circular_h,
                                                         bool circular_w,
                                                         const std::vector<int>& axes_dim,
-                                                        bool image_first = false) {
-        std::vector<std::vector<float>> ids = gen_z_image_ids(h, w, patch_size, bs, context_len, seq_multi_of, ref_latents, increase_ref_index, image_first);
+                                                        bool image_first = false,
+                                                        bool patch_major_image = false) {
+        std::vector<std::vector<float>> ids = gen_z_image_ids(h, w, patch_size, bs, context_len, seq_multi_of, ref_latents, increase_ref_index, image_first, patch_major_image);
         std::vector<std::vector<int>> wrap_dims;
         if ((circular_h || circular_w) && bs > 0 && axes_dim.size() >= 3) {
             int pad_h = (patch_size - (h % patch_size)) % patch_size;

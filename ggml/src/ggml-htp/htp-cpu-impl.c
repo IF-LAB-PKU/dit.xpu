@@ -1752,6 +1752,23 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_ADD:
             {
                 ggml_compute_forward_add(params, tensor);
+                if (params->ith == 0 && getenv("SD_HTP_RESIDUAL_VALUE_TRACE") != NULL &&
+                    tensor->src[0] != NULL && tensor->src[1] != NULL &&
+                    tensor->src[0]->type == GGML_TYPE_F32 && tensor->src[1]->type == GGML_TYPE_F32 &&
+                    tensor->ne[0] == 128 && tensor->ne[1] == 30 && tensor->ne[2] >= 256) {
+                    fprintf(stderr,
+                            "residual_value add node=%s src0_hash=%016" PRIx64
+                            " src1_hash=%016" PRIx64 " dst_hash=%016" PRIx64
+                            " src0=[%lld,%lld,%lld,%lld] src1=[%lld,%lld,%lld,%lld]\n",
+                            tensor->name[0] != '\0' ? tensor->name : "<unnamed>",
+                            ggml_htp_hash_tensor_bytes(tensor->src[0]),
+                            ggml_htp_hash_tensor_bytes(tensor->src[1]),
+                            ggml_htp_hash_tensor_bytes(tensor),
+                            (long long) tensor->src[0]->ne[0], (long long) tensor->src[0]->ne[1],
+                            (long long) tensor->src[0]->ne[2], (long long) tensor->src[0]->ne[3],
+                            (long long) tensor->src[1]->ne[0], (long long) tensor->src[1]->ne[1],
+                            (long long) tensor->src[1]->ne[2], (long long) tensor->src[1]->ne[3]);
+                }
             } break;
         case GGML_OP_ADD_ID:
             {

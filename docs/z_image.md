@@ -82,3 +82,9 @@ and uses the actual image grid. The context refiner is text-only; its packed
 route uses a synthetic 4-by-(tokens/4) grid and a full-keep block mask, so it
 does not apply an image halo to text tokens. Both single-stream routes require
 the padded token count to be divisible by 32.
+
+Sparse joint attention stores image tokens in patch-major order (4-by-4 image
+blocks), so its joint RoPE/PE uses the same patch-major order. The context and
+noise refiners continue to consume row-major image PE; these layouts must not
+be exchanged. With `SD_HTP_Z_IMAGE_TRACE=1`, the graph construction also emits
+`z_image_pe_layout joint=<image_patch_major|row_major> refiner=image_row_major`.
