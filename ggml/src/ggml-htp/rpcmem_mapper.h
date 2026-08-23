@@ -22,6 +22,7 @@ int prepare_tensor_rpcmem_mapping_with_extra(const struct ggml_tensor * dst, con
 #include <list>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 
 struct RpcMemMapper {
     RpcMemMapper() : max_active_map_size{ (size_t) -1 }, active_map_size{ 0 }, defer_unmap{ false } {}
@@ -34,6 +35,7 @@ struct RpcMemMapper {
     void validate(const struct ggml_tensor * dst, const struct ggml_tensor * extra = nullptr);
     std::pair<int, ssize_t> get_tensor_mapping(const struct ggml_tensor * tensor) const;
     void release_buffer(void * buf_base);
+    bool was_freed_by_diagnostic(void * buf_base) const;
 
     struct UnmapRequest {
         int fd;
@@ -61,5 +63,6 @@ struct RpcMemMapper {
     std::unordered_map<void *, std::pair<int, size_t>>      buf_mapping;
     std::unordered_map<void *, std::list<void *>::iterator> buf_iters;
     std::list<void *>                                       accessed_bufs;
+    std::unordered_set<void *>                              diagnostic_freed_bufs;
 };
 #endif

@@ -98,6 +98,11 @@ void send_rpcmem_puts_to_dsp(const std::list<RpcMemMapper::UnmapRequest> & pendi
     while (std::atomic_load_explicit(v1_ptr, std::memory_order_acquire) == 0) {
         usleep(1);
     }
+    if (std::getenv("SD_HTP_RPCMEM_TRACE") != nullptr) {
+        auto * response = message_header_get_request_ptr(msg_hdr, 0);
+        std::fprintf(stderr, "[rpcmem-trace] dsp_put n_puts=%d state=%d\n",
+                     n_unmap_fds, response->state);
+    }
     d_ptr->store(0, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_acquire);
 }
@@ -156,6 +161,17 @@ void RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) 
             buf_mapping.erase(buf_base);
             active_map_size -= buf_size;
             flush_pending_unmaps();
+
+            // This is intentionally diagnostic-only.  The tensor still points at
+            // buf_base, so a production implementation must reload/rebind it
+            // before the buffer can be used again.
+            const char * free_on_failure = std::getenv("SD_HTP_FREE_ON_MMAP_FAILURE");
+            if (free_on_failure != nullptr && free_on_failure[0] != '\0' && std::strcmp(free_on_failure, "0") != 0) {
+                rpcmem_free(buf_base);
+                diagnostic_freed_bufs.insert(buf_base);
+                std::fprintf(stderr, "[rpcmem-trace] free-on-mmap-failure ptr=%p fd=%d size=%zu\n",
+                             buf_base, fd, buf_size);
+            }
             return true;
         }
 
@@ -200,6 +216,10 @@ void RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) 
         }
 
         int fd = rpcmem_to_fd(buf_base);
+        if (diagnostic_freed_bufs.count(buf_base) != 0) {
+            GGML_ABORT("diagnostic free-on-mmap-failure requires reload for ptr %p, tensor %s\n",
+                       buf_base, dst->name);
+        }
         if (fd < 0) {
             GGML_ABORT("rpcmem_to_fd returns %d, ptr %p, for dst tensor %s, n_ops %d\n",
                        fd, buf_base, dst->name, n_map_ops);
@@ -266,6 +286,10 @@ void RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) 
         buf_mapping[buf_base] = { fd, buf_size };
         active_map_size += buf_size;
     }
+}
+
+bool RpcMemMapper::was_freed_by_diagnostic(void * buf_base) const {
+    return diagnostic_freed_bufs.count(buf_base) != 0;
 }
 
 std::pair<int, ssize_t> RpcMemMapper::get_tensor_mapping(const ggml_tensor * tensor) const {

@@ -1318,11 +1318,13 @@ public:
                 const bool htp_block_sparse_attn = sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_ATTN");
                 if (diffusion_model) {
                     diffusion_model->set_htp_backend(htp_backend);
+                    diffusion_model->set_htp_packed_staging_loader(retained_model_loader.get());
                     diffusion_model->set_block_sparse_attention_enabled(htp_attention_enabled && htp_block_sparse_attn);
                     diffusion_model->set_htp_attention_enabled(htp_attention_enabled);
                 }
                 if (high_noise_diffusion_model) {
                     high_noise_diffusion_model->set_htp_backend(htp_backend);
+                    high_noise_diffusion_model->set_htp_packed_staging_loader(retained_model_loader.get());
                     high_noise_diffusion_model->set_block_sparse_attention_enabled(htp_attention_enabled && htp_block_sparse_attn);
                     high_noise_diffusion_model->set_htp_attention_enabled(htp_attention_enabled);
                 }

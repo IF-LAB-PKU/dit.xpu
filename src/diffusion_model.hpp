@@ -71,6 +71,9 @@ struct DiffusionModel {
     virtual void set_htp_backend(ggml_backend_t backend)                         {
         (void)backend;
     };
+    virtual void set_htp_packed_staging_loader(ModelLoader* loader) {
+        (void)loader;
+    }
     virtual void set_block_sparse_attention_enabled(bool enabled)                {
         (void)enabled;
     };
@@ -127,6 +130,10 @@ struct UNetModel : public DiffusionModel {
     void set_htp_backend(ggml_backend_t backend) override {
         // 把预加载的 HTP backend 透传到具体 runner，图分配和执行阶段都会依赖它做判断。
         unet.set_htp_backend(backend);
+    }
+
+    void set_htp_packed_staging_loader(ModelLoader* loader) override {
+        unet.set_htp_packed_staging_loader(loader);
     }
 
     int64_t get_adm_in_channels() override {
@@ -201,6 +208,10 @@ struct MMDiTModel : public DiffusionModel {
 
     void set_htp_backend(ggml_backend_t backend) override {
         mmdit.set_htp_backend(backend);
+    }
+
+    void set_htp_packed_staging_loader(ModelLoader* loader) override {
+        mmdit.set_htp_packed_staging_loader(loader);
     }
 
     void set_block_sparse_attention_enabled(bool enabled) override {
@@ -292,6 +303,10 @@ struct FluxModel : public DiffusionModel {
 
     void set_htp_backend(ggml_backend_t backend) override {
         flux.set_htp_backend(backend);
+    }
+
+    void set_htp_packed_staging_loader(ModelLoader* loader) override {
+        flux.set_htp_packed_staging_loader(loader);
     }
 
     void set_block_sparse_attention_enabled(bool enabled) override {
@@ -389,6 +404,10 @@ struct AnimaModel : public DiffusionModel {
         anima.set_htp_backend(backend);
     }
 
+    void set_htp_packed_staging_loader(ModelLoader* loader) override {
+        anima.set_htp_packed_staging_loader(loader);
+    }
+
     int64_t get_adm_in_channels() override {
         return 768;
     }
@@ -460,6 +479,10 @@ struct WanModel : public DiffusionModel {
 
     void set_htp_backend(ggml_backend_t backend) override {
         wan.set_htp_backend(backend);
+    }
+
+    void set_htp_packed_staging_loader(ModelLoader* loader) override {
+        wan.set_htp_packed_staging_loader(loader);
     }
 
     int64_t get_adm_in_channels() override {
@@ -539,6 +562,10 @@ struct QwenImageModel : public DiffusionModel {
         qwen_image.set_htp_backend(backend);
     }
 
+    void set_htp_packed_staging_loader(ModelLoader* loader) override {
+        qwen_image.set_htp_packed_staging_loader(loader);
+    }
+
     int64_t get_adm_in_channels() override {
         return 768;
     }
@@ -610,6 +637,10 @@ struct HiDreamO1Model : public DiffusionModel {
 
     void set_htp_backend(ggml_backend_t backend) override {
         hidream_o1.set_htp_backend(backend);
+    }
+
+    void set_htp_packed_staging_loader(ModelLoader* loader) override {
+        hidream_o1.set_htp_packed_staging_loader(loader);
     }
 
     int64_t get_adm_in_channels() override {
@@ -691,6 +722,10 @@ struct ZImageModel : public DiffusionModel {
 
     void set_htp_backend(ggml_backend_t backend) override {
         z_image.set_htp_backend(backend);
+    }
+
+    void set_htp_packed_staging_loader(ModelLoader* loader) override {
+        z_image.set_htp_packed_staging_loader(loader);
     }
 
     void set_block_sparse_attention_enabled(bool enabled) override {
@@ -784,6 +819,10 @@ struct ErnieImageModel : public DiffusionModel {
         ernie_image.set_htp_backend(backend);
     }
 
+    void set_htp_packed_staging_loader(ModelLoader* loader) override {
+        ernie_image.set_htp_packed_staging_loader(loader);
+    }
+
     int64_t get_adm_in_channels() override {
         return 768;
     }
@@ -852,6 +891,10 @@ struct LTXAVModel : public DiffusionModel {
 
     void set_htp_backend(ggml_backend_t backend) override {
         ltxav.set_htp_backend(backend);
+    }
+
+    void set_htp_packed_staging_loader(ModelLoader* loader) override {
+        ltxav.set_htp_packed_staging_loader(loader);
     }
 
     int64_t get_adm_in_channels() override {

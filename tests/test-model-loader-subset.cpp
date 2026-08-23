@@ -101,6 +101,22 @@ int main() {
     ModelLoader loader;
     CHECK(loader.init_from_file(model_path.string()));
 
+    const TensorStorage* encoder_storage = loader.find_tensor_storage("encoder.weight");
+    const TensorStorage* diffusion_storage = loader.find_tensor_storage("diffusion.weight");
+    CHECK(encoder_storage != nullptr);
+    CHECK(diffusion_storage != nullptr);
+    CHECK(encoder_storage->nbytes_to_read() == ggml_nbytes(encoder_source));
+    CHECK(diffusion_storage->nbytes_to_read() == ggml_nbytes(diffusion_source));
+
+    std::vector<uint8_t> encoder_reload(encoder_storage->nbytes_to_read());
+    std::vector<uint8_t> diffusion_reload(diffusion_storage->nbytes_to_read());
+    CHECK(loader.reload_tensor_bytes("encoder.weight", encoder_reload.data(), encoder_reload.size()));
+    CHECK(loader.reload_tensor_bytes("diffusion.weight", diffusion_reload.data(), diffusion_reload.size()));
+    CHECK(memcmp(encoder_reload.data(), encoder_values.data(), encoder_reload.size()) == 0);
+    CHECK(memcmp(diffusion_reload.data(), diffusion_values.data(), diffusion_reload.size()) == 0);
+    CHECK(!loader.reload_tensor_bytes("encoder.weight", encoder_reload.data(), encoder_reload.size() - 1));
+    CHECK(!loader.reload_tensor_bytes("missing.weight", encoder_reload.data(), encoder_reload.size()));
+
     std::map<std::string, ggml_tensor*> encoder_only = {
         {"encoder.weight", encoder_destination},
     };

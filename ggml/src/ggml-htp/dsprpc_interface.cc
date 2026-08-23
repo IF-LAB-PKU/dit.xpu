@@ -6,6 +6,9 @@
 
 #include <dlfcn.h>
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 
@@ -19,6 +22,20 @@ using fastrpc_mmap_t   = decltype(fastrpc_mmap);
 using fastrpc_munmap_t = decltype(fastrpc_munmap);
 
 namespace {
+
+bool rpcmem_trace_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("SD_HTP_RPCMEM_TRACE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+std::atomic<unsigned long long> rpcmem_trace_sequence{0};
+
+unsigned long long next_rpcmem_trace_sequence() {
+    return rpcmem_trace_sequence.fetch_add(1, std::memory_order_relaxed);
+}
 
 #if defined(__ANDROID__)
 void preload_android_system_binder() {
@@ -105,11 +122,20 @@ void rpcmem_deinit(void) {
 
 void * rpcmem_alloc(int heap_id, uint32_t flags, int size) {
     auto & iface = dsprpc_interface::instance();
-    return iface.rpcmem_alloc_fn ? iface.rpcmem_alloc_fn(heap_id, flags, size) : nullptr;
+    void * result = iface.rpcmem_alloc_fn ? iface.rpcmem_alloc_fn(heap_id, flags, size) : nullptr;
+    if (rpcmem_trace_enabled()) {
+        std::fprintf(stderr, "[rpcmem-trace] #%llu alloc heap=%d flags=%u size=%d ptr=%p\n",
+                     next_rpcmem_trace_sequence(), heap_id, flags, size, result);
+    }
+    return result;
 }
 
 void rpcmem_free(void * p) {
     auto & iface = dsprpc_interface::instance();
+    if (rpcmem_trace_enabled()) {
+        std::fprintf(stderr, "[rpcmem-trace] #%llu free ptr=%p\n",
+                     next_rpcmem_trace_sequence(), p);
+    }
     if (iface.rpcmem_free_fn) {
         iface.rpcmem_free_fn(p);
     }
@@ -117,17 +143,32 @@ void rpcmem_free(void * p) {
 
 int rpcmem_to_fd(void * p) {
     auto & iface = dsprpc_interface::instance();
-    return iface.rpcmem_to_fd_fn ? iface.rpcmem_to_fd_fn(p) : -1;
+    int result = iface.rpcmem_to_fd_fn ? iface.rpcmem_to_fd_fn(p) : -1;
+    if (rpcmem_trace_enabled()) {
+        std::fprintf(stderr, "[rpcmem-trace] #%llu to_fd ptr=%p fd=%d\n",
+                     next_rpcmem_trace_sequence(), p, result);
+    }
+    return result;
 }
 
 int fastrpc_mmap(int domain, int fd, void * addr, int offset, size_t length, enum fastrpc_map_flags flags) {
     auto & iface = dsprpc_interface::instance();
-    return iface.fastrpc_mmap_fn ? iface.fastrpc_mmap_fn(domain, fd, addr, offset, length, flags) : -1;
+    int result = iface.fastrpc_mmap_fn ? iface.fastrpc_mmap_fn(domain, fd, addr, offset, length, flags) : -1;
+    if (rpcmem_trace_enabled()) {
+        std::fprintf(stderr, "[rpcmem-trace] #%llu mmap domain=%d fd=%d addr=%p offset=%d length=%zu flags=%d ret=%d\n",
+                     next_rpcmem_trace_sequence(), domain, fd, addr, offset, length, flags, result);
+    }
+    return result;
 }
 
 int fastrpc_munmap(int domain, int fd, void * addr, size_t length) {
     auto & iface = dsprpc_interface::instance();
-    return iface.fastrpc_munmap_fn ? iface.fastrpc_munmap_fn(domain, fd, addr, length) : -1;
+    int result = iface.fastrpc_munmap_fn ? iface.fastrpc_munmap_fn(domain, fd, addr, length) : -1;
+    if (rpcmem_trace_enabled()) {
+        std::fprintf(stderr, "[rpcmem-trace] #%llu munmap domain=%d fd=%d addr=%p length=%zu ret=%d\n",
+                     next_rpcmem_trace_sequence(), domain, fd, addr, length, result);
+    }
+    return result;
 }
 
 } // extern "C"

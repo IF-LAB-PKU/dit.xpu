@@ -38,6 +38,7 @@
 #include "ggml_qkv_buffer_plan.hpp"
 
 #include "htp_tensor_flags.h"
+#include "htp_packed_staging.h"
 #include "model.h"
 #include "tensor.hpp"
 
@@ -6235,6 +6236,10 @@ protected:
     ggml_backend_t runtime_backend = nullptr;
     // 只有 diffusion 推理明确注入 HTP backend 后，runner 才会启用 RPCMEM 放置和 hybrid compute 判定。
     ggml_backend_t htp_backend     = nullptr;
+    std::unique_ptr<HtpPackedStagingPool> htp_packed_staging_pool_;
+    HtpPackedStagingPool::LoadFn htp_packed_staging_loader_;
+    std::vector<HtpPackedStagingPool::Handle> htp_packed_staging_handles_;
+    std::vector<ggml_tensor*> htp_packed_staging_tensors_;
 
     ggml_context* params_ctx                    = nullptr;
     ggml_backend_buffer_t params_buffer         = nullptr;
@@ -7176,7 +7181,8 @@ protected:
             return false;
         }
         // view 权重本身不持有 buffer，但只要 backing root 已经按 llama.cpp-npu 形式直接放进 RPCMEM，就可以用 view offset 分发给 HTP。
-        return htp_placed_param_tensors_.find(root) != htp_placed_param_tensors_.end() &&
+        return (htp_placed_param_tensors_.find(root) != htp_placed_param_tensors_.end() ||
+                std::find(htp_packed_staging_tensors_.begin(), htp_packed_staging_tensors_.end(), root) != htp_packed_staging_tensors_.end()) &&
                ggml_backend_buft_is_rpcmem(ggml_backend_buffer_get_type(root->buffer));
     }
 
@@ -7355,7 +7361,8 @@ protected:
     }
 
     bool allocate_htp_placed_params() {
-        if (!htp_op_routing_enabled() || htp_param_placement_buffer_ != nullptr) {
+        if (!htp_op_routing_enabled() || htp_param_placement_buffer_ != nullptr ||
+            sd_env_flag_enabled("SD_HTP_PACKED_STAGING")) {
             return true;
         }
 
@@ -8467,6 +8474,7 @@ protected:
     }
 
     void restore_all_params() {
+        release_htp_packed_staging();
         restore_partial_params();
         if (!params_on_runtime_backend) {
             return;
@@ -8490,6 +8498,7 @@ protected:
     }
 
     void restore_partial_params() {
+        release_htp_packed_staging();
         if (partial_offload_pairs.empty()) {
             if (partial_runtime_params_buffer != nullptr) {
                 ggml_backend_buffer_free(partial_runtime_params_buffer);
@@ -8527,16 +8536,18 @@ protected:
     }
 
     bool should_use_graph_cut_segmented_compute(const GraphCutPlan& plan) {
-        return plan.has_cuts &&
+        // Packed staging and graph-cut execution are one opt-in experiment.
+        // With the flag unset, preserve the original full-graph path.
+        return sd_env_flag_enabled("SD_HTP_PACKED_STAGING") &&
+               plan.has_cuts &&
                plan.valid &&
                max_graph_vram_bytes > 0 &&
-               plan.segments.size() > 1 &&
-               !ggml_backend_is_cpu(runtime_backend);
+               plan.segments.size() > 1;
     }
 
     bool can_attempt_graph_cut_segmented_compute() const {
-        return max_graph_vram_bytes > 0 &&
-               !ggml_backend_is_cpu(runtime_backend);
+        return sd_env_flag_enabled("SD_HTP_PACKED_STAGING") &&
+               max_graph_vram_bytes > 0;
     }
 
     bool resolve_graph_cut_plan(ggml_cgraph* gf,
@@ -8626,6 +8637,118 @@ protected:
         return true;
     }
 
+    bool htp_packed_staging_enabled() const {
+        return sd_env_flag_enabled("SD_HTP_PACKED_STAGING") &&
+               htp_backend != nullptr && static_cast<bool>(htp_packed_staging_loader_);
+    }
+
+    bool ensure_htp_packed_staging_pool() {
+        if (!htp_packed_staging_enabled()) {
+            return true;
+        }
+        if (htp_packed_staging_pool_ != nullptr) {
+            return true;
+        }
+        const size_t budget_mb = static_cast<size_t>(std::max(1, sd_env_int_value("SD_HTP_PACKED_STAGING_BUDGET_MB", 512)));
+        const size_t slot_mb = static_cast<size_t>(std::max(1, sd_env_int_value("SD_HTP_PACKED_STAGING_SLOT_MB", 256)));
+        const size_t budget_bytes = budget_mb * 1024ull * 1024ull;
+        const size_t slot_bytes = slot_mb * 1024ull * 1024ull;
+        if (slot_bytes > budget_bytes) {
+            LOG_ERROR("%s packed staging slot (%zu MiB) exceeds budget (%zu MiB)",
+                      get_desc().c_str(), slot_mb, budget_mb);
+            return false;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(htp_backend);
+        htp_packed_staging_pool_ = std::make_unique<HtpPackedStagingPool>(
+            budget_bytes,
+            slot_bytes,
+            [buft](size_t bytes) {
+                ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, bytes);
+                if (buffer == nullptr) {
+                    return HtpPackedStagingPool::Allocation{};
+                }
+                return HtpPackedStagingPool::Allocation{ggml_backend_buffer_get_base(buffer), buffer};
+            },
+            [](const HtpPackedStagingPool::Allocation& allocation) {
+                if (allocation.buffer != nullptr) {
+                    ggml_backend_buffer_free(allocation.buffer);
+                }
+            });
+        LOG_INFO("%s HTP packed staging enabled: budget=%zu MiB slot=%zu MiB",
+                 get_desc().c_str(), budget_mb, slot_mb);
+        return true;
+    }
+
+    bool stage_htp_packed_weights(ggml_cgraph* gf) {
+        if (!htp_packed_staging_enabled()) {
+            return true;
+        }
+        if (!ensure_htp_packed_staging_pool() || gf == nullptr) {
+            return false;
+        }
+        std::vector<ggml_tensor*> tensors = collect_htp_packable_f16_weights(gf);
+        if (tensors.empty()) {
+            return true;
+        }
+        size_t required_bytes = 0;
+        for (ggml_tensor* tensor : tensors) {
+            required_bytes = GGML_PAD(required_bytes, 128) + ggml_nbytes(tensor);
+        }
+        htp_packed_staging_handles_.clear();
+        htp_packed_staging_tensors_.clear();
+        for (ggml_tensor* tensor : tensors) {
+            bool placed = false;
+            for (auto handle : htp_packed_staging_handles_) {
+                if (htp_packed_staging_pool_->place_tensor(
+                        htp_packed_staging_loader_, handle, tensor->name, tensor)) {
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed) {
+                HtpPackedStagingPool::Handle handle;
+                if (!htp_packed_staging_pool_->acquire(ggml_nbytes(tensor), &handle) ||
+                    !htp_packed_staging_pool_->place_tensor(
+                        htp_packed_staging_loader_, handle, tensor->name, tensor)) {
+                    if (handle.valid()) {
+                        htp_packed_staging_pool_->release(&handle);
+                    }
+                    LOG_ERROR("%s packed staging pool exhausted while placing '%s' (segment=%zu bytes, budget=%zu bytes)",
+                              get_desc().c_str(), tensor->name, required_bytes,
+                              htp_packed_staging_pool_->budget_bytes());
+                    release_htp_packed_staging();
+                    return false;
+                }
+                htp_packed_staging_handles_.push_back(handle);
+            }
+            if (!placed && htp_packed_staging_handles_.empty()) {
+                LOG_ERROR("%s failed to stage packed tensor '%s'", get_desc().c_str(), tensor->name);
+                release_htp_packed_staging();
+                return false;
+            }
+            htp_packed_staging_tensors_.push_back(tensor);
+        }
+        LOG_INFO("%s staged packed HTP weights: %zu tensors, %zu bytes, live_slots=%zu",
+                 get_desc().c_str(), htp_packed_staging_tensors_.size(), required_bytes,
+                 htp_packed_staging_pool_->active_slots());
+        return true;
+    }
+
+    void release_htp_packed_staging() {
+        if (htp_packed_staging_pool_ == nullptr) {
+            return;
+        }
+        for (auto handle : htp_packed_staging_handles_) {
+            for (auto it = htp_packed_staging_tensors_.rbegin();
+                 it != htp_packed_staging_tensors_.rend(); ++it) {
+                htp_packed_staging_pool_->unbind_tensor(handle, *it);
+            }
+            htp_packed_staging_pool_->release(&handle);
+        }
+        htp_packed_staging_handles_.clear();
+        htp_packed_staging_tensors_.clear();
+    }
+
     template <typename T>
     std::optional<sd::Tensor<T>> execute_graph(ggml_cgraph* gf,
                                                int n_threads,
@@ -8651,6 +8774,16 @@ protected:
             }
         }
         int64_t t_offload_end = ggml_time_ms();
+
+        if (use_htp_compute && htp_packed_staging_enabled() &&
+            !stage_htp_packed_weights(gf)) {
+            if (use_partial_param_offload) {
+                restore_partial_params();
+            }
+            return std::nullopt;
+        }
+        auto staging_guard_fn = [this](int*) { release_htp_packed_staging(); };
+        std::unique_ptr<int, decltype(staging_guard_fn)> staging_guard(nullptr, staging_guard_fn);
 
         if (use_htp_compute && !prepare_htp_packed_f16_weights(gf)) {
             LOG_ERROR("%s prepare HTP packed F16 weights failed", get_desc().c_str());
@@ -8764,6 +8897,7 @@ protected:
             }
         }
         active_compute_arena_generation_ = 0;
+        release_htp_packed_staging();
         int64_t t_compute_end   = ggml_time_ms();
         if (status != GGML_STATUS_SUCCESS) {
             LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
@@ -9104,6 +9238,7 @@ public:
     }
 
     void free_compute_buffer() {
+        release_htp_packed_staging();
         reap_retired_compute_arenas(false);
         if (compute_allocr != nullptr) {
             ggml_gallocr_free(compute_allocr);
@@ -9271,6 +9406,16 @@ public:
     // 由上层在模型初始化完成后注入 HTP backend，避免默认路径无意打开 HTP 逻辑。
     void set_htp_backend(ggml_backend_t backend) {
         htp_backend = backend;
+    }
+
+    void set_htp_packed_staging_loader(ModelLoader* loader) {
+        if (loader == nullptr) {
+            htp_packed_staging_loader_ = {};
+            return;
+        }
+        htp_packed_staging_loader_ = [loader](const std::string& name, void* dst, size_t bytes) {
+            return loader->reload_tensor_bytes(name, dst, bytes);
+        };
     }
 
     void set_max_graph_vram_bytes(size_t max_vram_bytes) {
