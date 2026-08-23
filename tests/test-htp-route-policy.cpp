@@ -138,6 +138,45 @@ void test_attention_policy() {
             "text-only attention must not enter the residual packed route");
 }
 
+void test_packed_residual_apply_layout_policy() {
+    require(sd_htp_packed_residual_apply_needs_contiguous(
+                true, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY, false),
+            "non-exact packed residual apply must materialize a contiguous output");
+    require(!sd_htp_packed_residual_apply_needs_contiguous(
+                 true, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY, true),
+            "exact-rho apply must keep its existing scaling path");
+    require(!sd_htp_packed_residual_apply_needs_contiguous(
+                 false, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY, false),
+            "reordered residual apply must not add a copy");
+    require(!sd_htp_packed_residual_apply_needs_contiguous(
+                 true, SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR, false),
+            "packed anchor must not use the apply-only copy policy");
+    require(!sd_htp_packed_residual_apply_uses_lse(
+                 true, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY),
+            "packed residual apply must not request an LSE slab");
+    require(sd_htp_packed_residual_apply_uses_lse(
+                true, SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR),
+            "packed residual anchor must retain its LSE slab");
+}
+
+void test_packed_residual_apply_lse_admission() {
+    require(!sd_htp_sparse_attention_needs_lse(
+                true, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY, 1.0f, false),
+            "packed residual apply should not need LSE at unit scale");
+    require(!sd_htp_sparse_attention_needs_lse(
+                true, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY, 1.0f / 128.0f, false),
+            "packed residual apply should not need LSE for kv scaling");
+    require(sd_htp_sparse_attention_needs_lse(
+                true, SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR, 1.0f / 128.0f, false),
+            "packed residual anchor must need LSE");
+    require(sd_htp_sparse_attention_needs_lse(
+                false, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY, 1.0f / 128.0f, false),
+            "reordered attention still needs LSE for kv scaling");
+    require(sd_htp_sparse_attention_needs_lse(
+                true, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY, 1.0f, true),
+            "exact rho anchor cache must need LSE");
+}
+
 void test_anchor_halo_loader_policy() {
     struct PolicyCase {
         sd_htp_route_mode route;
@@ -247,6 +286,114 @@ void test_z_image_route_selection() {
             "position-index offsets without ref tensors must keep sparse geometry eligible");
     require(!ZImage::z_image_sparse_layout_eligible(256, 16, 16, 11, true),
             "actual appended ref latent tokens must remain excluded");
+}
+
+void test_z_image_pe_ordering() {
+    const std::vector<ggml_tensor*> no_refs;
+    constexpr int h = 32;
+    constexpr int w = 32;
+    constexpr int patch_size = 2;
+    constexpr int token_h = 16;
+    constexpr int token_w = 16;
+    constexpr int context_len = 11;
+    constexpr int seq_multi_of = 32;
+    constexpr int text_padded = 32;
+    constexpr int image_tokens = token_h * token_w;
+    constexpr int sparse_patch = ZImage::Z_IMAGE_SPARSE_PATCH_SIZE;
+
+    const auto text_first = Rope::gen_z_image_ids(
+        h, w, patch_size, 1, context_len, seq_multi_of, no_refs, false,
+        false, false);
+    const auto image_first_row_major = Rope::gen_z_image_ids(
+        h, w, patch_size, 1, context_len, seq_multi_of, no_refs, false,
+        true, false);
+    const auto image_first_patch_major = Rope::gen_z_image_ids(
+        h, w, patch_size, 1, context_len, seq_multi_of, no_refs, false,
+        true, true);
+
+    require(text_first.size() == image_first_row_major.size() &&
+                image_first_row_major.size() == image_first_patch_major.size(),
+            "Z-Image PE layouts must have the same padded sequence length");
+    for (int i = 0; i < text_padded; ++i) {
+        require(text_first[i] == image_first_patch_major[image_tokens + i],
+                "text suffix must remain unchanged when image tokens are reordered");
+        require(text_first[i] == image_first_row_major[image_tokens + i],
+                "image-first row-major text suffix must match text-first IDs");
+    }
+    for (int i = 0; i < image_tokens; ++i) {
+        const int row_major = sd_row_major_index_from_patch_major(
+            i, token_h, token_w, sparse_patch);
+        require(image_first_patch_major[i] == image_first_row_major[row_major],
+                "patch-major image IDs must follow the shared inverse mapping");
+    }
+    require(image_first_patch_major[0] == image_first_row_major[0] &&
+                image_first_patch_major[1] == image_first_row_major[1] &&
+                image_first_patch_major[2] == image_first_row_major[2] &&
+                image_first_patch_major[3] == image_first_row_major[3] &&
+                image_first_patch_major[4] == image_first_row_major[16],
+            "patch-major order must differ at the first patch boundary");
+
+    for (int i = 0; i < image_tokens; ++i) {
+        const int patch_major = sd_patch_major_index_from_row_major(
+            i, token_h, token_w, sparse_patch);
+        require(sd_row_major_index_from_patch_major(
+                    patch_major, token_h, token_w, sparse_patch) == i,
+                "patch-major and row-major mappings must be inverses");
+    }
+
+    const auto dense_ids = Rope::gen_z_image_ids(
+        h, w, patch_size, 1, context_len, seq_multi_of, no_refs, false,
+        false, false);
+    require(dense_ids == text_first,
+            "explicit dense PE ordering must preserve the existing row-major layout");
+
+    const std::vector<int> axes_dim = {32, 48, 48};
+    const int pe_stride = 256;
+    const auto row_major_pe = Rope::gen_z_image_pe(
+        h, w, patch_size, 1, context_len, seq_multi_of, no_refs, false,
+        10000, false, false, axes_dim, true, false);
+    const auto patch_major_pe = Rope::gen_z_image_pe(
+        h, w, patch_size, 1, context_len, seq_multi_of, no_refs, false,
+        10000, false, false, axes_dim, true, true);
+    require(row_major_pe.size() == patch_major_pe.size(),
+            "patch-major and row-major PE tensors must have the same shape");
+    for (int i = 0; i < image_tokens; ++i) {
+        const int row_major = sd_row_major_index_from_patch_major(
+            i, token_h, token_w, sparse_patch);
+        for (int j = 0; j < pe_stride; ++j) {
+            require(patch_major_pe[i * pe_stride + j] ==
+                        row_major_pe[row_major * pe_stride + j],
+                    "patch-major PE values must follow the image ID mapping");
+        }
+    }
+    for (int i = 0; i < text_padded; ++i) {
+        for (int j = 0; j < pe_stride; ++j) {
+            require(patch_major_pe[(image_tokens + i) * pe_stride + j] ==
+                        row_major_pe[(image_tokens + i) * pe_stride + j],
+                    "patch-major PE text suffix must remain unchanged");
+        }
+    }
+
+    constexpr int padded_h = 5;
+    constexpr int padded_w = 5;
+    constexpr int valid_image_tokens = padded_h * padded_w;
+    constexpr int padded_image_tokens = 32;
+    const auto padded_row_major = Rope::gen_z_image_ids(
+        10, 10, patch_size, 1, context_len, seq_multi_of, no_refs, false,
+        true, false);
+    const auto padded_patch_major = Rope::gen_z_image_ids(
+        10, 10, patch_size, 1, context_len, seq_multi_of, no_refs, false,
+        true, true);
+    for (int i = 0; i < valid_image_tokens; ++i) {
+        const int row_major = sd_row_major_index_from_patch_major(
+            i, padded_h, padded_w, sparse_patch);
+        require(padded_patch_major[i] == padded_row_major[row_major],
+                "valid image IDs must be reordered before image padding");
+    }
+    for (int i = valid_image_tokens; i < padded_image_tokens; ++i) {
+        require(padded_patch_major[i] == std::vector<float>({0.f, 0.f, 0.f}),
+                "image padding IDs must remain at the end of the image segment");
+    }
 }
 
 void test_z_image_binding_sequences() {
@@ -827,10 +974,13 @@ int main() {
     test_flash_attention_halo_loader_metadata();
     test_route_mode_from_flags();
     test_attention_policy();
+    test_packed_residual_apply_layout_policy();
+    test_packed_residual_apply_lse_admission();
     test_anchor_halo_loader_policy();
     test_residual_binding_keys();
     test_model_binding_sequences();
     test_z_image_route_selection();
+    test_z_image_pe_ordering();
     test_z_image_binding_sequences();
     test_opencl_lifetime_mode_parser();
     test_opencl_staging_slot_parser();

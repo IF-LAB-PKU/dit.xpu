@@ -18,6 +18,7 @@ namespace ZImage {
     constexpr int Z_IMAGE_GRAPH_SIZE = 20480;
     constexpr int ADALN_EMBED_DIM    = 256;
     constexpr int SEQ_MULTI_OF       = 32;
+    constexpr int Z_IMAGE_SPARSE_PATCH_SIZE = Rope::Z_IMAGE_SPARSE_PATCH_SIZE;
 
     // Static-halo eligibility predicate for Z-Image dimensions.
     __STATIC_INLINE__ bool z_image_static_halo_eligible(int image_tokens,
@@ -722,6 +723,7 @@ namespace ZImage {
                                   ggml_tensor* timestep,
                                   ggml_tensor* context,
                                   ggml_tensor* pe,
+                                  ggml_tensor* joint_pe = nullptr,
                                   bool has_ref_latents = false) {
             auto x_embedder     = std::dynamic_pointer_cast<Linear>(blocks["x_embedder"]);
             auto t_embedder     = std::dynamic_pointer_cast<TimestepEmbedder>(blocks["t_embedder"]);
@@ -760,6 +762,9 @@ namespace ZImage {
             int64_t total_txt_tokens = txt->ne[1];  // padded text tokens
 
             GGML_ASSERT(total_txt_tokens + total_img_tokens == pe->ne[3]);
+            if (joint_pe != nullptr) {
+                GGML_ASSERT(joint_pe->ne[3] == pe->ne[3]);
+            }
 
             // Determine sparse layout eligibility
             int token_h           = ctx->block_sparse_token_h;
@@ -788,6 +793,12 @@ namespace ZImage {
                      image_tokens,
                      (long long)n_txt_token,
                      token_h, token_w);
+
+            if (sd_env_flag_enabled("SD_HTP_Z_IMAGE_TRACE") ||
+                sd_env_flag_enabled("SD_HTP_PACKED_Z_IMAGE_TRACE")) {
+                LOG_INFO("z_image_pe_layout joint=%s refiner=image_row_major",
+                         sparse_eligible && joint_pe != nullptr ? "image_patch_major" : "row_major");
+            }
 
             // PE slices for refiners: adjust to PE layout (text-first or image-first)
             ggml_tensor* txt_pe;
@@ -829,13 +840,14 @@ namespace ZImage {
             }
 
             ggml_tensor* txt_img;
-            ggml_tensor* joint_pe;
+            ggml_tensor* joint_stream_pe;
             int64_t img_slice_start;
             int64_t img_slice_len;
 
             if (sparse_eligible) {
                 // Sparse layout: image-first with patch-major reorder
-                int patch = 4;
+                GGML_ASSERT(joint_pe != nullptr);
+                const int patch = Z_IMAGE_SPARSE_PATCH_SIZE;
                 sd_patch_major_reorder_params* reorder_params = new sd_patch_major_reorder_params();
                 reorder_params->token_h       = token_h;
                 reorder_params->token_w       = token_w;
@@ -859,13 +871,13 @@ namespace ZImage {
 
                 // Image-first concatenation: [img_reordered, txt]
                 txt_img = ggml_concat(ctx->ggml_ctx, img_reordered, txt, 1);
-                joint_pe = pe;  // PE is image-first for sparse layout
+                joint_stream_pe = joint_pe;
                 img_slice_start = 0;
                 img_slice_len   = total_img_tokens;
             } else {
                 // Dense layout: text-first with row-major image tokens (current behavior)
                 txt_img = ggml_concat(ctx->ggml_ctx, txt, img, 1);
-                joint_pe = pe;
+                joint_stream_pe = pe;
                 img_slice_start = total_txt_tokens;
                 img_slice_len   = total_img_tokens;
             }
@@ -878,7 +890,7 @@ namespace ZImage {
             for (int i = 0; i < z_image_params.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<JointTransformerBlock>(blocks["layers." + std::to_string(i)]);
 
-                txt_img = block->forward(ctx, txt_img, joint_pe, nullptr, t_emb,
+                txt_img = block->forward(ctx, txt_img, joint_stream_pe, nullptr, t_emb,
                                          /*block_sparse_attn=*/sparse_eligible,
                                          block_sparse_protected_start,
                                          block_sparse_protected_len,
@@ -895,7 +907,7 @@ namespace ZImage {
 
             if (sparse_eligible) {
                 // Inverse-reorder image tokens from patch-major back to row-major
-                int patch = 4;
+                const int patch = Z_IMAGE_SPARSE_PATCH_SIZE;
                 sd_patch_major_reorder_params* inv_params = new sd_patch_major_reorder_params();
                 inv_params->token_h        = token_h;
                 inv_params->token_w        = token_w;
@@ -930,7 +942,8 @@ namespace ZImage {
                              ggml_tensor* context,
                              ggml_tensor* pe,
                              std::vector<ggml_tensor*> ref_latents = {},
-                             bool increase_ref_index = false) {
+                             bool increase_ref_index = false,
+                             ggml_tensor* joint_pe = nullptr) {
             // Forward pass of DiT.
             // x: [N, C, H, W]
             // timestep: [N,]
@@ -955,7 +968,7 @@ namespace ZImage {
                 }
             }
 
-            auto out = forward_core(ctx, img, timestep, context, pe,
+            auto out = forward_core(ctx, img, timestep, context, pe, joint_pe,
                                     !ref_latents.empty());
 
             out = ggml_ext_slice(ctx->ggml_ctx, out, 1, 0, n_img_token);                              // [N, n_img_token, ph*pw*C]
@@ -972,6 +985,7 @@ namespace ZImage {
         ZImageParams z_image_params;
         ZImageModel z_image;
         std::vector<float> pe_vec;
+        std::vector<float> joint_pe_vec;
         std::vector<float> timestep_vec;
         SDVersion version;
 
@@ -1026,11 +1040,16 @@ namespace ZImage {
             int token_w    = (W + pad_w) / patch_size;
             int image_tokens = token_h * token_w;
 
-            // Determine sparse eligibility for PE generation
-            bool sparse_pe_image_first = is_block_sparse_attention_enabled() &&
-                                         z_image_sparse_layout_eligible(image_tokens, token_h, token_w,
-                                                                         static_cast<int>(context->ne[1]),
-                                                                         !ref_latents.empty());
+            // Keep PE generation aligned with the same HTP sparse policy used by forward_core.
+            const bool sparse_policy_active =
+                is_block_sparse_attention_enabled() ||
+                block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR;
+            const bool sparse_pe_image_first =
+                htp_attention_enabled && sd_env_flag_enabled("SD_HTP_COMPUTE") &&
+                sparse_policy_active &&
+                z_image_sparse_layout_eligible(image_tokens, token_h, token_w,
+                                               static_cast<int>(context->ne[1]),
+                                               !ref_latents.empty());
 
             pe_vec      = Rope::gen_z_image_pe(static_cast<int>(x->ne[1]),
                                                static_cast<int>(x->ne[0]),
@@ -1044,10 +1063,37 @@ namespace ZImage {
                                                circular_y_enabled,
                                                circular_x_enabled,
                                                z_image_params.axes_dim,
-                                               sparse_pe_image_first);
+                                               sparse_pe_image_first,
+                                               false);
             int pos_len = static_cast<int>(pe_vec.size() / z_image_params.axes_dim_sum / 2);
             auto pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, z_image_params.axes_dim_sum / 2, pos_len);
             set_backend_tensor_data(pe, pe_vec.data());
+
+            ggml_tensor* joint_pe = nullptr;
+            joint_pe_vec.clear();
+            if (sparse_pe_image_first) {
+                joint_pe_vec = Rope::gen_z_image_pe(
+                    static_cast<int>(x->ne[1]),
+                    static_cast<int>(x->ne[0]),
+                    z_image_params.patch_size,
+                    static_cast<int>(x->ne[3]),
+                    static_cast<int>(context->ne[1]),
+                    SEQ_MULTI_OF,
+                    ref_latents,
+                    increase_ref_index,
+                    z_image_params.theta,
+                    circular_y_enabled,
+                    circular_x_enabled,
+                    z_image_params.axes_dim,
+                    true,
+                    true);
+                const int joint_pos_len = static_cast<int>(
+                    joint_pe_vec.size() / z_image_params.axes_dim_sum / 2);
+                joint_pe = ggml_new_tensor_4d(
+                    compute_ctx, GGML_TYPE_F32, 2, 2,
+                    z_image_params.axes_dim_sum / 2, joint_pos_len);
+                set_backend_tensor_data(joint_pe, joint_pe_vec.data());
+            }
             auto runner_ctx = get_context();
             sd_install_local_residual_graph_expansion(
                 gf, block_sparse_residual_mode, &runner_ctx);
@@ -1072,7 +1118,8 @@ namespace ZImage {
                                                context,
                                                pe,
                                                ref_latents,
-                                               increase_ref_index);
+                                               increase_ref_index,
+                                               joint_pe);
 
             runner_ctx.block_sparse_token_h = previous_token_h;
             runner_ctx.block_sparse_token_w = previous_token_w;

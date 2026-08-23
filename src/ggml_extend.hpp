@@ -221,6 +221,44 @@ __STATIC_INLINE__ bool sd_htp_patch_major_layout_enabled(bool sparse_attn_enable
     return sparse_attn_enabled || residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR;
 }
 
+// Packed attention with an LSE slab exposes a logical O view whose row stride
+// includes the extra LSE element. Residual caches use the dense O stride, so a
+// non-exact packed apply must materialize the O view before adding the cache.
+__STATIC_INLINE__ bool sd_htp_packed_residual_apply_needs_contiguous(
+    bool packed_layout, int residual_mode, bool exact_rho) {
+    return packed_layout &&
+           residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY &&
+           !exact_rho;
+}
+
+__STATIC_INLINE__ bool sd_htp_packed_residual_apply_uses_lse(
+    bool packed_layout, int residual_mode) {
+    return packed_layout &&
+           residual_mode != SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY;
+}
+
+__STATIC_INLINE__ bool sd_htp_sparse_attention_needs_lse(
+    bool packed_layout, int residual_mode, float kv_scale,
+    bool anchor_can_cache_exact_rho) {
+    return sd_htp_packed_residual_apply_uses_lse(packed_layout, residual_mode) ||
+           (!packed_layout && kv_scale != 1.0f) ||
+           anchor_can_cache_exact_rho;
+}
+
+__STATIC_INLINE__ uint64_t sd_htp_residual_trace_hash(const ggml_tensor* tensor) {
+    if (tensor == nullptr || tensor->data == nullptr) {
+        return 0;
+    }
+    const uint8_t* bytes = static_cast<const uint8_t*>(tensor->data);
+    uint64_t hash = UINT64_C(14695981039346656037);
+    const size_t size = ggml_nbytes(tensor);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
 __STATIC_INLINE__ sd_htp_block_sparse_residual_mode sd_htp_block_sparse_residual_mode(bool enabled,
                                                                                       bool periodic_dense,
                                                                                       int sparse_step_index) {
@@ -3190,8 +3228,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             // Keep the raw flash-attention node available until sparse metadata
             // has been attached. The non-LSE builders wrap kv-scaled outputs in
             // a scale op, which cannot be passed to the flash-attention setters.
-            const bool sparse_with_lse = packed_layout || kv_scale != 1.0f ||
-                                         (anchor_can_cache_residual && can_cache_exact_rho);
+            const bool sparse_with_lse = sd_htp_sparse_attention_needs_lse(
+                packed_layout, block_sparse_residual_mode, kv_scale,
+                anchor_can_cache_residual && can_cache_exact_rho);
             ggml_tensor* dense_candidate = nullptr;
             ggml_tensor* dense_lse = nullptr;
             bool candidate_is_htp_layout = false;
@@ -3406,7 +3445,26 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                 ggml_tensor* sparse_out = flash_attn_o_view(
                     candidate, sparse_with_lse, fused_anchor_used);
                 ggml_tensor* sparse_lse = sparse_with_lse ? flash_attn_lse_view(candidate) : nullptr;
+                const bool residual_layout_trace =
+                    sd_env_flag_enabled("SD_HTP_RESIDUAL_LAYOUT_TRACE");
+                if (residual_layout_trace && anchor_can_cache_residual) {
+                    std::fprintf(stderr,
+                                 "residual_layout sparse_candidate name=%s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] sparse_out ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] lse=%s\n",
+                                 candidate->name, ggml_type_name(candidate->type),
+                                 (long long) candidate->ne[0], (long long) candidate->ne[1],
+                                 (long long) candidate->ne[2], (long long) candidate->ne[3],
+                                 candidate->nb[0], candidate->nb[1], candidate->nb[2], candidate->nb[3],
+                                 (long long) sparse_out->ne[0], (long long) sparse_out->ne[1],
+                                 (long long) sparse_out->ne[2], (long long) sparse_out->ne[3],
+                                 sparse_out->nb[0], sparse_out->nb[1], sparse_out->nb[2], sparse_out->nb[3],
+                                 sparse_lse != nullptr ? "yes" : "no");
+                }
                 ggml_tensor* sparse_reshape_out = sparse_out;
+                if (sd_htp_packed_residual_apply_needs_contiguous(
+                        packed_layout, block_sparse_residual_mode,
+                        block_sparse_residual_exact_rho)) {
+                    sparse_reshape_out = ggml_cont(ctx, sparse_reshape_out);
+                }
                 const bool cached_exact_rho_valid =
                     block_sparse_residual_exact_rho &&
                     block_sparse_cached_rho != nullptr &&
@@ -3435,6 +3493,18 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                         dense_candidate, can_cache_exact_rho, fused_anchor_used);
                     if (can_cache_exact_rho) {
                         dense_lse = flash_attn_lse_view(dense_candidate);
+                    }
+                    if (residual_layout_trace) {
+                        std::fprintf(stderr,
+                                     "residual_layout dense_candidate name=%s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] dense_out ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] dense_lse=%s\n",
+                                     dense_candidate->name, ggml_type_name(dense_candidate->type),
+                                     (long long) dense_candidate->ne[0], (long long) dense_candidate->ne[1],
+                                     (long long) dense_candidate->ne[2], (long long) dense_candidate->ne[3],
+                                     dense_candidate->nb[0], dense_candidate->nb[1], dense_candidate->nb[2], dense_candidate->nb[3],
+                                     (long long) dense_out->ne[0], (long long) dense_out->ne[1],
+                                     (long long) dense_out->ne[2], (long long) dense_out->ne[3],
+                                     dense_out->nb[0], dense_out->nb[1], dense_out->nb[2], dense_out->nb[3],
+                                     dense_lse != nullptr ? "yes" : "no");
                     }
                     ggml_tensor* rho = nullptr;
                     ggml_tensor* residual = nullptr;
@@ -3485,6 +3555,15 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                         residual = ggml_sub(ctx, dense_out, sparse_reshape_out);
                         residual = ggml_cast(ctx, residual, GGML_TYPE_F16);
                     }
+                    if (residual_layout_trace) {
+                        std::fprintf(stderr,
+                                     "residual_layout cache residual name=%s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] rho=%s\n",
+                                     residual->name, ggml_type_name(residual->type),
+                                     (long long) residual->ne[0], (long long) residual->ne[1],
+                                     (long long) residual->ne[2], (long long) residual->ne[3],
+                                     residual->nb[0], residual->nb[1], residual->nb[2], residual->nb[3],
+                                     rho != nullptr ? ggml_type_name(rho->type) : "none");
+                    }
                     ggml_set_name(residual, block_sparse_residual_cache_name);
                     (*block_sparse_cache_tensor)(block_sparse_residual_cache_name, residual);
                     if (sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
@@ -3518,6 +3597,31 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                         residual = ggml_ext_scale(ctx, residual, block_sparse_residual_scale);
                     }
                     kqv = ggml_add(ctx, sparse_reshape_out, residual);
+                    if (sd_env_flag_enabled("SD_HTP_RESIDUAL_VALUE_TRACE")) {
+                        std::fprintf(stderr,
+                                     "residual_value apply sparse_hash=%016" PRIx64
+                                     " residual_hash=%016" PRIx64
+                                     " sparse_data=%p residual_data=%p shape=[%lld,%lld,%lld,%lld]\n",
+                                     sd_htp_residual_trace_hash(sparse_reshape_out),
+                                     sd_htp_residual_trace_hash(residual),
+                                     sparse_reshape_out->data, residual->data,
+                                     (long long) sparse_reshape_out->ne[0],
+                                     (long long) sparse_reshape_out->ne[1],
+                                     (long long) sparse_reshape_out->ne[2],
+                                     (long long) sparse_reshape_out->ne[3]);
+                    }
+                    if (residual_layout_trace) {
+                        std::fprintf(stderr,
+                                     "residual_layout apply cached_residual name=%s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] sparse_scaled ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n",
+                                     residual->name, ggml_type_name(residual->type),
+                                     (long long) residual->ne[0], (long long) residual->ne[1],
+                                     (long long) residual->ne[2], (long long) residual->ne[3],
+                                     residual->nb[0], residual->nb[1], residual->nb[2], residual->nb[3],
+                                     (long long) sparse_reshape_out->ne[0], (long long) sparse_reshape_out->ne[1],
+                                     (long long) sparse_reshape_out->ne[2], (long long) sparse_reshape_out->ne[3],
+                                     sparse_reshape_out->nb[0], sparse_reshape_out->nb[1],
+                                     sparse_reshape_out->nb[2], sparse_reshape_out->nb[3]);
+                    }
                     if (sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_MASK_TRACE")) {
                         std::fprintf(stderr,
                                      "block_sparse_residual apply=1 cache_hit=1 rho_cache_hit=%d scale=%.4f rho=%.4f cache=%s rho_cache=%s shape=[%lld,%lld,%lld,%lld]\n",
