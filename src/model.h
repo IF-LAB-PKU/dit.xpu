@@ -256,6 +256,11 @@ public:
     std::map<ggml_type, uint32_t> get_diffusion_model_wtype_stat();
     std::map<ggml_type, uint32_t> get_vae_wtype_stat();
     String2TensorStorage& get_tensor_storage_map() { return tensor_storage_map; }
+    const TensorStorage* find_tensor_storage(const std::string& name) const;
+    // Read the source representation without allocating a ggml tensor. This is
+    // used by bounded HTP staging buffers, which are filled directly from the
+    // authoritative model file.
+    bool reload_tensor_bytes(const std::string& name, void* dst, size_t dst_size);
     void set_wtype_override(ggml_type wtype, std::string tensor_type_rules = "");
     void process_model_files(bool enable_mmap = false, bool writable_mmap = true);
     std::vector<MmapTensorStore> mmap_tensors(std::map<std::string, ggml_tensor*>& tensors,

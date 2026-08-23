@@ -209,6 +209,79 @@ void ModelLoader::add_tensor_storage(const TensorStorage& tensor_storage) {
     tensor_storage_map[tensor_storage.name] = tensor_storage;
 }
 
+const TensorStorage* ModelLoader::find_tensor_storage(const std::string& name) const {
+    auto it = tensor_storage_map.find(name);
+    return it == tensor_storage_map.end() ? nullptr : &it->second;
+}
+
+bool ModelLoader::reload_tensor_bytes(const std::string& name, void* dst, size_t dst_size) {
+    if (dst == nullptr) {
+        LOG_ERROR("cannot reload tensor '%s' into a null destination", name.c_str());
+        return false;
+    }
+
+    const TensorStorage* tensor_storage = find_tensor_storage(name);
+    if (tensor_storage == nullptr) {
+        LOG_ERROR("cannot reload unknown tensor '%s'", name.c_str());
+        return false;
+    }
+
+    const size_t bytes_to_read = static_cast<size_t>(tensor_storage->nbytes_to_read());
+    if (dst_size < bytes_to_read) {
+        LOG_ERROR("destination for tensor '%s' is too small: got %zu bytes, need %zu",
+                  name.c_str(), dst_size, bytes_to_read);
+        return false;
+    }
+
+    process_model_files(false, false);
+    if (tensor_storage->file_index >= file_data.size()) {
+        LOG_ERROR("tensor '%s' refers to invalid model file index %zu",
+                  name.c_str(), tensor_storage->file_index);
+        return false;
+    }
+
+    const ModelFileData& fdata = file_data[tensor_storage->file_index];
+    if (fdata.is_zip || tensor_storage->index_in_zip >= 0) {
+        zip_t* zip = zip_open(fdata.path.c_str(), 0, 'r');
+        if (zip == nullptr) {
+            LOG_ERROR("failed to open zip '%s' while reloading '%s'", fdata.path.c_str(), name.c_str());
+            return false;
+        }
+        bool ok = zip_entry_openbyindex(zip, tensor_storage->index_in_zip) == 0;
+        if (ok) {
+            const size_t entry_size = zip_entry_size(zip);
+            if (tensor_storage->offset > entry_size || bytes_to_read > entry_size - tensor_storage->offset) {
+                LOG_ERROR("tensor '%s' exceeds zip entry bounds", name.c_str());
+                ok = false;
+            } else if (entry_size == bytes_to_read && tensor_storage->offset == 0) {
+                ok = zip_entry_noallocread(zip, dst, bytes_to_read) == 0;
+            } else {
+                std::vector<uint8_t> entry(entry_size);
+                ok = zip_entry_noallocread(zip, entry.data(), entry_size) == 0;
+                if (ok) {
+                    memcpy(dst, entry.data() + tensor_storage->offset, bytes_to_read);
+                }
+            }
+            zip_entry_close(zip);
+        }
+        zip_close(zip);
+        return ok;
+    }
+
+    std::ifstream file(fdata.path, std::ios::binary);
+    if (!file.is_open()) {
+        LOG_ERROR("failed to open '%s' while reloading '%s'", fdata.path.c_str(), name.c_str());
+        return false;
+    }
+    file.seekg(static_cast<std::streamoff>(tensor_storage->offset));
+    file.read(static_cast<char*>(dst), static_cast<std::streamsize>(bytes_to_read));
+    if (!file) {
+        LOG_ERROR("read tensor data failed while reloading '%s' from '%s'", name.c_str(), fdata.path.c_str());
+        return false;
+    }
+    return true;
+}
+
 bool ModelLoader::init_from_file(const std::string& file_path, const std::string& prefix) {
     if (is_directory(file_path)) {
         LOG_INFO("load %s using diffusers format", file_path.c_str());

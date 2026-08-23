@@ -505,6 +505,11 @@ static size_t ggml_backend_htp_get_buffer_max_size() {
     return 256ULL * 1024ULL * 1024ULL;
 }
 
+static bool ggml_backend_htp_defer_unmap_enabled() {
+    const char * env = std::getenv("SD_HTP_DEFER_UNMAP");
+    return env == nullptr || env[0] == '\0' || std::strcmp(env, "0") != 0;
+}
+
 static bool ggml_backend_htp_ensure_work_data(ggml_backend_htp_context * ctx, size_t work_size) {
     if (work_size == 0) {
         return true;
@@ -525,7 +530,8 @@ static bool ggml_backend_htp_ensure_work_data(ggml_backend_htp_context * ctx, si
     return true;
 }
 
-ggml_backend_htp_context::ggml_backend_htp_context() : mapper(ggml_backend_htp_get_max_active_map_size(), true) {
+ggml_backend_htp_context::ggml_backend_htp_context()
+    : mapper(ggml_backend_htp_get_max_active_map_size(), ggml_backend_htp_defer_unmap_enabled()) {
     if (!dsprpc_is_available()) {
         const char * err = dsprpc_last_error();
         runtime_error    = err ? err : "libcdsprpc.so is unavailable";
@@ -719,8 +725,11 @@ static void * ggml_backend_htp_buffer_get_base(ggml_backend_buffer_t buffer) {
 static void ggml_backend_htp_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<ggml_backend_htp_buffer_context *>(buffer->context);
     if (ctx->is_rpcmem) {
+        const bool diagnostic_freed = ctx->owner->mapper.was_freed_by_diagnostic(ctx->data);
         ctx->owner->mapper.release_buffer(ctx->data);
-        rpcmem_free(ctx->data);
+        if (!diagnostic_freed) {
+            rpcmem_free(ctx->data);
+        }
     } else {
         ggml_backend_htp_aligned_free(ctx->data);
     }
