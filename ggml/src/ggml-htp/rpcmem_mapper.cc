@@ -17,6 +17,7 @@
 #include "ggml-htp-impl.h"
 #include "ggml-htp.h"
 #include "message.h"
+#include "rpcmem_session_route.h"
 
 namespace {
 
@@ -48,17 +49,25 @@ void write_buf(uint8_t *& p, const T & v) {
     p += sizeof(v);
 }
 
-void send_rpcmem_puts_to_dsp(const std::list<RpcMemMapper::UnmapRequest> & pending_unmap_reqs) {
+void send_rpcmem_puts_to_dsp(
+        const std::list<RpcMemMapper::UnmapRequest> & pending_unmap_reqs,
+        int mapper_domain) {
     if (pending_unmap_reqs.empty()) {
         return;
     }
 
     auto * ctx = ggml_backend_htp_context::instance();
-    auto * msg_hdr = reinterpret_cast<MessageHeader *>(ctx->ops_msg_chan);
+    const int session_index = htp_rpcmem_session_index_for_domain(ctx->sessions, mapper_domain);
+    auto * runtime = ctx->session_runtime(session_index);
+    void * channel = runtime != nullptr ? runtime->message_channel : nullptr;
+    auto * msg_hdr = reinterpret_cast<MessageHeader *>(channel);
     GGML_ASSERT(msg_hdr != nullptr);
 
     const int n_unmap_fds = static_cast<int>(pending_unmap_reqs.size());
-    const size_t map_req_size = sizeof(RequestHeader) + sizeof(RpcmemMapRequest) + n_unmap_fds * sizeof(int32_t);
+    const bool use_v2 = ctx->multi_session_enabled && runtime != nullptr;
+    const size_t map_req_size = sizeof(RequestHeader) +
+        (use_v2 ? sizeof(RpcmemMapRequestV2) + n_unmap_fds * sizeof(RpcmemMapEntryV2)
+                : sizeof(RpcmemMapRequest) + n_unmap_fds * sizeof(int32_t));
 
     auto * d_ptr = reinterpret_cast<volatile std::atomic<uint64_t> *>(&(msg_hdr->state.d));
     std::atomic_store(d_ptr, uint64_t{0});
@@ -71,16 +80,27 @@ void send_rpcmem_puts_to_dsp(const std::list<RpcMemMapper::UnmapRequest> & pendi
         .state = 0,
         .type  = REQUEST_TYPE_RPCMEM_MAP,
     };
-    RpcmemMapRequest map_req{
-        .n_puts = n_unmap_fds,
-        .n_gets = 0,
-    };
-
     auto * p = reinterpret_cast<uint8_t *>(message_header_get_request_ptr(msg_hdr, 0));
     write_buf(p, req_hdr);
-    write_buf(p, map_req);
-    for (const auto & req : pending_unmap_reqs) {
-        write_buf(p, req.fd);
+    if (use_v2) {
+        RpcmemMapRequestV2 map_req{
+            .magic = RPCMEM_MAP_REQUEST_SESSION_MAGIC,
+            .version = RPCMEM_MAP_REQUEST_VERSION_SESSION,
+            .header_size = sizeof(RpcmemMapRequestV2),
+            .session_token = runtime->id == 0 ? 0 :
+                ((static_cast<uint64_t>(runtime->id) << 32) | runtime->domain),
+            .n_puts = n_unmap_fds,
+            .n_gets = 0,
+        };
+        write_buf(p, map_req);
+        for (const auto & req : pending_unmap_reqs) {
+            RpcmemMapEntryV2 entry{req.fd, 0, 0, req.buf_size, 0};
+            write_buf(p, entry);
+        }
+    } else {
+        RpcmemMapRequest map_req{n_unmap_fds, 0};
+        write_buf(p, map_req);
+        for (const auto & req : pending_unmap_reqs) write_buf(p, req.fd);
     }
 
     uint32_t sum = 0;
@@ -195,7 +215,7 @@ void RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) 
             pending_unmap_reqs.push_back({fd, buf_base, buf_size, false});
             pending_host_mapped_size += buf_size;
         } else {
-            int err = fastrpc_munmap(CDSP_DOMAIN_ID, fd, buf_base, buf_size);
+            int err = fastrpc_munmap(domain_id, fd, buf_base, buf_size);
             if (err != 0) {
                 std::fprintf(stderr, "fastrpc_munmap failed with return code: %x\n", err);
             }
@@ -230,7 +250,7 @@ void RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) 
             [fd](const auto & v) { return v.fd == fd; });
 
         if (it == pending_unmap_reqs.end()) {
-            int err = fastrpc_mmap(CDSP_DOMAIN_ID, fd, buf_base, 0, buf_size, FASTRPC_MAP_FD);
+            int err = fastrpc_mmap(domain_id, fd, buf_base, 0, buf_size, FASTRPC_MAP_FD);
             while (err != 0) {
                 // 部分真机的真实 FastRPC 映射窗口会比静态预算更小，这里在 mmap 失败后继续强制释放旧映射并重试，直到当前 buffer 真正映射成功或已经无可释放对象。
                 const size_t pending_size = get_pending_host_mapped_size(pending_unmap_reqs);
@@ -263,7 +283,7 @@ void RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) 
                                err, fd, buf_base, buf_size, buf->usage);
                 }
 
-                err = fastrpc_mmap(CDSP_DOMAIN_ID, fd, buf_base, 0, buf_size, FASTRPC_MAP_FD);
+                err = fastrpc_mmap(domain_id, fd, buf_base, 0, buf_size, FASTRPC_MAP_FD);
             }
 
             ++n_map_ops;
@@ -330,14 +350,25 @@ void RpcMemMapper::release_buffer(void * buf_base) {
 }
 
 void RpcMemMapper::flush_pending_unmaps() {
-    send_rpcmem_puts_to_dsp(pending_unmap_reqs);
+    send_rpcmem_puts_to_dsp(pending_unmap_reqs, domain_id);
     unmap_all_pending_buffers();
+}
+
+void RpcMemMapper::release_all_mappings() {
+    for (const auto & [buf_base, mapping] : buf_mapping) {
+        pending_unmap_reqs.push_back({mapping.first, buf_base, mapping.second, false});
+    }
+    buf_mapping.clear();
+    buf_iters.clear();
+    accessed_bufs.clear();
+    active_map_size = 0;
+    flush_pending_unmaps();
 }
 
 void RpcMemMapper::unmap_all_pending_buffers() {
     for (auto it = pending_unmap_reqs.begin(); it != pending_unmap_reqs.end();) {
         if (!it->host_unmapped) {
-            int err = fastrpc_munmap(CDSP_DOMAIN_ID, it->fd, it->buf_base, it->buf_size);
+            int err = fastrpc_munmap(domain_id, it->fd, it->buf_base, it->buf_size);
             if (err != 0) {
                 std::fprintf(stderr, "fastrpc_munmap failed with return code: 0x%x\n", err);
             }
@@ -369,12 +400,12 @@ void RpcMemMapper::dump_state() const {
 extern "C" {
 
 int prepare_tensor_rpcmem_mapping(const struct ggml_tensor * dst) {
-    ggml_backend_htp_context::instance()->mapper.validate(dst);
+    ggml_backend_htp_context::instance()->active_mapper().validate(dst);
     return 0;
 }
 
 int prepare_tensor_rpcmem_mapping_with_extra(const struct ggml_tensor * dst, const struct ggml_tensor * extra) {
-    ggml_backend_htp_context::instance()->mapper.validate(dst, extra);
+    ggml_backend_htp_context::instance()->active_mapper().validate(dst, extra);
     return 0;
 }
 

@@ -13,9 +13,14 @@
 #include <cstdlib>
 #include <cstdio>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/dma-buf.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -27,6 +32,7 @@
 #include "ggml-htp-impl.h"
 #include "ggml-htp.h"
 #include "ggml.h"
+#include "dsprpc_interface.h"
 #include "message.h"
 #include "op_reg.h"
 
@@ -147,7 +153,7 @@ void dump_missing_mapping_diagnostics(const ggml_tensor * dst,
 }
 
 auto get_all_rpcmem_mappings(const ggml_tensor * dst) {
-    const auto & mapper = ggml_backend_htp_context::instance()->mapper;
+    const auto & mapper = ggml_backend_htp_context::instance()->active_mapper();
 
     std::vector<std::pair<int, ssize_t>> mappings;
     const ggml_tensor * mapped_dst = get_tensor_with_backing_buffer(dst);
@@ -202,6 +208,37 @@ bool env_flag_enabled(const char * name) {
     return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
 }
 
+// Diagnostic boundary probe: this calls the existing htp-ops-lib DSP kernel
+// through its standard FastRPC entry point, bypassing only the custom message
+// channel. It is intentionally restricted to the reserved session so the
+// legacy domain-3 path remains byte-for-byte unchanged.
+using direct_f16_matmul_trace_session_fn = int(
+    htp_ops_session *, int, int, int, int, int, int, int, int, int, uint64_t *, uint64_t *, uint64_t *);
+
+bool htp_direct_reserved_matmul_enabled(const ggml_backend_htp_context * ctx) {
+    return ctx != nullptr && ctx->reserved_session != nullptr &&
+           ctx->reserved_domain_id >= 0 &&
+           ctx->active_mapper().domain() == ctx->reserved_domain_id &&
+           env_flag_enabled("SD_HTP_MULTI_SESSION_DIRECT");
+}
+
+bool htp_host_dma_buf_sync_read(int fd) {
+    if (fd < 0 || !env_flag_enabled("SD_HTP_HOST_DMA_BUF_SYNC")) {
+        return true;
+    }
+    dma_buf_sync sync = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+    if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+        std::fprintf(stderr, "[ggml-htp] DMA_BUF_SYNC START failed fd=%d errno=%d\n", fd, errno);
+        return false;
+    }
+    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+    if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+        std::fprintf(stderr, "[ggml-htp] DMA_BUF_SYNC END failed fd=%d errno=%d\n", fd, errno);
+        return false;
+    }
+    return true;
+}
+
 bool htp_debug_hash_enabled() {
     const char * env = std::getenv("GGML_HTP_DEBUG_HASH");
     return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
@@ -244,6 +281,265 @@ uint64_t htp_hash_tensor_bytes(const ggml_tensor * tensor) {
         return 0;
     }
     return htp_fnv1a64_update(FNV1A64_OFFSET, tensor->data, ggml_nbytes(tensor));
+}
+
+// This exists only for the reserved-session output-alias diagnostic. It keeps
+// tensor placement unchanged and is instantiated only when explicitly enabled.
+struct htp_independent_output {
+    void * ptr = nullptr;
+    int fd = -1;
+    size_t size = 0;
+    int domain = -1;
+    bool mapped = false;
+
+    bool ensure(int mapping_domain, size_t output_size) {
+        if (ptr != nullptr && mapped && domain == mapping_domain && size >= output_size) {
+            return true;
+        }
+        if (mapped) {
+            (void) fastrpc_munmap(domain, fd, ptr, size);
+            mapped = false;
+        }
+        if (ptr != nullptr) {
+            rpcmem_free(ptr);
+            ptr = nullptr;
+            fd = -1;
+        }
+        return init(mapping_domain, output_size);
+    }
+
+    bool init(int mapping_domain, size_t output_size) {
+        if (output_size == 0 || output_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            return false;
+        }
+
+        domain = mapping_domain;
+        size = output_size;
+        ptr = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED,
+                           static_cast<int>(output_size));
+        if (ptr == nullptr) {
+            return false;
+        }
+        fd = rpcmem_to_fd(ptr);
+        if (fd < 0) {
+            rpcmem_free(ptr);
+            ptr = nullptr;
+            return false;
+        }
+        const int ret = fastrpc_mmap(domain, fd, ptr, 0, size, FASTRPC_MAP_FD);
+        if (ret != 0) {
+            std::fprintf(stderr,
+                         "[ggml-htp] independent output fastrpc_mmap failed domain=%d fd=%d size=%zu ret=%d\n",
+                         domain, fd, size, ret);
+            rpcmem_free(ptr);
+            ptr = nullptr;
+            fd = -1;
+            return false;
+        }
+        mapped = true;
+        std::memset(ptr, 0, size);
+        return true;
+    }
+
+    ~htp_independent_output() {
+        if (mapped) {
+            const int ret = fastrpc_munmap(domain, fd, ptr, size);
+            if (ret != 0) {
+                std::fprintf(stderr,
+                             "[ggml-htp] independent output fastrpc_munmap failed domain=%d fd=%d size=%zu ret=%d\n",
+                             domain, fd, size, ret);
+            }
+        }
+        if (ptr != nullptr) {
+            rpcmem_free(ptr);
+        }
+    }
+};
+
+// Reserved-PD diagnostic: stage an activation in a dedicated RPCMEM
+// allocation before dispatch. This isolates the DSP input visibility path
+// from the graph's shared fd/offset placement.
+struct htp_independent_activation {
+    void * ptr = nullptr;
+    int fd = -1;
+    size_t size = 0;
+    int domain = -1;
+    bool mapped = false;
+
+    bool init(int mapping_domain, const void * source, size_t activation_size) {
+        if (source == nullptr || activation_size == 0 ||
+            activation_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            return false;
+        }
+
+        domain = mapping_domain;
+        size = activation_size;
+        ptr = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED,
+                           static_cast<int>(activation_size));
+        if (ptr == nullptr) {
+            return false;
+        }
+        fd = rpcmem_to_fd(ptr);
+        if (fd < 0) {
+            rpcmem_free(ptr);
+            ptr = nullptr;
+            return false;
+        }
+        const int ret = fastrpc_mmap(domain, fd, ptr, 0, size, FASTRPC_MAP_FD);
+        if (ret != 0) {
+            std::fprintf(stderr,
+                         "[ggml-htp] independent activation fastrpc_mmap failed domain=%d fd=%d size=%zu ret=%d\n",
+                         domain, fd, size, ret);
+            rpcmem_free(ptr);
+            ptr = nullptr;
+            fd = -1;
+            return false;
+        }
+        mapped = true;
+        std::memcpy(ptr, source, size);
+        return true;
+    }
+
+    ~htp_independent_activation() {
+        if (mapped) {
+            const int ret = fastrpc_munmap(domain, fd, ptr, size);
+            if (ret != 0) {
+                std::fprintf(stderr,
+                             "[ggml-htp] independent activation fastrpc_munmap failed domain=%d fd=%d size=%zu ret=%d\n",
+                             domain, fd, size, ret);
+            }
+        }
+        if (ptr != nullptr) {
+            rpcmem_free(ptr);
+        }
+    }
+};
+
+// Diagnostic output isolation for the custom channel. Most HTP parameter
+// structs put the destination descriptor first; packed QKV ops expose three
+// destinations sharing the same backing tensor and are handled together.
+struct htp_isolated_dispatch_output {
+    htp_independent_output * allocation = nullptr;
+    void * destination = nullptr;
+    size_t size = 0;
+    bool active = false;
+
+    bool init(int domain, ggml_tensor * dst) {
+        if (dst == nullptr || dst->data == nullptr) {
+            return false;
+        }
+        destination = dst->data;
+        size = ggml_nbytes(dst);
+        static htp_independent_output pool;
+        allocation = &pool;
+        // Reserve one reusable slot large enough for every SD3.5 HTP output;
+        // resizing would require a DSP put before munmap and would recreate
+        // the FastRPC VA accumulation this diagnostic is meant to avoid.
+        active = allocation->ensure(domain, std::max<size_t>(size, 16u * 1024u * 1024u));
+        return active;
+    }
+
+    bool bind(int op_index, void * params, int original_fd, ssize_t original_offset) {
+        if (!active || params == nullptr || original_fd < 0 || original_offset < 0) {
+            return false;
+        }
+
+        auto bind_descriptor = [&](RpcmemBufAddr & descriptor) {
+            if (descriptor.fd != original_fd || descriptor.offset < original_offset) {
+                return false;
+            }
+            const size_t relative = static_cast<size_t>(descriptor.offset - original_offset);
+            if (relative >= size) {
+                return false;
+            }
+            descriptor.fd = allocation->fd;
+            descriptor.offset = static_cast<int32_t>(relative);
+            return true;
+        };
+
+        auto * first = static_cast<RpcmemBufAddr *>(params);
+        if (!bind_descriptor(*first)) {
+            return false;
+        }
+        switch (op_index) {
+            case HTP_OPS_QKV_MUL_RMS_PACKED_W16A32:
+            {
+                auto * p = static_cast<QkvMulRmsPackedParams *>(params);
+                if (!bind_descriptor(p->k_out) || !bind_descriptor(p->v)) {
+                    return false;
+                }
+                break;
+            }
+            case HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_W16A32:
+            {
+                auto * p = static_cast<QkvMulRmsPackedDualParams *>(params);
+                if (!bind_descriptor(p->k_out) || !bind_descriptor(p->v)) {
+                    return false;
+                }
+                break;
+            }
+            case HTP_OPS_QKV_MUL_RMS_PACKED_ROPE_W16A32:
+            {
+                auto * p = static_cast<QkvMulRmsPackedRopeParams *>(params);
+                if (!bind_descriptor(p->k_out) || !bind_descriptor(p->v)) {
+                    return false;
+                }
+                break;
+            }
+            case HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_ROPE_W16A32:
+            {
+                auto * p = static_cast<QkvMulRmsPackedDualRopeParams *>(params);
+                if (!bind_descriptor(p->k_out) || !bind_descriptor(p->v)) {
+                    return false;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+        return true;
+    }
+
+    void copy_back() const {
+        if (active && destination != nullptr && allocation != nullptr && allocation->ptr != nullptr) {
+            std::memcpy(destination, allocation->ptr, size);
+        }
+    }
+};
+
+// Probe whether a completed RPCMEM write becomes visible through the existing
+// host mapping, after msync, or only through a fresh mapping of the same fd.
+void htp_host_cache_probe(int fd, ssize_t offset, const void * data, size_t size) {
+    if (fd < 0 || data == nullptr || size == 0 || !env_flag_enabled("SD_HTP_HOST_CACHE_PROBE")) {
+        return;
+    }
+
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const uintptr_t data_addr = reinterpret_cast<uintptr_t>(data);
+    const uintptr_t page_addr = data_addr & ~(static_cast<uintptr_t>(page_size) - 1);
+    const size_t page_delta = static_cast<size_t>(data_addr - page_addr);
+    const size_t sync_size = page_delta + size;
+    const bool msync_ok = msync(reinterpret_cast<void *>(page_addr), sync_size, MS_SYNC | MS_INVALIDATE) == 0;
+    const uint64_t existing_hash = htp_fnv1a64_update(UINT64_C(14695981039346656037), data, size);
+    const uint64_t msync_hash = htp_fnv1a64_update(UINT64_C(14695981039346656037), data, size);
+
+    const ssize_t page_offset = offset & -static_cast<ssize_t>(page_size);
+    const size_t fd_delta = static_cast<size_t>(offset - page_offset);
+    const size_t map_size = fd_delta + size;
+    void * fresh_map = mmap(nullptr, map_size, PROT_READ, MAP_SHARED, fd, page_offset);
+    const bool fresh_ok = fresh_map != MAP_FAILED;
+    uint64_t fresh_hash = 0;
+    if (fresh_ok) {
+        fresh_hash = htp_fnv1a64_update(UINT64_C(14695981039346656037),
+                                        static_cast<const uint8_t *>(fresh_map) + fd_delta, size);
+        munmap(fresh_map, map_size);
+    }
+
+    std::fprintf(stderr,
+                 "[ggml-htp-cache] fd=%d offset=%zd size=%zu msync=%d fresh_mmap=%d "
+                 "existing=%016" PRIx64 " after_msync=%016" PRIx64 " fresh=%016" PRIx64 " errno=%d\n",
+                 fd, offset, size, msync_ok ? 1 : 0, fresh_ok ? 1 : 0,
+                 existing_hash, msync_hash, fresh_hash, errno);
 }
 
 std::atomic<int> htp_debug_hash_counter{0};
@@ -1860,6 +2156,23 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     const ggml_tensor * debug_activation = nullptr;
     const ggml_tensor * debug_packed_weight = nullptr;
     bool debug_f16_matmul = false;
+    int debug_output_fd = -1;
+    int debug_weight_fd = -1;
+    int debug_activation_fd = -1;
+    ssize_t debug_output_offset = 0;
+    ssize_t debug_weight_offset = 0;
+    ssize_t debug_activation_offset = 0;
+#ifdef HTP_OPS_OP_TRACE
+    uint64_t debug_vtcm_base = 0;
+    uint32_t debug_vtcm_size = 0;
+    int32_t debug_vtcm_ctx = 0;
+    int32_t debug_hmx_ctx = 0;
+    uint64_t debug_worker_pool = 0;
+    int32_t debug_hmx_lock_result = 0;
+    uint64_t debug_dsp_activation_hash = 0;
+    uint64_t debug_dsp_output_hash = 0;
+    uint64_t debug_dsp_output_hash_after_invalidate = 0;
+#endif
 
     switch (dst->op) {
         case GGML_OP_RMS_NORM:
@@ -1921,7 +2234,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 ssize_t activation_offset = 0;
 
                 if (is_f16) {
-                    auto & mapper = ctx->mapper;
+                    auto & mapper = ctx->active_mapper();
                     std::tie(output_fd, output_offset)         = mapper.get_tensor_mapping(dst);
                     std::tie(weight_fd, weight_offset)         = mapper.get_tensor_mapping(packed_weight);
                     std::tie(activation_fd, activation_offset) = mapper.get_tensor_mapping(activation);
@@ -1958,6 +2271,12 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     debug_weight = weight;
                     debug_activation = activation;
                     debug_packed_weight = packed_weight;
+                    debug_output_fd = output_fd;
+                    debug_weight_fd = weight_fd;
+                    debug_activation_fd = activation_fd;
+                    debug_output_offset = output_offset;
+                    debug_weight_offset = weight_offset;
+                    debug_activation_offset = activation_offset;
                 } else if (dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_Q4_0 && activation->type == GGML_TYPE_F32) {
                     op_index = HTP_OPS_MAT_MUL_PERMUTED_W4D16A32;
                 } else if (dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_Q8_0 && activation->type == GGML_TYPE_F32) {
@@ -2219,7 +2538,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 }
                 if (is_qkv_mul_rms_packed_dual_rope_custom(dst)) {
                     prepare_tensor_rpcmem_mapping_with_extra(dst, dst->src[0]);
-                    const auto & mapper = ggml_backend_htp_context::instance()->mapper;
+                    const auto & mapper = ggml_backend_htp_context::instance()->active_mapper();
                     std::vector<std::pair<int, ssize_t>> mappings;
                     mappings.push_back(mapper.get_tensor_mapping(dst));
                     for (int i = 0; i <= 10; ++i) {
@@ -2273,7 +2592,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 }
                 if (is_qkv_mul_rms_packed_rope_custom(dst)) {
                     prepare_tensor_rpcmem_mapping_with_extra(dst, dst->src[1]);
-                    const auto & mapper = ggml_backend_htp_context::instance()->mapper;
+                    const auto & mapper = ggml_backend_htp_context::instance()->active_mapper();
                     std::vector<std::pair<int, ssize_t>> mappings;
                     mappings.push_back(mapper.get_tensor_mapping(dst));
                     for (int i = 0; i <= 5; ++i) {
@@ -2320,7 +2639,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 }
                 if (is_qkv_mul_rms_packed_dual_custom(dst)) {
                     prepare_tensor_rpcmem_mapping_with_extra(dst, dst->src[0]);
-                    const auto & mapper = ggml_backend_htp_context::instance()->mapper;
+                    const auto & mapper = ggml_backend_htp_context::instance()->active_mapper();
                     std::vector<std::pair<int, ssize_t>> mappings;
                     mappings.push_back(mapper.get_tensor_mapping(dst));
                     for (int i = 0; i < 10; ++i) {
@@ -2454,15 +2773,33 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
         return -EINVAL;
     }
 
+    const bool isolate_all_outputs =
+        env_flag_enabled("SD_HTP_MULTI_SESSION_INDEPENDENT_ALL_OUTPUT") &&
+        ctx->reserved_session != nullptr && ctx->active_mapper().domain() == ctx->reserved_domain_id;
+    htp_isolated_dispatch_output isolated_dispatch_output;
+    if (isolate_all_outputs) {
+        auto * output_descriptor = reinterpret_cast<RpcmemBufAddr *>(param_buf);
+        const int original_output_fd = output_descriptor->fd;
+        const ssize_t original_output_offset = output_descriptor->offset;
+        if (!isolated_dispatch_output.init(ctx->active_mapper().domain(), dst) ||
+            !isolated_dispatch_output.bind(op_index, param_buf, original_output_fd,
+                                           original_output_offset)) {
+            std::fprintf(stderr,
+                         "[ggml-htp] independent all-output isolation failed op=%d tensor=%s\n",
+                         op_index, dst->name[0] != '\0' ? dst->name : "<unnamed>");
+            return -ENOMEM;
+        }
+    }
+
     int  n_reqs         = 1;
-    int  n_unmap_fds    = (int) ctx->mapper.get_pending_unmap_reqs().size();
+    int  n_unmap_fds    = (int) ctx->active_mapper().get_pending_unmap_reqs().size();
     bool has_unmap_reqs = n_unmap_fds > 0;
     if (has_unmap_reqs) {
         ++n_reqs;
     }
 
     size_t op_req_size = sizeof(RequestHeader) + sizeof(OpComputeRequest) + args_size;
-    auto * msg_hdr = reinterpret_cast<MessageHeader *>(ctx->ops_msg_chan);
+    auto * msg_hdr = reinterpret_cast<MessageHeader *>(ctx->message_channel());
 
     auto * d_ptr = reinterpret_cast<volatile std::atomic<uint64_t> *>(&(msg_hdr->state.d));
     std::atomic_store(d_ptr, uint64_t{ 0 });
@@ -2487,23 +2824,38 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     }
 
     if (has_unmap_reqs) {
-        size_t map_req_size     = sizeof(RequestHeader) + sizeof(RpcmemMapRequest) + n_unmap_fds * sizeof(int32_t);
+        auto * runtime = ctx->session_runtime(ctx->active_session_index);
+        const bool use_v2_map = ctx->multi_session_enabled && runtime != nullptr;
+        size_t map_req_size = sizeof(RequestHeader) +
+            (use_v2_map ? sizeof(RpcmemMapRequestV2) + n_unmap_fds * sizeof(RpcmemMapEntryV2)
+                        : sizeof(RpcmemMapRequest) + n_unmap_fds * sizeof(int32_t));
         msg_hdr->req_offsets[2] = msg_hdr->req_offsets[1] + map_req_size;
 
         RequestHeader req_hdr{
             .state = 0,
             .type  = REQUEST_TYPE_RPCMEM_MAP,
         };
-        RpcmemMapRequest map_req{
-            .n_puts = n_unmap_fds,
-            .n_gets = 0,
-        };
-
         auto * p = reinterpret_cast<uint8_t *>(message_header_get_request_ptr(msg_hdr, 1));
         write_buf(p, req_hdr);
-        write_buf(p, map_req);
-        for (const auto & req : ctx->mapper.get_pending_unmap_reqs()) {
-            write_buf(p, req.fd);
+        if (use_v2_map) {
+            RpcmemMapRequestV2 map_req{
+                .magic = RPCMEM_MAP_REQUEST_SESSION_MAGIC,
+                .version = RPCMEM_MAP_REQUEST_VERSION_SESSION,
+                .header_size = sizeof(RpcmemMapRequestV2),
+                .session_token = runtime->id == 0 ? 0 :
+                    ((static_cast<uint64_t>(runtime->id) << 32) | runtime->domain),
+                .n_puts = n_unmap_fds,
+                .n_gets = 0,
+            };
+            write_buf(p, map_req);
+            for (const auto & req : ctx->active_mapper().get_pending_unmap_reqs()) {
+                RpcmemMapEntryV2 entry{req.fd, 0, 0, req.buf_size, 0};
+                write_buf(p, entry);
+            }
+        } else {
+            RpcmemMapRequest map_req{n_unmap_fds, 0};
+            write_buf(p, map_req);
+            for (const auto & req : ctx->active_mapper().get_pending_unmap_reqs()) write_buf(p, req.fd);
         }
     }
 
@@ -2534,6 +2886,132 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
         }
     }
 
+    if (htp_direct_reserved_matmul_enabled(ctx) && debug_f16_matmul) {
+        auto direct_matmul = reinterpret_cast<direct_f16_matmul_trace_session_fn *>(
+            dlsym(ops_dl_handle, "htp_ops_rpc_mat_mul_permuted_w16a32_trace_session"));
+        if (direct_matmul == nullptr) {
+            std::fprintf(stderr,
+                         "[ggml-htp] direct reserved matmul requested but libhtp_ops.so lacks "
+                         "htp_ops_rpc_mat_mul_permuted_w16a32_trace_session\n");
+            return -ENOSYS;
+        }
+
+        // Pending puts are encoded on the custom channel. Drain them before
+        // entering direct FastRPC so the direct call sees the same mapper
+        // state as the normal channel path.
+        ctx->active_mapper().flush_pending_unmaps();
+        uint64_t direct_dsp_activation_hash = 0;
+        uint64_t direct_dsp_output_hash = 0;
+        uint64_t direct_dsp_output_hash_after_remap = 0;
+        const bool use_independent_output =
+            env_flag_enabled("SD_HTP_MULTI_SESSION_INDEPENDENT_OUTPUT") &&
+            htp_debug_hash_filter_matches(debug_weight);
+        const bool use_independent_activation =
+            env_flag_enabled("SD_HTP_MULTI_SESSION_INDEPENDENT_ACTIVATION") &&
+            htp_debug_hash_filter_matches(debug_weight);
+        htp_independent_output independent_output;
+        htp_independent_activation independent_activation;
+        int direct_output_fd = debug_output_fd;
+        int direct_output_offset = static_cast<int>(debug_output_offset);
+        int direct_activation_fd = debug_activation_fd;
+        int direct_activation_offset = static_cast<int>(debug_activation_offset);
+        if (use_independent_output) {
+            if (!independent_output.init(ctx->active_mapper().domain(), ggml_nbytes(dst))) {
+                std::fprintf(stderr,
+                             "[ggml-htp] independent output allocation failed for weight=%s bytes=%zu\n",
+                             debug_weight != nullptr && debug_weight->name[0] != '\0'
+                                 ? debug_weight->name : "<unnamed>",
+                             ggml_nbytes(dst));
+                return -ENOMEM;
+            }
+            direct_output_fd = independent_output.fd;
+            direct_output_offset = 0;
+        }
+        if (use_independent_activation) {
+            if (!independent_activation.init(ctx->active_mapper().domain(),
+                                             debug_activation->data,
+                                             ggml_nbytes(debug_activation))) {
+                std::fprintf(stderr,
+                             "[ggml-htp] independent activation allocation failed for weight=%s bytes=%zu\n",
+                             debug_weight != nullptr && debug_weight->name[0] != '\0'
+                                 ? debug_weight->name : "<unnamed>",
+                             ggml_nbytes(debug_activation));
+                return -ENOMEM;
+            }
+            direct_activation_fd = independent_activation.fd;
+            direct_activation_offset = 0;
+        }
+        const int direct_ret = direct_matmul(
+            ctx->reserved_session,
+            direct_output_fd,
+            direct_output_offset,
+            direct_activation_fd,
+            direct_activation_offset,
+            debug_weight_fd,
+            static_cast<int>(debug_weight_offset),
+            dispatch_m,
+            dispatch_k,
+            dispatch_n,
+            &direct_dsp_activation_hash,
+            &direct_dsp_output_hash,
+            &direct_dsp_output_hash_after_remap);
+
+        if (direct_ret == 0) {
+            (void) htp_host_dma_buf_sync_read(direct_output_fd);
+        }
+        const uint64_t direct_independent_output_hash = use_independent_output
+            ? htp_fnv1a64_update(UINT64_C(14695981039346656037),
+                                  independent_output.ptr, independent_output.size)
+            : 0;
+        if (direct_ret == 0 && use_independent_output) {
+            // Preserve the graph's normal tensor ownership after observing the
+            // isolated Host readback, so only this output allocation differs.
+            std::memcpy(dst->data, independent_output.ptr, independent_output.size);
+        }
+        const uint64_t direct_weight_hash = htp_hash_tensor_bytes(debug_weight);
+        const uint64_t direct_packed_weight_hash = htp_hash_tensor_bytes(debug_packed_weight);
+        const uint64_t direct_output_hash = htp_hash_tensor_bytes(dst);
+        std::fprintf(stderr,
+                     "[ggml-htp-hash] idx=%d ret=%d direct=1 weight=%s packed=%s self_packed=%d "
+                     "mkn=[%d,%d,%d] domain=%d weight_hash=%016" PRIx64 " packed_hash=%016" PRIx64 " "
+                     "fds=[%d,%d,%d] offsets=[%zd,%zd,%zd] act_bytes=%zu act_hash=%016" PRIx64 " "
+                     "dsp_act_hash=%016" PRIx64 " dsp_out_hash=%016" PRIx64 " "
+                     "dsp_out_hash_after_remap=%016" PRIx64 " "
+                     "isolated_output=%d isolated_fd=%d isolated_host_hash=%016" PRIx64 " "
+                     "isolated_activation=%d isolated_activation_fd=%d "
+                     "out_bytes=%zu out_hash=%016" PRIx64 "\n",
+                     debug_hash_index,
+                     direct_ret,
+                     debug_weight != nullptr && debug_weight->name[0] != '\0' ? debug_weight->name : "<unnamed>",
+                     debug_packed_weight != nullptr && debug_packed_weight->name[0] != '\0' ? debug_packed_weight->name : "<unnamed>",
+                     debug_weight == debug_packed_weight ? 1 : 0,
+                     dispatch_m,
+                     dispatch_k,
+                     dispatch_n,
+                     ctx->active_mapper().domain(),
+                     direct_weight_hash,
+                     direct_packed_weight_hash,
+                     debug_output_fd,
+                     debug_weight_fd,
+                     debug_activation_fd,
+                     debug_output_offset,
+                     debug_weight_offset,
+                     debug_activation_offset,
+                     debug_activation != nullptr ? ggml_nbytes(debug_activation) : 0,
+                     debug_activation_hash,
+                     direct_dsp_activation_hash,
+                     direct_dsp_output_hash,
+                     direct_dsp_output_hash_after_remap,
+                     use_independent_output ? 1 : 0,
+                     use_independent_output ? independent_output.fd : -1,
+                     direct_independent_output_hash,
+                     use_independent_activation ? 1 : 0,
+                     use_independent_activation ? independent_activation.fd : -1,
+                     dst != nullptr ? ggml_nbytes(dst) : 0,
+                     direct_output_hash);
+        return direct_ret;
+    }
+
     std::atomic_store_explicit(v0_ptr, uint8_t{ 1 }, std::memory_order_release);
 
     const int timeout_ms = htp_dispatch_timeout_ms();
@@ -2544,7 +3022,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
             dump_htp_dispatch_state("dispatch-timeout", dst, op_index, dispatch_m, dispatch_k, dispatch_n, waited_ms);
             d_ptr->store(0, std::memory_order_relaxed);
             if (has_unmap_reqs) {
-                ctx->mapper.unmap_all_pending_buffers();
+                ctx->active_mapper().unmap_all_pending_buffers();
             }
             return -ETIMEDOUT;
         }
@@ -2553,13 +3031,19 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     d_ptr->store(0, std::memory_order_relaxed);
 
     if (has_unmap_reqs) {
-        ctx->mapper.unmap_all_pending_buffers();
+        ctx->active_mapper().unmap_all_pending_buffers();
     }
+
+    isolated_dispatch_output.copy_back();
 
     std::atomic_thread_fence(std::memory_order_acquire);
     auto * completed_request = message_header_get_request_ptr(msg_hdr, 0);
     int ret = completed_request->state;
     auto * compute_request = reinterpret_cast<OpComputeRequest *>(completed_request->data);
+    if (ret == 0 && debug_f16_matmul) {
+        (void) htp_host_dma_buf_sync_read(debug_output_fd);
+        htp_host_cache_probe(debug_output_fd, debug_output_offset, dst->data, ggml_nbytes(dst));
+    }
     if (env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE") && debug_f16_matmul && dst != nullptr &&
         dst->type == GGML_TYPE_F32 && dispatch_m == 768 && dispatch_k == 3072 &&
         (dispatch_n == 9216 || dispatch_n == 27648)) {
@@ -2675,9 +3159,30 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
         std::fprintf(stderr, "\n");
     }
     if (debug_hash_index >= 0) {
+#ifdef HTP_OPS_OP_TRACE
+        const auto * trace_params = reinterpret_cast<const MatMulParams *>(compute_request->payload);
+        debug_vtcm_base = trace_params->debug_vtcm_base;
+        debug_vtcm_size = trace_params->debug_vtcm_size;
+        debug_vtcm_ctx = trace_params->debug_vtcm_ctx;
+        debug_hmx_ctx = trace_params->debug_hmx_ctx;
+        debug_worker_pool = trace_params->debug_worker_pool;
+        debug_hmx_lock_result = trace_params->debug_hmx_lock_result;
+        debug_dsp_activation_hash = trace_params->debug_dsp_activation_hash;
+        debug_dsp_output_hash = trace_params->debug_dsp_output_hash;
+        debug_dsp_output_hash_after_invalidate = trace_params->debug_dsp_output_hash_after_invalidate;
+#endif
+        const uint64_t weight_hash = htp_hash_tensor_bytes(debug_weight);
+        const uint64_t packed_weight_hash = htp_hash_tensor_bytes(debug_packed_weight);
         const uint64_t output_hash = htp_hash_tensor_bytes(dst);
         std::fprintf(stderr,
                      "[ggml-htp-hash] idx=%d ret=%d weight=%s packed=%s self_packed=%d mkn=[%d,%d,%d] "
+                     "domain=%d weight_hash=%016" PRIx64 " packed_hash=%016" PRIx64 " "
+                     "fds=[%d,%d,%d] offsets=[%zd,%zd,%zd] "
+#ifdef HTP_OPS_OP_TRACE
+                     "vtcm=[%016" PRIx64 ",%u,ctx=%d] hmx_ctx=%d worker=%016" PRIx64 " lock=%d "
+                     "dsp_act_hash=%016" PRIx64 " dsp_out_hash=%016" PRIx64
+                     " dsp_out_hash_after_invalidate=%016" PRIx64 " "
+#endif
                      "act_bytes=%zu act_hash=%016" PRIx64 " out_bytes=%zu out_hash=%016" PRIx64 "\n",
                      debug_hash_index,
                      ret,
@@ -2687,6 +3192,26 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                      dispatch_m,
                      dispatch_k,
                      dispatch_n,
+                     ctx->active_mapper().domain(),
+                     weight_hash,
+                     packed_weight_hash,
+                     debug_output_fd,
+                     debug_weight_fd,
+                     debug_activation_fd,
+                     debug_output_offset,
+                     debug_weight_offset,
+                     debug_activation_offset,
+#ifdef HTP_OPS_OP_TRACE
+                     debug_vtcm_base,
+                     debug_vtcm_size,
+                     debug_vtcm_ctx,
+                     debug_hmx_ctx,
+                     debug_worker_pool,
+                     debug_hmx_lock_result,
+                     debug_dsp_activation_hash,
+                     debug_dsp_output_hash,
+                     debug_dsp_output_hash_after_invalidate,
+#endif
                      debug_activation != nullptr ? ggml_nbytes(debug_activation) : 0,
                      debug_activation_hash,
                      dst != nullptr ? ggml_nbytes(dst) : 0,

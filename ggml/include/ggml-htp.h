@@ -280,6 +280,16 @@ GGML_BACKEND_API struct ggml_tensor * ggml_backend_htp_get_packed_f16_weight(con
 // 暴露 hybrid 开关给上层推理线路，避免只能依赖全局环境变量控制 HTP 混合执行。
 GGML_BACKEND_API void ggml_backend_htp_set_hybrid_enabled(bool enabled);
 GGML_BACKEND_API bool ggml_backend_htp_get_hybrid_enabled(void);
+GGML_BACKEND_API bool ggml_backend_htp_set_active_session(ggml_backend_t backend, int session_index);
+// Select a session from the serialized hybrid graph worker.  This variant
+// intentionally does not take the backend mutex: it is called while the HTP
+// graph-compute mutex is already held by the owning backend.
+GGML_BACKEND_API bool ggml_backend_htp_select_session_for_compute(int session_index);
+GGML_BACKEND_API int ggml_backend_htp_session_count_for_compute(void);
+GGML_BACKEND_API int ggml_backend_htp_active_session(ggml_backend_t backend);
+GGML_BACKEND_API int ggml_backend_htp_active_domain(ggml_backend_t backend);
+GGML_BACKEND_API int ggml_backend_htp_session_count(ggml_backend_t backend);
+GGML_BACKEND_API int ggml_backend_htp_session_domain(ggml_backend_t backend, int session_index);
 
 // Mark packed dense attention tensors used by deferred OpenCL residual jobs as
 // graph outputs before gallocr plans the arena, so their spans stay live until

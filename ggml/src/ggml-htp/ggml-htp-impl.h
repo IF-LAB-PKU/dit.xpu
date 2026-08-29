@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -13,7 +14,10 @@
 
 #include "ggml.h"
 #include "ggml-htp.h"
+#include "htp_session.h"
 #include "rpcmem_mapper.h"
+
+struct htp_ops_session;
 
 static const char * HTP_OPS_DL_PATH = "libhtp_ops.so";
 
@@ -32,6 +36,30 @@ struct ggml_backend_htp_context {
     struct ggml_threadpool * threadpool = nullptr;
 
     RpcMemMapper mapper;
+    std::unique_ptr<RpcMemMapper> reserved_mapper;
+    // Session 0 uses the legacy mapper member for ABI/source compatibility.
+    // Every opt-in reserved session gets its own mapper and runtime record.
+    std::vector<std::unique_ptr<RpcMemMapper>> session_mappers;
+    std::vector<HtpSessionRuntime> sessions;
+
+    // The default session remains the only execution path unless explicitly
+    // enabled. The reserved session is kept separate until graph ownership
+    // and transfer scheduling are enabled in a later migration phase.
+    bool multi_session_enabled = false;
+    htp_ops_session * reserved_session = nullptr;
+    int reserved_domain_id = -1;
+    void * reserved_session_open_fn = nullptr;
+    void * reserved_session_init_fn = nullptr;
+    void * reserved_session_create_channel_fn = nullptr;
+    void * reserved_session_domain_fn = nullptr;
+    void * reserved_session_close_fn = nullptr;
+    void * reserved_ops_msg_chan = nullptr;
+    int reserved_msg_chan_fd = -1;
+    bool reserved_msg_chan_mapped = false;
+    void * active_ops_msg_chan = nullptr;
+    int active_session_index = 0;
+    void * reserved_session_acquire_fn = nullptr;
+    void * reserved_session_release_fn = nullptr;
 
     void * ops_dl_handle = nullptr;
     bool ops_backend_initialized = false;
@@ -78,6 +106,33 @@ struct ggml_backend_htp_context {
     ~ggml_backend_htp_context();
 
     int init_message_channel();
+    int init_reserved_message_channel();
+    int init_session_message_channel(HtpSessionRuntime & session);
+    int set_active_session(int session_index);
+    HtpSessionRuntime * session_runtime(int session_index) {
+        if (session_index < 0 || static_cast<size_t>(session_index) >= sessions.size()) {
+            return nullptr;
+        }
+        return &sessions[static_cast<size_t>(session_index)];
+    }
+    const HtpSessionRuntime * session_runtime(int session_index) const {
+        if (session_index < 0 || static_cast<size_t>(session_index) >= sessions.size()) {
+            return nullptr;
+        }
+        return &sessions[static_cast<size_t>(session_index)];
+    }
+    size_t session_count() const { return sessions.size(); }
+    RpcMemMapper & active_mapper() {
+        HtpSessionRuntime * runtime = session_runtime(active_session_index);
+        return runtime != nullptr && runtime->mapper != nullptr ? *runtime->mapper : mapper;
+    }
+    const RpcMemMapper & active_mapper() const {
+        const HtpSessionRuntime * runtime = session_runtime(active_session_index);
+        return runtime != nullptr && runtime->mapper != nullptr ? *runtime->mapper : mapper;
+    }
+    void * message_channel() const {
+        return active_ops_msg_chan != nullptr ? active_ops_msg_chan : ops_msg_chan;
+    }
 
     static ggml_backend_htp_context * instance();
     static ggml_backend_htp_context * acquire_instance();

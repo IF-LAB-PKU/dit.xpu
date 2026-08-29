@@ -39,6 +39,7 @@
 
 #include "htp_tensor_flags.h"
 #include "htp_packed_staging.h"
+#include "ggml/src/ggml-htp/session_ownership.h"
 #include "model.h"
 #include "tensor.hpp"
 
@@ -6262,6 +6263,17 @@ protected:
     };
     std::vector<CacheStorageSegment> cache_storage_segments_;
 
+    struct SessionTransferStorage {
+        ggml_context* ctx = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        ggml_tensor* tensor = nullptr;
+        std::string name;
+        HtpSessionOwner source;
+        HtpSessionOwner destination;
+    };
+    std::vector<SessionTransferStorage> session_transfer_storage_;
+    HtpSessionOwnership cache_session_ownership_;
+
     struct AsyncResidualCacheGeneration {
         uint64_t generation = 0;
         ggml_backend_htp_async_cache_slot* slot = nullptr;
@@ -6440,6 +6452,21 @@ protected:
             }
         }
         cache_storage_segments_.clear();
+    }
+
+    void free_session_transfer_storage() {
+        for (SessionTransferStorage& transfer : session_transfer_storage_) {
+            if (transfer.buffer != nullptr) {
+                ggml_backend_buffer_free(transfer.buffer);
+                transfer.buffer = nullptr;
+            }
+            if (transfer.ctx != nullptr) {
+                ggml_free(transfer.ctx);
+                transfer.ctx = nullptr;
+            }
+            transfer.tensor = nullptr;
+        }
+        session_transfer_storage_.clear();
     }
 
     void free_async_residual_cache_slots() {
@@ -7284,6 +7311,20 @@ protected:
         return hash;
     }
 
+    void log_graph_cut_cache_hash(const char* phase,
+                                  const std::string& name,
+                                  ggml_tensor* tensor,
+                                  uint64_t hash) const {
+        if (!sd_env_flag_enabled("SD_HTP_GRAPH_CUT_CACHE_HASH") ||
+            tensor == nullptr) {
+            return;
+        }
+        std::fprintf(stderr,
+                     "htp_graph_cut_cache_hash phase=%s name=%s bytes=%zu hash=%016" PRIx64 "\n",
+                     phase != nullptr ? phase : "unknown",
+                     name.c_str(), ggml_nbytes(tensor), hash);
+    }
+
     void log_htp_packed_f16_weight_hashes_for_debug(const std::vector<ggml_tensor*>& tensors) {
         if (!sd_env_flag_enabled("SD_HTP_DEBUG_PACKED_HASH")) {
             return;
@@ -7844,6 +7885,11 @@ protected:
                 free_cache_storage_segment(segment);
                 return false;
             }
+            uint64_t source_hash = 0;
+            if (sd_env_flag_enabled("SD_HTP_GRAPH_CUT_CACHE_HASH")) {
+                source_hash = hash_tensor_bytes_for_debug(src);
+                log_graph_cut_cache_hash("source", kv.second->name, src, source_hash);
+            }
             const bool use_staging_copy = src->view_src != nullptr ||
                                           !ggml_is_contiguous(src) ||
                                           src->buffer == nullptr;
@@ -7853,6 +7899,16 @@ protected:
                 ggml_backend_tensor_set(dst, host_data.data(), 0, host_data.size());
             } else {
                 ggml_backend_tensor_copy(src, dst);
+            }
+            if (sd_env_flag_enabled("SD_HTP_GRAPH_CUT_CACHE_HASH")) {
+                const uint64_t destination_hash = hash_tensor_bytes_for_debug(dst);
+                log_graph_cut_cache_hash("destination", kv.second->name, dst, destination_hash);
+                std::fprintf(stderr,
+                             "htp_graph_cut_cache_hash_compare name=%s bytes=%zu source=%016" PRIx64
+                             " destination=%016" PRIx64 " match=%d\n",
+                             kv.second->name,
+                             ggml_nbytes(src), source_hash, destination_hash,
+                             source_hash == destination_hash ? 1 : 0);
             }
         }
         ggml_backend_synchronize(runtime_backend);
@@ -8595,7 +8651,82 @@ protected:
         }
     }
 
-    bool bind_segment_cached_inputs(ggml_cgraph* gf, const GraphCutSegment& segment) {
+    bool make_session_transfer(const std::string& name,
+                               ggml_tensor* source,
+                               HtpSessionOwner destination,
+                               ggml_tensor** destination_tensor_out) {
+        GGML_ASSERT(destination_tensor_out != nullptr);
+        *destination_tensor_out = source;
+        if (source == nullptr || htp_backend == nullptr ||
+            !sd_env_flag_enabled("SD_HTP_MULTI_SESSION")) {
+            return true;
+        }
+
+        const HtpSessionOwner source_owner = cache_session_ownership_.owner(name);
+        if (!cache_session_ownership_.has(name) ||
+            (source_owner.session == destination.session &&
+             source_owner.domain == destination.domain)) {
+            return true;
+        }
+
+        ggml_context* transfer_ctx = new_cache_ctx();
+        ggml_tensor* transfer_tensor = ggml_dup_tensor(transfer_ctx, source);
+        ggml_set_name(transfer_tensor, name.c_str());
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(htp_backend);
+        ggml_backend_buffer_t transfer_buffer =
+            ggml_backend_alloc_ctx_tensors_from_buft(transfer_ctx, buft);
+        if (transfer_buffer == nullptr) {
+            ggml_free(transfer_ctx);
+            LOG_ERROR("%s session transfer allocation failed: name=%s bytes=%zu destination_session=%d domain=%d",
+                      get_desc().c_str(), name.c_str(), ggml_nbytes(source),
+                      destination.session, destination.domain);
+            return false;
+        }
+
+        std::vector<uint8_t> host_data(ggml_nbytes(source));
+        ggml_backend_tensor_get(source, host_data.data(), 0, host_data.size());
+        ggml_backend_tensor_set(transfer_tensor, host_data.data(), 0, host_data.size());
+        ggml_backend_synchronize(htp_backend);
+
+        if (sd_env_flag_enabled("SD_HTP_MULTI_SESSION_TRANSFER_TRACE")) {
+            static constexpr uint64_t FNV1A64_OFFSET = UINT64_C(14695981039346656037);
+            const uint64_t source_hash =
+                sd_fnv1a64_update(FNV1A64_OFFSET, host_data.data(), host_data.size());
+            const uint64_t destination_hash = hash_tensor_bytes_for_debug(transfer_tensor);
+            std::fprintf(stderr,
+                         "session_transfer_hash source_session=%d destination_session=%d bytes=%zu source=%016" PRIx64
+                         " destination=%016" PRIx64 " match=%d name=%s\n",
+                         source_owner.session, destination.session, host_data.size(),
+                         source_hash, destination_hash,
+                         source_hash == destination_hash ? 1 : 0, name.c_str());
+            if (source_hash != destination_hash) {
+                LOG_ERROR("%s session transfer readback mismatch: name=%s", get_desc().c_str(), name.c_str());
+                ggml_backend_buffer_free(transfer_buffer);
+                ggml_free(transfer_ctx);
+                return false;
+            }
+        }
+
+        session_transfer_storage_.push_back({
+            transfer_ctx,
+            transfer_buffer,
+            transfer_tensor,
+            name,
+            source_owner,
+            destination,
+        });
+        *destination_tensor_out = transfer_tensor;
+        std::fprintf(stderr,
+                     "session_transfer source_session=%d source_domain=%d destination_session=%d destination_domain=%d bytes=%zu name=%s\n",
+                     source_owner.session, source_owner.domain,
+                     destination.session, destination.domain,
+                     host_data.size(), name.c_str());
+        return true;
+    }
+
+    bool bind_segment_cached_inputs(ggml_cgraph* gf,
+                                    const GraphCutSegment& segment,
+                                    HtpSessionOwner destination) {
         GGML_ASSERT(gf != nullptr);
         for (const auto& input : segment.input_refs) {
             ggml_tensor* input_tensor = sd::ggml_graph_cut::input_tensor(gf, input);
@@ -8611,17 +8742,22 @@ protected:
                                   input.display_name.c_str());
                         return false;
                     }
+                    ggml_tensor* bound_cache_tensor = cache_tensor;
+                    if (!make_session_transfer(input.display_name, cache_tensor,
+                                               destination, &bound_cache_tensor)) {
+                        return false;
+                    }
                     if (input_tensor->view_src != nullptr) {
-                        input_tensor->view_src = cache_tensor;
+                        input_tensor->view_src = bound_cache_tensor;
                         input_tensor->buffer   = nullptr;
-                        input_tensor->data     = cache_tensor->data == nullptr
+                        input_tensor->data     = bound_cache_tensor->data == nullptr
                                                      ? nullptr
-                                                     : static_cast<void*>(static_cast<char*>(cache_tensor->data) + input_tensor->view_offs);
-                        input_tensor->extra    = cache_tensor->extra;
+                                                     : static_cast<void*>(static_cast<char*>(bound_cache_tensor->data) + input_tensor->view_offs);
+                        input_tensor->extra    = bound_cache_tensor->extra;
                     } else {
-                        input_tensor->buffer = cache_tensor->buffer;
-                        input_tensor->data   = cache_tensor->data;
-                        input_tensor->extra  = cache_tensor->extra;
+                        input_tensor->buffer = bound_cache_tensor->buffer;
+                        input_tensor->data   = bound_cache_tensor->data;
+                        input_tensor->extra  = bound_cache_tensor->extra;
                     }
                     for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                         input_tensor->src[src_idx] = nullptr;
@@ -8717,6 +8853,15 @@ protected:
                               get_desc().c_str(), tensor->name, required_bytes,
                               htp_packed_staging_pool_->budget_bytes());
                     release_htp_packed_staging();
+                    // Diagnostic-only escape hatch: graph-cut/session routing
+                    // can still be exercised with the original packed weights.
+                    // Keep the default behavior strict so production callers
+                    // never silently lose staging protection.
+                    if (sd_env_flag_enabled("SD_HTP_PACKED_STAGING_ALLOW_FALLBACK")) {
+                        LOG_INFO("%s packed staging fallback: continuing without staged weights",
+                                 get_desc().c_str());
+                        return true;
+                    }
                     return false;
                 }
                 htp_packed_staging_handles_.push_back(handle);
@@ -9039,6 +9184,10 @@ protected:
         free_cache_ctx_and_buffer();
 
         std::optional<sd::Tensor<T>> output = sd::Tensor<T>();
+        const bool use_multi_session_segments =
+            sd_env_flag_enabled("SD_HTP_MULTI_SESSION") &&
+            sd_env_flag_enabled("SD_HTP_PACKED_STAGING") &&
+            htp_backend != nullptr;
         for (size_t seg_idx = 0; seg_idx < plan.segments.size(); ++seg_idx) {
             int64_t t_segment_begin = ggml_time_ms();
             const auto& segment     = plan.segments[seg_idx];
@@ -9049,8 +9198,61 @@ protected:
                       plan.segments.size(),
                       segment.group_name.c_str());
 
+            int segment_session = 0;
+            if (use_multi_session_segments) {
+                const char* owner_mode = sd_env_value("SD_HTP_MULTI_SESSION_OWNER_MODE");
+                if (owner_mode != nullptr && std::strcmp(owner_mode, "default") == 0) {
+                    segment_session = 0;
+                } else if (owner_mode != nullptr && std::strcmp(owner_mode, "reserved") == 0) {
+                    segment_session = 1;
+                } else {
+                    segment_session = static_cast<int>(seg_idx & 1u);
+                }
+            }
+            if (use_multi_session_segments) {
+                if (seg_idx > 0 && sd_env_flag_enabled("SD_HTP_MULTI_SESSION_REACQUIRE_EACH_SEGMENT")) {
+                    const int active_session = ggml_backend_htp_active_session(htp_backend);
+                    if (active_session == segment_session) {
+                        const int temporary_session = segment_session == 0 ? 1 : 0;
+                        if (!ggml_backend_htp_set_active_session(htp_backend, temporary_session) ||
+                            !ggml_backend_htp_set_active_session(htp_backend, segment_session)) {
+                            LOG_ERROR("%s failed to reacquire HTP session=%d between segments",
+                                      get_desc().c_str(), segment_session);
+                            free_cache_ctx_and_buffer();
+                            free_compute_buffer();
+                            free_compute_ctx();
+                            return std::nullopt;
+                        }
+                        LOG_INFO("%s htp_segment_lease_reacquired session=%d domain=%d",
+                                 get_desc().c_str(), segment_session,
+                                 ggml_backend_htp_active_domain(htp_backend));
+                    }
+                }
+                if (!ggml_backend_htp_set_active_session(htp_backend, segment_session)) {
+                    LOG_ERROR("%s failed to activate HTP segment session=%d", get_desc().c_str(), segment_session);
+                    free_cache_ctx_and_buffer();
+                    free_compute_buffer();
+                    free_compute_ctx();
+                    return std::nullopt;
+                }
+                LOG_INFO("%s htp_segment_owner segment=%zu session=%d domain=%d",
+                         get_desc().c_str(), seg_idx, segment_session,
+                         ggml_backend_htp_active_domain(htp_backend));
+            }
+
+            // Transfers are scoped to one consumer segment.  Releasing the
+            // previous destination buffers here keeps the pool bounded and
+            // prevents a transfer from becoming an accidental persistent
+            // weight allocation.
+            free_session_transfer_storage();
+
             reset_segment_runtime_tensors(segment, gf);
-            if (!bind_segment_cached_inputs(gf, segment)) {
+            const HtpSessionOwner segment_owner{
+                segment_session,
+                use_multi_session_segments
+                    ? ggml_backend_htp_active_domain(htp_backend) : 3,
+            };
+            if (!bind_segment_cached_inputs(gf, segment, segment_owner)) {
                 free_cache_ctx_and_buffer();
                 free_compute_buffer();
                 free_compute_ctx();
@@ -9080,12 +9282,24 @@ protected:
                                                    &future_cut_names);
             ggml_free(segment_graph_ctx);
             if (!segment_output.has_value()) {
+                if (use_multi_session_segments) {
+                    (void) ggml_backend_htp_set_active_session(htp_backend, 0);
+                }
                 free_cache_ctx_and_buffer();
                 free_compute_buffer();
                 free_compute_ctx();
                 return std::nullopt;
             }
             output = std::move(segment_output);
+        }
+
+        if (use_multi_session_segments &&
+            !ggml_backend_htp_set_active_session(htp_backend, 0)) {
+            LOG_ERROR("%s failed to restore default HTP session after graph cuts", get_desc().c_str());
+            backend_tensor_data_map.clear();
+            free_cache_ctx_and_buffer();
+            free_compute_ctx();
+            return std::nullopt;
         }
 
         backend_tensor_data_map.clear();
@@ -9233,6 +9447,7 @@ public:
     }
 
     void free_cache_ctx_and_buffer() {
+        free_session_transfer_storage();
         free_cache_buffer();
         free_cache_ctx();
     }
@@ -9301,6 +9516,22 @@ public:
             tensor = ggml_cont(compute_ctx, tensor);
         }
         cache_tensor_map[name] = tensor;
+        if (sd_env_flag_enabled("SD_HTP_MULTI_SESSION") && htp_backend != nullptr) {
+            const HtpSessionOwner owner{
+                ggml_backend_htp_active_session(htp_backend),
+                ggml_backend_htp_active_domain(htp_backend),
+            };
+            if (!cache_session_ownership_.record(name, owner)) {
+                LOG_ERROR("%s cache session owner changed: name=%s existing_session=%d existing_domain=%d new_session=%d new_domain=%d",
+                          get_desc().c_str(), name.c_str(),
+                          cache_session_ownership_.owner(name).session,
+                          cache_session_ownership_.owner(name).domain,
+                          owner.session, owner.domain);
+            }
+            LOG_INFO("%s htp_cache_owner name=%s session=%d domain=%d bytes=%zu",
+                     get_desc().c_str(), name.c_str(), owner.session, owner.domain,
+                     tensor != nullptr ? ggml_nbytes(tensor) : 0);
+        }
         return tensor;
     }
 
@@ -9347,11 +9578,27 @@ public:
 
         const bool uses_cross_step_cache =
             !cache_tensor_map.empty() || !cache_backed_tensor_name_map.empty();
-        if (!uses_cross_step_cache && can_attempt_graph_cut_segmented_compute()) {
+        // Packed staging is segment-scoped, so its unified opt-in must also
+        // allow graph-cut when cross-step cache tensors are present. Multi-
+        // session only changes segment ownership and transfer routing.
+        const bool allow_packed_staging_graph_cut =
+            sd_env_flag_enabled("SD_HTP_PACKED_STAGING");
+        if ((!uses_cross_step_cache || allow_packed_staging_graph_cut) &&
+            can_attempt_graph_cut_segmented_compute()) {
+            if (allow_packed_staging_graph_cut && uses_cross_step_cache) {
+                LOG_INFO("%s packed-staging graph-cut override: cache tensors=%zu cache bindings=%zu",
+                         get_desc().c_str(), cache_tensor_map.size(),
+                         cache_backed_tensor_name_map.size());
+            }
             GraphCutPlan plan;
             if (!resolve_graph_cut_plan(gf, &plan)) {
                 free_compute_ctx();
                 return std::nullopt;
+            }
+            if (sd_env_flag_enabled("SD_HTP_MULTI_SESSION")) {
+                LOG_INFO("%s multi-session graph plan: has_cuts=%d valid=%d segments=%zu max_vram=%zu",
+                         get_desc().c_str(), plan.has_cuts ? 1 : 0, plan.valid ? 1 : 0,
+                         plan.segments.size(), max_graph_vram_bytes);
             }
             if (should_use_graph_cut_segmented_compute(plan)) {
                 return compute_with_graph_cuts<T>(gf,

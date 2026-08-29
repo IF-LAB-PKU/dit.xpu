@@ -10,9 +10,15 @@ set(GGML_SOURCES_HTP
     op_reg.h
     rpcmem_mapper.cc
     rpcmem_mapper.h
+    session_placement.h
 )
 
 ggml_add_backend_library(ggml-htp ${GGML_SOURCES_HTP})
+
+option(GGML_HTP_OP_TRACE "Trace HTP operation input/output mappings" OFF)
+if (GGML_HTP_OP_TRACE)
+    target_compile_definitions(ggml-htp PRIVATE HTP_OPS_OP_TRACE)
+endif()
 
 if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
     target_compile_definitions(ggml-htp PRIVATE GGML_HTP_OPENCL_SIDECAR)
