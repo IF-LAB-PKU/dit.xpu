@@ -16,6 +16,8 @@
 #include "ggml-backend.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-htp-lifetime.h"
+#include "ggml-htp.h"
+#include "session_placement.h"
 #include "ggml-impl.h"
 #include "ggml-threading.h"
 #include "ggml.h"
@@ -3472,6 +3474,26 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
     }
 
+    const int multi_session_count = ggml_backend_htp_session_count_for_compute();
+    const bool multi_session_enabled =
+        multi_session_count > 1 &&
+        getenv("SD_HTP_MULTI_SESSION") != NULL &&
+        getenv("SD_HTP_MULTI_SESSION")[0] != '0';
+    int htp_node_count = 0;
+    if (multi_session_enabled) {
+        for (int graph_node_n = 0; graph_node_n < cgraph->n_nodes; ++graph_node_n) {
+            const struct ggml_tensor * graph_node = cgraph->nodes[graph_node_n];
+            if (ggml_op_is_empty(graph_node->op) ||
+                (graph_node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                continue;
+            }
+            if (htp_ops_support_op_runtime(graph_node)) {
+                ++htp_node_count;
+            }
+        }
+    }
+    int htp_ordinal = 0;
+
     // 如果某个 HTP op 已经失败，当前节点同步完成后立刻停止后续节点，避免错误 dst 继续污染整张图。
     for (int node_n = 0; node_n < cgraph->n_nodes &&
             atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
@@ -3501,6 +3523,35 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (state->ith == 0) {
             htp_ops_opencl_trace_next_node_admitted(node);
         }
+        if (tp->ec != GGML_STATUS_SUCCESS) {
+            break;
+        }
+
+        // The hybrid graph worker is the actual dispatch boundary for dense
+        // HTP graphs.  Select the owner here, before worker zero enters
+        // htp_ops_compute_op; the graph remains one ordered serial graph and
+        // all other workers rendezvous on the existing node barrier.
+        if (state->ith == 0 && htp_ops_support_op_runtime(node)) {
+            if (multi_session_enabled) {
+                const int current_htp_ordinal = htp_ordinal;
+                const int owner_session = htp_session_owner_for_ordinal(
+                    current_htp_ordinal, htp_node_count, multi_session_count);
+                ++htp_ordinal;
+                if (!ggml_backend_htp_select_session_for_compute(owner_session)) {
+                    fprintf(stderr,
+                            "ggml-htp: hybrid session selection failed node=%d session=%d op=%s\n",
+                            node_n, owner_session, ggml_op_name(node->op));
+                    ggml_htp_mark_op_failed(&params, node, -1);
+                } else if (getenv("SD_HTP_MULTI_SESSION_TRACE") != NULL &&
+                           getenv("SD_HTP_MULTI_SESSION_TRACE")[0] != '0') {
+                    fprintf(stderr,
+                            "[ggml-htp] hybrid placement node=%d htp_ordinal=%d/%d owner_session=%d op=%s\n",
+                            node_n, current_htp_ordinal, htp_node_count,
+                            owner_session, ggml_op_name(node->op));
+                }
+            }
+        }
+        ggml_barrier(state->threadpool);
         if (tp->ec != GGML_STATUS_SUCCESS) {
             break;
         }

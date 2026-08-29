@@ -3,13 +3,18 @@ add_executable(${TEST_TARGET} test-model-loader-subset.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
 target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../src)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
-set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
+
+set(TEST_TARGET test-htp-message-layout)
+add_executable(${TEST_TARGET} ../ggml/src/ggml-htp/message_layout_test.cc)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-htp)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
 set(TEST_TARGET test-htp-packed-staging)
 add_executable(${TEST_TARGET} test-htp-packed-staging.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
 target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../src)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
 set(TEST_TARGET test-convert-f16)
 add_executable(${TEST_TARGET} test-convert-f16.cpp)
@@ -34,6 +39,24 @@ target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
 target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../src)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
+
+set(TEST_TARGET test-htp-tensor-session-view)
+add_executable(${TEST_TARGET} ../ggml/src/ggml-htp/tensor_session_view_test.cc)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-htp)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+set(TEST_TARGET test-htp-session-placement)
+add_executable(${TEST_TARGET}
+               ../ggml/src/ggml-htp/session_placement_test.cc)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-htp)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+
+set(TEST_TARGET test-htp-rpcmem-session-route)
+add_executable(${TEST_TARGET}
+               ../ggml/src/ggml-htp/rpcmem_session_route_test.cc)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-htp)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
 set(TEST_TARGET test-backend-htp-residual-cache)
 add_executable(${TEST_TARGET} ../ggml/tests/${TEST_TARGET}.cpp)
@@ -139,3 +162,9 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 
 add_test(NAME test-check-staged-weight-log
          COMMAND bash ${CMAKE_CURRENT_LIST_DIR}/test-check-staged-weight-log.sh)
+
+add_test(NAME test-htp-host-release-build-contract
+         COMMAND sh
+                 ${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-htp/test-release-build-contract.sh
+                 ${CMAKE_BINARY_DIR}/CMakeCache.txt
+                 ${CMAKE_BINARY_DIR}/compile_commands.json)

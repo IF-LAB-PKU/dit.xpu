@@ -25,12 +25,16 @@ int prepare_tensor_rpcmem_mapping_with_extra(const struct ggml_tensor * dst, con
 #include <unordered_set>
 
 struct RpcMemMapper {
-    RpcMemMapper() : max_active_map_size{ (size_t) -1 }, active_map_size{ 0 }, defer_unmap{ false } {}
+    RpcMemMapper() : max_active_map_size{ (size_t) -1 }, active_map_size{ 0 }, defer_unmap{ false }, domain_id{ 3 } {}
 
-    RpcMemMapper(size_t max_size, bool defer_unmap_ops) :
+    RpcMemMapper(size_t max_size, bool defer_unmap_ops, int mapping_domain = 3) :
         max_active_map_size{ max_size },
         active_map_size{ 0 },
-        defer_unmap{ defer_unmap_ops } {}
+        defer_unmap{ defer_unmap_ops },
+        domain_id{ mapping_domain } {}
+
+    int domain() const { return domain_id; }
+    void set_domain(int mapping_domain) { domain_id = mapping_domain; }
 
     void validate(const struct ggml_tensor * dst, const struct ggml_tensor * extra = nullptr);
     std::pair<int, ssize_t> get_tensor_mapping(const struct ggml_tensor * tensor) const;
@@ -49,6 +53,10 @@ struct RpcMemMapper {
     // 当 host 侧映射窗口不够时，先同步通知 DSP 释放 HAP_mmap，再执行 host 侧 fastrpc_munmap。
     void flush_pending_unmaps();
     void unmap_all_pending_buffers();
+    // Drop every mapping owned by this session. This is diagnostic-only for
+    // multi-session switching, where the same RPCMEM fd must not remain mapped
+    // in both FastRPC PDs at once.
+    void release_all_mappings();
     void dump_state() const;
 
   private:
@@ -58,6 +66,7 @@ struct RpcMemMapper {
     size_t active_map_size;
 
     bool defer_unmap;
+    int domain_id;
     std::list<UnmapRequest> pending_unmap_reqs;
 
     std::unordered_map<void *, std::pair<int, size_t>>      buf_mapping;

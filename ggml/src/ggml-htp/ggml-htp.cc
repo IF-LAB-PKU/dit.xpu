@@ -24,6 +24,8 @@
 #include "ggml-backend-impl.h"
 #include "ggml-htp-impl.h"
 #include "htp-ops.h"
+#include "rpcmem_session_route.h"
+#include "session_placement.h"
 
 #ifdef GGML_HTP_OPENCL_SIDECAR
 #include "ggml-opencl-htp.h"
@@ -54,9 +56,30 @@ struct ggml_backend_htp_async_cache_slot {
     uint64_t opencl_import_identity = 0;
 };
 
+using htp_ops_session_open_fn = int(htp_ops_session **, int, const char *, int);
+using htp_ops_session_init_fn = int(htp_ops_session *);
+using htp_ops_session_acquire_fn = int(htp_ops_session *);
+using htp_ops_session_release_fn = int(htp_ops_session *);
+using htp_ops_session_create_channel_fn = int(htp_ops_session *, int, unsigned int);
+using htp_ops_session_domain_fn = unsigned int(const htp_ops_session *);
+using htp_ops_session_close_fn = void(htp_ops_session *);
+
 static bool ggml_backend_htp_env_enabled(const char * name) {
     const char * value = std::getenv(name);
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+static int ggml_backend_htp_multi_session_count() {
+    const char * value = std::getenv("SD_HTP_MULTI_SESSION_COUNT");
+    if (value == nullptr || value[0] == '\0') {
+        return 2;
+    }
+    char * end = nullptr;
+    const long requested = std::strtol(value, &end, 10);
+    if (end == value || end == nullptr || *end != '\0') {
+        return 2;
+    }
+    return static_cast<int>(std::max(1L, std::min(16L, requested)));
 }
 
 static void * ggml_backend_htp_aligned_alloc(size_t size) {
@@ -569,6 +592,130 @@ ggml_backend_htp_context::ggml_backend_htp_context()
         runtime_error = "failed to initialize HTP message channel";
         return;
     }
+    active_ops_msg_chan = ops_msg_chan;
+
+    using default_session_fn_type = htp_ops_session *();
+    auto get_default_session = reinterpret_cast<default_session_fn_type *>(
+        dlsym(ops_dl_handle, "htp_ops_default_session"));
+    HtpSessionRuntime default_runtime(0, CDSP_DOMAIN_ID);
+    default_runtime.native_session = get_default_session != nullptr ? get_default_session() : nullptr;
+    default_runtime.mapper = &mapper;
+    default_runtime.channel_initialized = true;
+    default_runtime.message_channel = ops_msg_chan;
+    default_runtime.message_channel_fd = msg_chan_fd;
+    default_runtime.lease_active = true;
+    sessions.push_back(default_runtime);
+
+    if (ggml_backend_htp_env_enabled("SD_HTP_MULTI_SESSION")) {
+        auto open_reserved = reinterpret_cast<htp_ops_session_open_fn *>(
+            dlsym(ops_dl_handle, "htp_ops_session_open"));
+        auto get_domain = reinterpret_cast<htp_ops_session_domain_fn *>(
+            dlsym(ops_dl_handle, "htp_ops_session_domain"));
+        auto init_reserved = reinterpret_cast<htp_ops_session_init_fn *>(
+            dlsym(ops_dl_handle, "htp_ops_session_init_backend"));
+        auto create_reserved_channel = reinterpret_cast<htp_ops_session_create_channel_fn *>(
+            dlsym(ops_dl_handle, "htp_ops_session_create_channel"));
+        auto close_reserved = reinterpret_cast<htp_ops_session_close_fn *>(
+            dlsym(ops_dl_handle, "htp_ops_session_close"));
+        if (open_reserved == nullptr || get_domain == nullptr || init_reserved == nullptr ||
+            create_reserved_channel == nullptr || close_reserved == nullptr) {
+            runtime_error = "libhtp_ops.so lacks multi-session API";
+            return;
+        }
+
+        reserved_session_open_fn = reinterpret_cast<void *>(open_reserved);
+        reserved_session_init_fn = reinterpret_cast<void *>(init_reserved);
+        reserved_session_create_channel_fn = reinterpret_cast<void *>(create_reserved_channel);
+        reserved_session_domain_fn = reinterpret_cast<void *>(get_domain);
+        reserved_session_close_fn = reinterpret_cast<void *>(close_reserved);
+        reserved_session_acquire_fn = reinterpret_cast<void *>(
+            dlsym(ops_dl_handle, "htp_ops_session_acquire_backend"));
+        reserved_session_release_fn = reinterpret_cast<void *>(
+            dlsym(ops_dl_handle, "htp_ops_session_release_backend"));
+        if (reserved_session_acquire_fn == nullptr || reserved_session_release_fn == nullptr) {
+            runtime_error = "libhtp_ops.so lacks multi-session lease API";
+            return;
+        }
+        const int requested_sessions = ggml_backend_htp_multi_session_count();
+        for (int session_index = 1; session_index < requested_sessions; ++session_index) {
+            htp_ops_session * reserved = nullptr;
+            if (open_reserved(&reserved, CDSP_DOMAIN_ID, "", 1) != 0 || reserved == nullptr) {
+                std::fprintf(stderr,
+                             "[ggml-htp] reserve session index=%d failed; keeping %zu initialized sessions\n",
+                             session_index, sessions.size());
+                break;
+            }
+            const int reserved_domain = static_cast<int>(get_domain(reserved));
+            auto mapper_instance = std::make_unique<RpcMemMapper>(
+                ggml_backend_htp_get_max_active_map_size(),
+                ggml_backend_htp_defer_unmap_enabled(), reserved_domain);
+            HtpSessionRuntime runtime(static_cast<uint32_t>(session_index),
+                                      static_cast<uint32_t>(reserved_domain));
+            runtime.native_session = reserved;
+            runtime.reserved = true;
+            runtime.mapper = mapper_instance.get();
+            session_mappers.push_back(std::move(mapper_instance));
+
+            std::fprintf(stderr, "[ggml-htp] session[%d] backend init begin domain=%d ptr=%p\n",
+                         session_index, reserved_domain, static_cast<void *>(reserved));
+            const int init_err = init_reserved(reserved);
+            if (init_err != 0) {
+                std::fprintf(stderr, "[ggml-htp] session[%d] backend init failed rc=%d\n",
+                             session_index, init_err);
+                close_reserved(reserved);
+                session_mappers.pop_back();
+                break;
+            }
+            sessions.push_back(runtime);
+            HtpSessionRuntime & initialized = sessions.back();
+            if (init_session_message_channel(initialized) != 0) {
+                std::fprintf(stderr, "[ggml-htp] session[%d] channel init failed\n", session_index);
+                close_reserved(reserved);
+                sessions.pop_back();
+                session_mappers.pop_back();
+                break;
+            }
+            if (session_index == 1) {
+                reserved_session = reserved;
+                reserved_domain_id = reserved_domain;
+                reserved_mapper = std::unique_ptr<RpcMemMapper>(
+                    session_mappers.back().release());
+                initialized.mapper = reserved_mapper.get();
+                reserved_ops_msg_chan = initialized.message_channel;
+                reserved_msg_chan_fd = initialized.message_channel_fd;
+                reserved_msg_chan_mapped = true;
+                // Keep ownership in the legacy field for session 1. Extra
+                // sessions remain owned by session_mappers.
+            }
+            multi_session_enabled = true;
+            std::fprintf(stderr, "[ggml-htp] session[%d] ready domain=%d channel_fd=%d\n",
+                         session_index, reserved_domain, initialized.message_channel_fd);
+        }
+        if (sessions.size() <= 1) {
+            if (requested_sessions <= 1) {
+                // An explicit count of one is a useful way to exercise the
+                // compatibility path while keeping the opt-in environment
+                // present. Do not fail initialization in that case.
+                multi_session_enabled = false;
+            } else {
+                runtime_error = "no reserved HTP FastRPC session could be initialized";
+                return;
+            }
+        }
+        if (ggml_backend_htp_env_enabled("SD_HTP_MULTI_SESSION_USE_RESERVED")) {
+            // The reserved session is opened mapping-only. Promote it to the
+            // active compute owner here so direct diagnostics and custom
+            // channel dispatches cannot accidentally run while its DSP
+            // backend is still in mapping-only state.
+            if (set_active_session(1) != 0) {
+                runtime_error = "failed to activate reserved HTP session";
+                return;
+            }
+            std::fprintf(stderr,
+                         "[ggml-htp] diagnostic routing: all HTP mappings/ops use reserved domain=%d\n",
+                         reserved_domain_id);
+        }
+    }
 
     ops_backend_initialized = true;
 
@@ -597,6 +744,86 @@ ggml_backend_htp_context::ggml_backend_htp_context()
     if (std::getenv("SKIP_HTP_OPS") != nullptr) {
         skip_htp_ops = true;
     }
+}
+
+int ggml_backend_htp_context::set_active_session(int session_index) {
+    if (!multi_session_enabled) {
+        return session_index == 0 ? 0 : -1;
+    }
+    HtpSessionRuntime * target = session_runtime(session_index);
+    HtpSessionRuntime * current = session_runtime(active_session_index);
+    if (target == nullptr || current == nullptr || target->native_session == nullptr) {
+        return -1;
+    }
+    if (session_index == active_session_index) {
+        return 0;
+    }
+
+    if (ggml_backend_htp_env_enabled("SD_HTP_MULTI_SESSION_UNMAP_ON_SWITCH")) {
+        // A diagnostic isolation mode: do not leave the same RPCMEM fd mapped
+        // in both FastRPC PDs while ownership moves to the next session.
+        // Buffers remain allocated and are remapped lazily by the destination
+        // mapper, so this does not change tensor contents or the legacy path.
+        active_mapper().release_all_mappings();
+        std::fprintf(stderr, "[ggml-htp] released all mappings before session switch from=%d to=%d\n",
+                     active_session_index, session_index);
+    }
+
+    using release_fn_type = int(htp_ops_session *);
+    using acquire_fn_type = int(htp_ops_session *);
+    using init_fn_type = void();
+    using set_active_fn_type = int(htp_ops_session *);
+    using set_default_fn_type = int();
+
+    if (current->reserved && current->lease_active) {
+        auto release = reinterpret_cast<release_fn_type *>(reserved_session_release_fn);
+        if (release == nullptr || release(current->native_session) != 0) {
+            std::fprintf(stderr, "[ggml-htp] session[%d] release failed\n", active_session_index);
+            return -1;
+        }
+        current->lease_active = false;
+    } else if (!current->reserved && current->lease_active) {
+        auto release = reinterpret_cast<int (*)()>(dlsym(ops_dl_handle, "release_htp_backend"));
+        if (release == nullptr || release() != 0) {
+            std::fprintf(stderr, "[ggml-htp] default session release failed\n");
+            return -1;
+        }
+        current->lease_active = false;
+    }
+
+    if (target->reserved) {
+        auto acquire = reinterpret_cast<acquire_fn_type *>(reserved_session_acquire_fn);
+        if (acquire == nullptr || acquire(target->native_session) != 0) {
+            std::fprintf(stderr, "[ggml-htp] session[%d] acquire failed\n", session_index);
+            return -1;
+        }
+        target->lease_active = true;
+    } else {
+        auto init_default = reinterpret_cast<init_fn_type *>(dlsym(ops_dl_handle, "init_htp_backend"));
+        if (init_default == nullptr) {
+            return -1;
+        }
+        init_default();
+        target->lease_active = true;
+    }
+
+    auto set_active = reinterpret_cast<set_active_fn_type *>(
+        dlsym(ops_dl_handle, "htp_ops_set_active_session"));
+    auto set_default = reinterpret_cast<set_default_fn_type *>(
+        dlsym(ops_dl_handle, "htp_ops_set_default_session"));
+    const int select_err = target->reserved
+        ? (set_active == nullptr ? -1 : set_active(target->native_session))
+        : (set_default == nullptr ? -1 : set_default());
+    if (select_err != 0) {
+        std::fprintf(stderr, "[ggml-htp] session[%d] handle selection failed\n", session_index);
+        return -1;
+    }
+
+    active_ops_msg_chan = target->message_channel;
+    active_session_index = session_index;
+    std::fprintf(stderr, "[ggml-htp] active session=%d domain=%u\n",
+                 session_index, target->domain);
+    return 0;
 }
 
 namespace {
@@ -651,6 +878,30 @@ ggml_backend_htp_context::~ggml_backend_htp_context() {
             ops_backend_initialized = false;
         }
 
+        auto close_reserved = reinterpret_cast<htp_ops_session_close_fn *>(reserved_session_close_fn);
+        if (close_reserved != nullptr) {
+            for (size_t i = sessions.size(); i-- > 1;) {
+                HtpSessionRuntime & session = sessions[i];
+                if (session.message_channel != nullptr && session.message_channel_fd >= 0) {
+                    fastrpc_munmap(static_cast<int>(session.domain), session.message_channel_fd,
+                                   session.message_channel, MAX_MSG_SIZE);
+                    rpcmem_free(session.message_channel);
+                    session.message_channel = nullptr;
+                    session.message_channel_fd = -1;
+                }
+                if (session.native_session != nullptr) {
+                    close_reserved(session.native_session);
+                    session.native_session = nullptr;
+                }
+            }
+        }
+        reserved_session = nullptr;
+        reserved_domain_id = -1;
+        reserved_ops_msg_chan = nullptr;
+        reserved_msg_chan_fd = -1;
+        reserved_msg_chan_mapped = false;
+        multi_session_enabled = false;
+
         dlclose(ops_dl_handle);
     }
 
@@ -686,12 +937,107 @@ int ggml_backend_htp_context::init_message_channel() {
     return create_msg_channel(msg_chan_fd, MAX_MSG_SIZE);
 }
 
+int ggml_backend_htp_context::init_session_message_channel(HtpSessionRuntime & session) {
+    if (session.native_session == nullptr || session.domain == 0) {
+        return -1;
+    }
+
+    void * channel = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED, MAX_MSG_SIZE);
+    if (channel == nullptr) {
+        return -1;
+    }
+    const int channel_fd = rpcmem_to_fd(channel);
+    if (channel_fd < 0) {
+        rpcmem_free(channel);
+        return -1;
+    }
+    int err = fastrpc_mmap(static_cast<int>(session.domain), channel_fd, channel,
+                           0, MAX_MSG_SIZE, FASTRPC_MAP_FD);
+    if (err != 0) {
+        rpcmem_free(channel);
+        return -1;
+    }
+
+    auto create_channel = reinterpret_cast<htp_ops_session_create_channel_fn *>(
+        dlsym(ops_dl_handle, "htp_ops_session_create_channel_with_token"));
+    if (create_channel == nullptr) {
+        create_channel = reinterpret_cast<htp_ops_session_create_channel_fn *>(
+            dlsym(ops_dl_handle, "htp_ops_session_create_channel"));
+    }
+    if (create_channel == nullptr || create_channel(session.native_session, channel_fd, MAX_MSG_SIZE) != 0) {
+        fastrpc_munmap(static_cast<int>(session.domain), channel_fd, channel, MAX_MSG_SIZE);
+        rpcmem_free(channel);
+        return -1;
+    }
+    session.message_channel = channel;
+    session.message_channel_fd = channel_fd;
+    session.channel_initialized = true;
+    return 0;
+}
+
+int ggml_backend_htp_context::init_reserved_message_channel() {
+    HtpSessionRuntime * runtime = session_runtime(1);
+    return runtime != nullptr ? init_session_message_channel(*runtime) : -1;
+}
+
 ggml_backend_htp_context * ggml_backend_htp_context::instance() {
     std::lock_guard<std::mutex> lock(g_ctx_mutex);
     if (g_ctx_ptr == nullptr) {
         g_ctx_ptr.reset(new ggml_backend_htp_context());
     }
     return g_ctx_ptr.get();
+}
+
+bool ggml_backend_htp_set_active_session(ggml_backend_t backend, int session_index) {
+    if (backend == nullptr || !ggml_backend_is_htp(backend)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    return ctx->set_active_session(session_index) == 0;
+}
+
+bool ggml_backend_htp_select_session_for_compute(int session_index) {
+    auto * ctx = ggml_backend_htp_context::instance();
+    return ctx != nullptr && ctx->set_active_session(session_index) == 0;
+}
+
+int ggml_backend_htp_session_count_for_compute(void) {
+    auto * ctx = ggml_backend_htp_context::instance();
+    return ctx != nullptr ? static_cast<int>(ctx->session_count()) : 0;
+}
+
+int ggml_backend_htp_active_session(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_htp(backend)) {
+        return -1;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    return ctx->active_session_index;
+}
+
+int ggml_backend_htp_active_domain(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_htp(backend)) {
+        return -1;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    return ctx->active_mapper().domain();
+}
+
+int ggml_backend_htp_session_count(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_htp(backend)) {
+        return 0;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    return ctx != nullptr ? static_cast<int>(ctx->session_count()) : 0;
+}
+
+int ggml_backend_htp_session_domain(ggml_backend_t backend, int session_index) {
+    if (backend == nullptr || !ggml_backend_is_htp(backend)) {
+        return -1;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    const HtpSessionRuntime * runtime = ctx != nullptr ? ctx->session_runtime(session_index) : nullptr;
+    return runtime != nullptr ? static_cast<int>(runtime->domain) : -1;
 }
 
 ggml_backend_htp_context * ggml_backend_htp_context::acquire_instance() {
@@ -725,8 +1071,15 @@ static void * ggml_backend_htp_buffer_get_base(ggml_backend_buffer_t buffer) {
 static void ggml_backend_htp_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<ggml_backend_htp_buffer_context *>(buffer->context);
     if (ctx->is_rpcmem) {
-        const bool diagnostic_freed = ctx->owner->mapper.was_freed_by_diagnostic(ctx->data);
-        ctx->owner->mapper.release_buffer(ctx->data);
+        bool diagnostic_freed = false;
+        auto mappers = htp_unique_rpcmem_session_mappers(ctx->owner->sessions);
+        if (mappers.empty()) {
+            mappers.push_back(&ctx->owner->mapper);
+        }
+        for (RpcMemMapper * mapper : mappers) {
+            diagnostic_freed = diagnostic_freed || mapper->was_freed_by_diagnostic(ctx->data);
+            mapper->release_buffer(ctx->data);
+        }
         if (!diagnostic_freed) {
             rpcmem_free(ctx->data);
         }
@@ -1758,6 +2111,26 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
             std::fprintf(stderr, "ggml-htp: node[%d] missing rpcmem/contiguous buffers for op=%s\n",
                          i, node ? ggml_op_name(node->op) : "(null)");
             return GGML_STATUS_FAILED;
+        }
+
+        // Keep adjacent operations in the same session.  Each session owns a
+        // contiguous range of this ordered graph.
+        if (ctx->multi_session_enabled && ctx->session_count() > 1) {
+            const int owner_session = htp_session_owner_for_ordinal(
+                i, ggml_graph_n_nodes(cgraph), static_cast<int>(ctx->session_count()));
+            if (ctx->set_active_session(owner_session) != 0) {
+                std::fprintf(stderr,
+                             "ggml-htp: failed to select owner session[%d] for node[%d] op=%s\n",
+                             owner_session, i, node ? ggml_op_name(node->op) : "(null)");
+                return GGML_STATUS_FAILED;
+            }
+            if (ggml_backend_htp_env_enabled("SD_HTP_MULTI_SESSION_TRACE")) {
+                std::fprintf(stderr,
+                             "[ggml-htp] placement node=%d htp_ordinal=%d/%d owner_session=%d domain=%d op=%s\n",
+                             i, i, ggml_graph_n_nodes(cgraph), owner_session,
+                             ctx->active_mapper().domain(),
+                             node ? ggml_op_name(node->op) : "(null)");
+            }
         }
 
         const int err = htp_ops_compute_op(&params, node);
