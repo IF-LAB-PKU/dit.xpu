@@ -1308,7 +1308,9 @@ bool ModelLoader::load_tensors(std::map<std::string, ggml_tensor*>& tensors,
 }
 
 bool ModelLoader::load_tensor_subset(const std::map<std::string, ggml_tensor*>& tensors,
-                                     int n_threads) {
+                                     int n_threads,
+                                     TensorSubsetLoadStats* stats) {
+    TensorSubsetLoadStats local_stats;
     std::set<std::string> tensor_names_in_file;
     std::mutex tensor_names_mutex;
     auto on_new_tensor_cb = [&](const TensorStorage& tensor_storage, ggml_tensor** dst_tensor) -> bool {
@@ -1340,10 +1342,38 @@ bool ModelLoader::load_tensor_subset(const std::map<std::string, ggml_tensor*>& 
             return false;
         }
 
-        *dst_tensor = real;
         if (tensor_storage.layout == TensorDataLayout::HTP_PERMUTED_W16A32) {
             real->flags |= SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32;
         }
+        const bool deferred =
+            (real->flags & SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM) != 0;
+        if (deferred) {
+            if (real->type != tensor_storage.type) {
+                LOG_ERROR("deferred tensor '%s' has wrong type in model file: got %s, expected %s",
+                          tensor_storage.name.c_str(),
+                          ggml_type_name(tensor_storage.type), ggml_type_name(real->type));
+                return false;
+            }
+            if (real->buffer != nullptr || real->data != nullptr || real->extra != nullptr) {
+                LOG_ERROR("deferred tensor '%s' unexpectedly has backing storage",
+                          tensor_storage.name.c_str());
+                return false;
+            }
+            {
+                std::lock_guard<std::mutex> lock(tensor_names_mutex);
+                local_stats.deferred_packed_bytes += ggml_nbytes(real);
+                ++local_stats.deferred_packed_tensors;
+            }
+            *dst_tensor = nullptr;
+            return true;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(tensor_names_mutex);
+            local_stats.host_loaded_bytes += ggml_nbytes(real);
+            ++local_stats.host_loaded_tensors;
+        }
+        *dst_tensor = real;
         return true;
     };
 
@@ -1359,6 +1389,9 @@ bool ModelLoader::load_tensor_subset(const std::map<std::string, ggml_tensor*>& 
             LOG_ERROR("tensor '%s' not in model file", name.c_str());
             missing_tensor = true;
         }
+    }
+    if (stats != nullptr) {
+        *stats = local_stats;
     }
     return !missing_tensor;
 }

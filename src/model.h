@@ -13,6 +13,13 @@
 #include "model_io/tensor_storage.h"
 #include "ordered_map.hpp"
 
+struct TensorSubsetLoadStats {
+    size_t host_loaded_bytes = 0;
+    size_t deferred_packed_bytes = 0;
+    size_t host_loaded_tensors = 0;
+    size_t deferred_packed_tensors = 0;
+};
+
 enum SDVersion {
     VERSION_SD1,
     VERSION_SD1_INPAINT,
@@ -272,7 +279,8 @@ public:
                       int n_threads                        = 0,
                       bool use_mmap                        = false);
     bool load_tensor_subset(const std::map<std::string, ggml_tensor*>& tensors,
-                            int n_threads = 0);
+                            int n_threads = 0,
+                            TensorSubsetLoadStats* stats = nullptr);
 
     std::vector<std::string> get_tensor_names() const {
         std::vector<std::string> names;

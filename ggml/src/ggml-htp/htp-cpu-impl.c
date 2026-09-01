@@ -3480,6 +3480,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         getenv("SD_HTP_MULTI_SESSION") != NULL &&
         getenv("SD_HTP_MULTI_SESSION")[0] != '0';
     int htp_node_count = 0;
+    const bool use_dispatch_context = multi_session_enabled &&
+        getenv("SD_HTP_PACKED_STAGING") != NULL &&
+        getenv("SD_HTP_PACKED_STAGING")[0] != '0';
     if (multi_session_enabled) {
         for (int graph_node_n = 0; graph_node_n < cgraph->n_nodes; ++graph_node_n) {
             const struct ggml_tensor * graph_node = cgraph->nodes[graph_node_n];
@@ -3490,6 +3493,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             if (htp_ops_support_op_runtime(graph_node)) {
                 ++htp_node_count;
             }
+        }
+        if (use_dispatch_context) {
+            ggml_backend_htp_dispatch_begin(htp_node_count);
         }
     }
     int htp_ordinal = 0;
@@ -3534,10 +3540,19 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (state->ith == 0 && htp_ops_support_op_runtime(node)) {
             if (multi_session_enabled) {
                 const int current_htp_ordinal = htp_ordinal;
-                const int owner_session = htp_session_owner_for_ordinal(
-                    current_htp_ordinal, htp_node_count, multi_session_count);
                 ++htp_ordinal;
-                if (!ggml_backend_htp_select_session_for_compute(owner_session)) {
+                int owner_session = htp_session_owner_for_ordinal(
+                    current_htp_ordinal, htp_node_count, multi_session_count);
+                bool selected = false;
+                if (use_dispatch_context) {
+                    const int ordinal_owner = ggml_backend_htp_dispatch_next_owner();
+                    const int node_owner = ggml_backend_htp_node_session_owner(node);
+                    owner_session = node_owner >= 0 ? node_owner : ordinal_owner;
+                    selected = ggml_backend_htp_dispatch_acquire(owner_session);
+                } else {
+                    selected = ggml_backend_htp_select_session_for_compute(owner_session);
+                }
+                if (!selected) {
                     fprintf(stderr,
                             "ggml-htp: hybrid session selection failed node=%d session=%d op=%s\n",
                             node_n, owner_session, ggml_op_name(node->op));
@@ -3688,6 +3703,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
 #endif
+
+    // Dispatch state is thread-local and is owned by the serial HTP
+    // dispatcher (worker zero).  End it before returning from this graph
+    // view; secondary workers do not own that state.
+    if (use_dispatch_context && state->ith == 0) {
+        ggml_backend_htp_dispatch_end();
+    }
 
     return 0;
 }

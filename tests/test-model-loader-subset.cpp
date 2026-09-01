@@ -2,6 +2,7 @@
 #include "model_io/safetensors_io.h"
 #include "stable-diffusion.h"
 #include "ggml-htp.h"
+#include "htp_tensor_flags.h"
 
 #include <chrono>
 #include <cstdio>
@@ -71,13 +72,16 @@ int main() {
 
     ggml_tensor* encoder_source   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
     ggml_tensor* diffusion_source = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor* deferred_source  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 32, 32);
     ggml_set_name(encoder_source, "encoder.weight");
     ggml_set_name(diffusion_source, "diffusion.weight");
+    ggml_set_name(deferred_source, "diffusion.deferred.weight");
 
     const std::vector<float> encoder_values   = {1.f, 2.f, 3.f, 4.f};
     const std::vector<float> diffusion_values = {5.f, 6.f, 7.f, 8.f};
     memcpy(encoder_source->data, encoder_values.data(), ggml_nbytes(encoder_source));
     memcpy(diffusion_source->data, diffusion_values.data(), ggml_nbytes(diffusion_source));
+    memset(deferred_source->data, 0x5a, ggml_nbytes(deferred_source));
 
     const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
     const std::filesystem::path model_path =
@@ -86,13 +90,19 @@ int main() {
 
     std::string error;
     CHECK(write_safetensors_file(model_path.string(),
-                                 {tensor_write_info(encoder_source), tensor_write_info(diffusion_source)},
+                                 {tensor_write_info(encoder_source), tensor_write_info(diffusion_source),
+                                  tensor_write_info(deferred_source)},
                                  &error));
 
     ggml_tensor* encoder_destination   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
     ggml_tensor* diffusion_destination = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
     ggml_tensor* missing_destination   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
     ggml_tensor* optional_clip_destination = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_context* deferred_ctx = ggml_init({4 * ggml_tensor_overhead(), nullptr, true});
+    CHECK(deferred_ctx != nullptr);
+    ggml_tensor* deferred_destination =
+        ggml_new_tensor_2d(deferred_ctx, GGML_TYPE_F16, 32, 32);
+    deferred_destination->flags |= SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM;
     const std::vector<float> untouched(4, -1.f);
     memcpy(encoder_destination->data, untouched.data(), ggml_nbytes(encoder_destination));
     memcpy(diffusion_destination->data, untouched.data(), ggml_nbytes(diffusion_destination));
@@ -130,6 +140,27 @@ int main() {
     CHECK(loader.load_tensor_subset(diffusion_only, 1));
     assert_values(diffusion_destination, diffusion_values);
 
+    memcpy(diffusion_destination->data, untouched.data(), ggml_nbytes(diffusion_destination));
+    std::map<std::string, ggml_tensor*> mixed = {
+        {"diffusion.weight", diffusion_destination},
+        {"diffusion.deferred.weight", deferred_destination},
+    };
+    TensorSubsetLoadStats mixed_stats;
+    CHECK(loader.load_tensor_subset(mixed, 1, &mixed_stats));
+    assert_values(diffusion_destination, diffusion_values);
+    CHECK(deferred_destination->buffer == nullptr && deferred_destination->data == nullptr &&
+          deferred_destination->extra == nullptr);
+    CHECK(mixed_stats.host_loaded_bytes == ggml_nbytes(diffusion_destination));
+    CHECK(mixed_stats.deferred_packed_bytes == ggml_nbytes(deferred_destination));
+    CHECK(mixed_stats.host_loaded_tensors == 1);
+    CHECK(mixed_stats.deferred_packed_tensors == 1);
+
+    ggml_tensor* wrong_type_deferred =
+        ggml_new_tensor_2d(deferred_ctx, GGML_TYPE_F32, 32, 32);
+    wrong_type_deferred->flags |= SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM;
+    CHECK(!loader.load_tensor_subset(
+        {{"diffusion.deferred.weight", wrong_type_deferred}}, 1));
+
     std::map<std::string, ggml_tensor*> missing = {
         {"missing.weight", missing_destination},
     };
@@ -143,6 +174,7 @@ int main() {
     assert_values(optional_clip_destination, untouched);
 
     std::remove(model_path.string().c_str());
+    ggml_free(deferred_ctx);
     ggml_free(ctx);
     return 0;
 }

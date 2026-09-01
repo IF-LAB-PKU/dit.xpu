@@ -283,6 +283,18 @@ static int run_matrix(ggml_backend_t htp) {
         for (int ci = 0; ci < htp_attention_common::case_count(); ++ci) {
             const htp_attention_common::CaseSpec & spec = htp_attention_common::cases()[ci];
             if (!htp_attention_common::selected(size, spec)) continue;
+            if (std::strncmp(spec.model, "z-image", 7) == 0) {
+                if (std::strcmp(spec.family, "context-refiner") == 0) {
+                    if (route_enabled("dense")) {
+                        ++expected;
+                        passed += run_case(htp, size, spec, htp_attention_common::Route::Dense) ? 1 : 0;
+                    }
+                } else if (route_enabled("z-image-pair") || route_filter == nullptr) {
+                    ++expected;
+                    passed += htp_attention_common::run_z_image_route_pair(htp, size, spec) ? 1 : 0;
+                }
+                continue;
+            }
             if (route_enabled("dense")) {
                 ++expected;
                 passed += run_case(htp, size, spec, htp_attention_common::Route::Dense) ? 1 : 0;

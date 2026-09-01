@@ -76,6 +76,17 @@ public:
         return views_.find(Key{tensor, session_id}) != views_.end();
     }
 
+    bool release_view(const HtpTensorIdentity & tensor, uint32_t session_id) {
+        auto it = views_.find(Key{tensor, session_id});
+        if (it == views_.end() || it->second.map_refcount == 0) {
+            return false;
+        }
+        if (--it->second.map_refcount == 0) {
+            views_.erase(it);
+        }
+        return true;
+    }
+
     const HtpTensorSessionView & view(const HtpTensorIdentity & tensor, uint32_t session_id) const {
         return views_.at(Key{tensor, session_id});
     }
@@ -104,6 +115,17 @@ public:
         }
         view_it->second.producer_epoch = state_it->second.latest_epoch;
         return true;
+    }
+
+    bool prepare_input(const HtpTensorIdentity & tensor,
+                       uint32_t consumer_session_id,
+                       uint64_t expected_producer_epoch) {
+        auto state_it = tensors_.find(tensor);
+        if (state_it == tensors_.end() || !state_it->second.has_value ||
+            state_it->second.latest_epoch != expected_producer_epoch) {
+            return false;
+        }
+        return prepare_input(tensor, consumer_session_id);
     }
 
 private:

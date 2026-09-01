@@ -56,6 +56,8 @@ namespace sd::ggml_graph_cut {
         Plan graph_cut_plan;
         Plan budgeted_graph_cut_plan;
         size_t budgeted_graph_cut_plan_max_vram_bytes = 0;
+        int budgeted_graph_cut_plan_session_count = 1;
+        bool budgeted_graph_cut_plan_shared_param_backing = false;
     };
 
     static constexpr const char* GGML_RUNNER_CUT_PREFIX = "ggml_runner_cut:";
@@ -83,6 +85,13 @@ namespace sd::ggml_graph_cut {
                                           ggml_cgraph* gf,
                                           const Segment& segment,
                                           const char* log_desc);
+    size_t segment_vram_bytes_for_sessions(const Segment& segment,
+                                           int session_count,
+                                           bool shared_param_backing = false);
+    // Graph-cut execution always enters a segment through the first session;
+    // the segment's HTP nodes subsequently advance through the full session
+    // set using ordinal placement.
+    int segment_anchor_session(size_t segment_index, int session_count);
     size_t max_vram_gib_to_bytes(float max_vram);
     float resolve_max_vram_gib(float max_vram, ggml_backend_t backend);
     Plan build_plan(ggml_backend_t backend,
@@ -94,13 +103,17 @@ namespace sd::ggml_graph_cut {
                                size_t max_graph_vram_bytes,
                                ggml_backend_t backend,
                                const std::unordered_set<const ggml_tensor*>& params_tensor_set,
-                               const char* log_desc);
+                               const char* log_desc,
+                               int session_count = 1,
+                               bool shared_param_backing = false);
     Plan resolve_plan(ggml_backend_t backend,
                       ggml_cgraph* gf,
                       PlanCache* cache,
                       size_t max_graph_vram_bytes,
                       const std::unordered_set<const ggml_tensor*>& params_tensor_set,
-                      const char* log_desc);
+                      const char* log_desc,
+                      int session_count = 1,
+                      bool shared_param_backing = false);
 }  // namespace sd::ggml_graph_cut
 
 #endif

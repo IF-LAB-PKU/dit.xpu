@@ -286,10 +286,39 @@ GGML_BACKEND_API bool ggml_backend_htp_set_active_session(ggml_backend_t backend
 // graph-compute mutex is already held by the owning backend.
 GGML_BACKEND_API bool ggml_backend_htp_select_session_for_compute(int session_index);
 GGML_BACKEND_API int ggml_backend_htp_session_count_for_compute(void);
+// Shared serial placement hooks used by full-graph and graph-view hybrid
+// execution. A graph worker begins a view, consumes one owner per HTP op,
+// and ends the view after all workers have rendezvoused.
+GGML_BACKEND_API void ggml_backend_htp_dispatch_begin(int htp_node_count);
+GGML_BACKEND_API int ggml_backend_htp_dispatch_next_owner(void);
+GGML_BACKEND_API bool ggml_backend_htp_dispatch_acquire(int session_index);
+GGML_BACKEND_API void ggml_backend_htp_dispatch_force_owner(int session_index);
+GGML_BACKEND_API void ggml_backend_htp_dispatch_end(void);
 GGML_BACKEND_API int ggml_backend_htp_active_session(ggml_backend_t backend);
 GGML_BACKEND_API int ggml_backend_htp_active_domain(ggml_backend_t backend);
 GGML_BACKEND_API int ggml_backend_htp_session_count(ggml_backend_t backend);
 GGML_BACKEND_API int ggml_backend_htp_session_domain(ggml_backend_t backend, int session_index);
+// Allocate an RPCMEM backing with deterministic logical session ownership.
+// The owner is used by multi-session dispatch; the buffer remains mappable by
+// any initialized session through its session-local mapper when required.
+GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_htp_alloc_buffer_for_session(
+    ggml_backend_t backend,
+    int session_index,
+    size_t size);
+GGML_BACKEND_API void ggml_backend_htp_buffer_set_persistent_staging(
+    ggml_backend_buffer_t buffer,
+    bool persistent);
+GGML_BACKEND_API bool ggml_backend_htp_buffer_is_persistent_staging(
+    ggml_backend_buffer_t buffer);
+// Return the logical session that owns a buffer, or -1 for non-HTP buffers.
+GGML_BACKEND_API int ggml_backend_htp_buffer_session_index(
+        ggml_backend_buffer_t buffer);
+GGML_BACKEND_API void ggml_backend_htp_buffer_set_session_index(
+        ggml_backend_buffer_t buffer, int session_index);
+// Resolve the session that owns a node's persistent weight.  Returns -1 when
+// the node has no session-affine weight and the ordinal fallback should be used.
+GGML_BACKEND_API int ggml_backend_htp_node_session_owner(
+    const struct ggml_tensor * node);
 
 // Mark packed dense attention tensors used by deferred OpenCL residual jobs as
 // graph outputs before gallocr plans the arena, so their spans stay live until

@@ -12,6 +12,61 @@
 namespace htp_attention_common {
 namespace {
 
+struct RouteMetrics {
+    double max_abs = 0.0;
+    double rmse = 0.0;
+    bool finite = true;
+};
+
+static RouteMetrics compare_route_vectors(const std::vector<float> & expected,
+                                          const std::vector<float> & actual) {
+    RouteMetrics metrics;
+    if (expected.size() != actual.size() || expected.empty()) {
+        metrics.finite = false;
+        return metrics;
+    }
+    double sum_sq = 0.0;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        if (!std::isfinite(expected[i]) || !std::isfinite(actual[i])) {
+            metrics.finite = false;
+            continue;
+        }
+        const double diff = std::fabs(double(expected[i]) - double(actual[i]));
+        metrics.max_abs = std::max(metrics.max_abs, diff);
+        sum_sq += diff * diff;
+    }
+    metrics.rmse = std::sqrt(sum_sq / expected.size());
+    return metrics;
+}
+
+static void patch_majorize_image_activation(BranchData & branch,
+                                            int token_h, int token_w,
+                                            int image_tokens, int input_dim) {
+    if (branch.tokens < image_tokens) return;
+    std::vector<float> source = branch.activation;
+    for (int patch_token = 0; patch_token < image_tokens; ++patch_token) {
+        const int row_token = sd_patch_major_index_from_row_major(
+            patch_token, token_h, token_w, 4);
+        std::copy_n(source.data() + size_t(row_token) * input_dim, input_dim,
+                    branch.activation.data() + size_t(patch_token) * input_dim);
+    }
+}
+
+static void make_apply_residual(InputData & data, const CaseSpec & spec) {
+    if (!spec.residual_apply) return;
+    const int tokens = total_tokens(spec);
+    const int hidden = spec.heads * spec.head_dim;
+    data.residual.resize(size_t(tokens) * hidden);
+    for (int t = 0; t < tokens; ++t) {
+        for (int h = 0; h < spec.heads; ++h) {
+            for (int d = 0; d < spec.head_dim; ++d) {
+                data.residual[(size_t(t) * spec.heads + h) * spec.head_dim + d] =
+                    float(((t * 13 + h * 7 + d * 3) % 29) - 14) * 0.0025f;
+            }
+        }
+    }
+}
+
 constexpr ImageSize kImageSizes[] = {
     {256, 256, 4, 2},
     {512, 1024, 8, 4},
@@ -254,15 +309,22 @@ static void build_standard_attention(Graph & graph, const CaseSpec & spec, Route
         const bool block_sparse = spec.external_inference;
         const int protected_start = block_sparse && spec.text_tokens > 0 ? spec.image_tokens : 0;
         const int protected_len = block_sparse ? spec.text_tokens : 0;
+        if (spec.residual_apply) {
+            graph.apply_residual = ggml_new_tensor_4d(
+                graph.ctx, GGML_TYPE_F32, spec.head_dim, q->ne[2],
+                q->ne[1], q->ne[3]);
+            ggml_set_name(graph.apply_residual, "attention_apply_residual");
+        }
         graph.output = ggml_ext_attention_ext(graph.ctx, backend, q, k, v,
                                                spec.heads, nullptr,
                                                true, true, 1.0f / 128.0f,
                                                block_sparse,
                                                protected_start,
                                                protected_len,
-                                               SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
+                                               spec.residual_apply ? SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY
+                                                                   : SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
                                                1.0f, 1.0f, false,
-                                               nullptr, nullptr, nullptr, nullptr, nullptr,
+                                               nullptr, graph.apply_residual, nullptr, nullptr, nullptr,
                                                spec.image_block_rows * 4,
                                                spec.image_block_cols * 8);
         return;
@@ -400,13 +462,20 @@ static void build_packed_attention(Graph & graph, const CaseSpec & spec, ggml_ba
     }
     if (spec.packed_inference) {
         const int protected_start = spec.text_tokens > 0 ? spec.image_tokens : 0;
+        if (spec.residual_apply) {
+            graph.apply_residual = ggml_new_tensor_4d(
+                graph.ctx, GGML_TYPE_F32, spec.head_dim, spec.heads,
+                tokens, 1);
+            ggml_set_name(graph.apply_residual, "attention_apply_residual");
+        }
         graph.output = ggml_ext_attention_ext(
             graph.ctx, backend, q, k, v, spec.heads, nullptr,
             true, true, 1.0f / 128.0f, true,
             protected_start, spec.text_tokens,
-            SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
+            spec.residual_apply ? SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY
+                                : SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF,
             1.0f, 1.0f, false,
-            nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, graph.apply_residual, nullptr, nullptr, nullptr,
             spec.image_block_rows * 4,
             spec.image_block_cols * 8);
     } else {
@@ -483,6 +552,7 @@ InputData make_input(const CaseSpec & spec) {
     if (spec.dual) data.branches.push_back(make_branch(spec, spec.text_tokens, 7));
     data.block_index = make_block_index(spec);
     if (spec.rope) data.rope = identity_rope(total_tokens(spec), spec.head_dim);
+    make_apply_residual(data, spec);
     return data;
 }
 
@@ -633,6 +703,7 @@ Graph build_graph(const CaseSpec & spec, Route route, ggml_backend_t backend) {
     ggml_build_forward_expand(graph.graph, graph.output);
     if (graph.rho != nullptr) ggml_build_forward_expand(graph.graph, graph.rho);
     if (graph.residual != nullptr) ggml_build_forward_expand(graph.graph, graph.residual);
+    if (graph.apply_residual != nullptr) ggml_build_forward_expand(graph.graph, graph.apply_residual);
     return graph;
 }
 
@@ -662,6 +733,11 @@ bool upload_graph(Graph & graph, const InputData & data, ggml_backend_t backend)
     }
     if (graph.rope != nullptr) {
         ggml_backend_tensor_set(graph.rope, data.rope.data(), 0, data.rope.size() * sizeof(float));
+    }
+    if (graph.apply_residual != nullptr) {
+        if (data.residual.size() != size_t(ggml_nelements(graph.apply_residual))) return false;
+        ggml_backend_tensor_set(graph.apply_residual, data.residual.data(), 0,
+                                data.residual.size() * sizeof(float));
     }
     if (graph.mask == nullptr) {
         return true;
@@ -808,6 +884,169 @@ void free_graph(Graph & graph) {
     if (graph.buffer != nullptr) ggml_backend_buffer_free(graph.buffer);
     if (graph.ctx != nullptr) ggml_free(graph.ctx);
     graph = {};
+}
+
+bool run_z_image_route_pair(ggml_backend_t htp,
+                            const ImageSize & size,
+                            const CaseSpec & base) {
+    // Context refiner is intentionally dense in real Z-Image inference; it has
+    // no packed/reordered route pair to compare.
+    if (std::strcmp(base.family, "context-refiner") == 0) {
+        const CaseSpec dense_spec = make_inference_case(size, base, Route::Dense);
+        const InputData data = make_input(dense_spec);
+        Reference reference;
+        for (const BranchData & branch : data.branches) {
+            append_reference_branch(dense_spec, branch, false, reference);
+        }
+        const std::vector<float> expected = reference_attention(dense_spec, reference, nullptr);
+        setenv("SD_HTP_BLOCK_SPARSE_ATTN", "0", 1);
+        setenv("SD_HTP_PACKED_ATTENTION", "0", 1);
+        setenv("SD_HTP_PACKED_Z_IMAGE", "0", 1);
+        Graph graph = build_graph(dense_spec, Route::Dense, htp);
+        const bool ready = graph_contract(graph, dense_spec) && upload_graph(graph, data, htp) &&
+                           size_t(ggml_nelements(graph.output)) == expected.size();
+        std::vector<float> actual(expected.size(), 0.0f);
+        ggml_status status = GGML_STATUS_FAILED;
+        if (ready) {
+            status = ggml_backend_graph_compute(htp, graph.graph);
+            if (status == GGML_STATUS_SUCCESS) {
+                ggml_backend_tensor_get(graph.output, actual.data(), 0,
+                                        actual.size() * sizeof(float));
+            }
+        }
+        const RouteMetrics metrics = compare_route_vectors(expected, actual);
+        const bool pass = ready && status == GGML_STATUS_SUCCESS && metrics.finite &&
+                          metrics.max_abs <= 5.0e-3 && metrics.rmse <= 5.0e-3;
+        std::printf("[%s] %s/%s/resolution=%d route=dense-context "
+                    "ref=(%.9g,%.9g)\n",
+                    pass ? "PASS" : "FAIL", base.model, base.family, size.resolution,
+                    metrics.max_abs, metrics.rmse);
+        free_graph(graph);
+        return pass;
+    }
+
+    const CaseSpec packed_spec = make_inference_case(size, base, Route::PackedSparse);
+    const CaseSpec reordered_spec = make_inference_case(size, base, Route::ExternalSparseL2);
+    const InputData packed_data = make_input(packed_spec);
+    InputData reordered_data = make_input(reordered_spec);
+    InputData packed_input = packed_data;
+    for (BranchData & branch : packed_input.branches) {
+        patch_majorize_image_activation(branch, size.block_rows * 4, size.block_cols * 8,
+                                        size.image_tokens, kInputDim);
+    }
+    for (BranchData & branch : reordered_data.branches) {
+        patch_majorize_image_activation(branch, size.block_rows * 4, size.block_cols * 8,
+                                        size.image_tokens, kInputDim);
+    }
+    Reference packed_reference;
+    Reference reordered_reference;
+    for (const BranchData & branch : packed_input.branches) {
+        append_reference_branch(packed_spec, branch, true, packed_reference);
+    }
+    for (const BranchData & branch : reordered_data.branches) {
+        append_reference_branch(reordered_spec, branch, false, reordered_reference);
+    }
+    const std::vector<float> packed_expected = reference_attention(
+        packed_spec, packed_reference, &packed_data.block_index);
+    const std::vector<float> reordered_expected = reference_attention(
+        reordered_spec, reordered_reference, &reordered_data.block_index);
+
+    auto run_route = [&](const CaseSpec & spec, const InputData & data,
+                         const std::vector<float> & expected, Route route,
+                         std::vector<float> & actual) -> bool {
+        setenv("SD_HTP_BLOCK_SPARSE_ATTN", "1", 1);
+        setenv("SD_HTP_PACKED_ATTENTION", route == Route::PackedSparse ? "1" : "0", 1);
+        setenv("SD_HTP_PACKED_Z_IMAGE", route == Route::PackedSparse ? "1" : "0", 1);
+        setenv("SD_HTP_BLOCK_SPARSE_KEEP_RATIO", "0", 1);
+        setenv("SD_HTP_BLOCK_SPARSE_PATCH_HALO", "1", 1);
+        setenv("SD_HTP_HALO_KV_LOAD", "l2fetch", 1);
+        setenv("SD_HTP_SPARSE_OPENCL", "0", 1);
+        setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "0", 1);
+        setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE", "0", 1);
+        setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO", "0", 1);
+        setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR_ONLY", "0", 1);
+        Graph graph = build_graph(spec, route, htp);
+        const bool ready = graph_contract(graph, spec) && upload_graph(graph, data, htp) &&
+                           size_t(ggml_nelements(graph.output)) == expected.size();
+        ggml_status status = GGML_STATUS_FAILED;
+        if (ready) {
+            status = ggml_backend_graph_compute(htp, graph.graph);
+            if (status == GGML_STATUS_SUCCESS) {
+                actual.resize(expected.size());
+                ggml_backend_tensor_get(graph.output, actual.data(), 0,
+                                        actual.size() * sizeof(float));
+            }
+        }
+        const bool ok = ready && status == GGML_STATUS_SUCCESS;
+        free_graph(graph);
+        return ok;
+    };
+
+    std::vector<float> packed_actual;
+    std::vector<float> reordered_actual;
+    const bool packed_ok = run_route(packed_spec, packed_input, packed_expected,
+                                     Route::PackedSparse, packed_actual);
+    const bool reordered_ok = run_route(reordered_spec, reordered_data, reordered_expected,
+                                        Route::ExternalSparseL2, reordered_actual);
+    const RouteMetrics packed_metrics = compare_route_vectors(packed_expected, packed_actual);
+    const RouteMetrics reordered_metrics = compare_route_vectors(reordered_expected, reordered_actual);
+    const RouteMetrics pair_metrics = compare_route_vectors(reordered_actual, packed_actual);
+    CaseSpec packed_apply_spec = packed_spec;
+    CaseSpec reordered_apply_spec = reordered_spec;
+    packed_apply_spec.residual_apply = true;
+    reordered_apply_spec.residual_apply = true;
+    InputData packed_apply_data = make_input(packed_apply_spec);
+    InputData reordered_apply_data = make_input(reordered_apply_spec);
+    for (BranchData & branch : packed_apply_data.branches) {
+        patch_majorize_image_activation(branch, size.block_rows * 4, size.block_cols * 8,
+                                        size.image_tokens, kInputDim);
+    }
+    for (BranchData & branch : reordered_apply_data.branches) {
+        patch_majorize_image_activation(branch, size.block_rows * 4, size.block_cols * 8,
+                                        size.image_tokens, kInputDim);
+    }
+    std::vector<float> packed_apply_expected = packed_expected;
+    std::vector<float> reordered_apply_expected = reordered_expected;
+    for (size_t i = 0; i < packed_apply_expected.size(); ++i) {
+        packed_apply_expected[i] += packed_apply_data.residual[i];
+        reordered_apply_expected[i] += reordered_apply_data.residual[i];
+    }
+    std::vector<float> packed_apply_actual;
+    std::vector<float> reordered_apply_actual;
+    const bool packed_apply_ok = run_route(packed_apply_spec, packed_apply_data,
+                                           packed_apply_expected, Route::PackedSparse,
+                                           packed_apply_actual);
+    const bool reordered_apply_ok = run_route(reordered_apply_spec, reordered_apply_data,
+                                              reordered_apply_expected, Route::ExternalSparseL2,
+                                              reordered_apply_actual);
+    const RouteMetrics packed_apply_metrics = compare_route_vectors(
+        packed_apply_expected, packed_apply_actual);
+    const RouteMetrics reordered_apply_metrics = compare_route_vectors(
+        reordered_apply_expected, reordered_apply_actual);
+    const RouteMetrics apply_pair_metrics = compare_route_vectors(
+        reordered_apply_actual, packed_apply_actual);
+    const bool pass = packed_ok && reordered_ok && packed_apply_ok && reordered_apply_ok &&
+                      packed_metrics.finite && reordered_metrics.finite && pair_metrics.finite &&
+                      packed_apply_metrics.finite && reordered_apply_metrics.finite &&
+                      apply_pair_metrics.finite &&
+                      packed_metrics.max_abs <= 5.0e-3 && packed_metrics.rmse <= 5.0e-3 &&
+                      reordered_metrics.max_abs <= 5.0e-3 && reordered_metrics.rmse <= 5.0e-3 &&
+                      pair_metrics.max_abs <= 5.0e-3 && pair_metrics.rmse <= 5.0e-3 &&
+                      packed_apply_metrics.max_abs <= 5.0e-3 && packed_apply_metrics.rmse <= 5.0e-3 &&
+                      reordered_apply_metrics.max_abs <= 5.0e-3 && reordered_apply_metrics.rmse <= 5.0e-3 &&
+                      apply_pair_metrics.max_abs <= 5.0e-3 && apply_pair_metrics.rmse <= 5.0e-3;
+    std::printf(
+        "[%s] %s/%s/resolution=%d route=packed-vs-reordered "
+        "packed_ref=(%.9g,%.9g) reordered_ref=(%.9g,%.9g) pair=(%.9g,%.9g) "
+        "packed_apply=(%.9g,%.9g) reordered_apply=(%.9g,%.9g) apply_pair=(%.9g,%.9g)\n",
+        pass ? "PASS" : "FAIL", base.model, base.family, size.resolution,
+        packed_metrics.max_abs, packed_metrics.rmse,
+        reordered_metrics.max_abs, reordered_metrics.rmse,
+        pair_metrics.max_abs, pair_metrics.rmse,
+        packed_apply_metrics.max_abs, packed_apply_metrics.rmse,
+        reordered_apply_metrics.max_abs, reordered_apply_metrics.rmse,
+        apply_pair_metrics.max_abs, apply_pair_metrics.rmse);
+    return pass;
 }
 
 int run_fixture_contract_test() {

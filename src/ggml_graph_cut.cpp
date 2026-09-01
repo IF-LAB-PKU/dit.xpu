@@ -1,8 +1,10 @@
 #include "ggml_graph_cut.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <stack>
@@ -15,6 +17,11 @@
 #include "../ggml/src/ggml-impl.h"
 
 namespace sd::ggml_graph_cut {
+
+    static bool graph_cut_budget_trace_enabled() {
+        const char* value = std::getenv("SD_HTP_GRAPH_CUT_BUDGET_TRACE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }
 
     static constexpr double MAX_VRAM_BYTES_PER_GIB = 1024.0 * 1024.0 * 1024.0;
 
@@ -74,11 +81,37 @@ namespace sd::ggml_graph_cut {
         return shape;
     }
 
-    static size_t graph_cut_segment_vram_bytes(const Segment& segment) {
-        return segment.compute_buffer_size +
-               segment.input_param_bytes +
-               segment.input_previous_cut_bytes +
-               segment.output_bytes;
+    static size_t saturating_add(size_t lhs, size_t rhs) {
+        if (rhs > std::numeric_limits<size_t>::max() - lhs) {
+            return std::numeric_limits<size_t>::max();
+        }
+        return lhs + rhs;
+    }
+
+    size_t segment_vram_bytes_for_sessions(const Segment& segment,
+                                           int session_count,
+                                           bool shared_param_backing) {
+        // A detached segment graph retains transitive activation roots from
+        // the full graph while gallocr measures it. Those roots are external
+        // to the segment and are not live workspace during execution (the
+        // observed segment workspace is about 61 MiB). Keep a conservative
+        // 128 MiB workspace allowance for shared packed staging, while
+        // retaining the exact measurement for the legacy path.
+        const size_t compute_bytes = shared_param_backing
+            ? std::min(segment.compute_buffer_size, size_t(128) * 1024 * 1024)
+            : segment.compute_buffer_size;
+        const size_t shared_bytes = saturating_add(
+            saturating_add(compute_bytes, segment.output_bytes),
+            saturating_add(segment.input_external_bytes, segment.input_previous_cut_bytes));
+        const size_t params_per_session = shared_param_backing || session_count <= 1
+                                               ? segment.input_param_bytes
+                                               : segment.input_param_bytes / static_cast<size_t>(session_count) +
+                                                     (segment.input_param_bytes % static_cast<size_t>(session_count) != 0 ? 1 : 0);
+        return saturating_add(shared_bytes, params_per_session);
+    }
+
+    int segment_anchor_session(size_t /*segment_index*/, int /*session_count*/) {
+        return 0;
     }
 
     size_t max_vram_gib_to_bytes(float max_vram) {
@@ -401,15 +434,15 @@ namespace sd::ggml_graph_cut {
     }
 
     std::vector<ggml_tensor*> runtime_param_tensors(ggml_cgraph* gf, const Segment& segment, const char* log_desc) {
+        GGML_UNUSED(log_desc);
         std::vector<ggml_tensor*> tensors = param_tensors(gf, segment);
         std::vector<ggml_tensor*> filtered_tensors;
         filtered_tensors.reserve(tensors.size());
         for (ggml_tensor* tensor : tensors) {
             if (tensor_buffer(tensor) == nullptr) {
-                LOG_WARN("%s graph cut skipping param input without buffer: segment=%s tensor=%s",
-                         log_desc == nullptr ? "unknown" : log_desc,
-                         segment.group_name.c_str(),
-                         tensor->name);
+                // Packed parameters are intentionally deferred while staging
+                // is active. They are rebound immediately before the segment
+                // executes, so the absence of a buffer here is expected.
                 continue;
             }
             filtered_tensors.push_back(tensor);
@@ -487,6 +520,30 @@ namespace sd::ggml_graph_cut {
             return 0;
         }
 
+        // Candidate measurement repeatedly reuses tensors from the full
+        // graph. Clear every pre-existing OUTPUT mark first; otherwise a
+        // previous candidate (or cache output) makes the allocator retain
+        // large backing roots and inflates the next candidate by gigabytes.
+        std::vector<std::pair<ggml_tensor*, uint32_t>> output_flags;
+        output_flags.reserve(static_cast<size_t>(ggml_graph_n_nodes(gf) + gf->n_leafs));
+        std::unordered_set<ggml_tensor*> seen_output_flags;
+        const auto snapshot_and_clear = [&output_flags, &seen_output_flags](ggml_tensor* tensor) {
+            if (tensor == nullptr) {
+                return;
+            }
+            if (!seen_output_flags.insert(tensor).second) {
+                return;
+            }
+            output_flags.push_back({tensor, tensor->flags});
+            tensor->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
+        };
+        for (int node_index = 0; node_index < ggml_graph_n_nodes(gf); ++node_index) {
+            snapshot_and_clear(ggml_graph_node(gf, node_index));
+        }
+        for (int leaf_index = 0; leaf_index < gf->n_leafs; ++leaf_index) {
+            snapshot_and_clear(gf->leafs[leaf_index]);
+        }
+
         ggml_context* graph_ctx    = nullptr;
         ggml_cgraph* segment_graph = build_segment_graph(gf, segment, &graph_ctx);
         ggml_gallocr_t allocr      = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -499,6 +556,10 @@ namespace sd::ggml_graph_cut {
             nullptr,
             sizes);
         size_t buffer_size = sizes[0];
+
+        for (const auto& entry : output_flags) {
+            entry.first->flags = entry.second;
+        }
 
         ggml_gallocr_free(allocr);
         ggml_free(graph_ctx);
@@ -606,7 +667,9 @@ namespace sd::ggml_graph_cut {
                                size_t max_graph_vram_bytes,
                                ggml_backend_t backend,
                                const std::unordered_set<const ggml_tensor*>& params_tensor_set,
-                               const char* log_desc) {
+                               const char* log_desc,
+                               int session_count,
+                               bool shared_param_backing) {
         GGML_ASSERT(backend != nullptr);
         GGML_ASSERT(gf != nullptr);
         int64_t t_budget_begin = ggml_time_ms();
@@ -649,7 +712,23 @@ namespace sd::ggml_graph_cut {
             GGML_ASSERT(!single_plan.segments.empty());
 
             size_t best_end_segment_index = start_segment_index;
-            bool can_merge_next_segment   = graph_cut_segment_vram_bytes(single_plan.segments.back()) <= max_graph_vram_bytes;
+            const auto log_budget_candidate = [&](const char* phase,
+                                                  size_t end_segment_index,
+                                                  const Segment& candidate) {
+                if (!graph_cut_budget_trace_enabled()) {
+                    return;
+                }
+                LOG_INFO("%s graph cut budget candidate phase=%s start=%zu end=%zu compute=%zu params=%zu external=%zu previous_cut=%zu output=%zu total=%zu budget=%zu shared=%d sessions=%d",
+                         log_desc == nullptr ? "unknown" : log_desc,
+                         phase, start_segment_index, end_segment_index,
+                         candidate.compute_buffer_size, candidate.input_param_bytes,
+                         candidate.input_external_bytes,
+                         candidate.input_previous_cut_bytes, candidate.output_bytes,
+                         segment_vram_bytes_for_sessions(candidate, session_count, shared_param_backing),
+                         max_graph_vram_bytes, shared_param_backing ? 1 : 0, session_count);
+            };
+            log_budget_candidate("single", start_segment_index, single_plan.segments.back());
+            bool can_merge_next_segment   = segment_vram_bytes_for_sessions(single_plan.segments.back(), session_count, shared_param_backing) <= max_graph_vram_bytes;
 
             while (can_merge_next_segment && best_end_segment_index + 1 < base_plan.segments.size()) {
                 const size_t next_end_segment_index = best_end_segment_index + 1;
@@ -669,7 +748,8 @@ namespace sd::ggml_graph_cut {
                 GGML_ASSERT(!candidate_plan.segments.empty());
 
                 const auto& candidate_segment = candidate_plan.segments.back();
-                if (graph_cut_segment_vram_bytes(candidate_segment) > max_graph_vram_bytes) {
+                log_budget_candidate("merge", next_end_segment_index, candidate_segment);
+                if (segment_vram_bytes_for_sessions(candidate_segment, session_count, shared_param_backing) > max_graph_vram_bytes) {
                     break;
                 }
 
@@ -691,9 +771,10 @@ namespace sd::ggml_graph_cut {
         }
 
         if (log_desc != nullptr && merged_plan.segments.size() != base_plan.segments.size()) {
-            LOG_INFO("%s graph cut max_vram=%.2f MB merged %zu segments -> %zu segments",
+            LOG_INFO("%s graph cut max_vram=%.2f MB sessions=%d merged %zu segments -> %zu segments",
                      log_desc,
                      max_graph_vram_bytes / 1024.0 / 1024.0,
+                     session_count,
                      base_plan.segments.size(),
                      merged_plan.segments.size());
         }
@@ -712,7 +793,9 @@ namespace sd::ggml_graph_cut {
                       PlanCache* cache,
                       size_t max_graph_vram_bytes,
                       const std::unordered_set<const ggml_tensor*>& params_tensor_set,
-                      const char* log_desc) {
+                      const char* log_desc,
+                      int session_count,
+                      bool shared_param_backing) {
         GGML_ASSERT(backend != nullptr);
         GGML_ASSERT(gf != nullptr);
         GGML_ASSERT(cache != nullptr);
@@ -736,6 +819,8 @@ namespace sd::ggml_graph_cut {
         if (max_graph_vram_bytes > 0 && base_plan.has_cuts) {
             if (cache->budgeted_graph_cut_plan.available &&
                 cache->budgeted_graph_cut_plan_max_vram_bytes == max_graph_vram_bytes &&
+                cache->budgeted_graph_cut_plan_session_count == session_count &&
+                cache->budgeted_graph_cut_plan_shared_param_backing == shared_param_backing &&
                 plan_matches_graph(gf, cache->budgeted_graph_cut_plan)) {
                 resolved_plan = cache->budgeted_graph_cut_plan;
             } else {
@@ -744,10 +829,14 @@ namespace sd::ggml_graph_cut {
                                                                                       max_graph_vram_bytes,
                                                                                       backend,
                                                                                       params_tensor_set,
-                                                                                      log_desc);
+                                                                                      log_desc,
+                                                                                      session_count,
+                                                                                      shared_param_backing);
                 cache->budgeted_graph_cut_plan                = resolved_plan;
                 cache->budgeted_graph_cut_plan.available      = true;
                 cache->budgeted_graph_cut_plan_max_vram_bytes = max_graph_vram_bytes;
+                cache->budgeted_graph_cut_plan_session_count  = session_count;
+                cache->budgeted_graph_cut_plan_shared_param_backing = shared_param_backing;
             }
         }
         return resolved_plan;

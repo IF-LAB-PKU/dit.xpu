@@ -523,17 +523,22 @@ public:
                  stage_tensors.size(),
                  total_bytes,
                  htp_packed_bytes);
+        TensorSubsetLoadStats load_stats;
         if (!allocate_weight_stage(target) ||
-            !retained_model_loader->load_tensor_subset(stage_tensors, n_threads)) {
+            !retained_model_loader->load_tensor_subset(stage_tensors, n_threads, &load_stats)) {
             release_weight_stage_buffers(target);
             loaded_weight_stage = WeightStage::NONE;
             LOG_ERROR("loading weight stage %s failed", weight_stage_name(target));
             return false;
         }
         loaded_weight_stage = target;
-        LOG_INFO("weight stage %s loaded in %.2fs",
+        LOG_INFO("weight stage %s loaded in %.2fs (host_loaded=%zu bytes/%zu tensors, deferred_packed=%zu bytes/%zu tensors)",
                  weight_stage_name(target),
-                 (ggml_time_ms() - start_ms) / 1000.f);
+                 (ggml_time_ms() - start_ms) / 1000.f,
+                 load_stats.host_loaded_bytes,
+                 load_stats.host_loaded_tensors,
+                 load_stats.deferred_packed_bytes,
+                 load_stats.deferred_packed_tensors);
         return true;
     }
 
@@ -736,7 +741,7 @@ public:
             apply_lora_immediately = false;
         }
         if (staged_params_loading && apply_lora_immediately) {
-            LOG_WARN("staged parameter loading uses runtime LoRA adapters");
+            LOG_INFO("staged parameter loading uses runtime LoRA adapters");
             apply_lora_immediately = false;
         }
 
@@ -745,12 +750,12 @@ public:
         bool needs_writable_mmap = false;
         const bool enable_model_mmap = sd_ctx_params->enable_mmap && !staged_params_loading;
         if (sd_ctx_params->enable_mmap && staged_params_loading) {
-            LOG_WARN("mmap is disabled while staged parameter loading is enabled");
+            LOG_INFO("mmap is disabled while staged parameter loading is enabled");
         }
         if (enable_model_mmap) {
             if (apply_lora_immediately) {
                 needs_writable_mmap = true;
-                LOG_WARN("in mode 'immediately', LoRAs will cause extra memory usage with mmap");
+                LOG_INFO("in mode 'immediately', LoRAs will cause extra memory usage with mmap");
             }
             enable_mmap_tensors = true;
         }

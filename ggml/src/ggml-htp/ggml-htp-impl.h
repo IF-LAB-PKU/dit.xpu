@@ -15,6 +15,7 @@
 #include "ggml.h"
 #include "ggml-htp.h"
 #include "htp_session.h"
+#include "htp_session_dispatch.h"
 #include "rpcmem_mapper.h"
 
 struct htp_ops_session;
@@ -125,6 +126,17 @@ struct ggml_backend_htp_context {
     RpcMemMapper & active_mapper() {
         HtpSessionRuntime * runtime = session_runtime(active_session_index);
         return runtime != nullptr && runtime->mapper != nullptr ? *runtime->mapper : mapper;
+    }
+    // During a graph dispatch, resolve the mapper from the dispatch
+    // context's selected runtime rather than from mutable global state.  The
+    // legacy active mapper remains the fallback for single-session callers.
+    RpcMemMapper & dispatch_mapper() {
+        RpcMemMapper * selected = ggml_backend_htp_dispatch_mapper();
+        return selected != nullptr ? *selected : active_mapper();
+    }
+    const RpcMemMapper & dispatch_mapper() const {
+        RpcMemMapper * selected = ggml_backend_htp_dispatch_mapper();
+        return selected != nullptr ? *selected : active_mapper();
     }
     const RpcMemMapper & active_mapper() const {
         const HtpSessionRuntime * runtime = session_runtime(active_session_index);
