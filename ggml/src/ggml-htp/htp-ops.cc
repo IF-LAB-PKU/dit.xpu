@@ -4,7 +4,7 @@
 // 2) 将所有输入/输出张量解析为 (fd, offset) 形式的 RPC 内存地址；
 // 3) 将算子参数打包到共享内存消息缓冲区（MessageHeader 环形缓冲）；
 // 4) 通过原子标志位通知 DSP 侧开始计算，阻塞等待完成；
-// 5) 可选地批量处理延迟的 fastrpc_munmap 请求以降低开销。
+// 5) 可选地批量处理延迟的 DSP put + FastRPC munmap 请求。
 
 #include "htp-ops.h"
 
@@ -35,6 +35,7 @@
 #include "dsprpc_interface.h"
 #include "message.h"
 #include "op_reg.h"
+#include "rpcmem_session_route.h"
 
 #ifdef GGML_HTP_OPENCL_SIDECAR
 #include "ggml-opencl-htp.h"
@@ -153,7 +154,7 @@ void dump_missing_mapping_diagnostics(const ggml_tensor * dst,
 }
 
 auto get_all_rpcmem_mappings(const ggml_tensor * dst) {
-    const auto & mapper = ggml_backend_htp_context::instance()->active_mapper();
+    const auto & mapper = ggml_backend_htp_context::instance()->dispatch_mapper();
 
     std::vector<std::pair<int, ssize_t>> mappings;
     const ggml_tensor * mapped_dst = get_tensor_with_backing_buffer(dst);
@@ -218,7 +219,7 @@ using direct_f16_matmul_trace_session_fn = int(
 bool htp_direct_reserved_matmul_enabled(const ggml_backend_htp_context * ctx) {
     return ctx != nullptr && ctx->reserved_session != nullptr &&
            ctx->reserved_domain_id >= 0 &&
-           ctx->active_mapper().domain() == ctx->reserved_domain_id &&
+           ctx->dispatch_mapper().domain() == ctx->reserved_domain_id &&
            env_flag_enabled("SD_HTP_MULTI_SESSION_DIRECT");
 }
 
@@ -297,7 +298,13 @@ struct htp_independent_output {
             return true;
         }
         if (mapped) {
-            (void) fastrpc_munmap(domain, fd, ptr, size);
+            const int ret = fastrpc_munmap(domain, fd, ptr, size);
+            if (ret != 0) {
+                std::fprintf(stderr,
+                             "[ggml-htp] independent output fastrpc_munmap failed domain=%d fd=%d size=%zu ret=%d\n",
+                             domain, fd, size, ret);
+                return false;
+            }
             mapped = false;
         }
         if (ptr != nullptr) {
@@ -348,6 +355,7 @@ struct htp_independent_output {
                 std::fprintf(stderr,
                              "[ggml-htp] independent output fastrpc_munmap failed domain=%d fd=%d size=%zu ret=%d\n",
                              domain, fd, size, ret);
+                return;
             }
         }
         if (ptr != nullptr) {
@@ -407,6 +415,7 @@ struct htp_independent_activation {
                 std::fprintf(stderr,
                              "[ggml-htp] independent activation fastrpc_munmap failed domain=%d fd=%d size=%zu ret=%d\n",
                              domain, fd, size, ret);
+                return;
             }
         }
         if (ptr != nullptr) {
@@ -2234,7 +2243,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 ssize_t activation_offset = 0;
 
                 if (is_f16) {
-                    auto & mapper = ctx->active_mapper();
+                    auto & mapper = ctx->dispatch_mapper();
                     std::tie(output_fd, output_offset)         = mapper.get_tensor_mapping(dst);
                     std::tie(weight_fd, weight_offset)         = mapper.get_tensor_mapping(packed_weight);
                     std::tie(activation_fd, activation_offset) = mapper.get_tensor_mapping(activation);
@@ -2538,7 +2547,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 }
                 if (is_qkv_mul_rms_packed_dual_rope_custom(dst)) {
                     prepare_tensor_rpcmem_mapping_with_extra(dst, dst->src[0]);
-                    const auto & mapper = ggml_backend_htp_context::instance()->active_mapper();
+                    const auto & mapper = ggml_backend_htp_context::instance()->dispatch_mapper();
                     std::vector<std::pair<int, ssize_t>> mappings;
                     mappings.push_back(mapper.get_tensor_mapping(dst));
                     for (int i = 0; i <= 10; ++i) {
@@ -2592,7 +2601,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 }
                 if (is_qkv_mul_rms_packed_rope_custom(dst)) {
                     prepare_tensor_rpcmem_mapping_with_extra(dst, dst->src[1]);
-                    const auto & mapper = ggml_backend_htp_context::instance()->active_mapper();
+                    const auto & mapper = ggml_backend_htp_context::instance()->dispatch_mapper();
                     std::vector<std::pair<int, ssize_t>> mappings;
                     mappings.push_back(mapper.get_tensor_mapping(dst));
                     for (int i = 0; i <= 5; ++i) {
@@ -2639,7 +2648,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 }
                 if (is_qkv_mul_rms_packed_dual_custom(dst)) {
                     prepare_tensor_rpcmem_mapping_with_extra(dst, dst->src[0]);
-                    const auto & mapper = ggml_backend_htp_context::instance()->active_mapper();
+                    const auto & mapper = ggml_backend_htp_context::instance()->dispatch_mapper();
                     std::vector<std::pair<int, ssize_t>> mappings;
                     mappings.push_back(mapper.get_tensor_mapping(dst));
                     for (int i = 0; i < 10; ++i) {
@@ -2775,13 +2784,13 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
 
     const bool isolate_all_outputs =
         env_flag_enabled("SD_HTP_MULTI_SESSION_INDEPENDENT_ALL_OUTPUT") &&
-        ctx->reserved_session != nullptr && ctx->active_mapper().domain() == ctx->reserved_domain_id;
+        ctx->reserved_session != nullptr && ctx->dispatch_mapper().domain() == ctx->reserved_domain_id;
     htp_isolated_dispatch_output isolated_dispatch_output;
     if (isolate_all_outputs) {
         auto * output_descriptor = reinterpret_cast<RpcmemBufAddr *>(param_buf);
         const int original_output_fd = output_descriptor->fd;
         const ssize_t original_output_offset = output_descriptor->offset;
-        if (!isolated_dispatch_output.init(ctx->active_mapper().domain(), dst) ||
+        if (!isolated_dispatch_output.init(ctx->dispatch_mapper().domain(), dst) ||
             !isolated_dispatch_output.bind(op_index, param_buf, original_output_fd,
                                            original_output_offset)) {
             std::fprintf(stderr,
@@ -2792,7 +2801,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     }
 
     int  n_reqs         = 1;
-    int  n_unmap_fds    = (int) ctx->active_mapper().get_pending_unmap_reqs().size();
+    int  n_unmap_fds    = (int) ctx->dispatch_mapper().get_pending_unmap_reqs().size();
     bool has_unmap_reqs = n_unmap_fds > 0;
     if (has_unmap_reqs) {
         ++n_reqs;
@@ -2824,7 +2833,18 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     }
 
     if (has_unmap_reqs) {
-        auto * runtime = ctx->session_runtime(ctx->active_session_index);
+        auto & dispatch_mapper = ctx->dispatch_mapper();
+        const int mapper_domain = dispatch_mapper.domain();
+        const int mapper_session = htp_rpcmem_session_index_for_domain(ctx->sessions, mapper_domain);
+        auto * runtime = ctx->session_runtime(mapper_session);
+        if (env_flag_enabled("SD_HTP_RPCMEM_TRACE")) {
+            std::fprintf(stderr,
+                         "[rpcmem-trace] op_pending_put mapper_session=%d mapper_domain=%d "
+                         "active_session=%d active_domain=%d runtime_domain=%d channel=%p pending=%d\n",
+                         mapper_session, mapper_domain, ctx->active_session_index,
+                         ctx->active_mapper().domain(), runtime != nullptr ? static_cast<int>(runtime->domain) : -1,
+                         ctx->message_channel(), n_unmap_fds);
+        }
         const bool use_v2_map = ctx->multi_session_enabled && runtime != nullptr;
         size_t map_req_size = sizeof(RequestHeader) +
             (use_v2_map ? sizeof(RpcmemMapRequestV2) + n_unmap_fds * sizeof(RpcmemMapEntryV2)
@@ -2848,14 +2868,14 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 .n_gets = 0,
             };
             write_buf(p, map_req);
-            for (const auto & req : ctx->active_mapper().get_pending_unmap_reqs()) {
+            for (const auto & req : dispatch_mapper.get_pending_unmap_reqs()) {
                 RpcmemMapEntryV2 entry{req.fd, 0, 0, req.buf_size, 0};
                 write_buf(p, entry);
             }
         } else {
             RpcmemMapRequest map_req{n_unmap_fds, 0};
             write_buf(p, map_req);
-            for (const auto & req : ctx->active_mapper().get_pending_unmap_reqs()) write_buf(p, req.fd);
+            for (const auto & req : dispatch_mapper.get_pending_unmap_reqs()) write_buf(p, req.fd);
         }
     }
 
@@ -2899,7 +2919,9 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
         // Pending puts are encoded on the custom channel. Drain them before
         // entering direct FastRPC so the direct call sees the same mapper
         // state as the normal channel path.
-        ctx->active_mapper().flush_pending_unmaps();
+        if (!ctx->dispatch_mapper().flush_pending_unmaps()) {
+            return -EIO;
+        }
         uint64_t direct_dsp_activation_hash = 0;
         uint64_t direct_dsp_output_hash = 0;
         uint64_t direct_dsp_output_hash_after_remap = 0;
@@ -2916,7 +2938,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
         int direct_activation_fd = debug_activation_fd;
         int direct_activation_offset = static_cast<int>(debug_activation_offset);
         if (use_independent_output) {
-            if (!independent_output.init(ctx->active_mapper().domain(), ggml_nbytes(dst))) {
+            if (!independent_output.init(ctx->dispatch_mapper().domain(), ggml_nbytes(dst))) {
                 std::fprintf(stderr,
                              "[ggml-htp] independent output allocation failed for weight=%s bytes=%zu\n",
                              debug_weight != nullptr && debug_weight->name[0] != '\0'
@@ -2928,7 +2950,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
             direct_output_offset = 0;
         }
         if (use_independent_activation) {
-            if (!independent_activation.init(ctx->active_mapper().domain(),
+            if (!independent_activation.init(ctx->dispatch_mapper().domain(),
                                              debug_activation->data,
                                              ggml_nbytes(debug_activation))) {
                 std::fprintf(stderr,
@@ -2988,7 +3010,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                      dispatch_m,
                      dispatch_k,
                      dispatch_n,
-                     ctx->active_mapper().domain(),
+                     ctx->dispatch_mapper().domain(),
                      direct_weight_hash,
                      direct_packed_weight_hash,
                      debug_output_fd,
@@ -3022,7 +3044,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
             dump_htp_dispatch_state("dispatch-timeout", dst, op_index, dispatch_m, dispatch_k, dispatch_n, waited_ms);
             d_ptr->store(0, std::memory_order_relaxed);
             if (has_unmap_reqs) {
-                ctx->active_mapper().unmap_all_pending_buffers();
+                ctx->dispatch_mapper().flush_pending_unmaps();
             }
             return -ETIMEDOUT;
         }
@@ -3031,7 +3053,9 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     d_ptr->store(0, std::memory_order_relaxed);
 
     if (has_unmap_reqs) {
-        ctx->active_mapper().unmap_all_pending_buffers();
+        if (!ctx->dispatch_mapper().unmap_all_pending_buffers()) {
+            return -EIO;
+        }
     }
 
     isolated_dispatch_output.copy_back();
@@ -3192,7 +3216,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                      dispatch_m,
                      dispatch_k,
                      dispatch_n,
-                     ctx->active_mapper().domain(),
+                     ctx->dispatch_mapper().domain(),
                      weight_hash,
                      packed_weight_hash,
                      debug_output_fd,

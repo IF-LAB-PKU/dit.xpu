@@ -6,6 +6,8 @@ set(GGML_SOURCES_HTP
     htp-cpu-impl.c
     htp-ops.cc
     htp-ops.h
+    htp_session_dispatch.cc
+    htp_session_dispatch.h
     message.h
     op_reg.h
     rpcmem_mapper.cc

@@ -40,15 +40,36 @@ target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../s
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
+set(TEST_TARGET test-htp-graph-cut-session-budget)
+add_executable(${TEST_TARGET} test-htp-graph-cut-session-budget.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../src)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
 set(TEST_TARGET test-htp-tensor-session-view)
 add_executable(${TEST_TARGET} ../ggml/src/ggml-htp/tensor_session_view_test.cc)
 target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-htp)
+target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
 set(TEST_TARGET test-htp-session-placement)
 add_executable(${TEST_TARGET}
                ../ggml/src/ggml-htp/session_placement_test.cc)
 target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-htp)
+target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+set(TEST_TARGET test-htp-session-dispatch)
+add_executable(${TEST_TARGET}
+               ../ggml/src/ggml-htp/session_dispatch_test.cc)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-htp)
+target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+set(TEST_TARGET test-htp-graph-cut-session-dispatch)
+add_executable(${TEST_TARGET} test-htp-graph-cut-session-dispatch.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/..)
+target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
 

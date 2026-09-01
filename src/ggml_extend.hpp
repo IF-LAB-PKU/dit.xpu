@@ -39,6 +39,7 @@
 
 #include "htp_tensor_flags.h"
 #include "htp_packed_staging.h"
+#include "ggml/src/ggml-htp/session_placement.h"
 #include "ggml/src/ggml-htp/session_ownership.h"
 #include "model.h"
 #include "tensor.hpp"
@@ -48,6 +49,8 @@
 #include "util.h"
 
 #define EPS 1e-05f
+
+extern "C" bool htp_ops_support_op_runtime(const struct ggml_tensor * dst);
 
 #ifndef __STATIC_INLINE__
 #define __STATIC_INLINE__ static inline
@@ -6241,9 +6244,13 @@ protected:
     HtpPackedStagingPool::LoadFn htp_packed_staging_loader_;
     std::vector<HtpPackedStagingPool::Handle> htp_packed_staging_handles_;
     std::vector<ggml_tensor*> htp_packed_staging_tensors_;
+    bool preserve_htp_packed_staging_ = false;
+    int htp_packed_staging_owner_count_ = 1;
+    int htp_packed_staging_pool_owner_count_ = 0;
 
     ggml_context* params_ctx                    = nullptr;
     ggml_backend_buffer_t params_buffer         = nullptr;
+    HtpNonDeferredParamsAllocation non_deferred_params_allocation_;
     ggml_context* offload_ctx                   = nullptr;
     ggml_backend_buffer_t runtime_params_buffer = nullptr;
     bool params_on_runtime_backend              = false;
@@ -6252,6 +6259,8 @@ protected:
     // 参照 llama.cpp-npu，eligible diffusion 权重在参数分配阶段直接放进 RPCMEM，而不是图执行前再复制一份常驻权重池。
     ggml_context* htp_param_placement_ctx_            = nullptr;
     ggml_backend_buffer_t htp_param_placement_buffer_ = nullptr;
+    std::vector<ggml_context*> htp_param_placement_ctxs_;
+    std::vector<ggml_backend_buffer_t> htp_param_placement_buffers_;
     std::vector<std::pair<ggml_tensor*, ggml_tensor*>> htp_param_placement_pairs_;
     std::unordered_set<ggml_tensor*> htp_placed_param_tensors_;
     std::vector<ggml_tensor*> htp_packed_self_registered_weights_;
@@ -6262,17 +6271,6 @@ protected:
         std::unordered_set<std::string> names;
     };
     std::vector<CacheStorageSegment> cache_storage_segments_;
-
-    struct SessionTransferStorage {
-        ggml_context* ctx = nullptr;
-        ggml_backend_buffer_t buffer = nullptr;
-        ggml_tensor* tensor = nullptr;
-        std::string name;
-        HtpSessionOwner source;
-        HtpSessionOwner destination;
-    };
-    std::vector<SessionTransferStorage> session_transfer_storage_;
-    HtpSessionOwnership cache_session_ownership_;
 
     struct AsyncResidualCacheGeneration {
         uint64_t generation = 0;
@@ -6421,12 +6419,7 @@ protected:
             offload_ctx = nullptr;
         }
         runtime_offload_pairs_.clear();
-        if (htp_param_placement_ctx_ != nullptr) {
-            ggml_free(htp_param_placement_ctx_);
-            htp_param_placement_ctx_ = nullptr;
-        }
-        htp_param_placement_pairs_.clear();
-        htp_placed_param_tensors_.clear();
+        free_htp_param_placement();
         if (partial_offload_ctx != nullptr) {
             ggml_free(partial_offload_ctx);
             partial_offload_ctx = nullptr;
@@ -6452,21 +6445,6 @@ protected:
             }
         }
         cache_storage_segments_.clear();
-    }
-
-    void free_session_transfer_storage() {
-        for (SessionTransferStorage& transfer : session_transfer_storage_) {
-            if (transfer.buffer != nullptr) {
-                ggml_backend_buffer_free(transfer.buffer);
-                transfer.buffer = nullptr;
-            }
-            if (transfer.ctx != nullptr) {
-                ggml_free(transfer.ctx);
-                transfer.ctx = nullptr;
-            }
-            transfer.tensor = nullptr;
-        }
-        session_transfer_storage_.clear();
     }
 
     void free_async_residual_cache_slots() {
@@ -7474,7 +7452,6 @@ protected:
         if (tensors.empty()) {
             return true;
         }
-
         size_t self_registered_bytes = 0;
         for (ggml_tensor* tensor : tensors) {
             if (!htp_packed_f16_weight_is_prepared(tensor)) {
@@ -7514,14 +7491,25 @@ protected:
         htp_param_placement_pairs_.clear();
         htp_placed_param_tensors_.clear();
 
-        if (htp_param_placement_buffer_ != nullptr) {
+        if (htp_param_placement_buffer_ != nullptr &&
+            std::find(htp_param_placement_buffers_.begin(), htp_param_placement_buffers_.end(),
+                      htp_param_placement_buffer_) == htp_param_placement_buffers_.end()) {
             ggml_backend_buffer_free(htp_param_placement_buffer_);
-            htp_param_placement_buffer_ = nullptr;
         }
-        if (htp_param_placement_ctx_ != nullptr) {
-            ggml_free(htp_param_placement_ctx_);
-            htp_param_placement_ctx_ = nullptr;
+        for (ggml_backend_buffer_t buffer : htp_param_placement_buffers_) {
+            if (buffer != nullptr) {
+                ggml_backend_buffer_free(buffer);
+            }
         }
+        htp_param_placement_buffers_.clear();
+        for (ggml_context* ctx : htp_param_placement_ctxs_) {
+            if (ctx != nullptr) {
+                ggml_free(ctx);
+            }
+        }
+        htp_param_placement_ctxs_.clear();
+        htp_param_placement_buffer_ = nullptr;
+        htp_param_placement_ctx_ = nullptr;
     }
 
     // 参数张量做局部 offload 时必须落到根张量，partial offload 当前不接受 view 张量本身。
@@ -8405,6 +8393,9 @@ protected:
                 if (htp_placed_param_tensors_.find(t) != htp_placed_param_tensors_.end()) {
                     continue;
                 }
+                if (htp_packed_staging_contains(htp_packed_staging_tensors_, t)) {
+                    continue;
+                }
                 ggml_tensor* offload_t = ggml_dup_tensor(offload_ctx, t);
                 ggml_set_name(offload_t, t->name);
                 runtime_offload_pairs_.push_back({t, offload_t});
@@ -8471,6 +8462,9 @@ protected:
             if (htp_placed_param_tensors_.find(tensor) != htp_placed_param_tensors_.end()) {
                 continue;
             }
+            if (htp_packed_staging_contains(htp_packed_staging_tensors_, tensor)) {
+                continue;
+            }
             if (seen_tensors.insert(tensor).second) {
                 unique_tensors.push_back(tensor);
             }
@@ -8530,7 +8524,9 @@ protected:
     }
 
     void restore_all_params() {
-        release_htp_packed_staging();
+        if (!preserve_htp_packed_staging_) {
+            release_htp_packed_staging();
+        }
         restore_partial_params();
         if (!params_on_runtime_backend) {
             return;
@@ -8554,7 +8550,9 @@ protected:
     }
 
     void restore_partial_params() {
-        release_htp_packed_staging();
+        if (!preserve_htp_packed_staging_) {
+            release_htp_packed_staging();
+        }
         if (partial_offload_pairs.empty()) {
             if (partial_runtime_params_buffer != nullptr) {
                 ggml_backend_buffer_free(partial_runtime_params_buffer);
@@ -8610,12 +8608,29 @@ protected:
                                 GraphCutPlan* plan_out) {
         GGML_ASSERT(plan_out != nullptr);
         GGML_ASSERT(gf != nullptr);
+        int planner_session_count = 1;
+        const bool multi_session_enabled = sd_env_flag_enabled("SD_HTP_MULTI_SESSION");
+        if (multi_session_enabled && htp_backend != nullptr) {
+            const int actual_session_count = ggml_backend_htp_session_count(htp_backend);
+            if (actual_session_count > 0) {
+                planner_session_count = actual_session_count;
+            }
+        }
+        const bool shared_param_backing = sd_env_flag_enabled("SD_HTP_PACKED_STAGING");
         *plan_out = sd::ggml_graph_cut::resolve_plan(runtime_backend,
                                                      gf,
                                                      &graph_cut_plan_cache_,
                                                      max_graph_vram_bytes,
                                                      params_tensor_set_,
-                                                     get_desc().c_str());
+                                                     get_desc().c_str(),
+                                                     planner_session_count,
+                                                     shared_param_backing);
+        if (multi_session_enabled) {
+            LOG_INFO("%s graph-cut planner sessions=%d shared_params=%d segments=%zu max_vram=%zu",
+                     get_desc().c_str(), planner_session_count,
+                     shared_param_backing ? 1 : 0,
+                     plan_out->segments.size(), max_graph_vram_bytes);
+        }
         return true;
     }
 
@@ -8651,83 +8666,12 @@ protected:
         }
     }
 
-    bool make_session_transfer(const std::string& name,
-                               ggml_tensor* source,
-                               HtpSessionOwner destination,
-                               ggml_tensor** destination_tensor_out) {
-        GGML_ASSERT(destination_tensor_out != nullptr);
-        *destination_tensor_out = source;
-        if (source == nullptr || htp_backend == nullptr ||
-            !sd_env_flag_enabled("SD_HTP_MULTI_SESSION")) {
-            return true;
-        }
-
-        const HtpSessionOwner source_owner = cache_session_ownership_.owner(name);
-        if (!cache_session_ownership_.has(name) ||
-            (source_owner.session == destination.session &&
-             source_owner.domain == destination.domain)) {
-            return true;
-        }
-
-        ggml_context* transfer_ctx = new_cache_ctx();
-        ggml_tensor* transfer_tensor = ggml_dup_tensor(transfer_ctx, source);
-        ggml_set_name(transfer_tensor, name.c_str());
-        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(htp_backend);
-        ggml_backend_buffer_t transfer_buffer =
-            ggml_backend_alloc_ctx_tensors_from_buft(transfer_ctx, buft);
-        if (transfer_buffer == nullptr) {
-            ggml_free(transfer_ctx);
-            LOG_ERROR("%s session transfer allocation failed: name=%s bytes=%zu destination_session=%d domain=%d",
-                      get_desc().c_str(), name.c_str(), ggml_nbytes(source),
-                      destination.session, destination.domain);
-            return false;
-        }
-
-        std::vector<uint8_t> host_data(ggml_nbytes(source));
-        ggml_backend_tensor_get(source, host_data.data(), 0, host_data.size());
-        ggml_backend_tensor_set(transfer_tensor, host_data.data(), 0, host_data.size());
-        ggml_backend_synchronize(htp_backend);
-
-        if (sd_env_flag_enabled("SD_HTP_MULTI_SESSION_TRANSFER_TRACE")) {
-            static constexpr uint64_t FNV1A64_OFFSET = UINT64_C(14695981039346656037);
-            const uint64_t source_hash =
-                sd_fnv1a64_update(FNV1A64_OFFSET, host_data.data(), host_data.size());
-            const uint64_t destination_hash = hash_tensor_bytes_for_debug(transfer_tensor);
-            std::fprintf(stderr,
-                         "session_transfer_hash source_session=%d destination_session=%d bytes=%zu source=%016" PRIx64
-                         " destination=%016" PRIx64 " match=%d name=%s\n",
-                         source_owner.session, destination.session, host_data.size(),
-                         source_hash, destination_hash,
-                         source_hash == destination_hash ? 1 : 0, name.c_str());
-            if (source_hash != destination_hash) {
-                LOG_ERROR("%s session transfer readback mismatch: name=%s", get_desc().c_str(), name.c_str());
-                ggml_backend_buffer_free(transfer_buffer);
-                ggml_free(transfer_ctx);
-                return false;
-            }
-        }
-
-        session_transfer_storage_.push_back({
-            transfer_ctx,
-            transfer_buffer,
-            transfer_tensor,
-            name,
-            source_owner,
-            destination,
-        });
-        *destination_tensor_out = transfer_tensor;
-        std::fprintf(stderr,
-                     "session_transfer source_session=%d source_domain=%d destination_session=%d destination_domain=%d bytes=%zu name=%s\n",
-                     source_owner.session, source_owner.domain,
-                     destination.session, destination.domain,
-                     host_data.size(), name.c_str());
-        return true;
-    }
-
     bool bind_segment_cached_inputs(ggml_cgraph* gf,
-                                    const GraphCutSegment& segment,
-                                    HtpSessionOwner destination) {
+                                    const GraphCutSegment& segment) {
         GGML_ASSERT(gf != nullptr);
+        // Graph-cut has no segment-level owner.  The common HTP dispatcher
+        // selects the consuming session per operation and maps this canonical
+        // backing tensor in that session on demand.
         for (const auto& input : segment.input_refs) {
             ggml_tensor* input_tensor = sd::ggml_graph_cut::input_tensor(gf, input);
             if (input_tensor == nullptr) {
@@ -8743,10 +8687,6 @@ protected:
                         return false;
                     }
                     ggml_tensor* bound_cache_tensor = cache_tensor;
-                    if (!make_session_transfer(input.display_name, cache_tensor,
-                                               destination, &bound_cache_tensor)) {
-                        return false;
-                    }
                     if (input_tensor->view_src != nullptr) {
                         input_tensor->view_src = bound_cache_tensor;
                         input_tensor->buffer   = nullptr;
@@ -8783,7 +8723,16 @@ protected:
             return true;
         }
         if (htp_packed_staging_pool_ != nullptr) {
-            return true;
+            if (htp_packed_staging_pool_owner_count_ == htp_packed_staging_owner_count_) {
+                return true;
+            }
+            if (!htp_packed_staging_handles_.empty()) {
+                LOG_ERROR("%s cannot change packed staging owners with active slots",
+                          get_desc().c_str());
+                return false;
+            }
+            htp_packed_staging_pool_.reset();
+            htp_packed_staging_pool_owner_count_ = 0;
         }
         const size_t budget_mb = static_cast<size_t>(std::max(1, sd_env_int_value("SD_HTP_PACKED_STAGING_BUDGET_MB", 512)));
         const size_t slot_mb = static_cast<size_t>(std::max(1, sd_env_int_value("SD_HTP_PACKED_STAGING_SLOT_MB", 256)));
@@ -8795,23 +8744,80 @@ protected:
             return false;
         }
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(htp_backend);
-        htp_packed_staging_pool_ = std::make_unique<HtpPackedStagingPool>(
-            budget_bytes,
-            slot_bytes,
-            [buft](size_t bytes) {
-                ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, bytes);
-                if (buffer == nullptr) {
-                    return HtpPackedStagingPool::Allocation{};
+        HtpPackedStagingPool::DiagnosticFn diagnostic;
+        if (sd_env_flag_enabled("SD_HTP_PACKED_STAGING_DIAGNOSTICS")) {
+            diagnostic = [this](const HtpPackedStagingPool::DiagnosticEvent& event) {
+                const char* kind = "pool_created";
+                switch (event.kind) {
+                    case HtpPackedStagingPool::DiagnosticKind::PoolCreated:
+                        break;
+                    case HtpPackedStagingPool::DiagnosticKind::SlotAcquired:
+                        kind = "slot_acquired";
+                        break;
+                    case HtpPackedStagingPool::DiagnosticKind::TensorPlaced:
+                        kind = "tensor_placed";
+                        break;
+                    case HtpPackedStagingPool::DiagnosticKind::SlotReleased:
+                        kind = "slot_released";
+                        break;
                 }
-                return HtpPackedStagingPool::Allocation{ggml_backend_buffer_get_base(buffer), buffer};
-            },
-            [](const HtpPackedStagingPool::Allocation& allocation) {
-                if (allocation.buffer != nullptr) {
-                    ggml_backend_buffer_free(allocation.buffer);
-                }
-            });
-        LOG_INFO("%s HTP packed staging enabled: budget=%zu MiB slot=%zu MiB",
-                 get_desc().c_str(), budget_mb, slot_mb);
+                LOG_INFO("%s htp_staging event=%s requested=%zu slot=%zu session=%d domain=%d session_allocated=%zu total_allocated=%zu reused=%d tensor=%s",
+                         get_desc().c_str(), kind, event.requested_bytes,
+                         event.slot_index, event.logical_session_index, event.domain,
+                         event.session_allocated_bytes, event.total_allocated_bytes,
+                         event.reused ? 1 : 0, event.tensor_name.c_str());
+            };
+        }
+        const auto free_allocation = [](const HtpPackedStagingPool::Allocation& allocation) {
+            if (allocation.buffer != nullptr) {
+                ggml_backend_buffer_free(allocation.buffer);
+            }
+        };
+        // Keep one persistent arena, but allocate chunks with a stable
+        // session/domain affinity.  This target rejects a live 256 MiB fd
+        // being mapped in two FastRPC PDs, so a chunk must never contain
+        // weights consumed by another session.  The arena remains shared at
+        // runner level and chunks are retained until backend teardown.
+        if (htp_packed_staging_owner_count_ > 1) {
+            htp_packed_staging_pool_ = std::make_unique<HtpPackedStagingPool>(
+                budget_bytes,
+                slot_bytes,
+                htp_packed_staging_owner_count_,
+                [backend = htp_backend](size_t bytes, int logical_session_index) {
+                    ggml_backend_buffer_t buffer = ggml_backend_htp_alloc_buffer_for_session(
+                        backend, logical_session_index, bytes);
+                    if (buffer == nullptr) {
+                        return HtpPackedStagingPool::Allocation{};
+                    }
+                    ggml_backend_htp_buffer_set_persistent_staging(buffer, true);
+                    return HtpPackedStagingPool::Allocation{
+                        ggml_backend_buffer_get_base(buffer), buffer,
+                        logical_session_index,
+                        ggml_backend_htp_session_domain(backend, logical_session_index)};
+                },
+                free_allocation,
+                std::move(diagnostic));
+        } else {
+            htp_packed_staging_pool_ = std::make_unique<HtpPackedStagingPool>(
+                budget_bytes,
+                slot_bytes,
+                [buft, backend = htp_backend](size_t bytes) {
+                    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, bytes);
+                    if (buffer == nullptr) {
+                        return HtpPackedStagingPool::Allocation{};
+                    }
+                    ggml_backend_htp_buffer_set_persistent_staging(buffer, true);
+                    return HtpPackedStagingPool::Allocation{
+                        ggml_backend_buffer_get_base(buffer), buffer, 0,
+                        ggml_backend_htp_session_domain(backend, 0)};
+                },
+                free_allocation,
+                std::move(diagnostic));
+        }
+        htp_packed_staging_pool_owner_count_ = htp_packed_staging_owner_count_;
+        LOG_INFO("%s HTP packed staging enabled: budget=%zu MiB slot=%zu MiB owners=%d",
+                 get_desc().c_str(), budget_mb, slot_mb,
+                 htp_packed_staging_pool_owner_count_);
         return true;
     }
 
@@ -8826,6 +8832,59 @@ protected:
         if (tensors.empty()) {
             return true;
         }
+        std::unordered_set<ggml_tensor*> staged_lookup(tensors.begin(), tensors.end());
+        std::unordered_map<ggml_tensor*, int> tensor_sessions;
+        const int owner_count = std::max(1, htp_packed_staging_owner_count_);
+        int htp_node_count = 0;
+        for (int node_index = 0; node_index < ggml_graph_n_nodes(gf); ++node_index) {
+            ggml_tensor* node = ggml_graph_node(gf, node_index);
+            if (node != nullptr && is_htp_supported_f16_mul_mat(node)) {
+                ++htp_node_count;
+            }
+        }
+        int htp_ordinal = 0;
+        for (int node_index = 0; node_index < ggml_graph_n_nodes(gf); ++node_index) {
+            ggml_tensor* node = ggml_graph_node(gf, node_index);
+            if (node == nullptr || !is_htp_supported_f16_mul_mat(node)) {
+                continue;
+            }
+            const int owner = htp_session_owner_for_ordinal(
+                htp_ordinal++, htp_node_count, owner_count);
+            for (int src_index = 0; src_index < GGML_MAX_SRC; ++src_index) {
+                ggml_tensor* src = node->src[src_index];
+                while (src != nullptr && src->view_src != nullptr) {
+                    src = src->view_src;
+                }
+                if (src != nullptr) {
+                    if (staged_lookup.count(src) != 0) {
+                        tensor_sessions.emplace(src, owner);
+                    } else {
+                        ggml_tensor * packed_src = ggml_backend_htp_get_packed_f16_weight(src);
+                        if (packed_src != nullptr && staged_lookup.count(packed_src) != 0) {
+                            tensor_sessions.emplace(packed_src, owner);
+                        }
+                    }
+                }
+            }
+        }
+        if (!htp_packed_staging_handles_.empty()) {
+            // The graph-cut executor may already own the canonical staged
+            // slots from the complete graph. Rebind the tensors after a
+            // per-segment parameter swap without reloading their bytes.
+            for (ggml_tensor* tensor : tensors) {
+                bool rebound = false;
+                for (auto handle : htp_packed_staging_handles_) {
+                    if (htp_packed_staging_pool_->rebind_tensor(handle, tensor)) {
+                        rebound = true;
+                        break;
+                    }
+                }
+                if (!rebound) {
+                    return false;
+                }
+            }
+            return true;
+        }
         size_t required_bytes = 0;
         for (ggml_tensor* tensor : tensors) {
             required_bytes = GGML_PAD(required_bytes, 128) + ggml_nbytes(tensor);
@@ -8833,8 +8892,13 @@ protected:
         htp_packed_staging_handles_.clear();
         htp_packed_staging_tensors_.clear();
         for (ggml_tensor* tensor : tensors) {
+            const auto owner_it = tensor_sessions.find(tensor);
+            const int owner = owner_it != tensor_sessions.end() ? owner_it->second : 0;
             bool placed = false;
             for (auto handle : htp_packed_staging_handles_) {
+                if (htp_packed_staging_pool_->session_for_handle(handle) != owner) {
+                    continue;
+                }
                 if (htp_packed_staging_pool_->place_tensor(
                         htp_packed_staging_loader_, handle, tensor->name, tensor)) {
                     placed = true;
@@ -8843,7 +8907,8 @@ protected:
             }
             if (!placed) {
                 HtpPackedStagingPool::Handle handle;
-                if (!htp_packed_staging_pool_->acquire(ggml_nbytes(tensor), &handle) ||
+                if (!htp_packed_staging_pool_->acquire_for_session(
+                        ggml_nbytes(tensor), owner, &handle) ||
                     !htp_packed_staging_pool_->place_tensor(
                         htp_packed_staging_loader_, handle, tensor->name, tensor)) {
                     if (handle.valid()) {
@@ -8873,9 +8938,22 @@ protected:
             }
             htp_packed_staging_tensors_.push_back(tensor);
         }
-        LOG_INFO("%s staged packed HTP weights: %zu tensors, %zu bytes, live_slots=%zu",
+        const size_t reclaimed_slots = htp_packed_staging_pool_->reclaim_unleased();
+        if (reclaimed_slots > 0) {
+            LOG_INFO("%s reclaimed %zu unused HTP packed staging slots",
+                     get_desc().c_str(), reclaimed_slots);
+        }
+        std::string owner_bytes;
+        for (int session = 0; session < htp_packed_staging_pool_owner_count_; ++session) {
+            if (!owner_bytes.empty()) {
+                owner_bytes += ",";
+            }
+            owner_bytes += std::to_string(session) + ":" +
+                           std::to_string(htp_packed_staging_pool_->session_allocated_bytes(session));
+        }
+        LOG_INFO("%s staged packed HTP weights: %zu tensors, %zu bytes, live_slots=%zu owner_bytes=[%s]",
                  get_desc().c_str(), htp_packed_staging_tensors_.size(), required_bytes,
-                 htp_packed_staging_pool_->active_slots());
+                 htp_packed_staging_pool_->active_slots(), owner_bytes.c_str());
         return true;
     }
 
@@ -8906,6 +8984,31 @@ protected:
         const bool use_htp_compute           = htp_op_routing_enabled() &&
                                               sd_env_flag_enabled("SD_HTP_COMPUTE");
         const bool use_partial_param_offload = !runtime_param_tensors.empty();
+        const bool use_packed_staging = use_htp_compute && htp_packed_staging_enabled();
+        const bool preserve_staging_before_call = preserve_htp_packed_staging_;
+        auto staging_guard_fn = [this, use_packed_staging, preserve_staging_before_call](int*) {
+            if (use_packed_staging) {
+                release_htp_packed_staging();
+                preserve_htp_packed_staging_ = preserve_staging_before_call;
+            } else if (!preserve_htp_packed_staging_) {
+                release_htp_packed_staging();
+            }
+        };
+        int staging_guard_token = 0;
+        std::unique_ptr<int, decltype(staging_guard_fn)> staging_guard(
+            &staging_guard_token, staging_guard_fn);
+
+        // Stage the packed weights before parameter offload.  offload_* uses
+        // htp_packed_staging_tensors_ to exclude these tensors; doing this in
+        // the opposite order duplicates the complete packed model in HTP
+        // before the segment-sized staging allocation is attempted.
+        if (use_packed_staging) {
+            preserve_htp_packed_staging_ = true;
+            if (!stage_htp_packed_weights(gf)) {
+                return std::nullopt;
+            }
+        }
+
         int64_t t_offload_begin              = ggml_time_ms();
         if (use_partial_param_offload) {
             if (!offload_partial_params(runtime_param_tensors)) {
@@ -8919,16 +9022,6 @@ protected:
             }
         }
         int64_t t_offload_end = ggml_time_ms();
-
-        if (use_htp_compute && htp_packed_staging_enabled() &&
-            !stage_htp_packed_weights(gf)) {
-            if (use_partial_param_offload) {
-                restore_partial_params();
-            }
-            return std::nullopt;
-        }
-        auto staging_guard_fn = [this](int*) { release_htp_packed_staging(); };
-        std::unique_ptr<int, decltype(staging_guard_fn)> staging_guard(nullptr, staging_guard_fn);
 
         if (use_htp_compute && !prepare_htp_packed_f16_weights(gf)) {
             LOG_ERROR("%s prepare HTP packed F16 weights failed", get_desc().c_str());
@@ -9042,7 +9135,9 @@ protected:
             }
         }
         active_compute_arena_generation_ = 0;
-        release_htp_packed_staging();
+        if (!preserve_htp_packed_staging_) {
+            release_htp_packed_staging();
+        }
         int64_t t_compute_end   = ggml_time_ms();
         if (status != GGML_STATUS_SUCCESS) {
             LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
@@ -9180,79 +9275,47 @@ protected:
                                                          bool no_return = false) {
         GGML_ASSERT(gf != nullptr);
 
+        struct StagingOwnerCountGuard {
+            int* value;
+            int previous;
+            ~StagingOwnerCountGuard() { *value = previous; }
+        } staging_owner_guard{
+            &htp_packed_staging_owner_count_, htp_packed_staging_owner_count_};
+        const int initialized_session_count = htp_backend != nullptr
+            ? ggml_backend_htp_session_count(htp_backend) : 1;
+        htp_packed_staging_owner_count_ = ::htp_packed_staging_owner_count(
+            true,
+            sd_env_flag_enabled("SD_HTP_MULTI_SESSION"),
+            initialized_session_count);
+
         free_compute_buffer();
         free_cache_ctx_and_buffer();
 
         std::optional<sd::Tensor<T>> output = sd::Tensor<T>();
-        const bool use_multi_session_segments =
-            sd_env_flag_enabled("SD_HTP_MULTI_SESSION") &&
-            sd_env_flag_enabled("SD_HTP_PACKED_STAGING") &&
-            htp_backend != nullptr;
+        // Staging is scoped to one graph view (segment), not the complete
+        // graph.  A complete MMDiT graph can exceed the staging budget by an
+        // order of magnitude; execute_graph() stages only the weights needed
+        // by its segment and releases them after that view completes.  The
+        // allocation remains shared by every session dispatch within the
+        // segment, so session switches do not reload the same weight.
+        preserve_htp_packed_staging_ = false;
+        release_htp_packed_staging();
         for (size_t seg_idx = 0; seg_idx < plan.segments.size(); ++seg_idx) {
             int64_t t_segment_begin = ggml_time_ms();
             const auto& segment     = plan.segments[seg_idx];
-            auto future_cut_names   = sd::ggml_graph_cut::collect_future_input_names(gf, plan, seg_idx);
+            auto future_cut_names   = sd::ggml_graph_cut::collect_future_input_names(
+                gf, plan, seg_idx);
             LOG_DEBUG("%s graph cut executing segment %zu/%zu: %s",
-                      get_desc().c_str(),
-                      seg_idx + 1,
-                      plan.segments.size(),
-                      segment.group_name.c_str());
+                      get_desc().c_str(), seg_idx + 1,
+                      plan.segments.size(), segment.group_name.c_str());
 
-            int segment_session = 0;
-            if (use_multi_session_segments) {
-                const char* owner_mode = sd_env_value("SD_HTP_MULTI_SESSION_OWNER_MODE");
-                if (owner_mode != nullptr && std::strcmp(owner_mode, "default") == 0) {
-                    segment_session = 0;
-                } else if (owner_mode != nullptr && std::strcmp(owner_mode, "reserved") == 0) {
-                    segment_session = 1;
-                } else {
-                    segment_session = static_cast<int>(seg_idx & 1u);
-                }
-            }
-            if (use_multi_session_segments) {
-                if (seg_idx > 0 && sd_env_flag_enabled("SD_HTP_MULTI_SESSION_REACQUIRE_EACH_SEGMENT")) {
-                    const int active_session = ggml_backend_htp_active_session(htp_backend);
-                    if (active_session == segment_session) {
-                        const int temporary_session = segment_session == 0 ? 1 : 0;
-                        if (!ggml_backend_htp_set_active_session(htp_backend, temporary_session) ||
-                            !ggml_backend_htp_set_active_session(htp_backend, segment_session)) {
-                            LOG_ERROR("%s failed to reacquire HTP session=%d between segments",
-                                      get_desc().c_str(), segment_session);
-                            free_cache_ctx_and_buffer();
-                            free_compute_buffer();
-                            free_compute_ctx();
-                            return std::nullopt;
-                        }
-                        LOG_INFO("%s htp_segment_lease_reacquired session=%d domain=%d",
-                                 get_desc().c_str(), segment_session,
-                                 ggml_backend_htp_active_domain(htp_backend));
-                    }
-                }
-                if (!ggml_backend_htp_set_active_session(htp_backend, segment_session)) {
-                    LOG_ERROR("%s failed to activate HTP segment session=%d", get_desc().c_str(), segment_session);
-                    free_cache_ctx_and_buffer();
-                    free_compute_buffer();
-                    free_compute_ctx();
-                    return std::nullopt;
-                }
-                LOG_INFO("%s htp_segment_owner segment=%zu session=%d domain=%d",
-                         get_desc().c_str(), seg_idx, segment_session,
-                         ggml_backend_htp_active_domain(htp_backend));
-            }
-
-            // Transfers are scoped to one consumer segment.  Releasing the
-            // previous destination buffers here keeps the pool bounded and
-            // prevents a transfer from becoming an accidental persistent
-            // weight allocation.
-            free_session_transfer_storage();
-
+            // A segment is only a graph view.  Its HTP nodes are assigned by
+            // the same ordinal dispatcher used by full-graph execution; do
+            // not select an owner or reacquire a lease for the whole segment.
+            // Cached tensors retain one canonical backing allocation and are
+            // mapped lazily by whichever session consumes them.
             reset_segment_runtime_tensors(segment, gf);
-            const HtpSessionOwner segment_owner{
-                segment_session,
-                use_multi_session_segments
-                    ? ggml_backend_htp_active_domain(htp_backend) : 3,
-            };
-            if (!bind_segment_cached_inputs(gf, segment, segment_owner)) {
+            if (!bind_segment_cached_inputs(gf, segment)) {
                 free_cache_ctx_and_buffer();
                 free_compute_buffer();
                 free_compute_ctx();
@@ -9282,24 +9345,12 @@ protected:
                                                    &future_cut_names);
             ggml_free(segment_graph_ctx);
             if (!segment_output.has_value()) {
-                if (use_multi_session_segments) {
-                    (void) ggml_backend_htp_set_active_session(htp_backend, 0);
-                }
                 free_cache_ctx_and_buffer();
                 free_compute_buffer();
                 free_compute_ctx();
                 return std::nullopt;
             }
             output = std::move(segment_output);
-        }
-
-        if (use_multi_session_segments &&
-            !ggml_backend_htp_set_active_session(htp_backend, 0)) {
-            LOG_ERROR("%s failed to restore default HTP session after graph cuts", get_desc().c_str());
-            backend_tensor_data_map.clear();
-            free_cache_ctx_and_buffer();
-            free_compute_ctx();
-            return std::nullopt;
         }
 
         backend_tensor_data_map.clear();
@@ -9380,6 +9431,42 @@ public:
             if (!allocate_htp_placed_params()) {
                 return false;
             }
+
+            size_t deferred_tensor_count = 0;
+            for (ggml_tensor* tensor = ggml_get_first_tensor(params_ctx);
+                 tensor != nullptr;
+                 tensor = ggml_get_next_tensor(params_ctx, tensor)) {
+                tensor->flags &= ~SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM;
+                if (htp_should_defer_packed_param(
+                        htp_op_routing_enabled(),
+                        sd_env_flag_enabled("SD_HTP_PACKED_STAGING"),
+                        max_graph_vram_bytes,
+                        tensor)) {
+                    tensor->flags |= SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM;
+                    ++deferred_tensor_count;
+                }
+            }
+            if (deferred_tensor_count > 0) {
+                if (!non_deferred_params_allocation_.allocate(params_ctx, params_backend)) {
+                    LOG_ERROR("%s alloc non-deferred params backend buffer failed, num_tensors = %i",
+                              get_desc().c_str(), num_tensors);
+                    return false;
+                }
+                params_buffer = nullptr;
+                rebuild_params_tensor_set();
+                LOG_INFO("%s deferred packed params allocation: logical=%zu bytes host_backed=%zu bytes deferred_packed=%zu bytes deferred_tensors=%zu",
+                         get_desc().c_str(),
+                         non_deferred_params_allocation_.logical_bytes(),
+                         non_deferred_params_allocation_.host_backed_bytes(),
+                         non_deferred_params_allocation_.deferred_bytes(),
+                         deferred_tensor_count);
+                LOG_DEBUG("%s params backend buffer size = % 6.2f MB(%s) (%i tensors)",
+                          get_desc().c_str(),
+                          non_deferred_params_allocation_.buffer_size() / (1024.f * 1024.f),
+                          ggml_backend_is_cpu(params_backend) ? "RAM" : "VRAM",
+                          num_tensors);
+                return true;
+            }
             bool all_have_data = true;
             for (ggml_tensor* t = ggml_get_first_tensor(params_ctx); t != nullptr; t = ggml_get_next_tensor(params_ctx, t)) {
                 if (t->data == nullptr) {
@@ -9423,6 +9510,7 @@ public:
 
     void free_params_buffer() {
         free_htp_param_placement();
+        non_deferred_params_allocation_.clear();
         if (params_buffer != nullptr) {
             ggml_backend_buffer_free(params_buffer);
             params_buffer = nullptr;
@@ -9443,17 +9531,24 @@ public:
         if (htp_param_placement_buffer_ != nullptr) {
             size += ggml_backend_buffer_get_size(htp_param_placement_buffer_);
         }
+        for (ggml_backend_buffer_t buffer : htp_param_placement_buffers_) {
+            if (buffer != nullptr && buffer != htp_param_placement_buffer_) {
+                size += ggml_backend_buffer_get_size(buffer);
+            }
+        }
+        size += non_deferred_params_allocation_.buffer_size();
         return size;
     }
 
     void free_cache_ctx_and_buffer() {
-        free_session_transfer_storage();
         free_cache_buffer();
         free_cache_ctx();
     }
 
     void free_compute_buffer() {
-        release_htp_packed_staging();
+        if (!preserve_htp_packed_staging_) {
+            release_htp_packed_staging();
+        }
         reap_retired_compute_arenas(false);
         if (compute_allocr != nullptr) {
             ggml_gallocr_free(compute_allocr);
@@ -9516,22 +9611,9 @@ public:
             tensor = ggml_cont(compute_ctx, tensor);
         }
         cache_tensor_map[name] = tensor;
-        if (sd_env_flag_enabled("SD_HTP_MULTI_SESSION") && htp_backend != nullptr) {
-            const HtpSessionOwner owner{
-                ggml_backend_htp_active_session(htp_backend),
-                ggml_backend_htp_active_domain(htp_backend),
-            };
-            if (!cache_session_ownership_.record(name, owner)) {
-                LOG_ERROR("%s cache session owner changed: name=%s existing_session=%d existing_domain=%d new_session=%d new_domain=%d",
-                          get_desc().c_str(), name.c_str(),
-                          cache_session_ownership_.owner(name).session,
-                          cache_session_ownership_.owner(name).domain,
-                          owner.session, owner.domain);
-            }
-            LOG_INFO("%s htp_cache_owner name=%s session=%d domain=%d bytes=%zu",
-                     get_desc().c_str(), name.c_str(), owner.session, owner.domain,
-                     tensor != nullptr ? ggml_nbytes(tensor) : 0);
-        }
+        // Cache entries are backing allocations, not session-owned segments.
+        // The consuming HTP operation creates/uses its session-local mapper
+        // view through the common dispatch path.
         return tensor;
     }
 

@@ -43,6 +43,9 @@ struct ggml_backend_htp_buffer_context {
     size_t logical_size;
     size_t allocation_size;
     bool is_rpcmem;
+    bool persistent_staging = false;
+    int logical_session_index;
+    int domain;
     ggml_backend_htp_context * owner;
 };
 
@@ -56,11 +59,14 @@ struct ggml_backend_htp_async_cache_slot {
     uint64_t opencl_import_identity = 0;
 };
 
+static ggml_backend_buffer_t ggml_backend_htp_get_backing_buffer(const ggml_tensor * tensor);
+
 using htp_ops_session_open_fn = int(htp_ops_session **, int, const char *, int);
 using htp_ops_session_init_fn = int(htp_ops_session *);
 using htp_ops_session_acquire_fn = int(htp_ops_session *);
 using htp_ops_session_release_fn = int(htp_ops_session *);
 using htp_ops_session_create_channel_fn = int(htp_ops_session *, int, unsigned int);
+using htp_ops_session_destroy_channel_fn = int(htp_ops_session *);
 using htp_ops_session_domain_fn = unsigned int(const htp_ops_session *);
 using htp_ops_session_close_fn = void(htp_ops_session *);
 
@@ -502,7 +508,10 @@ static void ggml_backend_htp_print_route_summary(
         summary.status_ok ? "ok" : "error");
 }
 
-// 部分设备的 fastrpc 可用映射窗口明显小于 3 GiB，这里给一个保守默认值，并允许用环境变量按 MiB 覆盖。
+// Qualcomm documents a 2 GiB DSP VA limit on older Snapdragon devices and a
+// 3 GiB limit on newer devices such as Snapdragon 8 Gen 3. Keep the default
+// at the newer-device limit; deployments with an older target can override it
+// explicitly with GGML_HTP_MAX_ACTIVE_MAP_MB.
 static size_t ggml_backend_htp_get_max_active_map_size() {
     const char * env = std::getenv("GGML_HTP_MAX_ACTIVE_MAP_MB");
     if (env != nullptr && env[0] != '\0') {
@@ -512,7 +521,7 @@ static size_t ggml_backend_htp_get_max_active_map_size() {
             return static_cast<size_t>(mb) * 1024ULL * 1024ULL;
         }
     }
-    return 2560ULL * 1024ULL * 1024ULL;
+    return 3072ULL * 1024ULL * 1024ULL;
 }
 
 // HTP 参数 offload 的 buffer 切分粒度也做成环境变量，便于在真机上验证是“映射窗口不够”还是“切成太多独立 fd”导致的 fastrpc_mmap 失败。
@@ -864,32 +873,65 @@ ggml_backend_htp_context::~ggml_backend_htp_context() {
     if (ops_dl_handle != nullptr) {
         if (ops_backend_initialized) {
             using close_session_fn_type = void();
+            using destroy_channel_fn_type = int();
 
             auto close_session = reinterpret_cast<close_session_fn_type *>(dlsym(ops_dl_handle, "close_dsp_session"));
-            if (close_session != nullptr) {
+            auto destroy_channel = reinterpret_cast<destroy_channel_fn_type *>(
+                dlsym(ops_dl_handle, "destroy_htp_message_channel"));
+            if (ops_msg_chan != nullptr && msg_chan_fd >= 0 && close_session != nullptr) {
+                const bool released = htp_teardown_rpcmem_channel(
+                    [&]() { return destroy_channel != nullptr ? destroy_channel() : -1; },
+                    [&]() { return fastrpc_munmap(
+                        CDSP_DOMAIN_ID, msg_chan_fd, ops_msg_chan, MAX_MSG_SIZE); },
+                    [&]() {
+                        rpcmem_free(ops_msg_chan);
+                        ops_msg_chan = nullptr;
+                        msg_chan_fd = -1;
+                    },
+                    [&]() { close_session(); });
+                if (!released) {
+                    std::fprintf(stderr, "[ggml-htp] default message channel teardown failed\n");
+                }
+            } else if (close_session != nullptr) {
                 close_session();
-            }
-
-            if (ops_msg_chan != nullptr && msg_chan_fd >= 0) {
-                fastrpc_munmap(CDSP_DOMAIN_ID, msg_chan_fd, ops_msg_chan, MAX_MSG_SIZE);
-                rpcmem_free(ops_msg_chan);
             }
 
             ops_backend_initialized = false;
         }
 
         auto close_reserved = reinterpret_cast<htp_ops_session_close_fn *>(reserved_session_close_fn);
+        auto destroy_reserved = reinterpret_cast<htp_ops_session_destroy_channel_fn *>(
+            dlsym(ops_dl_handle, "htp_ops_session_destroy_channel"));
         if (close_reserved != nullptr) {
             for (size_t i = sessions.size(); i-- > 1;) {
                 HtpSessionRuntime & session = sessions[i];
-                if (session.message_channel != nullptr && session.message_channel_fd >= 0) {
-                    fastrpc_munmap(static_cast<int>(session.domain), session.message_channel_fd,
-                                   session.message_channel, MAX_MSG_SIZE);
-                    rpcmem_free(session.message_channel);
-                    session.message_channel = nullptr;
-                    session.message_channel_fd = -1;
-                }
-                if (session.native_session != nullptr) {
+                if (session.message_channel != nullptr && session.message_channel_fd >= 0 &&
+                    session.native_session != nullptr) {
+                    const bool released = htp_teardown_rpcmem_channel(
+                        [&]() {
+                            return destroy_reserved != nullptr
+                                ? destroy_reserved(session.native_session) : -1;
+                        },
+                        [&]() {
+                            return fastrpc_munmap(
+                                static_cast<int>(session.domain), session.message_channel_fd,
+                                session.message_channel, MAX_MSG_SIZE);
+                        },
+                        [&]() {
+                            rpcmem_free(session.message_channel);
+                            session.message_channel = nullptr;
+                            session.message_channel_fd = -1;
+                            session.channel_initialized = false;
+                        },
+                        [&]() {
+                            close_reserved(session.native_session);
+                            session.native_session = nullptr;
+                        });
+                    if (!released) {
+                        std::fprintf(stderr,
+                                     "[ggml-htp] session[%zu] message channel teardown failed\n", i);
+                    }
+                } else if (session.native_session != nullptr) {
                     close_reserved(session.native_session);
                     session.native_session = nullptr;
                 }
@@ -1073,12 +1115,15 @@ static void ggml_backend_htp_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     if (ctx->is_rpcmem) {
         bool diagnostic_freed = false;
         auto mappers = htp_unique_rpcmem_session_mappers(ctx->owner->sessions);
-        if (mappers.empty()) {
+        if (std::find(mappers.begin(), mappers.end(), &ctx->owner->mapper) == mappers.end()) {
             mappers.push_back(&ctx->owner->mapper);
         }
         for (RpcMemMapper * mapper : mappers) {
             diagnostic_freed = diagnostic_freed || mapper->was_freed_by_diagnostic(ctx->data);
-            mapper->release_buffer(ctx->data);
+            if (!mapper->release_buffer(ctx->data)) {
+                GGML_ABORT("failed to release RPCMEM buffer mapping domain=%d ptr=%p\n",
+                           mapper->domain(), ctx->data);
+            }
         }
         if (!diagnostic_freed) {
             rpcmem_free(ctx->data);
@@ -1148,7 +1193,11 @@ static const char * ggml_backend_htp_qkv_buffer_type_get_name(ggml_backend_buffe
     return "RPCMEM-QKV";
 }
 
-static ggml_backend_buffer_t ggml_backend_htp_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+static ggml_backend_buffer_t ggml_backend_htp_buffer_type_alloc_buffer_for_session(
+        ggml_backend_buffer_type_t buft,
+        size_t size,
+        int logical_session_index,
+        int domain) {
     auto * ctx            = new ggml_backend_htp_buffer_context();
     auto * htp_ctx        = ggml_backend_htp_context::acquire_instance();
     ctx->owner            = htp_ctx;
@@ -1156,6 +1205,8 @@ static ggml_backend_buffer_t ggml_backend_htp_buffer_type_alloc_buffer(ggml_back
     ctx->fd               = -1;
     ctx->logical_size     = size;
     ctx->allocation_size  = size;
+    ctx->logical_session_index = logical_session_index;
+    ctx->domain = domain;
 
 #ifdef GGML_HTP_OPENCL_SIDECAR
     const size_t ext_mem_padding = htp_ctx->sparse_opencl_sidecar != nullptr
@@ -1197,6 +1248,15 @@ static ggml_backend_buffer_t ggml_backend_htp_buffer_type_alloc_buffer(ggml_back
     }
 
     return ggml_backend_buffer_init(buft, ggml_backend_htp_buffer_i, ctx, size);
+}
+
+static ggml_backend_buffer_t ggml_backend_htp_buffer_type_alloc_buffer(
+        ggml_backend_buffer_type_t buft,
+        size_t size) {
+    auto * htp_ctx = ggml_backend_htp_context::instance();
+    const HtpSessionRuntime * runtime = htp_ctx != nullptr ? htp_ctx->session_runtime(0) : nullptr;
+    return ggml_backend_htp_buffer_type_alloc_buffer_for_session(
+        buft, size, 0, runtime != nullptr ? static_cast<int>(runtime->domain) : CDSP_DOMAIN_ID);
 }
 
 static size_t ggml_backend_htp_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -1261,6 +1321,24 @@ bool ggml_backend_buft_is_rpcmem(ggml_backend_buffer_type_t buft) {
                                buft->iface.get_name == ggml_backend_htp_qkv_buffer_type_get_name);
 }
 
+ggml_backend_buffer_t ggml_backend_htp_alloc_buffer_for_session(
+        ggml_backend_t backend,
+        int session_index,
+        size_t size) {
+    if (backend == nullptr || !ggml_backend_is_htp(backend) || size == 0) {
+        return nullptr;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
+    const HtpSessionRuntime * runtime =
+        ctx != nullptr ? ctx->session_runtime(session_index) : nullptr;
+    if (runtime == nullptr || !runtime->initialized || runtime->mapper == nullptr) {
+        return nullptr;
+    }
+    return ggml_backend_htp_buffer_type_alloc_buffer_for_session(
+        ggml_backend_htp_buffer_type(), size, session_index,
+        static_cast<int>(runtime->domain));
+}
+
 bool ggml_backend_htp_get_rpcmem_info(
         ggml_backend_buffer_t buffer,
         struct ggml_backend_htp_rpcmem_info * info) {
@@ -1285,6 +1363,49 @@ bool ggml_backend_htp_get_rpcmem_info(
     info->logical_size = ctx->logical_size;
     info->allocation_size = ctx->allocation_size;
     return true;
+}
+
+void ggml_backend_htp_buffer_set_persistent_staging(
+        ggml_backend_buffer_t buffer, bool persistent) {
+    if (buffer == nullptr || buffer->context == nullptr) {
+        return;
+    }
+    auto * ctx = static_cast<ggml_backend_htp_buffer_context *>(buffer->context);
+    ctx->persistent_staging = persistent;
+}
+
+bool ggml_backend_htp_buffer_is_persistent_staging(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || buffer->context == nullptr) {
+        return false;
+    }
+    return static_cast<ggml_backend_htp_buffer_context *>(buffer->context)->persistent_staging;
+}
+
+int ggml_backend_htp_buffer_session_index(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || buffer->context == nullptr ||
+        !ggml_backend_buft_is_rpcmem(ggml_backend_buffer_get_type(buffer))) {
+        return -1;
+    }
+    return static_cast<ggml_backend_htp_buffer_context *>(buffer->context)->logical_session_index;
+}
+
+void ggml_backend_htp_buffer_set_session_index(ggml_backend_buffer_t buffer, int session_index) {
+    if (buffer != nullptr && buffer->context != nullptr &&
+        ggml_backend_buft_is_rpcmem(ggml_backend_buffer_get_type(buffer))) {
+        static_cast<ggml_backend_htp_buffer_context *>(buffer->context)->logical_session_index = session_index;
+    }
+}
+
+int ggml_backend_htp_node_session_owner(const struct ggml_tensor * node) {
+    if (node == nullptr) return -1;
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const ggml_backend_buffer_t buffer = ggml_backend_htp_get_backing_buffer(node->src[i]);
+        if (buffer != nullptr && ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            const int owner = ggml_backend_htp_buffer_session_index(buffer);
+            if (owner >= 0) return owner;
+        }
+    }
+    return -1;
 }
 
 ggml_backend_htp_async_cache_slot * ggml_backend_htp_async_cache_slot_create(
@@ -2097,6 +2218,17 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
         /* .use_ref    = */ false,
     };
 
+    const bool multi_session_enabled =
+        ctx->multi_session_enabled && ctx->session_count() > 1;
+    const bool use_dispatch_context = multi_session_enabled &&
+        ggml_backend_htp_env_enabled("SD_HTP_PACKED_STAGING");
+    if (use_dispatch_context) {
+        // The direct HTP path uses the same ordinal policy as the hybrid
+        // worker and graph-cut graph views.  Only HTP operations consume an
+        // ordinal; there is no second graph-cut owner rule.
+        ggml_backend_htp_dispatch_begin(ggml_graph_n_nodes(cgraph));
+    }
+
     for (int i = 0; i < ggml_graph_n_nodes(cgraph); ++i) {
         ggml_tensor * node = ggml_graph_node(cgraph, i);
         if (!htp_ops_support_op(node)) {
@@ -2104,24 +2236,40 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
                          i,
                          node ? ggml_op_name(node->op) : "(null)",
                          node ? ggml_type_name(node->type) : "(null)");
+            if (use_dispatch_context) {
+                ggml_backend_htp_dispatch_end();
+            }
             return GGML_STATUS_FAILED;
         }
 
         if (!ggml_backend_htp_node_has_rpcmem_buffers(node)) {
             std::fprintf(stderr, "ggml-htp: node[%d] missing rpcmem/contiguous buffers for op=%s\n",
                          i, node ? ggml_op_name(node->op) : "(null)");
+            if (use_dispatch_context) {
+                ggml_backend_htp_dispatch_end();
+            }
             return GGML_STATUS_FAILED;
         }
 
-        // Keep adjacent operations in the same session.  Each session owns a
-        // contiguous range of this ordered graph.
-        if (ctx->multi_session_enabled && ctx->session_count() > 1) {
-            const int owner_session = htp_session_owner_for_ordinal(
+        if (multi_session_enabled) {
+            int owner_session = htp_session_owner_for_ordinal(
                 i, ggml_graph_n_nodes(cgraph), static_cast<int>(ctx->session_count()));
-            if (ctx->set_active_session(owner_session) != 0) {
+            bool selected = false;
+            if (use_dispatch_context) {
+                const int ordinal_owner = ggml_backend_htp_dispatch_next_owner();
+                const int node_owner = ggml_backend_htp_node_session_owner(node);
+                owner_session = node_owner >= 0 ? node_owner : ordinal_owner;
+                selected = ggml_backend_htp_dispatch_acquire(owner_session);
+            } else {
+                selected = ctx->set_active_session(owner_session) == 0;
+            }
+            if (!selected) {
                 std::fprintf(stderr,
                              "ggml-htp: failed to select owner session[%d] for node[%d] op=%s\n",
                              owner_session, i, node ? ggml_op_name(node->op) : "(null)");
+                if (use_dispatch_context) {
+                    ggml_backend_htp_dispatch_end();
+                }
                 return GGML_STATUS_FAILED;
             }
             if (ggml_backend_htp_env_enabled("SD_HTP_MULTI_SESSION_TRACE")) {
@@ -2137,8 +2285,15 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
         if (err != 0) {
             std::fprintf(stderr, "ggml-htp: node[%d] compute failed err=0x%x op=%s\n",
                          i, err, node ? ggml_op_name(node->op) : "(null)");
+            if (use_dispatch_context) {
+                ggml_backend_htp_dispatch_end();
+            }
             return GGML_STATUS_FAILED;
         }
+    }
+
+    if (use_dispatch_context) {
+        ggml_backend_htp_dispatch_end();
     }
 
     return GGML_STATUS_SUCCESS;

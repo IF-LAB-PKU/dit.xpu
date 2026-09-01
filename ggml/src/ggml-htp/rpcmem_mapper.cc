@@ -1,7 +1,7 @@
 // RpcMemMapper 的实现。
 // validate(): 在执行算子前确保其所有张量 buffer 已 mmap 到 DSP，必要时驱逐旧的映射。
 // get_tensor_mapping(): 将 ggml_tensor 指针解析为 (fd, offset_in_buffer) 对供 DSP 端寻址。
-// unmap_all_pending_buffers(): 批量执行所有延迟的 fastrpc_munmap 请求。
+// unmap_all_pending_buffers(): 在 DSP put 完成后清理 FastRPC session 映射。
 
 #include "rpcmem_mapper.h"
 
@@ -21,6 +21,17 @@
 
 namespace {
 
+// FastRPC normally receives the host RPCMEM address as the requested DSP
+// mapping address.  Some devices reject a reused address after a domain
+// switch even though the fd was unmapped successfully.  Keep the legacy
+// fixed-address behavior by default, but allow a diagnostic run to let
+// FastRPC choose a fresh remote address.
+void * mapping_addr(void * host_addr) {
+    const char * env = std::getenv("SD_HTP_RPCMEM_MAP_NULL_ADDR");
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0
+        ? nullptr : host_addr;
+}
+
 // 在 hybrid 路径里 view 张量可能还没把 buffer 挂回自己身上，这里统一沿着 view_src 找到底层 backing buffer。
 ggml_backend_buffer * get_backing_buffer(const ggml_tensor * tensor) {
     while (tensor != nullptr) {
@@ -32,13 +43,11 @@ ggml_backend_buffer * get_backing_buffer(const ggml_tensor * tensor) {
     return nullptr;
 }
 
-// pending 列表里只有 host 尚未真正 munmap 的条目会继续占用 DSP 映射窗口。
+// pending 列表里的 DSP put 尚未发送前仍占用映射窗口。
 size_t get_pending_host_mapped_size(const std::list<RpcMemMapper::UnmapRequest> & pending_unmap_reqs) {
     size_t total = 0;
     for (const auto & req : pending_unmap_reqs) {
-        if (!req.host_unmapped) {
-            total += req.buf_size;
-        }
+        total += req.buf_size;
     }
     return total;
 }
@@ -49,11 +58,11 @@ void write_buf(uint8_t *& p, const T & v) {
     p += sizeof(v);
 }
 
-void send_rpcmem_puts_to_dsp(
+bool send_rpcmem_puts_to_dsp(
         const std::list<RpcMemMapper::UnmapRequest> & pending_unmap_reqs,
         int mapper_domain) {
     if (pending_unmap_reqs.empty()) {
-        return;
+        return true;
     }
 
     auto * ctx = ggml_backend_htp_context::instance();
@@ -118,18 +127,20 @@ void send_rpcmem_puts_to_dsp(
     while (std::atomic_load_explicit(v1_ptr, std::memory_order_acquire) == 0) {
         usleep(1);
     }
+    auto * response = message_header_get_request_ptr(msg_hdr, 0);
+    const int response_state = response->state;
     if (std::getenv("SD_HTP_RPCMEM_TRACE") != nullptr) {
-        auto * response = message_header_get_request_ptr(msg_hdr, 0);
         std::fprintf(stderr, "[rpcmem-trace] dsp_put n_puts=%d state=%d\n",
-                     n_unmap_fds, response->state);
+                     n_unmap_fds, response_state);
     }
     d_ptr->store(0, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_acquire);
+    return response_state == 0;
 }
 
 } // namespace
 
-void RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) {
+bool RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) {
     std::vector<ggml_backend_buffer *> buffers;
     std::unordered_set<ggml_backend_buffer *> seen_buffers;
 
@@ -137,6 +148,10 @@ void RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) 
         // 同一个 RPCMEM buffer 可能同时作为 src / dst / view backing 出现，这里先按 buffer 去重，避免预算和映射重试被重复放大。
         if (buf != nullptr && ggml_backend_buft_is_rpcmem(buf->buft) && seen_buffers.insert(buf).second) {
             buffers.push_back(buf);
+            void * base = ggml_backend_buffer_get_base(buf);
+            if (ggml_backend_htp_buffer_is_persistent_staging(buf)) {
+                persistent_bufs.insert(base);
+            }
         }
     };
 
@@ -156,76 +171,34 @@ void RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) 
         void * buf_base = ggml_backend_buffer_get_base(buf);
         required_buf_bases.insert(buf_base);
         if (buf_mapping.count(buf_base)) {
-            accessed_bufs.erase(buf_iters.at(buf_base));
-            accessed_bufs.push_front(buf_base);
-            buf_iters[buf_base] = accessed_bufs.begin();
-        } else {
+            if (persistent_bufs.count(buf_base) == 0) {
+                accessed_bufs.erase(buf_iters.at(buf_base));
+                accessed_bufs.push_front(buf_base);
+                buf_iters[buf_base] = accessed_bufs.begin();
+            }
+        } else if (persistent_bufs.count(buf_base) == 0) {
             required_size += buf->size;
         }
     }
 
-    // 预算驱逐阶段仍按原有 LRU 逻辑工作；只有真正 hit 到 fastrpc_mmap 失败时，才额外强制释放非当前算子所需的旧映射。
-    auto force_release_one_lru_mapping = [&]() -> bool {
-        for (auto it = accessed_bufs.end(); it != accessed_bufs.begin();) {
-            --it;
-
-            void * buf_base = *it;
-            if (required_buf_bases.count(buf_base) != 0) {
-                continue;
-            }
-
-            auto [fd, buf_size] = buf_mapping.at(buf_base);
-            pending_unmap_reqs.push_back({fd, buf_base, buf_size, false});
-            accessed_bufs.erase(it);
-            buf_iters.erase(buf_base);
-            buf_mapping.erase(buf_base);
-            active_map_size -= buf_size;
-            flush_pending_unmaps();
-
-            // This is intentionally diagnostic-only.  The tensor still points at
-            // buf_base, so a production implementation must reload/rebind it
-            // before the buffer can be used again.
-            const char * free_on_failure = std::getenv("SD_HTP_FREE_ON_MMAP_FAILURE");
-            if (free_on_failure != nullptr && free_on_failure[0] != '\0' && std::strcmp(free_on_failure, "0") != 0) {
-                rpcmem_free(buf_base);
-                diagnostic_freed_bufs.insert(buf_base);
-                std::fprintf(stderr, "[rpcmem-trace] free-on-mmap-failure ptr=%p fd=%d size=%zu\n",
-                             buf_base, fd, buf_size);
-            }
-            return true;
-        }
-
-        return false;
-    };
-
     size_t pending_host_mapped_size = get_pending_host_mapped_size(pending_unmap_reqs);
-    GGML_ASSERT(required_size <= max_active_map_size);
-    while (active_map_size + pending_host_mapped_size + required_size > max_active_map_size) {
-        // 如果仅靠继续驱逐 active 映射还是不够，就先同步通知 DSP put_map，再执行 host munmap，释放真实地址空间。
-        if (pending_host_mapped_size > 0) {
-            flush_pending_unmaps();
-            pending_host_mapped_size = 0;
-            continue;
-        }
-
-        void * buf_base     = accessed_bufs.back();
-        auto [fd, buf_size] = buf_mapping.at(buf_base);
-
-        if (defer_unmap) {
-            pending_unmap_reqs.push_back({fd, buf_base, buf_size, false});
-            pending_host_mapped_size += buf_size;
-        } else {
-            int err = fastrpc_munmap(domain_id, fd, buf_base, buf_size);
-            if (err != 0) {
-                std::fprintf(stderr, "fastrpc_munmap failed with return code: %x\n", err);
-            }
-            ++n_map_ops;
-        }
-
-        accessed_bufs.pop_back();
-        buf_iters.erase(buf_base);
-        buf_mapping.erase(buf_base);
-        active_map_size -= buf_size;
+    const auto * htp_ctx = ggml_backend_htp_context::instance();
+    const bool multi_session = htp_ctx != nullptr && htp_ctx->multi_session_enabled &&
+        htp_ctx->session_count() > 1;
+    if (!multi_session && (persistent_map_size > max_active_map_size ||
+        required_size > max_active_map_size - persistent_map_size)) {
+        return false;
+    }
+    if (!multi_session && !htp_rpcmem_mapping_fits(
+            max_active_map_size,
+            persistent_map_size,
+            active_map_size,
+            pending_host_mapped_size,
+            required_size)) {
+        // A live allocation retains its cumulative FastRPC VA consumption even
+        // after fastrpc_munmap (FastRPC issue #137). Removing only mapper
+        // bookkeeping would hide that consumption without making the VA reusable.
+        return false;
     }
 
     for (auto * buf : buffers) {
@@ -250,62 +223,36 @@ void RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) 
             [fd](const auto & v) { return v.fd == fd; });
 
         if (it == pending_unmap_reqs.end()) {
-            int err = fastrpc_mmap(domain_id, fd, buf_base, 0, buf_size, FASTRPC_MAP_FD);
+            int err = fastrpc_mmap(domain_id, fd, mapping_addr(buf_base), 0, buf_size, FASTRPC_MAP_FD);
             while (err != 0) {
-                // 部分真机的真实 FastRPC 映射窗口会比静态预算更小，这里在 mmap 失败后继续强制释放旧映射并重试，直到当前 buffer 真正映射成功或已经无可释放对象。
-                const size_t pending_size = get_pending_host_mapped_size(pending_unmap_reqs);
-                if (pending_size > 0) {
-                    flush_pending_unmaps();
-                } else if (!force_release_one_lru_mapping()) {
-                    dump_state();
-
-                    for (int i = 0; i < GGML_MAX_SRC; ++i) {
-                        auto * src = dst->src[i];
-                        if (src == nullptr) {
-                            continue;
-                        }
-
-                        std::fprintf(stderr, "  src index %d name %s", i, src->name);
-                        ggml_backend_buffer * src_buf = get_backing_buffer(src);
-                        if (src_buf != nullptr && ggml_backend_buft_is_rpcmem(src_buf->buft)) {
-                            auto * base = ggml_backend_buffer_get_base(src_buf);
-                            std::fprintf(stderr, " buf %p\n", base);
-                        } else {
-                            std::fprintf(stderr, " (non rpcmem)\n");
-                        }
-                    }
-
-                    std::fprintf(stderr,
-                                 "dst name: %s, op: %s, n buffers to map in this step: %ld, active size: %.2f MiB\n",
-                                 dst->name, ggml_op_name(dst->op), buffers.size(), active_map_size / 1048576.0);
-
-                    GGML_ABORT("fastrpc_mmap failed with return code: 0x%x fd: %d buf_base: %p buf_size: %ld buf usage: %d\n",
-                               err, fd, buf_base, buf_size, buf->usage);
-                }
-
-                err = fastrpc_mmap(domain_id, fd, buf_base, 0, buf_size, FASTRPC_MAP_FD);
+                dump_state();
+                return false;
             }
 
             ++n_map_ops;
         } else {
-            if (it->host_unmapped) {
-                pending_unmap_reqs.erase(it);
-            } else {
-                // 如果 buffer 还没真正 host-unmap 就又被需要了，直接撤销这条 pending 释放请求并恢复为 active。
-                pending_unmap_reqs.erase(it);
-                accessed_bufs.push_front(buf_base);
-                buf_iters[buf_base]   = accessed_bufs.begin();
-                buf_mapping[buf_base] = { fd, buf_size };
-                active_map_size += buf_size;
-                continue;
-            }
+            // The DSP put has not been sent yet, so cancel it and restore the
+            // mapper entry when this buffer is needed again.
+            pending_unmap_reqs.erase(it);
+            accessed_bufs.push_front(buf_base);
+            buf_iters[buf_base]   = accessed_bufs.begin();
+            buf_mapping[buf_base] = { fd, buf_size };
+            active_map_size += buf_size;
+            continue;
         }
 
-        accessed_bufs.push_front(buf_base);
-        buf_iters[buf_base]   = accessed_bufs.begin();
+        if (persistent_bufs.count(buf_base) == 0) {
+            accessed_bufs.push_front(buf_base);
+            buf_iters[buf_base]   = accessed_bufs.begin();
+        }
         buf_mapping[buf_base] = { fd, buf_size };
-        active_map_size += buf_size;
+        if (persistent_bufs.count(buf_base) == 0) {
+            active_map_size += buf_size;
+        } else {
+            persistent_map_size += buf_size;
+        }
     }
+    return true;
 }
 
 bool RpcMemMapper::was_freed_by_diagnostic(void * buf_base) const {
@@ -323,59 +270,99 @@ std::pair<int, ssize_t> RpcMemMapper::get_tensor_mapping(const ggml_tensor * ten
     return { fd, offset };
 }
 
-void RpcMemMapper::release_buffer(void * buf_base) {
+bool RpcMemMapper::release_buffer(void * buf_base) {
     auto pending_it = std::find_if(
         pending_unmap_reqs.begin(), pending_unmap_reqs.end(),
         [buf_base](const auto & req) { return req.buf_base == buf_base; });
     if (pending_it != pending_unmap_reqs.end()) {
-        flush_pending_unmaps();
-        return;
+        return flush_pending_unmaps();
     }
 
     auto mapping_it = buf_mapping.find(buf_base);
     if (mapping_it == buf_mapping.end()) {
-        return;
+        return true;
     }
 
     const auto [fd, buf_size] = mapping_it->second;
-    pending_unmap_reqs.push_back({fd, buf_base, buf_size, false});
+    if (persistent_bufs.count(buf_base) != 0) {
+        // fastrpc_munmap alone does not reclaim cumulative DSP VA (issue #137),
+        // but it must remove libcdsprpc's per-session static_map entry before
+        // rpcmem_free closes the fd. Otherwise immediate fd reuse returns
+        // AEE_EALREADY from the next fastrpc_mmap.
+        pending_unmap_reqs.push_back({fd, buf_base, buf_size});
+        if (!flush_pending_unmaps()) {
+            return false;
+        }
+        buf_mapping.erase(mapping_it);
+        persistent_bufs.erase(buf_base);
+        GGML_ASSERT(persistent_map_size >= buf_size);
+        persistent_map_size -= buf_size;
+        return true;
+    }
+    pending_unmap_reqs.push_back({fd, buf_base, buf_size});
+    if (!flush_pending_unmaps()) {
+        return false;
+    }
     accessed_bufs.erase(buf_iters.at(buf_base));
     buf_iters.erase(buf_base);
     buf_mapping.erase(mapping_it);
     active_map_size -= buf_size;
-
-    // The rpcmem allocation is about to be freed, so both DSP and host mappings
-    // must be gone before the fd or virtual address can be reused.
-    flush_pending_unmaps();
+    return true;
 }
 
-void RpcMemMapper::flush_pending_unmaps() {
-    send_rpcmem_puts_to_dsp(pending_unmap_reqs, domain_id);
-    unmap_all_pending_buffers();
+bool RpcMemMapper::flush_pending_unmaps() {
+    if (!send_rpcmem_puts_to_dsp(pending_unmap_reqs, domain_id)) {
+        return false;
+    }
+    return unmap_all_pending_buffers();
 }
 
 void RpcMemMapper::release_all_mappings() {
     for (const auto & [buf_base, mapping] : buf_mapping) {
-        pending_unmap_reqs.push_back({mapping.first, buf_base, mapping.second, false});
+        if (persistent_bufs.count(buf_base) != 0) {
+            continue;
+        }
+        pending_unmap_reqs.push_back({mapping.first, buf_base, mapping.second});
     }
-    buf_mapping.clear();
-    buf_iters.clear();
-    accessed_bufs.clear();
+    for (auto it = buf_mapping.begin(); it != buf_mapping.end();) {
+        if (persistent_bufs.count(it->first) == 0) {
+            it = buf_mapping.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = buf_iters.begin(); it != buf_iters.end();) {
+        if (persistent_bufs.count(it->first) == 0) {
+            it = buf_iters.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    accessed_bufs.remove_if([this](void * buf_base) {
+        return persistent_bufs.count(buf_base) == 0;
+    });
     active_map_size = 0;
-    flush_pending_unmaps();
+    if (!flush_pending_unmaps()) {
+        GGML_ABORT("failed to release FastRPC mappings for domain %d\n", domain_id);
+    }
 }
 
-void RpcMemMapper::unmap_all_pending_buffers() {
+bool RpcMemMapper::unmap_all_pending_buffers() {
+    bool success = true;
     for (auto it = pending_unmap_reqs.begin(); it != pending_unmap_reqs.end();) {
-        if (!it->host_unmapped) {
-            int err = fastrpc_munmap(domain_id, it->fd, it->buf_base, it->buf_size);
-            if (err != 0) {
-                std::fprintf(stderr, "fastrpc_munmap failed with return code: 0x%x\n", err);
-            }
-            ++n_map_ops;
+        const int err = fastrpc_munmap(domain_id, it->fd, it->buf_base, it->buf_size);
+        ++n_map_ops;
+        if (err != 0) {
+            std::fprintf(stderr,
+                         "fastrpc_munmap failed domain=%d fd=%d addr=%p size=%zu ret=0x%x\n",
+                         domain_id, it->fd, it->buf_base, it->buf_size, err);
+            success = false;
+            ++it;
+            continue;
         }
         it = pending_unmap_reqs.erase(it);
     }
+    return success;
 }
 
 void RpcMemMapper::dump_state() const {
@@ -392,21 +379,53 @@ void RpcMemMapper::dump_state() const {
         std::fprintf(stderr, "pending unmap requests:\n");
     }
     for (const auto & req : pending_unmap_reqs) {
-        std::fprintf(stderr, "    fd %d, addr %p, size %.2f MiB, host_unmapped=%d\n",
-                     req.fd, req.buf_base, req.buf_size / 1048576.0, req.host_unmapped ? 1 : 0);
+        std::fprintf(stderr, "    fd %d, addr %p, size %.2f MiB\n",
+                     req.fd, req.buf_base, req.buf_size / 1048576.0);
     }
 }
 
 extern "C" {
 
 int prepare_tensor_rpcmem_mapping(const struct ggml_tensor * dst) {
-    ggml_backend_htp_context::instance()->active_mapper().validate(dst);
-    return 0;
+    auto * ctx = ggml_backend_htp_context::instance();
+    if (ctx == nullptr) return -1;
+    if (ctx->dispatch_mapper().validate(dst)) return 0;
+    if (ctx->multi_session_enabled && ctx->session_count() > 1) {
+        const int current = ctx->active_session_index;
+        for (size_t offset = 1; offset < ctx->session_count(); ++offset) {
+            const int candidate = (current + static_cast<int>(offset)) %
+                static_cast<int>(ctx->session_count());
+            if (!ggml_backend_htp_dispatch_acquire(candidate) &&
+                !ggml_backend_htp_select_session_for_compute(candidate)) continue;
+            if (ctx->dispatch_mapper().validate(dst)) {
+                ggml_backend_htp_dispatch_force_owner(candidate);
+                return 0;
+            }
+        }
+    }
+    GGML_ABORT("HTP RPCMEM mapping budget exhausted in all session-local views for tensor %s\n",
+               dst != nullptr ? dst->name : "(null)");
 }
 
 int prepare_tensor_rpcmem_mapping_with_extra(const struct ggml_tensor * dst, const struct ggml_tensor * extra) {
-    ggml_backend_htp_context::instance()->active_mapper().validate(dst, extra);
-    return 0;
+    auto * ctx = ggml_backend_htp_context::instance();
+    if (ctx == nullptr) return -1;
+    if (ctx->dispatch_mapper().validate(dst, extra)) return 0;
+    if (ctx->multi_session_enabled && ctx->session_count() > 1) {
+        const int current = ctx->active_session_index;
+        for (size_t offset = 1; offset < ctx->session_count(); ++offset) {
+            const int candidate = (current + static_cast<int>(offset)) %
+                static_cast<int>(ctx->session_count());
+            if (!ggml_backend_htp_dispatch_acquire(candidate) &&
+                !ggml_backend_htp_select_session_for_compute(candidate)) continue;
+            if (ctx->dispatch_mapper().validate(dst, extra)) {
+                ggml_backend_htp_dispatch_force_owner(candidate);
+                return 0;
+            }
+        }
+    }
+    GGML_ABORT("HTP RPCMEM mapping budget exhausted in all session-local views for tensor %s\n",
+               dst != nullptr ? dst->name : "(null)");
 }
 
 }

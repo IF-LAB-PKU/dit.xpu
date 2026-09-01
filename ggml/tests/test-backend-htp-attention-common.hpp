@@ -41,6 +41,7 @@ struct CaseSpec {
     bool packed_inference = false;
     bool head_major_v_input = false;
     bool head_major_qkv_input = false;
+    bool residual_apply = false;
 };
 
 enum class Route {
@@ -77,6 +78,7 @@ struct InputData {
     std::vector<BranchData> branches;
     std::vector<float> rope;
     std::vector<int32_t> block_index;
+    std::vector<float> residual;
 };
 
 struct Graph {
@@ -98,6 +100,7 @@ struct Graph {
     ggml_tensor * sparse_lse = nullptr;
     ggml_tensor * rho = nullptr;
     ggml_tensor * residual = nullptr;
+    ggml_tensor * apply_residual = nullptr;
     ggml_tensor * rope = nullptr;
     ggml_tensor * built_in_one = nullptr;
     std::vector<ggml_tensor *> activations;
@@ -130,6 +133,11 @@ Graph build_graph(const CaseSpec & spec, Route route, ggml_backend_t backend = n
 bool upload_graph(Graph & graph, const InputData & data, ggml_backend_t backend);
 bool graph_contract(const Graph & graph, const CaseSpec & spec);
 void free_graph(Graph & graph);
+
+// Compare the realistic packed and reordered Z-Image attention subgraphs.
+bool run_z_image_route_pair(ggml_backend_t htp,
+                            const ImageSize & size,
+                            const CaseSpec & base);
 
 // Host-only RED/GREEN contract test used during fixture migration.
 int run_fixture_contract_test();

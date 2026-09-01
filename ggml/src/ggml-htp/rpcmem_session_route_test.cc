@@ -30,5 +30,44 @@ int main() {
     assert(mappers[0] == mapper0);
     assert(mappers[1] == mapper1);
     assert(mappers[2] == mapper2);
+
+    // Persistent staging mappings consume the same FastRPC window as
+    // evictable mappings and the next required mapping.
+    assert(!htp_rpcmem_mapping_fits(
+        2560ULL * 1024ULL * 1024ULL,
+        9ULL * 256ULL * 1024ULL * 1024ULL,
+        90ULL * 1024ULL * 1024ULL,
+        0,
+        181ULL * 1024ULL * 1024ULL));
+    assert(htp_rpcmem_mapping_fits(
+        2560ULL * 1024ULL * 1024ULL,
+        9ULL * 256ULL * 1024ULL * 1024ULL,
+        0,
+        0,
+        181ULL * 1024ULL * 1024ULL));
+
+    std::vector<int> teardown_steps;
+    if (!htp_teardown_rpcmem_channel(
+        [&]() { teardown_steps.push_back(1); return 0; },
+        [&]() { teardown_steps.push_back(2); return 0; },
+        [&]() { teardown_steps.push_back(3); },
+        [&]() { teardown_steps.push_back(4); })) {
+        return 1;
+    }
+    if (teardown_steps != std::vector<int>{1, 2, 3, 4}) {
+        return 2;
+    }
+
+    teardown_steps.clear();
+    if (htp_teardown_rpcmem_channel(
+        [&]() { teardown_steps.push_back(1); return 0; },
+        [&]() { teardown_steps.push_back(2); return 1; },
+        [&]() { teardown_steps.push_back(3); },
+        [&]() { teardown_steps.push_back(4); })) {
+        return 3;
+    }
+    if (teardown_steps != std::vector<int>{1, 2, 4}) {
+        return 4;
+    }
     return 0;
 }
