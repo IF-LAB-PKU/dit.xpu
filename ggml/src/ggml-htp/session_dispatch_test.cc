@@ -27,5 +27,14 @@ int main() {
     assert(context.acquire(0));
     assert(context.active_session() == 0);
     assert(context.switch_count() == 2);
+
+    // A new view clears any forced owner left by a prior diagnostic/staging
+    // path and rebuilds the same immutable ordinal plan.
+    context.force_owner(3);
+    context.begin_graph_view(/*htp_node_count=*/4, /*graph_view_id=*/19);
+    assert(context.next_htp_owner() == 0);
+    assert(context.next_htp_owner() == 1);
+    assert(context.next_htp_owner() == 2);
+    assert(context.next_htp_owner() == 3);
     return 0;
 }

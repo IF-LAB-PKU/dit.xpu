@@ -59,10 +59,32 @@ target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../g
 target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
+set(TEST_TARGET test-htp-session-placement-plan)
+add_executable(${TEST_TARGET}
+               ../ggml/src/ggml-htp/session_placement_plan_test.cc)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-htp)
+target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+set(TEST_TARGET test-htp-session-param-placement)
+add_executable(${TEST_TARGET}
+               ../ggml/src/ggml-htp/session_param_placement_test.cc)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-htp)
+target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
 set(TEST_TARGET test-htp-session-dispatch)
 add_executable(${TEST_TARGET}
                ../ggml/src/ggml-htp/session_dispatch_test.cc)
 target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-htp)
+target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+set(TEST_TARGET test-htp-rpcmem-mapper-range)
+add_executable(${TEST_TARGET}
+               ../ggml/src/ggml-htp/rpcmem_mapper_range_test.cc)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-htp)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../ggml/include)
 target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 

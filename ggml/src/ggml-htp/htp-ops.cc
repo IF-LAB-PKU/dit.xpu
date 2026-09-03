@@ -2869,7 +2869,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
             };
             write_buf(p, map_req);
             for (const auto & req : dispatch_mapper.get_pending_unmap_reqs()) {
-                RpcmemMapEntryV2 entry{req.fd, 0, 0, req.buf_size, 0};
+                RpcmemMapEntryV2 entry{req.fd, req.role, req.offset, req.buf_size, 0};
                 write_buf(p, entry);
             }
         } else {

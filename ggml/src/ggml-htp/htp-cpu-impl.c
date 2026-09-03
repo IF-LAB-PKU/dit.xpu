@@ -3480,9 +3480,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         getenv("SD_HTP_MULTI_SESSION") != NULL &&
         getenv("SD_HTP_MULTI_SESSION")[0] != '0';
     int htp_node_count = 0;
-    const bool use_dispatch_context = multi_session_enabled &&
-        getenv("SD_HTP_PACKED_STAGING") != NULL &&
-        getenv("SD_HTP_PACKED_STAGING")[0] != '0';
+    const bool use_dispatch_context = multi_session_enabled;
     if (multi_session_enabled) {
         for (int graph_node_n = 0; graph_node_n < cgraph->n_nodes; ++graph_node_n) {
             const struct ggml_tensor * graph_node = cgraph->nodes[graph_node_n];
@@ -3541,13 +3539,16 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             if (multi_session_enabled) {
                 const int current_htp_ordinal = htp_ordinal;
                 ++htp_ordinal;
-                int owner_session = htp_session_owner_for_ordinal(
-                    current_htp_ordinal, htp_node_count, multi_session_count);
+                int owner_session = 0;
                 bool selected = false;
                 if (use_dispatch_context) {
                     const int ordinal_owner = ggml_backend_htp_dispatch_next_owner();
-                    const int node_owner = ggml_backend_htp_node_session_owner(node);
-                    owner_session = node_owner >= 0 ? node_owner : ordinal_owner;
+                    owner_session = ordinal_owner;
+                    if (getenv("SD_HTP_PACKED_STAGING") != NULL &&
+                        getenv("SD_HTP_PACKED_STAGING")[0] != '0') {
+                        const int node_owner = ggml_backend_htp_node_session_owner(node);
+                        owner_session = node_owner >= 0 ? node_owner : ordinal_owner;
+                    }
                     selected = ggml_backend_htp_dispatch_acquire(owner_session);
                 } else {
                     selected = ggml_backend_htp_select_session_for_compute(owner_session);

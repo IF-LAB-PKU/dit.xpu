@@ -38,6 +38,11 @@ void ggml_backend_htp_dispatch_force_owner(int session_index) {
 }
 
 void ggml_backend_htp_dispatch_end(void) {
+    if (g_dispatch_context != nullptr) {
+        // Discard the immutable plan only after all dispatch callers have
+        // finished using this graph view.
+        g_dispatch_context->end_graph_view();
+    }
     g_dispatch_context = nullptr;
 }
 
