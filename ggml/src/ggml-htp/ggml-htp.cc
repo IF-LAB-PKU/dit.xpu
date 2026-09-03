@@ -2,7 +2,7 @@
 // 1) 初始化 DSP 会话并加载 libhtp_ops.so；
 // 2) 实现基于 RPCMEM（ION 共享内存）的缓冲区分配/释放；
 // 3) 实现后端设备接口：设备属性、算力查询、图计算调度（逐节点 HTP 分发或混合模式）。
-// 支持的缓冲区类型为 "RPCMEM"，默认按 256 MiB 分块，128 字节对齐；必要时可用环境变量调整切分粒度。
+// 支持的缓冲区类型为 "RPCMEM"，默认按 rpcmem_alloc(int) 的最大参数分块，128 字节对齐；必要时可用环境变量调整切分粒度。
 
 #include "ggml-htp.h"
 
@@ -534,7 +534,11 @@ static size_t ggml_backend_htp_get_buffer_max_size() {
             return static_cast<size_t>(mb) * 1024ULL * 1024ULL;
         }
     }
-    return 256ULL * 1024ULL * 1024ULL;
+    // rpcmem_alloc() accepts the allocation size as an int.  Keep the
+    // default chunk limit at that ABI limit so owner-aware parameter
+    // placement uses the largest safe single allocation and automatically
+    // splits larger session ranges into multiple buffers.
+    return static_cast<size_t>(std::numeric_limits<int>::max());
 }
 
 static bool ggml_backend_htp_defer_unmap_enabled() {
@@ -2220,13 +2224,18 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
 
     const bool multi_session_enabled =
         ctx->multi_session_enabled && ctx->session_count() > 1;
-    const bool use_dispatch_context = multi_session_enabled &&
-        ggml_backend_htp_env_enabled("SD_HTP_PACKED_STAGING");
+    const bool use_dispatch_context = multi_session_enabled;
     if (use_dispatch_context) {
+        int htp_node_count = 0;
+        for (int node_index = 0; node_index < ggml_graph_n_nodes(cgraph); ++node_index) {
+            if (htp_ops_support_op_runtime(ggml_graph_node(cgraph, node_index))) {
+                ++htp_node_count;
+            }
+        }
         // The direct HTP path uses the same ordinal policy as the hybrid
         // worker and graph-cut graph views.  Only HTP operations consume an
         // ordinal; there is no second graph-cut owner rule.
-        ggml_backend_htp_dispatch_begin(ggml_graph_n_nodes(cgraph));
+        ggml_backend_htp_dispatch_begin(htp_node_count);
     }
 
     for (int i = 0; i < ggml_graph_n_nodes(cgraph); ++i) {
@@ -2251,14 +2260,16 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
             return GGML_STATUS_FAILED;
         }
 
-        if (multi_session_enabled) {
-            int owner_session = htp_session_owner_for_ordinal(
-                i, ggml_graph_n_nodes(cgraph), static_cast<int>(ctx->session_count()));
+        if (multi_session_enabled && htp_ops_support_op_runtime(node)) {
+            int owner_session = ggml_backend_htp_dispatch_next_owner();
             bool selected = false;
             if (use_dispatch_context) {
-                const int ordinal_owner = ggml_backend_htp_dispatch_next_owner();
-                const int node_owner = ggml_backend_htp_node_session_owner(node);
-                owner_session = node_owner >= 0 ? node_owner : ordinal_owner;
+                if (ggml_backend_htp_env_enabled("SD_HTP_PACKED_STAGING")) {
+                    const int node_owner = ggml_backend_htp_node_session_owner(node);
+                    if (node_owner >= 0) {
+                        owner_session = node_owner;
+                    }
+                }
                 selected = ggml_backend_htp_dispatch_acquire(owner_session);
             } else {
                 selected = ctx->set_active_session(owner_session) == 0;

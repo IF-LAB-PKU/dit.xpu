@@ -7405,14 +7405,83 @@ protected:
         htp_placed_param_tensors_.clear();
         htp_placed_param_tensors_.reserve(tensors.size());
 
+        ggml_backend_buffer_type_t htp_buft = ggml_backend_get_default_buffer_type(htp_backend);
+        const int session_count = ggml_backend_htp_session_count(htp_backend);
+        const bool owner_aware = sd_env_flag_enabled("SD_HTP_MULTI_SESSION") &&
+            session_count > 1 && !sd_env_flag_enabled("SD_HTP_PACKED_STAGING");
+
+        // Duplicate metadata once, then bind each duplicate into an owner-
+        // specific RPCMEM chunk.  The ordinary path below remains unchanged
+        // for single-session and staging execution.
+        std::vector<ggml_tensor*> htp_tensors;
+        htp_tensors.reserve(tensors.size());
         for (ggml_tensor* tensor : tensors) {
             ggml_tensor* htp_tensor = ggml_dup_tensor(htp_param_placement_ctx_, tensor);
             ggml_set_name(htp_tensor, tensor->name);
+            htp_tensors.push_back(htp_tensor);
             htp_param_placement_pairs_.push_back({tensor, htp_tensor});
         }
 
-        ggml_backend_buffer_type_t htp_buft = ggml_backend_get_default_buffer_type(htp_backend);
-        htp_param_placement_buffer_ = ggml_backend_alloc_ctx_tensors_from_buft(htp_param_placement_ctx_, htp_buft);
+        if (owner_aware) {
+            const size_t max_chunk = ggml_backend_buft_get_max_size(htp_buft);
+            struct ParamChunk { size_t begin; size_t end; size_t bytes; int owner; };
+            std::vector<ParamChunk> chunks;
+            size_t chunk_begin = 0;
+            size_t chunk_bytes = 0;
+            int chunk_owner = -1;
+            for (size_t index = 0; index < tensors.size(); ++index) {
+                const size_t tensor_size = GGML_PAD(
+                    ggml_backend_buft_get_alloc_size(htp_buft, tensors[index]),
+                    ggml_backend_buft_get_alignment(htp_buft));
+                const int owner = htp_session_owner_for_ordinal(
+                    static_cast<int>(index), static_cast<int>(tensors.size()), session_count);
+                if (chunk_owner >= 0 &&
+                    (owner != chunk_owner ||
+                     chunk_bytes > 0 && tensor_size > max_chunk - chunk_bytes)) {
+                    chunks.push_back({chunk_begin, index, chunk_bytes, chunk_owner});
+                    chunk_begin = index;
+                    chunk_bytes = 0;
+                }
+                if (chunk_owner < 0 || chunk_bytes == 0) {
+                    chunk_owner = owner;
+                }
+                chunk_bytes += tensor_size;
+            }
+            if (chunk_owner >= 0) {
+                chunks.push_back({chunk_begin, tensors.size(), chunk_bytes, chunk_owner});
+            }
+
+            for (const ParamChunk & chunk : chunks) {
+                ggml_backend_buffer_t chunk_buffer = ggml_backend_htp_alloc_buffer_for_session(
+                    htp_backend, chunk.owner, chunk.bytes);
+                if (chunk_buffer == nullptr) {
+                    LOG_ERROR("%s alloc owner-aware HTP parameter chunk failed: owner=%d bytes=%zu",
+                              get_desc().c_str(), chunk.owner, chunk.bytes);
+                    free_htp_param_placement();
+                    return false;
+                }
+                ggml_backend_buffer_set_usage(chunk_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                htp_param_placement_buffers_.push_back(chunk_buffer);
+                if (htp_param_placement_buffer_ == nullptr) {
+                    htp_param_placement_buffer_ = chunk_buffer;
+                }
+                size_t chunk_offset = 0;
+                for (size_t index = chunk.begin; index < chunk.end; ++index) {
+                    const size_t tensor_size = GGML_PAD(
+                        ggml_backend_buft_get_alloc_size(htp_buft, tensors[index]),
+                        ggml_backend_buft_get_alignment(htp_buft));
+                    ggml_tensor* htp_tensor = htp_tensors[index];
+                    htp_tensor->buffer = chunk_buffer;
+                    htp_tensor->data = static_cast<uint8_t *>(ggml_backend_buffer_get_base(chunk_buffer)) + chunk_offset;
+                    htp_tensor->extra = nullptr;
+                    chunk_offset += tensor_size;
+                }
+            }
+            LOG_INFO("%s owner-aware non-staging HTP params: tensors=%zu chunks=%zu sessions=%d",
+                     get_desc().c_str(), tensors.size(), chunks.size(), session_count);
+        } else {
+            htp_param_placement_buffer_ = ggml_backend_alloc_ctx_tensors_from_buft(htp_param_placement_ctx_, htp_buft);
+        }
         if (htp_param_placement_buffer_ == nullptr) {
             LOG_ERROR("%s alloc HTP packed-only params buffer failed, num_tensors = %zu",
                       get_desc().c_str(),
@@ -7423,13 +7492,25 @@ protected:
             htp_param_placement_ctx_ = nullptr;
             return false;
         }
-        ggml_backend_buffer_set_usage(htp_param_placement_buffer_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        if (!owner_aware) {
+            ggml_backend_buffer_set_usage(htp_param_placement_buffer_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        } else {
+            for (ggml_backend_buffer_t buffer : htp_param_placement_buffers_) {
+                ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            }
+        }
 
         size_t placed_bytes = 0;
         for (auto& pair : htp_param_placement_pairs_) {
             ggml_tensor* tensor     = pair.first;
             ggml_tensor* htp_tensor = pair.second;
-            bind_tensor_allocation(tensor, htp_tensor);
+            if (!owner_aware) {
+                bind_tensor_allocation(tensor, htp_tensor);
+            } else {
+                tensor->buffer = htp_tensor->buffer;
+                tensor->data = htp_tensor->data;
+                tensor->extra = htp_tensor->extra;
+            }
             htp_placed_param_tensors_.insert(tensor);
             placed_bytes += ggml_nbytes(tensor);
         }

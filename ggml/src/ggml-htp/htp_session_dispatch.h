@@ -1,6 +1,7 @@
 #pragma once
 
 #include "session_placement.h"
+#include "session_placement_plan.h"
 
 #include <cstddef>
 
@@ -20,6 +21,8 @@ public:
         htp_ordinal_ = 0;
         active_session_ = -1;
         switch_count_ = 0;
+        forced_session_ = -1;
+        plan_.begin(session_count_, htp_node_count_, ++generation_);
     }
 
     int next_htp_owner() {
@@ -27,8 +30,7 @@ public:
             ++htp_ordinal_;
             return forced_session_;
         }
-        const int owner = htp_session_owner_for_ordinal(
-            htp_ordinal_, htp_node_count_, session_count_);
+        const int owner = plan_.owner_for_ordinal(htp_ordinal_);
         ++htp_ordinal_;
         return owner;
     }
@@ -53,6 +55,8 @@ public:
     void force_owner(int session) { forced_session_ = valid_session(session) ? session : -1; }
     int htp_node_count() const { return htp_node_count_; }
     std::size_t graph_view_id() const { return graph_view_id_; }
+    const HtpSessionPlacementPlan & plan() const { return plan_; }
+    void end_graph_view() { plan_.end(); }
 
 private:
     int session_count_ = 1;
@@ -62,6 +66,8 @@ private:
     int switch_count_ = 0;
     int forced_session_ = -1;
     std::size_t graph_view_id_ = 0;
+    uint64_t generation_ = 0;
+    HtpSessionPlacementPlan plan_;
 };
 
 extern "C" {
