@@ -1,6 +1,8 @@
 #include "session_placement.h"
+#include "htp_param_placement.h"
 
 #include <cassert>
+#include <vector>
 
 int main() {
     const int expected[] = {0, 0, 0, 1, 1, 2, 2, 2, 3, 3};
@@ -8,9 +10,9 @@ int main() {
         assert(htp_session_owner_for_ordinal(i, 10, 4) == expected[i]);
     }
 
-    // A parameter chunk planner uses the same contiguous interval policy as
-    // operation placement; this is intentionally independent of staging.
-    assert(htp_session_owner_for_ordinal(0, 2, 2) == 0);
-    assert(htp_session_owner_for_ordinal(1, 2, 2) == 1);
+    const std::vector<size_t> tensor_sizes = {128, 256, 13 * 1024 * 1024};
+    const auto chunks = htp_per_tensor_chunk_sizes(tensor_sizes, 1024 * 1024 * 256);
+    assert(chunks.size() == tensor_sizes.size());
+    assert(chunks == tensor_sizes);
     return 0;
 }

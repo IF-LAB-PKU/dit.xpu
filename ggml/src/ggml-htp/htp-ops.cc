@@ -2808,6 +2808,29 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     }
 
     size_t op_req_size = sizeof(RequestHeader) + sizeof(OpComputeRequest) + args_size;
+    if (has_unmap_reqs) {
+        const int mapper_domain = ctx->dispatch_mapper().domain();
+        const int mapper_session = htp_rpcmem_session_index_for_domain(ctx->sessions, mapper_domain);
+        const auto * runtime = ctx->session_runtime(mapper_session);
+        const bool use_v2_map = ctx->multi_session_enabled && runtime != nullptr;
+        const size_t entry_size = use_v2_map ? sizeof(RpcmemMapEntryV2) : sizeof(int32_t);
+        const size_t map_req_size = sizeof(RequestHeader) +
+            (use_v2_map ? sizeof(RpcmemMapRequestV2) + static_cast<size_t>(n_unmap_fds) * entry_size
+                        : sizeof(RpcmemMapRequest) + static_cast<size_t>(n_unmap_fds) * entry_size);
+        const size_t total_size = sizeof(MessageHeader) + 3 * sizeof(int32_t) +
+            op_req_size + map_req_size;
+        if (total_size > ggml_backend_htp_context::MAX_MSG_SIZE) {
+            if (!ctx->dispatch_mapper().flush_pending_unmaps()) {
+                std::fprintf(stderr,
+                             "ggml-htp: failed to flush %d pending RPCMEM puts before oversized op message\n",
+                             n_unmap_fds);
+                return -ENOMEM;
+            }
+            n_unmap_fds = 0;
+            has_unmap_reqs = false;
+            n_reqs = 1;
+        }
+    }
     auto * msg_hdr = reinterpret_cast<MessageHeader *>(ctx->message_channel());
 
     auto * d_ptr = reinterpret_cast<volatile std::atomic<uint64_t> *>(&(msg_hdr->state.d));

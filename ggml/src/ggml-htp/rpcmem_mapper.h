@@ -36,14 +36,22 @@ class RpcMemRangeLedger {
 public:
     explicit RpcMemRangeLedger(size_t budget) : budget_(budget) {}
 
-    bool reserve(int fd, size_t offset, size_t size) {
+    bool reserve(int fd, size_t offset, size_t size, size_t allocation_size = 0) {
         if (fd < 0 || size == 0) return false;
+        if (allocation_size == 0) allocation_size = size;
         const Key key{fd, offset, size};
         if (views_.find(key) != views_.end()) return true;
-        if (active_bytes_ > budget_ || size > budget_ - active_bytes_) return false;
+        const bool new_allocation = allocations_.find(fd) == allocations_.end();
+        if (new_allocation && (active_bytes_ > budget_ || allocation_size > budget_ - active_bytes_)) {
+            return false;
+        }
         views_.insert(key);
-        active_bytes_ += size;
-        cumulative_bytes_ += size;
+        if (new_allocation) {
+            allocations_.insert(fd);
+            allocation_sizes_[fd] = allocation_size;
+            active_bytes_ += allocation_size;
+            cumulative_bytes_ += allocation_size;
+        }
         return true;
     }
 
@@ -52,7 +60,19 @@ public:
         auto it = views_.find(key);
         if (it == views_.end()) return;
         views_.erase(it);
-        if (active_bytes_ >= size) active_bytes_ -= size;
+        bool allocation_still_viewed = false;
+        for (const Key & view : views_) {
+            if (view.fd == fd) {
+                allocation_still_viewed = true;
+                break;
+            }
+        }
+        if (!allocation_still_viewed) {
+            allocations_.erase(fd);
+            const size_t allocation_size = allocation_sizes_[fd];
+            allocation_sizes_.erase(fd);
+            if (active_bytes_ >= allocation_size) active_bytes_ -= allocation_size;
+        }
     }
 
     bool contains(int fd, size_t offset, size_t size) const {
@@ -83,6 +103,8 @@ private:
     size_t active_bytes_ = 0;
     size_t cumulative_bytes_ = 0;
     std::unordered_set<Key, KeyHash> views_;
+    std::unordered_set<int> allocations_;
+    std::unordered_map<int, size_t> allocation_sizes_;
 };
 
 struct RpcMemMapper {
@@ -170,7 +192,11 @@ struct RpcMemMapper {
         uint32_t role;
         bool persistent;
     };
+    void queue_unmap_request(const ViewRecord & view, size_t allocation_size);
     std::unordered_map<ViewKey, ViewRecord, ViewKeyHash> view_mapping;
+    // FastRPC maps a complete backing allocation. Keep budget accounting at
+    // that granularity even when one allocation has multiple logical views.
+    std::unordered_set<void *> accounted_bufs;
     // FastRPC/libcdsprpc keeps one live VA mapping per fd in a session.  Keep
     // the physical mapping stable and represent subsequent tensor subranges as
     // logical views instead of issuing a second mmap for the same fd.
