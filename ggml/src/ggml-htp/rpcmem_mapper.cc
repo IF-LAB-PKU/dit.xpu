@@ -46,8 +46,11 @@ ggml_backend_buffer * get_backing_buffer(const ggml_tensor * tensor) {
 // pending 列表里的 DSP put 尚未发送前仍占用映射窗口。
 size_t get_pending_host_mapped_size(const std::list<RpcMemMapper::UnmapRequest> & pending_unmap_reqs) {
     size_t total = 0;
+    std::unordered_set<void *> seen;
     for (const auto & req : pending_unmap_reqs) {
-        total += req.buf_size;
+        if (seen.insert(req.host_map_addr).second) {
+            total += req.host_map_size;
+        }
     }
     return total;
 }
@@ -72,70 +75,73 @@ bool send_rpcmem_puts_to_dsp(
     auto * msg_hdr = reinterpret_cast<MessageHeader *>(channel);
     GGML_ASSERT(msg_hdr != nullptr);
 
-    const int n_unmap_fds = static_cast<int>(pending_unmap_reqs.size());
     const bool use_v2 = ctx->multi_session_enabled && runtime != nullptr;
-    const size_t map_req_size = sizeof(RequestHeader) +
-        (use_v2 ? sizeof(RpcmemMapRequestV2) + n_unmap_fds * sizeof(RpcmemMapEntryV2)
-                : sizeof(RpcmemMapRequest) + n_unmap_fds * sizeof(int32_t));
+    const size_t entry_size = use_v2 ? sizeof(RpcmemMapEntryV2) : sizeof(int32_t);
+    const size_t fixed_size = sizeof(MessageHeader) + 2 * sizeof(int32_t) +
+        sizeof(RequestHeader) + (use_v2 ? sizeof(RpcmemMapRequestV2) : sizeof(RpcmemMapRequest));
+    const size_t max_entries = fixed_size < ggml_backend_htp_context::MAX_MSG_SIZE
+        ? (ggml_backend_htp_context::MAX_MSG_SIZE - fixed_size) / entry_size : 0;
+    if (max_entries == 0) return false;
 
-    auto * d_ptr = reinterpret_cast<volatile std::atomic<uint64_t> *>(&(msg_hdr->state.d));
-    std::atomic_store(d_ptr, uint64_t{0});
-
-    msg_hdr->n_reqs         = 1;
-    msg_hdr->req_offsets[0] = message_header_size(msg_hdr);
-    msg_hdr->req_offsets[1] = msg_hdr->req_offsets[0] + map_req_size;
-
-    RequestHeader req_hdr{
-        .state = 0,
-        .type  = REQUEST_TYPE_RPCMEM_MAP,
-    };
-    auto * p = reinterpret_cast<uint8_t *>(message_header_get_request_ptr(msg_hdr, 0));
-    write_buf(p, req_hdr);
-    if (use_v2) {
-        RpcmemMapRequestV2 map_req{
-            .magic = RPCMEM_MAP_REQUEST_SESSION_MAGIC,
-            .version = RPCMEM_MAP_REQUEST_VERSION_SESSION,
-            .header_size = sizeof(RpcmemMapRequestV2),
-            .session_token = runtime->id == 0 ? 0 :
-                ((static_cast<uint64_t>(runtime->id) << 32) | runtime->domain),
-            .n_puts = n_unmap_fds,
-            .n_gets = 0,
-        };
-        write_buf(p, map_req);
-        for (const auto & req : pending_unmap_reqs) {
-            RpcmemMapEntryV2 entry{req.fd, req.role, req.offset, req.buf_size, 0};
-            write_buf(p, entry);
+    auto begin = pending_unmap_reqs.begin();
+    while (begin != pending_unmap_reqs.end()) {
+        auto end = begin;
+        size_t count = 0;
+        while (end != pending_unmap_reqs.end() && count < max_entries) {
+            ++end;
+            ++count;
         }
-    } else {
-        RpcmemMapRequest map_req{n_unmap_fds, 0};
-        write_buf(p, map_req);
-        for (const auto & req : pending_unmap_reqs) write_buf(p, req.fd);
+        const int n_unmap_fds = static_cast<int>(count);
+        const size_t map_req_size = sizeof(RequestHeader) +
+            (use_v2 ? sizeof(RpcmemMapRequestV2) + count * sizeof(RpcmemMapEntryV2)
+                    : sizeof(RpcmemMapRequest) + count * sizeof(int32_t));
+        auto * d_ptr = reinterpret_cast<volatile std::atomic<uint64_t> *>(&(msg_hdr->state.d));
+        std::atomic_store(d_ptr, uint64_t{0});
+        msg_hdr->n_reqs = 1;
+        msg_hdr->req_offsets[0] = message_header_size(msg_hdr);
+        msg_hdr->req_offsets[1] = msg_hdr->req_offsets[0] + map_req_size;
+        RequestHeader req_hdr{.state = 0, .type = REQUEST_TYPE_RPCMEM_MAP};
+        auto * p = reinterpret_cast<uint8_t *>(message_header_get_request_ptr(msg_hdr, 0));
+        write_buf(p, req_hdr);
+        if (use_v2) {
+            RpcmemMapRequestV2 map_req{
+                .magic = RPCMEM_MAP_REQUEST_SESSION_MAGIC,
+                .version = RPCMEM_MAP_REQUEST_VERSION_SESSION,
+                .header_size = sizeof(RpcmemMapRequestV2),
+                .session_token = runtime->id == 0 ? 0 :
+                    ((static_cast<uint64_t>(runtime->id) << 32) | runtime->domain),
+                .n_puts = n_unmap_fds,
+                .n_gets = 0,
+            };
+            write_buf(p, map_req);
+            for (auto it = begin; it != end; ++it) {
+                RpcmemMapEntryV2 entry{it->fd, it->role, it->offset, it->buf_size, 0};
+                write_buf(p, entry);
+            }
+        } else {
+            RpcmemMapRequest map_req{n_unmap_fds, 0};
+            write_buf(p, map_req);
+            for (auto it = begin; it != end; ++it) write_buf(p, it->fd);
+        }
+        uint32_t sum = 0;
+        uint32_t * sum_begin = reinterpret_cast<uint32_t *>(msg_hdr) + 3;
+        uint32_t * sum_end = reinterpret_cast<uint32_t *>(msg_hdr) + ggml_backend_htp_context::MAX_MSG_SIZE / 4;
+        for (auto * cur = sum_begin; cur < sum_end; ++cur) sum += *cur;
+        msg_hdr->checksum = -(sum + 0x00000001 + 0x00000000);
+        auto * v0_ptr = reinterpret_cast<volatile std::atomic<uint8_t> *>(&(msg_hdr->state.v[0]));
+        auto * v1_ptr = reinterpret_cast<volatile std::atomic<uint8_t> *>(&(msg_hdr->state.v[1]));
+        std::atomic_store_explicit(v0_ptr, uint8_t{1}, std::memory_order_release);
+        while (std::atomic_load_explicit(v1_ptr, std::memory_order_acquire) == 0) usleep(1);
+        const int response_state = message_header_get_request_ptr(msg_hdr, 0)->state;
+        if (std::getenv("SD_HTP_RPCMEM_TRACE") != nullptr) {
+            std::fprintf(stderr, "[rpcmem-trace] dsp_put n_puts=%d state=%d\n", n_unmap_fds, response_state);
+        }
+        d_ptr->store(0, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (response_state != 0) return false;
+        begin = end;
     }
-
-    uint32_t sum = 0;
-    uint32_t * begin = reinterpret_cast<uint32_t *>(msg_hdr) + 3;
-    uint32_t * end   = reinterpret_cast<uint32_t *>(msg_hdr) + ggml_backend_htp_context::MAX_MSG_SIZE / 4;
-    for (auto * cur = begin; cur < end; ++cur) {
-        sum += *cur;
-    }
-    sum += 0x00000001 + 0x00000000;
-    msg_hdr->checksum = -sum;
-
-    auto * v0_ptr = reinterpret_cast<volatile std::atomic<uint8_t> *>(&(msg_hdr->state.v[0]));
-    auto * v1_ptr = reinterpret_cast<volatile std::atomic<uint8_t> *>(&(msg_hdr->state.v[1]));
-    std::atomic_store_explicit(v0_ptr, uint8_t{1}, std::memory_order_release);
-    while (std::atomic_load_explicit(v1_ptr, std::memory_order_acquire) == 0) {
-        usleep(1);
-    }
-    auto * response = message_header_get_request_ptr(msg_hdr, 0);
-    const int response_state = response->state;
-    if (std::getenv("SD_HTP_RPCMEM_TRACE") != nullptr) {
-        std::fprintf(stderr, "[rpcmem-trace] dsp_put n_puts=%d state=%d\n",
-                     n_unmap_fds, response_state);
-    }
-    d_ptr->store(0, std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_acquire);
-    return response_state == 0;
+    return true;
 }
 
 } // namespace
@@ -256,8 +262,9 @@ bool RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) 
 
     size_t required_size = 0;
     for (const RequiredRange & range : required) {
-        const ViewKey key{range.base, range.fd, range.offset, range.size};
-        if (view_mapping.find(key) == view_mapping.end()) required_size += range.size;
+        if (accounted_bufs.find(range.base) == accounted_bufs.end()) {
+            required_size += range.buffer->size;
+        }
     }
     const size_t pending_host_mapped_size = get_pending_host_mapped_size(pending_unmap_reqs);
     if (std::getenv("SD_HTP_MULTI_SESSION_TRACE") != nullptr) {
@@ -286,10 +293,7 @@ bool RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) 
         }
         void * map_addr = static_cast<uint8_t *>(range.base) + range.offset;
         auto pending_it = std::find_if(pending_unmap_reqs.begin(), pending_unmap_reqs.end(),
-            [&](const auto & request) {
-                return request.fd == range.fd && request.offset == range.offset &&
-                    request.buf_size == range.size;
-            });
+            [&](const auto & request) { return request.fd == range.fd; });
         if (pending_it != pending_unmap_reqs.end()) {
             pending_unmap_reqs.erase(pending_it);
         } else if (mapped_fds.insert(range.fd).second) {
@@ -300,6 +304,15 @@ bool RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) 
                                          0, range.buffer->size, FASTRPC_MAP_FD);
             if (err != 0) {
                 mapped_fds.erase(range.fd);
+                std::fprintf(stderr,
+                             "fastrpc_mmap failed domain=%d fd=%d alloc_size=%zu "
+                             "logical_offset=%zu logical_size=%zu active=%zu "
+                             "persistent=%zu pending=%zu max=%zu tensor=%s ret=0x%x\n",
+                             domain_id, range.fd, range.buffer->size, range.offset,
+                             range.size, active_map_size, persistent_map_size,
+                             get_pending_host_mapped_size(pending_unmap_reqs),
+                             max_active_map_size,
+                             dst != nullptr ? dst->name : "(null)", err);
                 dump_state();
                 return false;
             }
@@ -311,14 +324,18 @@ bool RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) 
         if (buf_mapping.find(range.base) == buf_mapping.end()) {
             buf_mapping.emplace(range.base, std::make_pair(range.fd, range.buffer->size));
         }
+        if (accounted_bufs.insert(range.base).second) {
+            if (!range.persistent) {
+                active_map_size += range.buffer->size;
+            } else {
+                persistent_map_size += range.buffer->size;
+            }
+        }
         if (!range.persistent) {
-            active_map_size += range.size;
             if (buf_iters.find(range.base) == buf_iters.end()) {
                 accessed_bufs.push_front(range.base);
                 buf_iters[range.base] = accessed_bufs.begin();
             }
-        } else {
-            persistent_map_size += range.size;
         }
         if (std::getenv("SD_HTP_MULTI_SESSION_TRACE") != nullptr) {
             std::fprintf(stderr,
@@ -371,17 +388,18 @@ bool RpcMemMapper::release_buffer(void * buf_base) {
             continue;
         }
         const ViewRecord view = it->second;
-            pending_unmap_reqs.push_back({view.fd, view.buf_base, view.map_addr,
-                                      view.offset, view.size, view.role, view.buf_base,
-                                      buf_mapping.at(buf_base).second});
-        if (view.persistent) {
-            GGML_ASSERT(persistent_map_size >= view.size);
-            persistent_map_size -= view.size;
-        } else {
-            GGML_ASSERT(active_map_size >= view.size);
-            active_map_size -= view.size;
-        }
+        queue_unmap_request(view, buf_mapping.at(buf_base).second);
         it = view_mapping.erase(it);
+    }
+    if (accounted_bufs.erase(buf_base) != 0) {
+        const size_t allocation_size = buf_mapping.at(buf_base).second;
+        if (persistent_bufs.count(buf_base) != 0) {
+            GGML_ASSERT(persistent_map_size >= allocation_size);
+            persistent_map_size -= allocation_size;
+        } else {
+            GGML_ASSERT(active_map_size >= allocation_size);
+            active_map_size -= allocation_size;
+        }
     }
     if (!flush_pending_unmaps()) return false;
     if (auto iter = buf_iters.find(buf_base); iter != buf_iters.end()) {
@@ -391,6 +409,18 @@ bool RpcMemMapper::release_buffer(void * buf_base) {
     buf_mapping.erase(buf_base);
     persistent_bufs.erase(buf_base);
     return true;
+}
+
+void RpcMemMapper::queue_unmap_request(const ViewRecord & view, size_t allocation_size) {
+    auto existing = std::find_if(pending_unmap_reqs.begin(), pending_unmap_reqs.end(),
+        [&](const UnmapRequest & request) { return request.fd == view.fd; });
+    if (existing != pending_unmap_reqs.end()) {
+        existing->role |= view.role;
+        return;
+    }
+    pending_unmap_reqs.push_back({view.fd, view.buf_base, view.buf_base,
+                                  0, allocation_size, view.role,
+                                  view.buf_base, allocation_size});
 }
 
 bool RpcMemMapper::flush_pending_unmaps() {
@@ -407,12 +437,21 @@ void RpcMemMapper::release_all_mappings() {
             ++it;
             continue;
         }
-        pending_unmap_reqs.push_back({view.fd, view.buf_base, view.map_addr,
-                                      view.offset, view.size, view.role, view.buf_base,
-                                      buf_mapping.at(view.buf_base).second});
-        GGML_ASSERT(active_map_size >= view.size);
-        active_map_size -= view.size;
+        queue_unmap_request(view, buf_mapping.at(view.buf_base).second);
         it = view_mapping.erase(it);
+    }
+    for (auto it = accounted_bufs.begin(); it != accounted_bufs.end();) {
+        void * base = *it;
+        if (persistent_bufs.count(base) == 0) {
+            auto mapping = buf_mapping.find(base);
+            if (mapping != buf_mapping.end()) {
+                GGML_ASSERT(active_map_size >= mapping->second.second);
+                active_map_size -= mapping->second.second;
+            }
+            it = accounted_bufs.erase(it);
+        } else {
+            ++it;
+        }
     }
     for (auto it = buf_mapping.begin(); it != buf_mapping.end();) {
         if (persistent_bufs.count(it->first) == 0) it = buf_mapping.erase(it);

@@ -14,6 +14,7 @@ set(GGML_SOURCES_HTP
     rpcmem_mapper.h
     session_placement.h
     session_placement_plan.h
+    htp_param_placement.h
 )
 
 ggml_add_backend_library(ggml-htp ${GGML_SOURCES_HTP})
