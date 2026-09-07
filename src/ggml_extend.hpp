@@ -7153,10 +7153,7 @@ protected:
     bool is_htp_supported_packed_qkv(ggml_tensor* node) const {
         if (!htp_op_routing_enabled() || !htp_attention_enabled || node == nullptr ||
             node->op != GGML_OP_CUSTOM ||
-            (std::strcmp(node->name, "qkv_mul_rms_packed") != 0 &&
-             std::strcmp(node->name, "qkv_mul_rms_packed_dual") != 0 &&
-             std::strcmp(node->name, "qkv_mul_rms_packed_rope") != 0 &&
-             std::strcmp(node->name, "qkv_mul_rms_packed_dual_rope") != 0)) {
+            !htp_packed_qkv_node_name_is_supported(node->name)) {
             return false;
         }
         return ggml_backend_supports_op(htp_backend, node);
@@ -7263,13 +7260,21 @@ protected:
         std::unordered_set<ggml_tensor*> seen;
         for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
             ggml_tensor* node = ggml_graph_node(gf, i);
-            if (!is_htp_supported_f16_mul_mat(node)) {
+            if (is_htp_supported_f16_mul_mat(node)) {
+                ggml_tensor* root = get_htp_tensor_backing_root(node->src[0]);
+                if (should_prepare_htp_packed_f16_weight(root) && seen.insert(root).second) {
+                    tensors.push_back(root);
+                }
                 continue;
             }
-            ggml_tensor* weight = node->src[0];
-            ggml_tensor* root = get_htp_tensor_backing_root(weight);
-            if (should_prepare_htp_packed_f16_weight(root) && seen.insert(root).second) {
-                tensors.push_back(root);
+            if (!is_htp_supported_packed_qkv(node)) {
+                continue;
+            }
+            for (int src_index : htp_packed_qkv_weight_src_indices(node->name)) {
+                ggml_tensor* root = get_htp_tensor_backing_root(node->src[src_index]);
+                if (should_prepare_htp_packed_f16_weight(root) && seen.insert(root).second) {
+                    tensors.push_back(root);
+                }
             }
         }
         return tensors;
@@ -8907,8 +8912,28 @@ protected:
             return false;
         }
         std::vector<ggml_tensor*> tensors = collect_htp_packable_f16_weights(gf);
-        if (tensors.empty()) {
+        const auto validate_deferred_qkv_staging = [&]() {
+            for (int node_index = 0; node_index < ggml_graph_n_nodes(gf); ++node_index) {
+                ggml_tensor* node = ggml_graph_node(gf, node_index);
+                if (!is_htp_supported_packed_qkv(node)) {
+                    continue;
+                }
+                for (int src_index : htp_packed_qkv_weight_src_indices(node->name)) {
+                    ggml_tensor* weight = get_htp_tensor_backing_root(node->src[src_index]);
+                    if (weight != nullptr &&
+                        (weight->flags & SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM) != 0 &&
+                        !htp_packed_staging_contains(htp_packed_staging_tensors_, weight)) {
+                        LOG_ERROR("%s deferred packed QKV weight is not staged: node=%s src[%d] weight=%s bytes=%zu",
+                                  get_desc().c_str(), node->name, src_index,
+                                  weight->name, ggml_nbytes(weight));
+                        return false;
+                    }
+                }
+            }
             return true;
+        };
+        if (tensors.empty()) {
+            return validate_deferred_qkv_staging();
         }
         std::unordered_set<ggml_tensor*> staged_lookup(tensors.begin(), tensors.end());
         std::unordered_map<ggml_tensor*, int> tensor_sessions;
@@ -8916,19 +8941,27 @@ protected:
         int htp_node_count = 0;
         for (int node_index = 0; node_index < ggml_graph_n_nodes(gf); ++node_index) {
             ggml_tensor* node = ggml_graph_node(gf, node_index);
-            if (node != nullptr && is_htp_supported_f16_mul_mat(node)) {
+            if (node != nullptr && (is_htp_supported_f16_mul_mat(node) ||
+                                    is_htp_supported_packed_qkv(node))) {
                 ++htp_node_count;
             }
         }
         int htp_ordinal = 0;
         for (int node_index = 0; node_index < ggml_graph_n_nodes(gf); ++node_index) {
             ggml_tensor* node = ggml_graph_node(gf, node_index);
-            if (node == nullptr || !is_htp_supported_f16_mul_mat(node)) {
+            if (node == nullptr || (!is_htp_supported_f16_mul_mat(node) &&
+                                    !is_htp_supported_packed_qkv(node))) {
                 continue;
             }
             const int owner = htp_session_owner_for_ordinal(
                 htp_ordinal++, htp_node_count, owner_count);
-            for (int src_index = 0; src_index < GGML_MAX_SRC; ++src_index) {
+            std::vector<int> weight_src_indices;
+            if (is_htp_supported_f16_mul_mat(node)) {
+                weight_src_indices.push_back(0);
+            } else {
+                weight_src_indices = htp_packed_qkv_weight_src_indices(node->name);
+            }
+            for (int src_index : weight_src_indices) {
                 ggml_tensor* src = node->src[src_index];
                 while (src != nullptr && src->view_src != nullptr) {
                     src = src->view_src;
@@ -8961,7 +8994,7 @@ protected:
                     return false;
                 }
             }
-            return true;
+            return validate_deferred_qkv_staging();
         }
         size_t required_bytes = 0;
         for (ggml_tensor* tensor : tensors) {
@@ -9015,6 +9048,10 @@ protected:
                 return false;
             }
             htp_packed_staging_tensors_.push_back(tensor);
+        }
+        if (!validate_deferred_qkv_staging()) {
+            release_htp_packed_staging();
+            return false;
         }
         const size_t reclaimed_slots = htp_packed_staging_pool_->reclaim_unleased();
         if (reclaimed_slots > 0) {

@@ -20,6 +20,11 @@ bool htp_should_defer_packed_param(bool htp_routing_active,
                                    size_t max_graph_vram_bytes,
                                    const ggml_tensor* tensor);
 
+// Packed QKV custom nodes carry their offline-packed projection weights at
+// different source positions for single- and dual-stream variants.
+bool htp_packed_qkv_node_name_is_supported(const char* name);
+std::vector<int> htp_packed_qkv_weight_src_indices(const char* name);
+
 class HtpNonDeferredParamsAllocation {
 public:
     ~HtpNonDeferredParamsAllocation();
