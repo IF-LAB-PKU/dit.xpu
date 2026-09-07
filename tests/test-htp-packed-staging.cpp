@@ -1,6 +1,7 @@
 #include "htp_packed_staging.h"
 
 #include "htp_tensor_flags.h"
+#include "flux.hpp"
 #include "model.h"
 #include "model_io/safetensors_io.h"
 #include "stable-diffusion.h"
@@ -40,6 +41,24 @@ static TensorWriteInfo info_for(ggml_tensor* tensor) {
 }
 
 int main() {
+    // Packed Flux2 Q/K/V must remain graph views so gallocr can release the
+    // shared storage after the attention node consumes the last view.
+    ggml_context* packed_ctx = ggml_init({64 * 1024 * 1024, nullptr, false});
+    CHECK(packed_ctx != nullptr);
+    GGMLRunnerContext packed_runner;
+    packed_runner.ggml_ctx = packed_ctx;
+    ggml_tensor* packed_storage = ggml_new_tensor_1d(
+        packed_ctx, GGML_TYPE_F16, 3 * 24 * 48 * 4 * 1024);
+    CHECK(packed_storage != nullptr);
+    const Flux::PackedRopeQkv packed_views = Flux::make_packed_flux2_qkv_views(
+        &packed_runner, packed_storage, 1536);
+    CHECK(packed_views.storage == packed_storage);
+    CHECK(packed_views.qkv.size() == 3);
+    CHECK(packed_views.qkv[0]->op == GGML_OP_VIEW);
+    CHECK(packed_views.qkv[1]->op == GGML_OP_VIEW);
+    CHECK(packed_views.qkv[2]->op == GGML_OP_VIEW);
+    ggml_free(packed_ctx);
+
     CHECK(htp_packed_staging_owner_count(true, true, 4) == 4);
     CHECK(htp_packed_staging_owner_count(true, true, 1) == 1);
     CHECK(htp_packed_staging_owner_count(true, false, 4) == 1);

@@ -125,10 +125,14 @@ void test_attention_policy() {
     require(apply.residual_eligible,
             "image attention must participate in apply residual accounting");
 
-    const auto sparse_without_apply = sd_htp_attention_policy_for(
+    const auto sparse_without_residual_cache = sd_htp_attention_policy_for(
         true, SD_HTP_BLOCK_SPARSE_RESIDUAL_OFF, true);
-    require(!sparse_without_apply.packed_qkv_allowed,
-            "packed QKV is reserved for sparse residual apply steps");
+    require(sparse_without_residual_cache.sparse_policy_active,
+            "a sparse step without residual cache must activate sparse geometry");
+    require(sparse_without_residual_cache.packed_qkv_allowed,
+            "packed QKV must be allowed without residual cache on non-anchor sparse steps");
+    require(!sparse_without_residual_cache.residual_eligible,
+            "residual accounting must remain disabled without residual cache");
 
     const auto text_only = sd_htp_attention_policy_for(
         true, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY, false);
