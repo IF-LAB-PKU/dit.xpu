@@ -18,6 +18,29 @@ size_t align_up(size_t value) {
 }
 }  // namespace
 
+bool htp_packed_qkv_node_name_is_supported(const char* name) {
+    return name != nullptr &&
+           (std::strcmp(name, "qkv_mul_rms_packed") == 0 ||
+            std::strcmp(name, "qkv_mul_rms_packed_rope") == 0 ||
+            std::strcmp(name, "qkv_mul_rms_packed_dual") == 0 ||
+            std::strcmp(name, "qkv_mul_rms_packed_dual_rope") == 0);
+}
+
+std::vector<int> htp_packed_qkv_weight_src_indices(const char* name) {
+    if (name == nullptr) {
+        return {};
+    }
+    if (std::strcmp(name, "qkv_mul_rms_packed_dual") == 0 ||
+        std::strcmp(name, "qkv_mul_rms_packed_dual_rope") == 0) {
+        return {1, 6};
+    }
+    if (std::strcmp(name, "qkv_mul_rms_packed") == 0 ||
+        std::strcmp(name, "qkv_mul_rms_packed_rope") == 0) {
+        return {1};
+    }
+    return {};
+}
+
 bool htp_should_defer_packed_param(bool htp_routing_active,
                                    bool packed_staging_enabled,
                                    size_t max_graph_vram_bytes,
