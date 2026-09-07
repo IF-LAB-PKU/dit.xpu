@@ -232,10 +232,9 @@ namespace Flux {
             ggml_view_4d(ctx->ggml_ctx, storage, head_dim, tokens, n_heads, 1,
                          sizeof(ggml_fp16_t), head_dim * sizeof(ggml_fp16_t), head_stride, 2 * qkv_bytes),
         };
-        for (ggml_tensor* tensor : result.qkv) {
-            tensor->op = GGML_OP_NONE;
-            tensor->type = GGML_TYPE_F16;
-        }
+        // Keep these tensors as real graph views.  Marking them as NONE turns
+        // them into leaves, so gallocr misses the corresponding view counts
+        // during its graph prepass and never releases the backing storage.
         return result;
     }
 

@@ -217,7 +217,7 @@ __STATIC_INLINE__ sd_htp_attention_policy sd_htp_attention_policy_for(
     const bool apply  = residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY;
     return {
         has_image_region && (block_sparse_step || anchor),
-        has_image_region && block_sparse_step && apply,
+        has_image_region && block_sparse_step && !anchor,
         has_image_region && (anchor || apply),
     };
 }
