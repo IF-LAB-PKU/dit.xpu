@@ -213,12 +213,16 @@ static void configure_sparse_route() {
     setenv("SD_HTP_ATTENTION", "1", 1);
     setenv("SD_HTP_BLOCK_SPARSE_ATTN", "1", 1);
     setenv("SD_HTP_PACKED_ATTENTION", "0", 1);
+    // The HTP route state machine requires the residual flag to select the
+    // OpenCL anchor sidecar route, even when this benchmark has no residual
+    // tensor in its attention graph.
+    setenv("SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE", "1", 1);
     setenv("SD_HTP_SPARSE_OPENCL", "1", 1);
     setenv("SD_HTP_SPARSE_OPENCL_STRICT", "1", 1);
     setenv("SD_HTP_SPARSE_OPENCL_ASYNC", "0", 1);
     setenv("SD_HTP_SPARSE_OPENCL_EARLY_SUBMIT", "0", 1);
     setenv("SD_HTP_SPARSE_OPENCL_SUBMIT_THREAD", "0", 1);
-    setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "0", 1);
+    setenv("SD_HTP_SPARSE_OPENCL_RESIDUAL", "1", 1);
     setenv("SD_HTP_HALO_KV_LOAD", "l2fetch", 1);
 }
 
