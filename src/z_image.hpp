@@ -203,8 +203,10 @@ namespace ZImage {
             ggml_view_4d(ctx->ggml_ctx, storage, head_dim, tokens, n_heads, 1,
                          sizeof(ggml_fp16_t), head_dim * sizeof(ggml_fp16_t), head_stride, 2 * qkv_bytes),
         };
+        // Keep Q/K/V as real graph views. Marking them as NONE turns them
+        // into leaves, so gallocr misses the view counts and cannot release
+        // the packed storage for reuse by the next attention block.
         for (ggml_tensor* t : result.qkv) {
-            t->op   = GGML_OP_NONE;
             t->type = GGML_TYPE_F16;
         }
         return result;

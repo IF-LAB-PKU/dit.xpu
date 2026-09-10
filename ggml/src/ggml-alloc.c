@@ -919,8 +919,12 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
-    // add 25% margin to avoid hash collisions
-    min_hash_size += min_hash_size / 4;
+    // A cut graph may reference external source/view tensors that are not
+    // represented as nodes or explicit leafs.  alloc_graph_impl hashes those
+    // dependencies as it walks each node, so sizing from only n_nodes+n_leafs
+    // can fill the table and abort before allocation starts.  Reserve a full
+    // extra copy to cover these dependencies while retaining headroom.
+    min_hash_size += min_hash_size;
 
     // initialize hash table
     if (galloc->hash_set.size < min_hash_size) {

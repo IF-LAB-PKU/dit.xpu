@@ -2,6 +2,7 @@
 
 #include "htp_tensor_flags.h"
 #include "flux.hpp"
+#include "z_image.hpp"
 #include "model.h"
 #include "model_io/safetensors_io.h"
 #include "stable-diffusion.h"
@@ -58,6 +59,28 @@ int main() {
     CHECK(packed_views.qkv[1]->op == GGML_OP_VIEW);
     CHECK(packed_views.qkv[2]->op == GGML_OP_VIEW);
     ggml_free(packed_ctx);
+
+    // Packed Z-Image Q/K/V must also remain graph views.  Turning these into
+    // leaves breaks gallocr's view accounting and exhausts the hash table
+    // during the third sparse denoise step.
+    ggml_context* z_image_ctx = ggml_init({64 * 1024 * 1024, nullptr, false});
+    CHECK(z_image_ctx != nullptr);
+    GGMLRunnerContext z_image_runner;
+    z_image_runner.ggml_ctx = z_image_ctx;
+    constexpr int z_image_tokens = 32;
+    constexpr size_t z_image_qkv_bytes =
+        (size_t)30 * (size_t)1 * (size_t)4 * (size_t)1024 * sizeof(ggml_fp16_t);
+    ggml_tensor* z_image_storage = ggml_new_tensor_1d(
+        z_image_ctx, GGML_TYPE_F16, (int64_t)(3 * z_image_qkv_bytes / sizeof(ggml_fp16_t)));
+    CHECK(z_image_storage != nullptr);
+    const ZImage::PackedRopeQkv z_image_views = ZImage::make_packed_z_image_qkv_views(
+        &z_image_runner, z_image_storage, z_image_tokens);
+    CHECK(z_image_views.storage == z_image_storage);
+    CHECK(z_image_views.qkv.size() == 3);
+    CHECK(z_image_views.qkv[0]->op == GGML_OP_VIEW);
+    CHECK(z_image_views.qkv[1]->op == GGML_OP_VIEW);
+    CHECK(z_image_views.qkv[2]->op == GGML_OP_VIEW);
+    ggml_free(z_image_ctx);
 
     CHECK(htp_packed_staging_owner_count(true, true, 4) == 4);
     CHECK(htp_packed_staging_owner_count(true, true, 1) == 1);
