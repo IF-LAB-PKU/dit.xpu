@@ -3057,6 +3057,11 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
         return direct_ret;
     }
 
+    // The doorbell closes the host submit window: the request is written, the
+    // checksum is in place, and the DSP is told to pick the request up.  The
+    // timestamp is what lets a caller split the host window of the node into a
+    // submit part (in front of the doorbell) and a wait part (behind it).
+    ctx->last_dispatch_doorbell_us.store(ggml_time_us(), std::memory_order_release);
     std::atomic_store_explicit(v0_ptr, uint8_t{ 1 }, std::memory_order_release);
 
     const int timeout_ms = htp_dispatch_timeout_ms();

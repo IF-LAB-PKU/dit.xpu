@@ -70,6 +70,11 @@ struct ggml_backend_htp_context {
     bool skip_htp_ops = false;
     bool runtime_available = false;
     std::atomic<int64_t> last_attention_elapsed_us{-1};
+    // Host instant of the DSP doorbell of the last dispatched node: everything
+    // the host spends before the store is the submit, everything after it is the
+    // wait for the DSP.  -1 until a node has been dispatched since the last
+    // reset_attention_profile.
+    std::atomic<int64_t> last_dispatch_doorbell_us{-1};
     ggml_htp_route_summary last_route_summary = {};
     bool has_last_route_summary = false;
     ggml_htp_memory_ledger_snapshot pending_memory_ledger = {};

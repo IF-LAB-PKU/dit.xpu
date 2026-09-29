@@ -272,6 +272,12 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_htp_qkv_buffer_type(voi
 GGML_BACKEND_API void ggml_backend_htp_set_n_threads(ggml_backend_t backend, int n_threads);
 GGML_BACKEND_API void ggml_backend_htp_reset_attention_profile(ggml_backend_t backend);
 GGML_BACKEND_API int64_t ggml_backend_htp_get_last_attention_elapsed_us(ggml_backend_t backend);
+// Host wall clock (CLOCK_MONOTONIC microseconds, the same base ggml_time_us
+// uses) of the DSP doorbell of the last node dispatched after the last
+// ggml_backend_htp_reset_attention_profile: the node's host window splits into
+// submit (anything before this instant) and wait (anything after it).  -1 when
+// nothing has been dispatched yet.
+GGML_BACKEND_API int64_t ggml_backend_htp_get_last_dispatch_doorbell_us(ggml_backend_t backend);
 GGML_BACKEND_API void ggml_backend_htp_pack_f16_weight(ggml_fp16_t * dst, const ggml_fp16_t * src, int64_t k, int64_t n);
 GGML_BACKEND_API void ggml_backend_htp_register_packed_f16_weight(const struct ggml_tensor * original,
                                                                   struct ggml_tensor * packed);
