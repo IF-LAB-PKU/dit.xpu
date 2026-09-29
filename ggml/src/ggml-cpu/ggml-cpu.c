@@ -2908,6 +2908,23 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t DK = node->src[1]->ne[0];
                         const int64_t DV = node->src[2]->ne[0];
 
+                        // Block-sparse path (I32 block-index mask)
+                        // Per-thread: Q/K/V tiles, score tile, and output accumulator
+                        // for the SIMD block-sparse attention kernel.
+                        if (node->op_params[7] == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX) {
+                            const int64_t block_q = node->op_params[4];
+                            const int64_t block_k = node->op_params[5];
+                            GGML_ASSERT(block_q > 0 && block_k > 0);
+
+                            cur += sizeof(float)*(GGML_FA_TILE_Q*DK +
+                                                   GGML_FA_TILE_Q*GGML_FA_TILE_KV +
+                                                   GGML_FA_TILE_Q*DV +
+                                                   DK*GGML_FA_TILE_KV +
+                                                   GGML_FA_TILE_KV*DV +
+                                                   CACHE_LINE_SIZE_F32)*n_tasks;
+                            break;
+                        }
+
                         // Tiled flash attention scratch (tile sizes defined in common.h)
                         // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + K_f32 + padding
                         size_t prefill  = sizeof(float)*(GGML_FA_TILE_Q*DK + 2*GGML_FA_TILE_Q*GGML_FA_TILE_KV + GGML_FA_TILE_Q*DV + GGML_FA_TILE_KV*DV + GGML_FA_TILE_KV*DK)*n_tasks;

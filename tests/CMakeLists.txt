@@ -227,6 +227,23 @@ target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/.. $
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
+set(TEST_TARGET test-backend-cpu-sparse-attention-kernel-performance)
+add_executable(${TEST_TARGET}
+               ../ggml/tests/test-backend-cpu-sparse-attention-kernel-performance.cpp
+               ../ggml/tests/test-backend-htp-attention-common.cpp)
+if (NOT GGML_HTP)
+    target_sources(${TEST_TARGET} PRIVATE test-htp-host-stubs.cpp)
+endif()
+target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
+if (APPLE)
+    target_link_options(${TEST_TARGET} PRIVATE "-Wl,-multiply_defined" "-Wl,suppress")
+else()
+    target_link_options(${TEST_TARGET} PRIVATE "-Wl,--allow-multiple-definition")
+endif()
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/.. ${CMAKE_CURRENT_LIST_DIR}/../include)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
+
 set(TEST_TARGET test-backend-opencl-attention-kernel-performance)
 add_executable(${TEST_TARGET}
                ../ggml/tests/test-backend-opencl-attention-kernel-performance.cpp

@@ -8817,6 +8817,203 @@ static void ggml_flash_attn_ext_reduce_partials(
     }
 }
 
+// Block-sparse flash attention driven by an I32 block-index mask, i.e. the
+// mask the "block halo" sparse policy produces.
+//
+// Every row of the mask belongs to one (head, query block) pair and lists the
+// KV blocks that contribute to it: entry = head*n_k_blocks + kv_block, the row
+// is terminated by a negative entry, and a full row is also valid (the reader
+// is bounded by mask->ne[0]). Queries inside a block share the row, so the K/V
+// rows of a block are loaded once and reused by the whole query tile.
+static void ggml_compute_forward_flash_attn_ext_block_index(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    GGML_ASSERT(mask != NULL && mask->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(mask));
+    GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
+    GGML_ASSERT(sinks == NULL);
+
+    const int64_t DK        = k->ne[0];
+    const int64_t DV        = v->ne[0];
+    const int64_t n_q       = q->ne[1];
+    const int64_t n_head    = q->ne[2];
+    const int64_t n_kv      = k->ne[1];
+    const int64_t n_kv_head = k->ne[2];
+    const int64_t ne3       = q->ne[3];
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
+    GGML_ASSERT(v->type == k->type);
+    GGML_ASSERT(q->ne[0] == DK && v->ne[1] == n_kv && v->ne[2] == n_kv_head);
+    GGML_ASSERT(q->ne[3] == ne3 && k->ne[3] == ne3 && v->ne[3] == ne3);
+    GGML_ASSERT(n_head % n_kv_head == 0);
+
+    const int64_t block_q  = ggml_get_op_params_i32(dst, 4);
+    const int64_t block_k  = ggml_get_op_params_i32(dst, 5);
+    const bool    with_lse = ggml_get_op_params_i32(dst, 6) != 0;
+
+    GGML_ASSERT(block_q > 0 && block_k > 0);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_nelements(dst) == (DV + (with_lse ? 1 : 0))*n_head*n_q*ne3);
+
+    float scale         = 1.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    GGML_ASSERT(max_bias == 0.0f && logit_softcap == 0.0f &&
+                "block-index flash attention does not implement ALiBi or logit softcap");
+
+    const int64_t n_q_blocks = (n_q + block_q - 1)/block_q;
+    const int64_t n_k_blocks = (n_kv + block_k - 1)/block_k;
+
+    GGML_ASSERT(mask->ne[0] > 0 && mask->ne[0] <= INT32_MAX);
+    GGML_ASSERT(mask->ne[1] == n_head*n_q_blocks);
+
+    const int64_t head_group = n_head/n_kv_head;
+    const int64_t n_blocks   = mask->ne[0];
+
+    // Keep the sparse path's tile shape aligned with the dense flash-attention
+    // path.  Q/K/V are packed once per indexed KV block and both matrix
+    // products use the CPU SIMD GEMM microkernel.
+    static constexpr int Q_TILE_SZ  = ggml_fa_tile_config::Q;
+    static constexpr int KV_TILE_SZ = ggml_fa_tile_config::KV;
+    GGML_ASSERT(block_q <= Q_TILE_SZ && block_k <= KV_TILE_SZ);
+
+    // Per-thread scratch layout:
+    // Q_f32: [Q_TILE, DK], scores: [Q_TILE, KV_TILE], acc: [Q_TILE, DV],
+    // K_f32: [DK, KV_TILE] (transposed for GEMM), V_f32: [KV_TILE, DV].
+    const size_t stride = (size_t) (Q_TILE_SZ*DK + Q_TILE_SZ*KV_TILE_SZ +
+                                    Q_TILE_SZ*DV + DK*KV_TILE_SZ + KV_TILE_SZ*DV +
+                                    CACHE_LINE_SIZE_F32);
+    float * base   = (float *) params->wdata + params->ith*stride;
+    float * q_f32  = base;
+    float * scores = q_f32 + Q_TILE_SZ*DK;
+    float * acc    = scores + Q_TILE_SZ*KV_TILE_SZ;
+    float * k_f32  = acc + Q_TILE_SZ*DV;
+    float * v_f32  = k_f32 + DK*KV_TILE_SZ;
+
+    const int64_t total = ne3*n_head*n_q_blocks;
+
+    for (int64_t ir = params->ith; ir < total; ir += params->nth) {
+        const int64_t iq3 = ir/(n_head*n_q_blocks);
+        const int64_t rem = ir%(n_head*n_q_blocks);
+        const int64_t iq2 = rem/n_q_blocks;
+        const int64_t iqb = rem%n_q_blocks;
+
+        const int64_t iq1_0   = iqb*block_q;
+        const int64_t nq_tile = MIN(block_q, n_q - iq1_0);
+
+        const int64_t ik2 = iq2/head_group;
+
+        float row_max[Q_TILE_SZ];
+        float row_sum[Q_TILE_SZ];
+        memset(acc, 0, (size_t) Q_TILE_SZ*DV*sizeof(float));
+        for (int i = 0; i < Q_TILE_SZ; ++i) {
+            row_max[i] = -INFINITY;
+            row_sum[i] = 0.0f;
+        }
+
+        for (int64_t i = 0; i < nq_tile; ++i) {
+            const char * qp = (const char *) q->data +
+                    (iq1_0 + i)*q->nb[1] + iq2*q->nb[2] + iq3*q->nb[3];
+            memcpy(q_f32 + i*DK, qp, (size_t) DK*sizeof(float));
+        }
+        const int32_t * row = (const int32_t *) ((const char *) mask->data +
+                (iq2*n_q_blocks + iqb)*mask->nb[1]);
+
+        for (int64_t p = 0; p < n_blocks; ++p) {
+            const int32_t entry = row[p];
+            if (entry < 0) {
+                break;
+            }
+
+            const int64_t kb  = entry%n_k_blocks;
+            const int64_t kt0 = kb*block_k;
+            const int64_t kt1 = MIN(kt0 + block_k, n_kv);
+
+            const int kv_tile = (int) (kt1 - kt0);
+            // Use the actual block dimensions as GEMM M/N.  The scratch is
+            // sized for the maximum tile, but never compute padded query or
+            // key rows for the common 32x32 block configuration.
+            memset(k_f32, 0, (size_t) DK*kv_tile*sizeof(float));
+
+            // Pack K transposed for Q[K] * K^T and convert each source row once.
+            for (int tk = 0; tk < kv_tile; ++tk) {
+                const char * kp = (const char *) k->data +
+                        (kt0 + tk)*k->nb[1] + ik2*k->nb[2] + iq3*k->nb[3];
+                if (k->type == GGML_TYPE_F16) {
+                    const ggml_fp16_t * src = (const ggml_fp16_t *) kp;
+                    for (int64_t d = 0; d < DK; ++d) {
+                        k_f32[d*kv_tile + tk] = GGML_CPU_FP16_TO_FP32(src[d]);
+                    }
+                } else {
+                    const float * src = (const float *) kp;
+                    for (int64_t d = 0; d < DK; ++d) {
+                        k_f32[d*kv_tile + tk] = src[d];
+                    }
+                }
+            }
+
+            memset(scores, 0, (size_t) nq_tile*kv_tile*sizeof(float));
+            simd_gemm(scores, q_f32, k_f32, (int) nq_tile, (int) DK, kv_tile);
+            ggml_vec_scale_f32((int) (nq_tile*kv_tile), scores, scale);
+
+            for (int i = 0; i < nq_tile; ++i) {
+                float * score_row = scores + i*kv_tile;
+                float tile_max = -INFINITY;
+                ggml_vec_max_f32(kv_tile, &tile_max, score_row);
+                if (tile_max == -INFINITY) continue;
+
+                const float old_max = row_max[i];
+                const float new_max = fmaxf(old_max, tile_max);
+                if (new_max > old_max) {
+                    const float correction = expf(old_max - new_max);
+                    ggml_vec_scale_f32((int) DV, acc + i*DV, correction);
+                    row_sum[i] *= correction;
+                    row_max[i] = new_max;
+                }
+                row_sum[i] += ggml_vec_soft_max_f32(kv_tile, score_row,
+                                                     score_row, new_max);
+            }
+
+            // Pack V as [KV_TILE, DV] and use the softmax score tile as GEMM A.
+            memset(v_f32, 0, (size_t) kv_tile*DV*sizeof(float));
+            for (int tk = 0; tk < kv_tile; ++tk) {
+                const char * vp = (const char *) v->data +
+                        (kt0 + tk)*v->nb[1] + ik2*v->nb[2] + iq3*v->nb[3];
+                if (v->type == GGML_TYPE_F16) {
+                    ggml_fp16_to_fp32_row((const ggml_fp16_t *) vp,
+                                          v_f32 + tk*DV, DV);
+                } else {
+                    memcpy(v_f32 + tk*DV, vp, (size_t) DV*sizeof(float));
+                }
+            }
+            simd_gemm(acc, scores, v_f32, (int) nq_tile, kv_tile, (int) DV);
+        }
+
+        for (int i = 0; i < nq_tile; ++i) {
+            float * out = (float *) ((char *) dst->data +
+                    (iq1_0 + i)*dst->nb[2] + iq2*dst->nb[1] + iq3*dst->nb[3]);
+            const float inv = row_sum[i] > 0.0f ? 1.0f/row_sum[i] : 0.0f;
+            ggml_vec_scale_f32((int) DV, acc + i*DV, inv);
+            memcpy(out, acc + i*DV, (size_t) DV*sizeof(float));
+            if (with_lse) {
+                out[DV] = row_sum[i] > 0.0f ? row_max[i] + logf(row_sum[i]) : -INFINITY;
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -8952,6 +9149,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    // An I32 block-index mask selects the block-sparse path; the dense kernel
+    // below reads the mask as f16 and would misread the block indices.
+    if (ggml_flash_attn_ext_get_mask_format(dst) == GGML_FLASH_ATTN_EXT_MASK_BLOCK_INDEX) {
+        ggml_compute_forward_flash_attn_ext_block_index(params, dst);
+        return;
+    }
+
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:
