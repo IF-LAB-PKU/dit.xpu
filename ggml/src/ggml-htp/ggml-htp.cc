@@ -2358,6 +2358,7 @@ void ggml_backend_htp_reset_attention_profile(ggml_backend_t backend) {
     }
     auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
     ctx->last_attention_elapsed_us.store(-1, std::memory_order_release);
+    ctx->last_dispatch_doorbell_us.store(-1, std::memory_order_release);
 }
 
 int64_t ggml_backend_htp_get_last_attention_elapsed_us(ggml_backend_t backend) {
@@ -2366,6 +2367,14 @@ int64_t ggml_backend_htp_get_last_attention_elapsed_us(ggml_backend_t backend) {
     }
     const auto * ctx = static_cast<const ggml_backend_htp_context *>(backend->context);
     return ctx->last_attention_elapsed_us.load(std::memory_order_acquire);
+}
+
+int64_t ggml_backend_htp_get_last_dispatch_doorbell_us(ggml_backend_t backend) {
+    if (!ggml_backend_is_htp(backend)) {
+        return -1;
+    }
+    const auto * ctx = static_cast<const ggml_backend_htp_context *>(backend->context);
+    return ctx->last_dispatch_doorbell_us.load(std::memory_order_acquire);
 }
 
 void ggml_backend_htp_opencl_set_compute_arena_generation(
