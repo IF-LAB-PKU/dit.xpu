@@ -214,7 +214,10 @@ const TensorStorage* ModelLoader::find_tensor_storage(const std::string& name) c
     return it == tensor_storage_map.end() ? nullptr : &it->second;
 }
 
-bool ModelLoader::reload_tensor_bytes(const std::string& name, void* dst, size_t dst_size) {
+bool ModelLoader::reload_tensor_bytes(const std::string& name,
+                                      void* dst,
+                                      size_t dst_size,
+                                      ggml_type dst_type) {
     if (dst == nullptr) {
         LOG_ERROR("cannot reload tensor '%s' into a null destination", name.c_str());
         return false;
@@ -227,10 +230,31 @@ bool ModelLoader::reload_tensor_bytes(const std::string& name, void* dst, size_t
     }
 
     const size_t bytes_to_read = static_cast<size_t>(tensor_storage->nbytes_to_read());
-    if (dst_size < bytes_to_read) {
+    const bool convert_to_destination = dst_type != GGML_TYPE_COUNT &&
+                                        tensor_storage->type != dst_type;
+    const size_t destination_bytes = dst_type != GGML_TYPE_COUNT
+        ? static_cast<size_t>(ggml_type_size(dst_type)) *
+              static_cast<size_t>(tensor_storage->nelements()) /
+              static_cast<size_t>(ggml_blck_size(dst_type))
+        : bytes_to_read;
+    if (dst_type != GGML_TYPE_COUNT && dst_size < destination_bytes) {
+        LOG_ERROR("destination for tensor '%s' is too small: got %zu bytes, need %zu",
+                  name.c_str(), dst_size,
+                  destination_bytes);
+        return false;
+    }
+    if (!convert_to_destination && dst_size < bytes_to_read) {
         LOG_ERROR("destination for tensor '%s' is too small: got %zu bytes, need %zu",
                   name.c_str(), dst_size, bytes_to_read);
         return false;
+    }
+
+    std::vector<uint8_t> source_buffer;
+    void* read_dst = dst;
+    if (convert_to_destination) {
+        source_buffer.resize(std::max(bytes_to_read,
+                                      static_cast<size_t>(tensor_storage->nbytes())));
+        read_dst = source_buffer.data();
     }
 
     process_model_files(false, false);
@@ -254,12 +278,12 @@ bool ModelLoader::reload_tensor_bytes(const std::string& name, void* dst, size_t
                 LOG_ERROR("tensor '%s' exceeds zip entry bounds", name.c_str());
                 ok = false;
             } else if (entry_size == bytes_to_read && tensor_storage->offset == 0) {
-                ok = zip_entry_noallocread(zip, dst, bytes_to_read) == 0;
+                ok = zip_entry_noallocread(zip, read_dst, bytes_to_read) == 0;
             } else {
                 std::vector<uint8_t> entry(entry_size);
                 ok = zip_entry_noallocread(zip, entry.data(), entry_size) == 0;
                 if (ok) {
-                    memcpy(dst, entry.data() + tensor_storage->offset, bytes_to_read);
+                    memcpy(read_dst, entry.data() + tensor_storage->offset, bytes_to_read);
                 }
             }
             zip_entry_close(zip);
@@ -274,11 +298,40 @@ bool ModelLoader::reload_tensor_bytes(const std::string& name, void* dst, size_t
         return false;
     }
     file.seekg(static_cast<std::streamoff>(tensor_storage->offset));
-    file.read(static_cast<char*>(dst), static_cast<std::streamsize>(bytes_to_read));
+    file.read(static_cast<char*>(read_dst), static_cast<std::streamsize>(bytes_to_read));
     if (!file) {
         LOG_ERROR("read tensor data failed while reloading '%s' from '%s'", name.c_str(), fdata.path.c_str());
         return false;
     }
+
+    if (!convert_to_destination) {
+        return true;
+    }
+
+    if (tensor_storage->is_f8_e4m3) {
+        f8_e4m3_to_f16_vec(static_cast<uint8_t*>(read_dst),
+                           reinterpret_cast<uint16_t*>(read_dst),
+                           tensor_storage->nelements());
+    } else if (tensor_storage->is_f8_e5m2) {
+        f8_e5m2_to_f16_vec(static_cast<uint8_t*>(read_dst),
+                           reinterpret_cast<uint16_t*>(read_dst),
+                           tensor_storage->nelements());
+    } else if (tensor_storage->is_f64) {
+        f64_to_f32_vec(reinterpret_cast<double*>(read_dst),
+                       static_cast<float*>(read_dst),
+                       tensor_storage->nelements());
+    } else if (tensor_storage->is_i64) {
+        i64_to_i32_vec(reinterpret_cast<int64_t*>(read_dst),
+                       reinterpret_cast<int32_t*>(read_dst),
+                       tensor_storage->nelements());
+    }
+
+    convert_tensor(read_dst,
+                   tensor_storage->type,
+                   dst,
+                   dst_type,
+                   static_cast<int>(tensor_storage->nelements() / tensor_storage->ne[0]),
+                   static_cast<int>(tensor_storage->ne[0]));
     return true;
 }
 

@@ -6242,7 +6242,7 @@ protected:
     // 只有 diffusion 推理明确注入 HTP backend 后，runner 才会启用 RPCMEM 放置和 hybrid compute 判定。
     ggml_backend_t htp_backend     = nullptr;
     std::unique_ptr<HtpPackedStagingPool> htp_packed_staging_pool_;
-    HtpPackedStagingPool::LoadFn htp_packed_staging_loader_;
+    HtpPackedStagingPool::TypedLoadFn htp_packed_staging_loader_;
     std::vector<HtpPackedStagingPool::Handle> htp_packed_staging_handles_;
     std::vector<ggml_tensor*> htp_packed_staging_tensors_;
     bool preserve_htp_packed_staging_ = false;
@@ -7189,11 +7189,26 @@ protected:
                ggml_backend_buft_is_rpcmem(ggml_backend_buffer_get_type(root->buffer));
     }
 
+    static bool is_htp_packed_qkv_param_name(const char* name) {
+        if (name == nullptr || name[0] == '\0') {
+            return false;
+        }
+        return std::strstr(name, ".attn.qkv.bias") != nullptr ||
+               std::strstr(name, ".attn.ln_q.weight") != nullptr ||
+               std::strstr(name, ".attn.ln_k.weight") != nullptr ||
+               std::strstr(name, ".attn2.qkv.bias") != nullptr ||
+               std::strstr(name, ".attn2.ln_q.weight") != nullptr ||
+               std::strstr(name, ".attn2.ln_k.weight") != nullptr ||
+               std::strstr(name, ".query_norm.weight") != nullptr ||
+               std::strstr(name, ".key_norm.weight") != nullptr;
+    }
+
     bool should_place_param_in_htp_rpcmem(ggml_tensor* tensor) const {
         if (!htp_op_routing_enabled() || !sd_env_flag_enabled("SD_HTP_COMPUTE") || htp_backend == nullptr || tensor == nullptr) {
             return false;
         }
-        if ((tensor->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_QKV_PARAM) != 0) {
+        if ((tensor->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_QKV_PARAM) != 0 ||
+            is_htp_packed_qkv_param_name(tensor->name)) {
             return tensor->view_src == nullptr && tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor);
         }
         // packed GGUF 里这类权重已经是 HTP kernel 需要的 W16A32 布局，不能留在普通 CPU buffer；
@@ -7273,6 +7288,12 @@ protected:
             for (int src_index : htp_packed_qkv_weight_src_indices(node->name)) {
                 ggml_tensor* root = get_htp_tensor_backing_root(node->src[src_index]);
                 if (should_prepare_htp_packed_f16_weight(root) && seen.insert(root).second) {
+                    tensors.push_back(root);
+                }
+            }
+            for (int src_index : htp_packed_qkv_staging_src_indices(node->name)) {
+                ggml_tensor* root = get_htp_tensor_backing_root(node->src[src_index]);
+                if (should_place_param_in_htp_rpcmem(root) && seen.insert(root).second) {
                     tensors.push_back(root);
                 }
             }
@@ -8872,6 +8893,7 @@ protected:
                     if (buffer == nullptr) {
                         return HtpPackedStagingPool::Allocation{};
                     }
+                    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                     ggml_backend_htp_buffer_set_persistent_staging(buffer, true);
                     return HtpPackedStagingPool::Allocation{
                         ggml_backend_buffer_get_base(buffer), buffer,
@@ -8889,6 +8911,7 @@ protected:
                     if (buffer == nullptr) {
                         return HtpPackedStagingPool::Allocation{};
                     }
+                    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                     ggml_backend_htp_buffer_set_persistent_staging(buffer, true);
                     return HtpPackedStagingPool::Allocation{
                         ggml_backend_buffer_get_base(buffer), buffer, 0,
@@ -8918,14 +8941,15 @@ protected:
                 if (!is_htp_supported_packed_qkv(node)) {
                     continue;
                 }
-                for (int src_index : htp_packed_qkv_weight_src_indices(node->name)) {
-                    ggml_tensor* weight = get_htp_tensor_backing_root(node->src[src_index]);
-                    if (weight != nullptr &&
-                        (weight->flags & SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM) != 0 &&
-                        !htp_packed_staging_contains(htp_packed_staging_tensors_, weight)) {
-                        LOG_ERROR("%s deferred packed QKV weight is not staged: node=%s src[%d] weight=%s bytes=%zu",
+                for (int src_index : htp_packed_qkv_staging_src_indices(node->name)) {
+                    ggml_tensor* param = get_htp_tensor_backing_root(node->src[src_index]);
+                    if (param != nullptr &&
+                        (((param->flags & SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM) != 0) ||
+                         should_place_param_in_htp_rpcmem(param)) &&
+                        !htp_packed_staging_contains(htp_packed_staging_tensors_, param)) {
+                        LOG_ERROR("%s HTP QKV parameter is not staged: node=%s src[%d] tensor=%s bytes=%zu",
                                   get_desc().c_str(), node->name, src_index,
-                                  weight->name, ggml_nbytes(weight));
+                                  param->name, ggml_nbytes(param));
                         return false;
                     }
                 }
@@ -8959,7 +8983,7 @@ protected:
             if (is_htp_supported_f16_mul_mat(node)) {
                 weight_src_indices.push_back(0);
             } else {
-                weight_src_indices = htp_packed_qkv_weight_src_indices(node->name);
+                weight_src_indices = htp_packed_qkv_staging_src_indices(node->name);
             }
             for (int src_index : weight_src_indices) {
                 ggml_tensor* src = node->src[src_index];
@@ -9857,8 +9881,11 @@ public:
             htp_packed_staging_loader_ = {};
             return;
         }
-        htp_packed_staging_loader_ = [loader](const std::string& name, void* dst, size_t bytes) {
-            return loader->reload_tensor_bytes(name, dst, bytes);
+        htp_packed_staging_loader_ = [loader](const std::string& name,
+                                              void* dst,
+                                              size_t bytes,
+                                              ggml_type dst_type) {
+            return loader->reload_tensor_bytes(name, dst, bytes, dst_type);
         };
     }
 

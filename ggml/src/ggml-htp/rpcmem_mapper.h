@@ -24,10 +24,25 @@ int prepare_tensor_rpcmem_mapping_with_extra(const struct ggml_tensor * dst, con
 #include <list>
 #include <tuple>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+// 映射路径的选择。multi session 和 packed staging 都没开时，后端是单会话、
+// 图所有权不变的普通路径，沿用 final 版的整块映射 + LRU 驱逐逻辑；只要开了
+// 其中之一，就走 session 感知的 range-view 路径。
+inline bool htp_rpcmem_plain_mapping_path() {
+    const char * multi_session = std::getenv("SD_HTP_MULTI_SESSION");
+    const bool multi_session_enabled =
+        multi_session != nullptr && multi_session[0] != '\0' && std::strcmp(multi_session, "0") != 0;
+    const char * staging = std::getenv("SD_HTP_PACKED_STAGING");
+    const bool staging_enabled =
+        staging != nullptr && staging[0] != '\0' && std::strcmp(staging, "0") != 0;
+    return !multi_session_enabled && !staging_enabled;
+}
 
 // Session-local logical view accounting.  A released view lowers active bytes,
 // but cumulative bytes remain monotonic for the lifetime of the backing fd;
@@ -124,6 +139,7 @@ struct RpcMemMapper {
     size_t cumulative_bytes() const { return cumulative_map_size; }
 
     bool validate(const struct ggml_tensor * dst, const struct ggml_tensor * extra = nullptr);
+    bool validate_plain(const struct ggml_tensor * dst, const struct ggml_tensor * extra);
     std::pair<int, ssize_t> get_tensor_mapping(const struct ggml_tensor * tensor) const;
     bool release_buffer(void * buf_base);
     bool was_freed_by_diagnostic(void * buf_base) const;
@@ -193,6 +209,7 @@ struct RpcMemMapper {
         bool persistent;
     };
     void queue_unmap_request(const ViewRecord & view, size_t allocation_size);
+    bool evict_lru_buffer(const std::unordered_set<void *> & required_buf_bases);
     std::unordered_map<ViewKey, ViewRecord, ViewKeyHash> view_mapping;
     // FastRPC maps a complete backing allocation. Keep budget accounting at
     // that granularity even when one allocation has multiple logical views.

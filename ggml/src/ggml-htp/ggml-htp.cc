@@ -508,10 +508,14 @@ static void ggml_backend_htp_print_route_summary(
         summary.status_ok ? "ok" : "error");
 }
 
-// Qualcomm documents a 2 GiB DSP VA limit on older Snapdragon devices and a
-// 3 GiB limit on newer devices such as Snapdragon 8 Gen 3. Keep the default
-// at the newer-device limit; deployments with an older target can override it
-// explicitly with GGML_HTP_MAX_ACTIVE_MAP_MB.
+// 两条映射路径的默认活跃映射预算不同：
+// - 不开 multi session / staging 时走 final 版的整块映射 + LRU 驱逐逻辑，
+//   默认沿用 final 的 2560MB（低于 8gen3 的 3GiB 窗口，靠驱逐收敛）；
+// - 开了之后走 session 感知的 range-view 路径，默认按 8gen3 的 3GiB 上限。
+// 两条路径都可以用 GGML_HTP_MAX_ACTIVE_MAP_MB 覆盖。
+static constexpr size_t GGML_HTP_PLAIN_MAX_ACTIVE_MAP_SIZE = 2560ULL * 1024ULL * 1024ULL;
+static constexpr size_t GGML_HTP_SESSION_MAX_ACTIVE_MAP_SIZE = 3072ULL * 1024ULL * 1024ULL;
+
 static size_t ggml_backend_htp_get_max_active_map_size() {
     const char * env = std::getenv("GGML_HTP_MAX_ACTIVE_MAP_MB");
     if (env != nullptr && env[0] != '\0') {
@@ -521,7 +525,8 @@ static size_t ggml_backend_htp_get_max_active_map_size() {
             return static_cast<size_t>(mb) * 1024ULL * 1024ULL;
         }
     }
-    return 3072ULL * 1024ULL * 1024ULL;
+    return htp_rpcmem_plain_mapping_path() ? GGML_HTP_PLAIN_MAX_ACTIVE_MAP_SIZE
+                                           : GGML_HTP_SESSION_MAX_ACTIVE_MAP_SIZE;
 }
 
 // HTP 参数 offload 的 buffer 切分粒度也做成环境变量，便于在真机上验证是“映射窗口不够”还是“切成太多独立 fd”导致的 fastrpc_mmap 失败。
@@ -534,10 +539,13 @@ static size_t ggml_backend_htp_get_buffer_max_size() {
             return static_cast<size_t>(mb) * 1024ULL * 1024ULL;
         }
     }
-    // rpcmem_alloc() accepts the allocation size as an int.  Keep the
-    // default chunk limit at that ABI limit so owner-aware parameter
-    // placement uses the largest safe single allocation and automatically
-    // splits larger session ranges into multiple buffers.
+    // 普通路径沿用 final 的 256MB 分块：整块映射的 LRU 驱逐粒度就是分块大小，
+    // 用 ~2GB 的大块会让一次驱逐/重映射抖动 2GB。开了 multi session / staging
+    // 时按 rpcmem_alloc() 的 int 上限分块，让 owner-aware placement 用尽量大的
+    // 单次分配，大范围再自动切分。
+    if (htp_rpcmem_plain_mapping_path()) {
+        return 256ULL * 1024ULL * 1024ULL;
+    }
     return static_cast<size_t>(std::numeric_limits<int>::max());
 }
 
@@ -873,6 +881,11 @@ ggml_backend_htp_context::~ggml_backend_htp_context() {
 #endif
 
     ggml_backend_htp_aligned_free(work_data);
+
+    // 退出时打印映射统计，用来判断活跃映射集有没有被回收过。
+    if (ggml_backend_htp_env_enabled("SD_HTP_MAP_STATS")) {
+        mapper.dump_state();
+    }
 
     if (ops_dl_handle != nullptr) {
         if (ops_backend_initialized) {
@@ -1402,6 +1415,7 @@ void ggml_backend_htp_buffer_set_session_index(ggml_backend_buffer_t buffer, int
 
 int ggml_backend_htp_node_session_owner(const struct ggml_tensor * node) {
     if (node == nullptr) return -1;
+
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         const ggml_backend_buffer_t buffer = ggml_backend_htp_get_backing_buffer(node->src[i]);
         if (buffer != nullptr && ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
@@ -1409,6 +1423,7 @@ int ggml_backend_htp_node_session_owner(const struct ggml_tensor * node) {
             if (owner >= 0) return owner;
         }
     }
+
     return -1;
 }
 

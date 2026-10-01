@@ -24,6 +24,7 @@ bool htp_should_defer_packed_param(bool htp_routing_active,
 // different source positions for single- and dual-stream variants.
 bool htp_packed_qkv_node_name_is_supported(const char* name);
 std::vector<int> htp_packed_qkv_weight_src_indices(const char* name);
+std::vector<int> htp_packed_qkv_staging_src_indices(const char* name);
 
 class HtpNonDeferredParamsAllocation {
 public:
@@ -65,6 +66,7 @@ public:
     using SessionAllocateFn = std::function<Allocation(size_t, int)>;
     using FreeFn = std::function<void(const Allocation&)>;
     using LoadFn = std::function<bool(const std::string&, void*, size_t)>;
+    using TypedLoadFn = std::function<bool(const std::string&, void*, size_t, ggml_type)>;
 
     enum class DiagnosticKind {
         PoolCreated,
@@ -118,6 +120,10 @@ public:
                       Handle handle,
                       const std::string& name,
                       ggml_tensor* tensor);
+    bool place_tensor(const TypedLoadFn& load,
+                      Handle handle,
+                      const std::string& name,
+                      ggml_tensor* tensor);
     // Rebind an already loaded tensor to its slot without invoking the loader
     // again. This is used when a graph view temporarily swaps tensor buffers.
     bool rebind_tensor(Handle handle, ggml_tensor* tensor);
@@ -157,6 +163,10 @@ private:
     Slot* get_slot(Handle handle);
     const Slot* get_slot(Handle handle) const;
     size_t reserve(Slot& slot, size_t bytes);
+    bool place_tensor_impl(const LoadFn& load,
+                           Handle handle,
+                           const std::string& name,
+                           ggml_tensor* tensor);
     void free_slot_allocation(Slot& slot);
     void emit(DiagnosticKind kind,
               size_t requested_bytes,
