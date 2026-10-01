@@ -1094,7 +1094,12 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
         }
         return false;
     }
-    if (!tensor_ready_for_htp_dispatch(dst)) {
+    const bool view_backed_custom = dst != nullptr && dst->op == GGML_OP_CUSTOM &&
+        (is_qkv_mul_rms_packed_custom(dst) ||
+         is_qkv_mul_rms_packed_rope_custom(dst) ||
+         is_qkv_mul_rms_packed_dual_custom(dst) ||
+         is_qkv_mul_rms_packed_dual_rope_custom(dst));
+    if (!view_backed_custom && !tensor_ready_for_htp_dispatch(dst)) {
         if (trace_fused_anchor) {
             std::fprintf(stderr, "fused_anchor_runtime_support rejected stage=dst_rpcmem\n");
             dump_tensor_rpcmem_state("fused_dst", dst);

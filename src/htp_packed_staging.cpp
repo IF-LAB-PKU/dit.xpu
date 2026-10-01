@@ -41,6 +41,25 @@ std::vector<int> htp_packed_qkv_weight_src_indices(const char* name) {
     return {};
 }
 
+std::vector<int> htp_packed_qkv_staging_src_indices(const char* name) {
+    if (name == nullptr) {
+        return {};
+    }
+    if (std::strcmp(name, "qkv_mul_rms_packed_dual_rope") == 0) {
+        return {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+    }
+    if (std::strcmp(name, "qkv_mul_rms_packed_dual") == 0) {
+        return {1, 2, 3, 4, 6, 7, 8, 9};
+    }
+    if (std::strcmp(name, "qkv_mul_rms_packed_rope") == 0) {
+        return {1, 2, 3, 4, 5};
+    }
+    if (std::strcmp(name, "qkv_mul_rms_packed") == 0) {
+        return {1, 2, 3, 4};
+    }
+    return {};
+}
+
 bool htp_should_defer_packed_param(bool htp_routing_active,
                                    bool packed_staging_enabled,
                                    size_t max_graph_vram_bytes,
@@ -342,6 +361,27 @@ bool HtpPackedStagingPool::place_tensor(const LoadFn& load,
     tensor->extra = nullptr;
     emit(DiagnosticKind::TensorPlaced, bytes, handle.slot, slot, false, name);
     return true;
+}
+
+bool HtpPackedStagingPool::place_tensor(const TypedLoadFn& load,
+                                        Handle handle,
+                                        const std::string& name,
+                                        ggml_tensor* tensor) {
+    if (!load || tensor == nullptr) {
+        return false;
+    }
+    return place_tensor_impl(
+        [&load, tensor](const std::string& load_name, void* dst, size_t bytes) {
+            return load(load_name, dst, bytes, tensor->type);
+        },
+        handle, name, tensor);
+}
+
+bool HtpPackedStagingPool::place_tensor_impl(const LoadFn& load,
+                                             Handle handle,
+                                             const std::string& name,
+                                             ggml_tensor* tensor) {
+    return place_tensor(load, handle, name, tensor);
 }
 
 bool HtpPackedStagingPool::rebind_tensor(Handle handle, ggml_tensor* tensor) {

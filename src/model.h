@@ -267,7 +267,10 @@ public:
     // Read the source representation without allocating a ggml tensor. This is
     // used by bounded HTP staging buffers, which are filled directly from the
     // authoritative model file.
-    bool reload_tensor_bytes(const std::string& name, void* dst, size_t dst_size);
+    bool reload_tensor_bytes(const std::string& name,
+                             void* dst,
+                             size_t dst_size,
+                             ggml_type dst_type = GGML_TYPE_COUNT);
     void set_wtype_override(ggml_type wtype, std::string tensor_type_rules = "");
     void process_model_files(bool enable_mmap = false, bool writable_mmap = true);
     std::vector<MmapTensorStore> mmap_tensors(std::map<std::string, ggml_tensor*>& tensors,

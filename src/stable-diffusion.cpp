@@ -3593,6 +3593,7 @@ struct GenerationRequest {
     int clip_skip                            = -1;
     int vae_scale_factor                     = -1;
     int diffusion_model_down_factor          = -1;
+    SDVersion version                        = VERSION_COUNT;
     int64_t seed                             = -1;
     bool use_uncond                          = false;
     bool use_img_cond                        = false;
@@ -3622,6 +3623,7 @@ struct GenerationRequest {
         height                      = sd_img_gen_params->height;
         vae_scale_factor            = sd_ctx->sd->get_vae_scale_factor();
         diffusion_model_down_factor = sd_ctx->sd->get_diffusion_model_down_factor();
+        version                     = sd_ctx->sd->version;
         seed                        = sd_img_gen_params->seed;
         batch_count                 = sd_img_gen_params->batch_count;
         clip_skip                   = sd_img_gen_params->clip_skip;
@@ -3649,6 +3651,7 @@ struct GenerationRequest {
         fps                         = std::max(1, sd_vid_gen_params->fps);
         vae_scale_factor            = sd_ctx->sd->get_vae_scale_factor();
         diffusion_model_down_factor = sd_ctx->sd->get_diffusion_model_down_factor();
+        version                     = sd_ctx->sd->version;
         seed                        = sd_vid_gen_params->seed;
         strength                    = sd_vid_gen_params->strength;
         cache_params                = &sd_vid_gen_params->cache;
@@ -3670,15 +3673,44 @@ struct GenerationRequest {
     }
 
     void align_image_size(int* target_width, int* target_height, const char* label) {
+        int original_width  = *target_width;
+        int original_height = *target_height;
+
+        const bool sparse_grid_alignment = version == VERSION_SD3 ||
+                                            sd_version_is_flux2(version) ||
+                                            version == VERSION_Z_IMAGE;
+        if (sparse_grid_alignment) {
+            const int vae_scale = std::max(1, vae_scale_factor);
+            const int patch_size = 2;
+            const int latent_width = (*target_width + vae_scale - 1) / vae_scale;
+            const int latent_height = (*target_height + vae_scale - 1) / vae_scale;
+            const int patch_width = (latent_width + patch_size - 1) / patch_size;
+            const int patch_height = (latent_height + patch_size - 1) / patch_size;
+            const int aligned_patch_width = align_up(patch_width, 8);
+            const int aligned_patch_height = align_up(patch_height, 4);
+            *target_width = aligned_patch_width * patch_size * vae_scale;
+            *target_height = aligned_patch_height * patch_size * vae_scale;
+            if (*target_width != original_width || *target_height != original_height) {
+                LOG_WARN("align %s up %dx%d to %dx%d: patch grid %dx%d -> %dx%d",
+                         label,
+                         original_width,
+                         original_height,
+                         *target_width,
+                         *target_height,
+                         patch_width,
+                         patch_height,
+                         aligned_patch_width,
+                         aligned_patch_height);
+            }
+            return;
+        }
+
         int spatial_multiple = vae_scale_factor * diffusion_model_down_factor;
         int width_offset     = align_up_offset(*target_width, spatial_multiple);
         int height_offset    = align_up_offset(*target_height, spatial_multiple);
         if (width_offset <= 0 && height_offset <= 0) {
             return;
         }
-
-        int original_width  = *target_width;
-        int original_height = *target_height;
 
         *target_width += width_offset;
         *target_height += height_offset;

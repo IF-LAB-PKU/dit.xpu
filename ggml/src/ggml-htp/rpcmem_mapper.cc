@@ -147,6 +147,10 @@ bool send_rpcmem_puts_to_dsp(
 } // namespace
 
 bool RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) {
+    if (htp_rpcmem_plain_mapping_path()) {
+        return validate_plain(dst, extra);
+    }
+
     const char * staging_env = std::getenv("SD_HTP_PACKED_STAGING");
     const bool staging = staging_env != nullptr && staging_env[0] != '\0' &&
         std::strcmp(staging_env, "0") != 0;
@@ -351,6 +355,103 @@ bool RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) 
 
 bool RpcMemMapper::was_freed_by_diagnostic(void * buf_base) const {
     return diagnostic_freed_bufs.count(buf_base) != 0;
+}
+
+// final 版逻辑：buffer 整块映射，活跃集超过预算时按 LRU 整块解除映射，
+// mmap 失败时也强制再驱逐一条重试，因此真机窗口比预算小时同样能收敛。
+bool RpcMemMapper::validate_plain(const ggml_tensor * dst, const ggml_tensor * extra) {
+    std::vector<ggml_backend_buffer *> buffers;
+    std::unordered_set<ggml_backend_buffer *> seen_buffers;
+    auto add_buffer = [&](ggml_backend_buffer * buf) {
+        if (buf != nullptr && ggml_backend_buft_is_rpcmem(buf->buft) && seen_buffers.insert(buf).second) {
+            buffers.push_back(buf);
+        }
+    };
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const ggml_tensor * src = dst != nullptr ? dst->src[i] : nullptr;
+        if (src != nullptr) add_buffer(get_backing_buffer(src));
+    }
+    add_buffer(get_backing_buffer(dst));
+    add_buffer(get_backing_buffer(extra));
+
+    // 本次算子自身需要的 buffer 不能在驱逐里被放掉，否则会一边释放一边又要用。
+    std::unordered_set<void *> required_buf_bases;
+    size_t required_size = 0;
+    for (auto * buf : buffers) {
+        void * buf_base = ggml_backend_buffer_get_base(buf);
+        required_buf_bases.insert(buf_base);
+        if (accounted_bufs.count(buf_base) != 0) {
+            if (auto iter = buf_iters.find(buf_base); iter != buf_iters.end()) {
+                accessed_bufs.erase(iter->second);
+                accessed_bufs.push_front(buf_base);
+                buf_iters[buf_base] = accessed_bufs.begin();
+            }
+        } else {
+            required_size += buf->size;
+        }
+    }
+
+    size_t pending_host_mapped_size = get_pending_host_mapped_size(pending_unmap_reqs);
+    while (!htp_rpcmem_mapping_fits(max_active_map_size, persistent_map_size, active_map_size,
+                                    pending_host_mapped_size, required_size)) {
+        // 先让步于未完成的 DSP put，再继续驱逐更旧的映射。
+        if (pending_host_mapped_size > 0) {
+            flush_pending_unmaps();
+            pending_host_mapped_size = 0;
+            continue;
+        }
+        if (!evict_lru_buffer(required_buf_bases)) return false;
+    }
+
+    for (auto * buf : buffers) {
+        void * buf_base = ggml_backend_buffer_get_base(buf);
+        if (accounted_bufs.count(buf_base) != 0) continue;
+
+        const size_t buf_size = buf->size;
+        const int fd = rpcmem_to_fd(buf_base);
+        if (fd < 0) {
+            GGML_ABORT("rpcmem_to_fd returns %d, ptr %p, for dst tensor %s, n_ops %d\n",
+                       fd, buf_base, dst != nullptr ? dst->name : "(null)", n_map_ops);
+        }
+
+        int err = fastrpc_mmap(domain_id, fd, mapping_addr(buf_base), 0, buf_size, FASTRPC_MAP_FD);
+        while (err != 0) {
+            // 静态预算可能比真机的映射窗口大，映射失败时强制驱逐更旧的映射再重试。
+            if (!evict_lru_buffer(required_buf_bases)) {
+                std::fprintf(stderr,
+                             "fastrpc_mmap failed domain=%d fd=%d buf_size=%zu active=%zu max=%zu tensor=%s ret=0x%x\n",
+                             domain_id, fd, buf_size, active_map_size, max_active_map_size,
+                             dst != nullptr ? dst->name : "(null)", err);
+                dump_state();
+                GGML_ABORT("fastrpc_mmap failed with return code: 0x%x fd: %d buf_base: %p buf_size: %zu\n",
+                           err, fd, buf_base, buf_size);
+            }
+            err = fastrpc_mmap(domain_id, fd, mapping_addr(buf_base), 0, buf_size, FASTRPC_MAP_FD);
+        }
+
+        ++n_map_ops;
+        cumulative_map_size += buf_size;
+        buf_mapping[buf_base] = { fd, buf_size };
+        const ViewKey key{ buf_base, fd, 0, buf_size };
+        view_mapping.emplace(key, ViewRecord{ fd, buf_base, buf_base, 0, buf_size, 0, false });
+        accounted_bufs.insert(buf_base);
+        active_map_size += buf_size;
+        accessed_bufs.push_front(buf_base);
+        buf_iters[buf_base] = accessed_bufs.begin();
+    }
+    return true;
+}
+
+bool RpcMemMapper::evict_lru_buffer(const std::unordered_set<void *> & required_buf_bases) {
+    for (auto it = accessed_bufs.end(); it != accessed_bufs.begin();) {
+        --it;
+        void * buf_base = *it;
+        if (required_buf_bases.count(buf_base) != 0 || persistent_bufs.count(buf_base) != 0) {
+            continue;
+        }
+        return release_buffer(buf_base);
+    }
+    return false;
 }
 
 std::pair<int, ssize_t> RpcMemMapper::get_tensor_mapping(const ggml_tensor * tensor) const {
