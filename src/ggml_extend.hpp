@@ -6284,6 +6284,7 @@ protected:
     std::map<ggml_tensor*, uint64_t> cache_backed_tensor_generation_map_;
     std::vector<std::pair<std::string, uint64_t>> active_async_cache_consumers_;
     uint64_t next_async_residual_cache_generation_ = 1;
+    uint64_t active_async_residual_cache_generation_ = 0;
 
     struct AsyncResidualCacheOutputBinding {
         ggml_tensor* tensor = nullptr;
@@ -6587,13 +6588,18 @@ protected:
     }
 
     bool replace_async_residual_cache_slots(
-            const std::vector<std::pair<std::string, ggml_tensor*>>& outputs) {
+            const std::vector<std::pair<std::string, ggml_tensor*>>& outputs,
+            uint64_t preserve_generation = 0) {
         std::vector<std::pair<std::string, uint64_t>> old_slots;
         old_slots.reserve(outputs.size());
         for (const auto& output : outputs) {
             auto found = async_residual_cache_slots_.find(output.first);
             if (found == async_residual_cache_slots_.end() ||
                 found->second.slot == nullptr) {
+                continue;
+            }
+            if (preserve_generation != 0 &&
+                found->second.generation == preserve_generation) {
                 continue;
             }
             old_slots.emplace_back(output.first, found->second.generation);
@@ -8015,9 +8021,22 @@ protected:
     }
 
     bool copy_cache_tensors_to_cache_buffer(
-            const std::unordered_set<std::string>* cache_keep_names = nullptr) {
+            const std::unordered_set<std::string>* cache_keep_names = nullptr,
+            ggml_cgraph* gf = nullptr) {
+        std::unordered_set<const ggml_tensor*> graph_nodes;
+        if (gf != nullptr) {
+            for (int node_idx = 0; node_idx < ggml_graph_n_nodes(gf); ++node_idx) {
+                graph_nodes.insert(ggml_graph_node(gf, node_idx));
+            }
+        }
         std::map<std::string, ggml_tensor*> pending_sources;
-        for (const auto& kv : cache_tensor_map) {
+        for (auto entry = cache_tensor_map.begin(); entry != cache_tensor_map.end();) {
+            if (gf != nullptr && graph_nodes.count(entry->second) == 0) {
+                ++entry;
+                continue;
+            }
+            const auto kv = *entry;
+            entry = cache_tensor_map.erase(entry);
             if (cache_keep_names != nullptr &&
                 cache_keep_names->find(kv.first) == cache_keep_names->end()) {
                 continue;
@@ -8026,7 +8045,6 @@ protected:
                 pending_sources[kv.first] = kv.second;
             }
         }
-        cache_tensor_map.clear();
 
         if (cache_keep_names == nullptr && pending_sources.empty()) {
             return true;
@@ -8203,7 +8221,8 @@ protected:
     }
 
     bool bind_cache_backed_tensors(
-            CacheInputBindingTransaction* transaction) {
+            CacheInputBindingTransaction* transaction,
+            ggml_cgraph* gf) {
         if (transaction == nullptr || transaction->active) {
             return false;
         }
@@ -8212,7 +8231,17 @@ protected:
         transaction->bindings.reserve(cache_backed_tensor_name_map.size());
         transaction->active = true;
         transaction->committed = false;
+        std::unordered_set<const ggml_tensor*> graph_tensors;
+        for (int node_idx = 0; node_idx < ggml_graph_n_nodes(gf); ++node_idx) {
+            graph_tensors.insert(ggml_graph_node(gf, node_idx));
+        }
+        for (int leaf_idx = 0; leaf_idx < sd::ggml_graph_cut::leaf_count(gf); ++leaf_idx) {
+            graph_tensors.insert(sd::ggml_graph_cut::leaf_tensor(gf, leaf_idx));
+        }
         for (const auto& kv : cache_backed_tensor_name_map) {
+            if (graph_tensors.count(kv.first) == 0) {
+                continue;
+            }
             ggml_tensor* graph_tensor = kv.first;
             ggml_tensor* cache_tensor = nullptr;
             uint64_t async_generation = 0;
@@ -8356,7 +8385,7 @@ protected:
             CacheInputBindingTransaction* transaction,
             CacheInputAllocationFailurePoint failure_point =
                 CacheInputAllocationFailurePoint::none) {
-        if (!bind_cache_backed_tensors(transaction)) {
+        if (!bind_cache_backed_tensors(transaction, gf)) {
             return false;
         }
         if (failure_point ==
@@ -8416,16 +8445,21 @@ protected:
     }
 
     bool prepare_async_residual_cache_outputs(
-            AsyncResidualCacheOutputTransaction* transaction) {
+            AsyncResidualCacheOutputTransaction* transaction,
+            ggml_cgraph* gf) {
         GGML_ASSERT(transaction != nullptr);
         GGML_ASSERT(!transaction->active);
         if (!sd_htp_opencl_persistent_cache_outputs_enabled()) {
             return true;
         }
         std::vector<std::pair<std::string, ggml_tensor*>> outputs;
+        std::unordered_set<const ggml_tensor*> graph_nodes;
+        for (int node_idx = 0; node_idx < ggml_graph_n_nodes(gf); ++node_idx) {
+            graph_nodes.insert(ggml_graph_node(gf, node_idx));
+        }
         for (const auto& entry : cache_tensor_map) {
             ggml_tensor* tensor = entry.second;
-            if (tensor == nullptr || tensor->op != GGML_OP_CUSTOM ||
+            if (graph_nodes.count(tensor) == 0 || tensor == nullptr || tensor->op != GGML_OP_CUSTOM ||
                 entry.first.rfind("htp_block_sparse_residual_", 0) != 0) {
                 continue;
             }
@@ -8435,11 +8469,13 @@ protected:
             return true;
         }
 
-        if (!replace_async_residual_cache_slots(outputs)) {
+        const uint64_t generation = active_async_residual_cache_generation_ != 0
+            ? active_async_residual_cache_generation_
+            : next_async_residual_cache_generation_++;
+        if (!replace_async_residual_cache_slots(outputs, generation)) {
             return false;
         }
 
-        const uint64_t generation = next_async_residual_cache_generation_++;
         const bool trace = sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL_TRACE");
         bool allocation_failed = false;
         transaction->generation = generation;
@@ -9196,7 +9232,7 @@ protected:
             sd_htp_opencl_bind_cache_outputs_before_reserve();
         if (bind_cache_outputs_before_reserve &&
             !prepare_async_residual_cache_outputs(
-                &cache_output_transaction)) {
+                &cache_output_transaction, gf)) {
             LOG_ERROR("%s prepare async residual cache outputs failed",
                       get_desc().c_str());
             if (use_partial_param_offload) {
@@ -9222,7 +9258,7 @@ protected:
         int64_t t_copy_begin = ggml_time_ms();
         if (!bind_cache_outputs_before_reserve &&
             !prepare_async_residual_cache_outputs(
-                &cache_output_transaction)) {
+                &cache_output_transaction, gf)) {
             LOG_ERROR("%s prepare async residual cache outputs failed", get_desc().c_str());
             if (free_compute_buffer_immediately) {
                 free_compute_buffer();
@@ -9358,7 +9394,7 @@ protected:
                          (long long) ggml_time_us());
         }
         int64_t t_cache_begin = ggml_time_ms();
-        if (!copy_cache_tensors_to_cache_buffer(cache_keep_names)) {
+        if (!copy_cache_tensors_to_cache_buffer(cache_keep_names, gf)) {
             if (free_compute_buffer_immediately) {
                 free_compute_buffer();
             } else if (use_partial_param_offload) {
@@ -9414,6 +9450,22 @@ protected:
                                                          bool no_return = false) {
         GGML_ASSERT(gf != nullptr);
 
+        GGML_ASSERT(active_async_residual_cache_generation_ == 0);
+        struct AsyncResidualCacheGenerationScope {
+            uint64_t* active_generation;
+            AsyncResidualCacheGenerationScope(
+                    uint64_t* active_generation,
+                    uint64_t generation)
+                : active_generation(active_generation) {
+                *this->active_generation = generation;
+            }
+            ~AsyncResidualCacheGenerationScope() {
+                *active_generation = 0;
+            }
+        } async_cache_generation_scope(
+            &active_async_residual_cache_generation_,
+            next_async_residual_cache_generation_++);
+
         struct StagingOwnerCountGuard {
             int* value;
             int previous;
@@ -9444,6 +9496,11 @@ protected:
             const auto& segment     = plan.segments[seg_idx];
             auto future_cut_names   = sd::ggml_graph_cut::collect_future_input_names(
                 gf, plan, seg_idx);
+            for (const auto& entry : cache_tensor_map) {
+                if (entry.first.rfind("htp_block_sparse_residual_", 0) == 0) {
+                    future_cut_names.insert(entry.first);
+                }
+            }
             LOG_DEBUG("%s graph cut executing segment %zu/%zu: %s",
                       get_desc().c_str(), seg_idx + 1,
                       plan.segments.size(), segment.group_name.c_str());
@@ -9465,9 +9522,14 @@ protected:
             if (!is_last_segment) {
                 for (size_t output_idx = 0; output_idx < segment.output_node_indices.size(); ++output_idx) {
                     ggml_tensor* output_tensor = sd::ggml_graph_cut::output_tensor(gf, segment, output_idx);
+                    const bool is_residual_output = output_tensor != nullptr &&
+                        output_tensor->op == GGML_OP_CUSTOM &&
+                        std::strncmp(output_tensor->name,
+                                     "htp_block_sparse_residual_b", 27) == 0;
                     if (output_tensor != nullptr &&
-                        sd::ggml_graph_cut::is_graph_cut_tensor(output_tensor) &&
-                        future_cut_names.find(output_tensor->name) != future_cut_names.end()) {
+                        (is_residual_output ||
+                         (sd::ggml_graph_cut::is_graph_cut_tensor(output_tensor) &&
+                          future_cut_names.find(output_tensor->name) != future_cut_names.end()))) {
                         cache(output_tensor->name, output_tensor);
                     }
                 }
