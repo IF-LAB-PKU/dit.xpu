@@ -216,7 +216,25 @@ namespace sd::ggml_graph_cut {
             }
         }
 
-        while (!work_stack.empty()) {
+        while (true) {
+            if (work_stack.empty()) {
+                for (int node_idx = 0; node_idx < ggml_graph_n_nodes(gf); ++node_idx) {
+                    ggml_tensor* node = ggml_graph_node(gf, node_idx);
+                    if (node->op != GGML_OP_CUSTOM ||
+                        std::strncmp(node->name, "htp_block_sparse_residual_b", 27) != 0 ||
+                        internal_nodes.count(node_idx) != 0) {
+                        continue;
+                    }
+                    auto dense = producer_index.find(node->src[0]);
+                    if (dense != producer_index.end() && internal_nodes.count(dense->second) != 0) {
+                        segment.output_node_indices.push_back(node_idx);
+                        work_stack.push(node);
+                    }
+                }
+                if (work_stack.empty()) {
+                    break;
+                }
+            }
             ggml_tensor* tensor = work_stack.top();
             work_stack.pop();
 
