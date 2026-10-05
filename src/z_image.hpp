@@ -73,6 +73,7 @@ namespace ZImage {
         bool htp_enabled,
         bool sparse_enabled,
         bool packed_requested,
+        bool packed_experimental,
         bool geometry_supported,
         bool packed_shape_supported,
         bool packed_weights_available,
@@ -99,6 +100,9 @@ namespace ZImage {
         }
         if (!packed_requested) {
             return {ZImageAttentionRoute::REORDERED, "packed_disabled"};
+        }
+        if (!packed_experimental) {
+            return {ZImageAttentionRoute::REORDERED, "packed_integration_unverified"};
         }
         if (!packed_shape_supported) {
             return {ZImageAttentionRoute::REORDERED, "packed_unsupported_shape"};
@@ -195,13 +199,15 @@ namespace ZImage {
                                  (size_t)(head_dim / 32) * (size_t)1024 * sizeof(ggml_fp16_t);
         const size_t head_stride = (size_t)token_tiles * (size_t)(head_dim / 32) *
                                     (size_t)1024 * sizeof(ggml_fp16_t);
+        // These strides describe each region's extent for ggml allocation and
+        // mapping; packed attention reads the contents using HMX tile indices.
         result.qkv = {
             ggml_view_4d(ctx->ggml_ctx, storage, head_dim, tokens, n_heads, 1,
-                         sizeof(ggml_fp16_t), head_dim * sizeof(ggml_fp16_t), head_stride, 0),
+                         head_dim * sizeof(ggml_fp16_t), head_stride, qkv_bytes, 0),
             ggml_view_4d(ctx->ggml_ctx, storage, head_dim, tokens, n_heads, 1,
-                         sizeof(ggml_fp16_t), head_dim * sizeof(ggml_fp16_t), head_stride, qkv_bytes),
+                         head_dim * sizeof(ggml_fp16_t), head_stride, qkv_bytes, qkv_bytes),
             ggml_view_4d(ctx->ggml_ctx, storage, head_dim, tokens, n_heads, 1,
-                         sizeof(ggml_fp16_t), head_dim * sizeof(ggml_fp16_t), head_stride, 2 * qkv_bytes),
+                         head_dim * sizeof(ggml_fp16_t), head_stride, qkv_bytes, 2 * qkv_bytes),
         };
         // Keep Q/K/V as real graph views. Marking them as NONE turns them
         // into leaves, so gallocr misses the view counts and cannot release
@@ -247,7 +253,9 @@ namespace ZImage {
         ggml_tensor* storage = ggml_custom_4d(ctx->ggml_ctx, GGML_TYPE_F16,
                                                static_cast<int64_t>(3 * region_bytes / sizeof(ggml_fp16_t)),
                                                1, 1, 1, args, 6,
-                                               [](ggml_tensor*, int, int, void*) {}, 1, nullptr);
+                                               [](ggml_tensor*, int, int, void*) {
+                                                   GGML_ABORT("Z-Image packed QKV requires HTP dispatch");
+                                               }, 1, nullptr);
         ggml_set_name(storage, "qkv_mul_rms_packed_rope");
         if (sd_env_flag_enabled("SD_HTP_PACKED_Z_IMAGE_TRACE")) {
             LOG_INFO("z_image_packed_qkv kind=single heads=30 image_tokens=%d text_tokens=%d head_dim=%d",
@@ -312,6 +320,8 @@ namespace ZImage {
             const bool packed_requested = attention_policy.packed_qkv_allowed &&
                                           sd_env_flag_enabled("SD_HTP_PACKED_Z_IMAGE") &&
                                           sd_env_flag_enabled_default("SD_HTP_PACKED_ATTENTION", true);
+            const bool packed_experimental =
+                sd_env_flag_enabled_default("SD_HTP_PACKED_Z_IMAGE_EXPERIMENTAL", true);
             auto qkv_proj_weight = qkv_proj->get_param("weight");
             auto q_norm_block    = std::dynamic_pointer_cast<RMSNorm>(blocks["q_norm"]);
             auto k_norm_block    = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
@@ -325,6 +335,7 @@ namespace ZImage {
                 htp_enabled,
                 sparse_policy_active,
                 packed_requested,
+                packed_experimental,
                 geometry_supported,
                 packed_shape_supported,
                 packed_weights_available,
@@ -786,7 +797,9 @@ namespace ZImage {
                                           ctx->block_sparse_residual_mode != SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&
                                           sd_env_flag_enabled("SD_HTP_PACKED_Z_IMAGE") &&
                                           sd_env_flag_enabled_default("SD_HTP_PACKED_ATTENTION", true);
-            const char* layout_mode = sparse_eligible ? (packed_requested ? "packed" : "reordered") : "dense";
+            const bool packed_experimental = packed_requested &&
+                sd_env_flag_enabled_default("SD_HTP_PACKED_Z_IMAGE_EXPERIMENTAL", true);
+            const char* layout_mode = sparse_eligible ? (packed_experimental ? "packed" : "reordered") : "dense";
             LOG_INFO("z_image_layout mode=%s heads=%lld kv_heads=%lld head_dim=%lld image_tokens=%d text_tokens=%lld token_h=%d token_w=%d",
                      layout_mode,
                      (long long)z_image_params.num_heads,

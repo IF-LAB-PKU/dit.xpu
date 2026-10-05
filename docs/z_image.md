@@ -52,7 +52,7 @@ The route is selected per attention construction:
 |---|---|
 | `dense` | HTP is disabled, sparse attention is disabled, or the graph is not eligible |
 | `reordered` | HTP and sparse attention are enabled, using generic raw HTP attention |
-| `packed` | `reordered` is eligible and packed Z-Image QKV weights are available; image-only and text-only refiners use the single-stream packed op |
+| `packed` | `reordered` is eligible and packed Z-Image QKV weights are available; the image-only noise refiner and joint attention use the single-stream packed op |
 
 Set these environment variables when running on the Qualcomm 8 Gen 3 target:
 
@@ -64,10 +64,19 @@ SD_HTP_PACKED_Z_IMAGE=1
 SD_HTP_Z_IMAGE_TRACE=1
 ```
 
-`SD_HTP_PACKED_Z_IMAGE=1` does not force an unsupported graph onto the packed
-kernel. Reference latents, residual-anchor steps, unsupported token geometry,
-missing packed weights, and invalid packed shapes fall back to dense or raw
-reordered attention. The stable trace format is:
+Packed Z-Image requests use the packed route by default. The legacy
+`SD_HTP_PACKED_Z_IMAGE_EXPERIMENTAL=0` override still selects the reordered
+reference path. Q/K RMSNorm scales are placed in HTP RPCMEM alongside packed
+projection weights; a packed producer that cannot dispatch to HTP fails instead
+of silently returning unwritten Q/K/V. Reference latents, residual-anchor steps,
+unsupported token geometry, missing packed weights, and invalid packed shapes
+fall back to dense or reordered attention.
+
+LSE-bearing HTP attention uses unscaled V. Its Q/K scaling is already balanced,
+so dense and OpenCL sparse anchor producers share the same softmax scale and
+final-scale O contract as packed apply steps.
+
+The stable trace format is:
 
 ```text
 z_image_attention route=<dense|reordered|packed> fallback=<reason> heads=<n> kv_heads=<n> head_dim=<d> image_tokens=<n> text_tokens=<n> token_h=<h> token_w=<w>
@@ -78,10 +87,9 @@ Sparse static-halo geometry requires an image token count divisible by 32,
 currently targets the Z-Image contract of 30 heads, 30 KV heads, and head
 dimension 128. L2-prefetch and UserDMA halo modes remain HTP backend settings;
 the route trace is identical for both modes. The noise refiner is image-only
-and uses the actual image grid. The context refiner is text-only; its packed
-route uses a synthetic 4-by-(tokens/4) grid and a full-keep block mask, so it
-does not apply an image halo to text tokens. Both single-stream routes require
-the padded token count to be divisible by 32.
+and uses the actual image grid. The context refiner is text-only and remains
+on dense attention. Packed image and joint streams use token counts padded
+to a multiple of 32.
 
 Sparse joint attention stores image tokens in patch-major order (4-by-4 image
 blocks), so its joint RoPE/PE uses the same patch-major order. The context and

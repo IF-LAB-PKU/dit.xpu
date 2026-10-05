@@ -1,9 +1,13 @@
 #include <cstdlib>
 #include <cstdio>
+#include <cmath>
+#include <cstring>
 #include <iostream>
+#include <map>
 #include <string>
 
 #include "ggml-htp.h"
+#include "ggml-cpu.h"
 #include "z_image.hpp"
 
 namespace {
@@ -12,6 +16,133 @@ void require(bool condition, const char* message) {
     if (!condition) {
         std::cerr << "FAIL: " << message << '\n';
         std::exit(1);
+    }
+}
+
+void test_packed_rope_reference_convention() {
+    ggml_context* ctx = ggml_init({1024 * 1024, nullptr, false});
+    require(ctx != nullptr, "RoPE reference context must initialize");
+    constexpr int dim = 4, heads = 2, tokens = 3;
+    ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dim, heads, tokens, 1);
+    ggml_tensor* pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, dim / 2, tokens);
+    float* input = static_cast<float*>(x->data);
+    float* matrices = static_cast<float*>(pe->data);
+    const auto embeddings = Rope::rope({1.0f, 3.0f, 7.0f}, dim, 10000.0f);
+    for (int t = 0; t < tokens; ++t) {
+        std::memcpy(matrices + t * dim * 2, embeddings[t].data(), dim * 2 * sizeof(float));
+    }
+    for (int i = 0; i < dim * heads * tokens; ++i) {
+        input[i] = 0.25f * (i + 1);
+    }
+    ggml_tensor* out = Rope::apply_rope(ctx, x, pe, true);
+    ggml_cgraph* graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    require(ggml_graph_compute_with_ctx(ctx, graph, 1) == GGML_STATUS_SUCCESS,
+            "RoPE reference graph must compute");
+    const float* actual = static_cast<const float*>(out->data);
+    for (int h = 0; h < heads; ++h) {
+        for (int t = 0; t < tokens; ++t) {
+            for (int d = 0; d < dim / 2; ++d) {
+                const float* pair = input + (t * heads + h) * dim + 2 * d;
+                const float* m = matrices + t * dim * 2 + d * 4;
+                const int i = (h * tokens + t) * dim + 2 * d;
+                require(std::fabs(actual[i] - (pair[0] * m[0] + pair[1] * m[1])) < 1e-5f &&
+                            std::fabs(actual[i + 1] - (pair[0] * m[2] + pair[1] * m[3])) < 1e-5f,
+                        "packed RoPE reference must match the unfused graph");
+            }
+        }
+    }
+    ggml_free(ctx);
+}
+
+void test_z_image_packed_qkv_param_placement() {
+    ggml_context* ctx = ggml_init({1024 * 1024, nullptr, true});
+    require(ctx != nullptr, "Z-Image parameter context must initialize");
+    ZImage::JointAttention attention(3840, 128, 30, 30, true);
+    attention.init(ctx, {}, "layers.0.attention");
+    std::map<std::string, ggml_tensor*> parameters;
+    attention.get_param_tensors(parameters, "layers.0.attention");
+    for (const char* name : {"layers.0.attention.q_norm.weight",
+                             "layers.0.attention.k_norm.weight"}) {
+        ggml_tensor* gamma = parameters.at(name);
+        require(gamma != nullptr && gamma->type == GGML_TYPE_F32 &&
+                    (gamma->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_QKV_PARAM) != 0,
+                "Z-Image Q/K norm scales must be marked for HTP RPCMEM placement");
+    }
+    GGMLRunnerContext runner = {};
+    runner.ggml_ctx = ctx;
+    constexpr int tokens = 288;
+    constexpr size_t region_bytes = 30 * tokens * 128 * sizeof(ggml_fp16_t);
+    ggml_tensor* storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 3 * region_bytes / sizeof(ggml_fp16_t));
+    const auto packed = ZImage::make_packed_z_image_qkv_views(&runner, storage, tokens);
+    for (size_t i = 0; i < packed.qkv.size(); ++i) {
+        require(ggml_nbytes(packed.qkv[i]) == region_bytes &&
+                    packed.qkv[i]->view_offs == i * region_bytes,
+                "packed Q/K/V views must cover separate complete regions");
+    }
+    ggml_free(ctx);
+}
+
+void test_z_image_anchor_scale_contract() {
+    const char* enabled[] = {"SD_HTP_OPS", "SD_HTP_COMPUTE", "SD_HTP_ATTENTION"};
+    const char* disabled[] = {"SD_HTP_SPARSE_OPENCL", "SD_HTP_SPARSE_OPENCL_RESIDUAL",
+                              "SD_HTP_BLOCK_SPARSE_FUSED_ANCHOR"};
+    std::map<std::string, std::string> saved;
+    for (const auto& names : {std::vector<const char*>(std::begin(enabled), std::end(enabled)),
+                              std::vector<const char*>(std::begin(disabled), std::end(disabled))}) {
+        for (const char* name : names) {
+            if (const char* value = std::getenv(name)) saved[name] = value;
+        }
+    }
+    for (const char* name : enabled) setenv(name, "1", 1);
+    for (const char* name : disabled) setenv(name, "0", 1);
+    ggml_context* ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
+    require(ctx != nullptr, "anchor scale context must initialize");
+    ggml_tensor* one = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_set_name(one, "ggml_runner_build_in_tensor:one");
+    ggml_tensor* q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 64, 30);
+    ggml_tensor* k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 64, 30);
+    ggml_tensor* v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 30, 64);
+    ggml_cgraph* graph = ggml_new_graph(ctx);
+    const std::function<ggml_tensor*(const std::string&, ggml_tensor*)> cache =
+        [&](const std::string&, ggml_tensor* tensor) {
+            ggml_build_forward_expand(graph, tensor);
+            return tensor;
+        };
+    ggml_tensor* out = ggml_ext_attention_ext(
+        ctx, nullptr, q, k, v, 30, nullptr, true, true, 1.0f / 128.0f,
+        true, 0, 0, SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR, 1.0f, 1.0f, true,
+        "residual", nullptr, "rho", nullptr, &cache, 8, 8, true);
+    ggml_build_forward_expand(graph, out);
+    int attention_count = 0;
+    ggml_tensor* shared_v = nullptr;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        ggml_tensor* node = ggml_graph_node(graph, i);
+        if (node->op != GGML_OP_FLASH_ATTN_EXT) continue;
+        ++attention_count;
+        float scale;
+        std::memcpy(&scale, node->op_params, sizeof(scale));
+        require(std::fabs(scale - 1.0f / std::sqrt(128.0f)) < 1e-6f,
+                "anchor Q/K compensation must not be applied twice by OpenCL");
+        if (shared_v == nullptr) shared_v = node->src[2];
+        require(node->src[2] == shared_v, "anchor pair must share its V input");
+        ggml_tensor* source = node->src[2];
+        while (source != v && source != nullptr) {
+            require(source->op != GGML_OP_SCALE,
+                    "LSE anchor must expose unscaled V for residual cache and packed apply");
+            source = source->src[0];
+        }
+        require(source == v, "anchor V must originate from the original values");
+    }
+    require(attention_count == 2, "exact-rho anchor must construct dense and sparse attention");
+    ggml_free(ctx);
+    for (const auto& names : {std::vector<const char*>(std::begin(enabled), std::end(enabled)),
+                              std::vector<const char*>(std::begin(disabled), std::end(disabled))}) {
+        for (const char* name : names) {
+            const auto previous = saved.find(name);
+            if (previous == saved.end()) unsetenv(name);
+            else setenv(name, previous->second.c_str(), 1);
+        }
     }
 }
 
@@ -144,32 +275,29 @@ void test_attention_policy() {
 
 void test_packed_residual_apply_layout_policy() {
     require(sd_htp_packed_residual_apply_needs_contiguous(
-                true, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY, false),
-            "non-exact packed residual apply must materialize a contiguous output");
+                true, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY),
+            "packed residual apply must materialize a contiguous output");
     require(!sd_htp_packed_residual_apply_needs_contiguous(
-                 true, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY, true),
-            "exact-rho apply must keep its existing scaling path");
-    require(!sd_htp_packed_residual_apply_needs_contiguous(
-                 false, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY, false),
+                 false, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY),
             "reordered residual apply must not add a copy");
     require(!sd_htp_packed_residual_apply_needs_contiguous(
-                 true, SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR, false),
+                 true, SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR),
             "packed anchor must not use the apply-only copy policy");
-    require(!sd_htp_packed_residual_apply_uses_lse(
+    require(sd_htp_packed_residual_apply_uses_lse(
                  true, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY),
-            "packed residual apply must not request an LSE slab");
+            "packed residual apply must request the stable LSE writeback path");
     require(sd_htp_packed_residual_apply_uses_lse(
                 true, SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR),
             "packed residual anchor must retain its LSE slab");
 }
 
 void test_packed_residual_apply_lse_admission() {
-    require(!sd_htp_sparse_attention_needs_lse(
+    require(sd_htp_sparse_attention_needs_lse(
                 true, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY, 1.0f, false),
-            "packed residual apply should not need LSE at unit scale");
-    require(!sd_htp_sparse_attention_needs_lse(
+            "packed residual apply must need LSE at unit scale");
+    require(sd_htp_sparse_attention_needs_lse(
                 true, SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY, 1.0f / 128.0f, false),
-            "packed residual apply should not need LSE for kv scaling");
+            "packed residual apply must need LSE for kv scaling");
     require(sd_htp_sparse_attention_needs_lse(
                 true, SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR, 1.0f / 128.0f, false),
             "packed residual anchor must need LSE");
@@ -267,22 +395,28 @@ void test_z_image_route_selection() {
     using ZImage::z_image_select_attention_route;
 
     const auto anchor = z_image_select_attention_route(
-        true, true, true, true, true, true, false, true);
+        true, true, true, true, true, true, true, false, true);
     require(anchor.route == ZImageAttentionRoute::REORDERED,
             "Z-Image anchor attention must use the non-packed reordered route");
 
+    const auto packed_disabled = z_image_select_attention_route(
+        true, true, true, false, true, true, true, false, false);
+    require(packed_disabled.route == ZImageAttentionRoute::REORDERED &&
+                std::string(packed_disabled.fallback_reason) == "packed_integration_unverified",
+            "Z-Image packed request must fall back until full-graph integration is verified");
+
     const auto packed_apply = z_image_select_attention_route(
-        true, true, true, true, true, true, false, false);
+        true, true, true, true, true, true, true, false, false);
     require(packed_apply.route == ZImageAttentionRoute::PACKED,
-            "Z-Image sparse apply may use packed QKV when available");
+            "Z-Image experimental packed route may use QKV when available");
 
     const auto reordered_apply = z_image_select_attention_route(
-        true, true, true, true, true, false, false, false);
+        true, true, true, true, true, true, false, false, false);
     require(reordered_apply.route == ZImageAttentionRoute::REORDERED,
             "Z-Image sparse apply must fall back to reordered non-packed QKV");
 
     const auto text_only = z_image_select_attention_route(
-        true, false, false, false, false, false, false, false);
+        true, false, false, false, false, false, false, false, false);
     require(text_only.route == ZImageAttentionRoute::DENSE,
             "Z-Image text-only context refiner must remain dense");
 
@@ -975,6 +1109,9 @@ void test_fused_route_summary_uses_actual_routed_set() {
 }  // namespace
 
 int main() {
+    test_packed_rope_reference_convention();
+    test_z_image_packed_qkv_param_placement();
+    test_z_image_anchor_scale_contract();
     test_flash_attention_halo_loader_metadata();
     test_route_mode_from_flags();
     test_attention_policy();
