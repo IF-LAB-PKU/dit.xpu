@@ -227,20 +227,19 @@ __STATIC_INLINE__ bool sd_htp_patch_major_layout_enabled(bool sparse_attn_enable
     return sparse_attn_enabled || residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR;
 }
 
-// Packed attention with an LSE slab exposes a logical O view whose row stride
-// includes the extra LSE element. Residual caches use the dense O stride, so a
-// non-exact packed apply must materialize the O view before adding the cache.
+// Residual caches use the canonical dense O stride. Every packed apply must
+// materialize its logical O view before adding the cache, regardless of which
+// rho path produced that cache.
 __STATIC_INLINE__ bool sd_htp_packed_residual_apply_needs_contiguous(
-    bool packed_layout, int residual_mode, bool exact_rho) {
+    bool packed_layout, int residual_mode) {
     return packed_layout &&
-           residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY &&
-           !exact_rho;
+           residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY;
 }
 
 __STATIC_INLINE__ bool sd_htp_packed_residual_apply_uses_lse(
     bool packed_layout, int residual_mode) {
-    return packed_layout &&
-           residual_mode != SD_HTP_BLOCK_SPARSE_RESIDUAL_APPLY;
+    SD_UNUSED(residual_mode);
+    return packed_layout;
 }
 
 __STATIC_INLINE__ bool sd_htp_sparse_attention_needs_lse(
@@ -3078,9 +3077,12 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
 
     auto build_htp_kqv = [&](ggml_tensor* mask_in, bool with_lse = false) -> ggml_tensor* {
         const bool block_sparse_mask = mask_in != nullptr && mask_in->type == GGML_TYPE_I32;
+        // LSE producers share their O slabs with residual cache consumers,
+        // which require final-scale values just like packed attention outputs.
         const htp_attention_inputs inputs =
             prepare_htp_attention_inputs(block_sparse_mask ? nullptr : mask_in,
-                                         !block_sparse_mask);
+                                         !block_sparse_mask,
+                                         !with_lse);
         if (inputs.q == nullptr || inputs.k == nullptr || inputs.v == nullptr) {
             return nullptr;
         }
@@ -3239,6 +3241,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                 anchor_can_cache_residual && can_cache_exact_rho);
             ggml_tensor* dense_candidate = nullptr;
             ggml_tensor* dense_lse = nullptr;
+            bool dense_candidate_is_htp_layout = false;
             bool candidate_is_htp_layout = false;
             bool fused_anchor_used = false;
             ggml_tensor* candidate = nullptr;
@@ -3388,6 +3391,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             // producers and is used whenever fused admission is not selected.
             if (!fused_anchor_used && anchor_can_cache_residual && can_cache_exact_rho) {
                 dense_candidate = build_htp_kqv(nullptr, true);
+                dense_candidate_is_htp_layout = dense_candidate != nullptr;
                 candidate_is_htp_layout = dense_candidate != nullptr;
                 if (dense_candidate == nullptr) {
                     dense_candidate = build_kqv(q, k, v, nullptr, true);
@@ -3410,7 +3414,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                     dense_candidate->src[1],
                     dense_candidate->src[2],
                     block_mask,
-                    scale / kv_scale,
+                    scale,
                     0,
                     0);
                 ggml_flash_attn_ext_set_prec(candidate, GGML_PREC_F32);
@@ -3449,7 +3453,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             }
             if ((candidate_is_htp_layout && keep_for_htp_hybrid) || backend == nullptr || ggml_backend_supports_op(backend, candidate)) {
                 ggml_tensor* sparse_out = flash_attn_o_view(
-                    candidate, sparse_with_lse, fused_anchor_used);
+                    candidate, sparse_with_lse, fused_anchor_used || candidate_is_htp_layout);
                 ggml_tensor* sparse_lse = sparse_with_lse ? flash_attn_lse_view(candidate) : nullptr;
                 const bool residual_layout_trace =
                     sd_env_flag_enabled("SD_HTP_RESIDUAL_LAYOUT_TRACE");
@@ -3467,8 +3471,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                 }
                 ggml_tensor* sparse_reshape_out = sparse_out;
                 if (sd_htp_packed_residual_apply_needs_contiguous(
-                        packed_layout, block_sparse_residual_mode,
-                        block_sparse_residual_exact_rho)) {
+                        packed_layout, block_sparse_residual_mode)) {
                     sparse_reshape_out = ggml_cont(ctx, sparse_reshape_out);
                 }
                 const bool cached_exact_rho_valid =
@@ -3486,17 +3489,20 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                 if (anchor_can_cache_residual) {
                     if (dense_candidate == nullptr && can_cache_exact_rho) {
                         dense_candidate = build_htp_kqv(nullptr, true);
+                        dense_candidate_is_htp_layout = dense_candidate != nullptr;
                         if (dense_candidate == nullptr) {
                             dense_candidate = build_kqv(q, k, v, nullptr, true);
                         }
                     } else if (dense_candidate == nullptr) {
                         dense_candidate = build_htp_kqv(nullptr);
+                        dense_candidate_is_htp_layout = dense_candidate != nullptr;
                         if (dense_candidate == nullptr) {
                             dense_candidate = build_kqv(q, k, v, nullptr);
                         }
                     }
                     ggml_tensor* dense_out = flash_attn_o_view(
-                        dense_candidate, can_cache_exact_rho, fused_anchor_used);
+                        dense_candidate, can_cache_exact_rho,
+                        fused_anchor_used || dense_candidate_is_htp_layout);
                     if (can_cache_exact_rho) {
                         dense_lse = flash_attn_lse_view(dense_candidate);
                     }
@@ -3551,7 +3557,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                 residual_args, 3, sd_htp_exact_residual_cache_cpu,
                                 GGML_N_TASKS_MAX, nullptr);
                         } else {
-                            sparse_reshape_out = ggml_mul(ctx, sparse_out, rho);
+                            sparse_reshape_out = ggml_mul(ctx, sparse_reshape_out, rho);
                             ggml_set_name(
                                 sparse_reshape_out,
                                 "htp_cpu_residual_scale_mul");
@@ -7205,6 +7211,8 @@ protected:
                std::strstr(name, ".attn2.qkv.bias") != nullptr ||
                std::strstr(name, ".attn2.ln_q.weight") != nullptr ||
                std::strstr(name, ".attn2.ln_k.weight") != nullptr ||
+               std::strstr(name, ".attention.q_norm.weight") != nullptr ||
+               std::strstr(name, ".attention.k_norm.weight") != nullptr ||
                std::strstr(name, ".query_norm.weight") != nullptr ||
                std::strstr(name, ".key_norm.weight") != nullptr;
     }
@@ -7944,6 +7952,9 @@ protected:
             const std::map<std::string, ggml_tensor*>& sources,
             CacheStorageSegment* segment_out) {
         GGML_ASSERT(segment_out != nullptr);
+        if (htp_backend != nullptr && htp_backend != runtime_backend) {
+            ggml_backend_synchronize(htp_backend);
+        }
         CacheStorageSegment segment;
         segment.ctx = new_cache_ctx();
         std::vector<std::pair<ggml_tensor*, ggml_tensor*>> source_to_cache_tensors;
@@ -10013,7 +10024,7 @@ public:
             prefix = prefix + ".";
         }
         init_params(ctx, tensor_storage_map, prefix);
-        // Mark dual packed QKV's F32 bias and RMSNorm scales before parameter
+        // Mark packed QKV's F32 bias and RMSNorm scales before parameter
         // placement, so they are allocated in RPCMEM with the packed weights.
         const bool packed_qkv_param_prefix = prefix.find("attn.qkv.") != std::string::npos ||
                                              prefix.find("attn.ln_q.") != std::string::npos ||
@@ -10021,6 +10032,8 @@ public:
                                              prefix.find("attn2.qkv.") != std::string::npos ||
                                              prefix.find("attn2.ln_q.") != std::string::npos ||
                                              prefix.find("attn2.ln_k.") != std::string::npos ||
+                                             prefix.find("attention.q_norm.") != std::string::npos ||
+                                             prefix.find("attention.k_norm.") != std::string::npos ||
                                              prefix.find("norm.query_norm.") != std::string::npos ||
                                              prefix.find("norm.key_norm.") != std::string::npos;
         if (packed_qkv_param_prefix) {
