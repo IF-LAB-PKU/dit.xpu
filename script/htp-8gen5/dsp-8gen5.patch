@@ -1,0 +1,99 @@
+--- a/src/dsp/hmx_mgr.c
++++ b/src/dsp/hmx_mgr.c
+@@ -4,6 +4,14 @@
+ #include <HAP_compute_res.h>
+ #include <HAP_farf.h>
+ 
++// SM8850 rejects HAP_COMPUTE_RES_HMX_SHARED. Lock HMX only around the
++// existing per-kernel critical sections so both the receiver and HMX worker
++// threads can use the non-shared API safely. Set to 0 to restore the original
++// long-lived shared-lock behavior.
++#ifndef HTP_OPS_HMX_LOCK_PER_SECTION
++#define HTP_OPS_HMX_LOCK_PER_SECTION 1
++#endif
++
+ static int hmx_mgr_ctx_id;
+ static int hmx_mgr_spin_lock;
+ 
+@@ -39,6 +47,7 @@
+ }
+ 
+ void hmx_manager_enable_execution() {
++#if !HTP_OPS_HMX_LOCK_PER_SECTION
+   if (!hmx_mgr_ctx_id) {
+     return;
+   }
+@@ -48,14 +57,17 @@
+   if (err) {
+     FARF(ALWAYS, "HAP_compute_res_hmx_lock2 failed with return code 0x%x", err);
+   }
++#endif
+ }
+ 
+ void hmx_manager_disable_execution() {
++#if !HTP_OPS_HMX_LOCK_PER_SECTION
+   if (!hmx_mgr_ctx_id) {
+     return;
+   }
+ 
+   HAP_compute_res_hmx_unlock2(hmx_mgr_ctx_id, HAP_COMPUTE_RES_HMX_SHARED);
++#endif
+ }
+ 
+ void hmx_unit_acquire() {
+@@ -70,8 +82,24 @@
+     "    jump 1b                  \n"
+     "3:"
+     : "+r"(lock_ptr)::"p0", "r0");
++
++#if HTP_OPS_HMX_LOCK_PER_SECTION
++  int err = hmx_mgr_ctx_id ? HAP_compute_res_hmx_lock(hmx_mgr_ctx_id) : -1;
++  if (err) {
++    *(volatile int *) &hmx_mgr_spin_lock = 0;
++    FARF(ALWAYS, "HAP_compute_res_hmx_lock failed with return code 0x%x", err);
++    __builtin_trap();
++  }
++#endif
+ }
+ 
+ void hmx_unit_release() {
++#if HTP_OPS_HMX_LOCK_PER_SECTION
++  int err = hmx_mgr_ctx_id ? HAP_compute_res_hmx_unlock(hmx_mgr_ctx_id) : -1;
++  if (err) {
++    FARF(ALWAYS, "HAP_compute_res_hmx_unlock failed with return code 0x%x", err);
++  }
++#endif
++
+   *(volatile int *) &hmx_mgr_spin_lock = 0;
+ }
+--- a/src/dsp/ops/flash_attn.c
++++ b/src/dsp/ops/flash_attn.c
+@@ -1480,7 +1480,7 @@
+   }
+ 
+   const int    n_workers            = num_hvx128_contexts;
+-  const size_t vtcm_size_per_thread = 1024 * 1024;
++  const size_t vtcm_size_per_thread = smin((size_t) (6 * 1024 * 1024) / n_workers, (size_t) (1024 * 1024));
+   assert(n_workers * vtcm_size_per_thread <= 6 * 1024 * 1024);  // don't use too much VTCM
+ 
+   simple_fa_task_state_t state;
+@@ -2349,7 +2349,7 @@
+   }
+ 
+   const int    n_workers            = num_hvx128_contexts;
+-  const size_t vtcm_size_per_thread = 1024 * 1024;
++  const size_t vtcm_size_per_thread = smin((size_t) (6 * 1024 * 1024) / n_workers, (size_t) (1024 * 1024));
+   assert(n_workers * vtcm_size_per_thread <= 6 * 1024 * 1024);
+ 
+   block_sparse_fa_task_state_t state;
+--- a/src/dsp/ops/flash_attn_sp_hdim.c
++++ b/src/dsp/ops/flash_attn_sp_hdim.c
+@@ -788,7 +788,7 @@
+   }
+ 
+   const int    n_workers            = num_hvx128_contexts;
+-  const size_t vtcm_size_per_thread = 1024 * 1024;
++  const size_t vtcm_size_per_thread = smin((size_t) (6 * 1024 * 1024) / n_workers, (size_t) (1024 * 1024));
+   assert(n_workers * vtcm_size_per_thread <= 6 * 1024 * 1024);  // don't use too much VTCM
+ 
+   simple_fa_task_state_t state;
