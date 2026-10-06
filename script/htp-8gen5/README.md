@@ -80,6 +80,20 @@ export SD_PRELOAD_BACKENDS=htp SD_HTP_OPS=1 SD_HTP_COMPUTE=1 SD_HTP_ATTENTION=1
 - FLUX.2 klein 4B（`flux-2-klein-4b_htp_w16a32.gguf`，256×256，1 步）：
   `sampling completed`，`generate_image completed`，`EXIT:0`。
 
+## 时延测试
+
+`bench-8gen5-npu.sh` 自动测试 sd3.5m / sd3.5l / flux2 / zimage / zimageturbo
+× 256/512 的 NPU 时延（HTP dense，`--diffusion-fa`，euler，seed 42）。
+脚本按需从宿主机传输大模型（sd3.5l / z-image / z-image-turbo），
+测试完默认删除传输的模型以节省设备空间（`AUTO_CLEAN=0` 保留）。
+每例结果含 `sampling_s`、每分支 `compute` 平均值、`generate_s`。
+
+```sh
+script/htp-8gen5/bench-8gen5-npu.sh
+# 结果: /data/anqian/8gen5test/8gen5result/npu-all/summary-npu-all.tsv
+MODELS="sd3.5m flux2" SIZES="256" script/htp-8gen5/bench-8gen5-npu.sh
+```
+
 ## 限制
 
 本目录预编译的 skel 来自 `htp-ops-lib-sd.cpp@20f5248`，包含 8 个算子
