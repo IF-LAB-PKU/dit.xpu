@@ -94,6 +94,25 @@ script/htp-8gen5/bench-8gen5-npu.sh
 MODELS="sd3.5m flux2" SIZES="256" script/htp-8gen5/bench-8gen5-npu.sh
 ```
 
+2026-10-06 实测（SM8850，本仓库 Android 构建 + 本目录 v81 库，HTP dense，
+`--diffusion-fa`，euler，seed 42，每分支 `compute` 取平均）：
+
+| 模型 | 尺寸 | 步数 | sampling (s) | 分支 | 每分支 (s) | generate (s) |
+|---|---|---|---|---|---|---|
+| sd3.5m | 256 | 20 | 42.74 | 40 | 1.07 | 96.50 |
+| sd3.5m | 512 | 20 | 104.97 | 40 | 2.62 | 292.09 |
+| flux2 | 256 | 4 | 41.35 | 4 | 10.32 | 94.96 |
+| flux2 | 512 | 4 | 70.61 | 4 | 17.60 | 184.16 |
+| zimage | 256 | 10 | 45.40 | 10 | 4.54 | 70.89 |
+| zimage | 512 | 10 | 151.53 | 10 | 15.14 | 343.08 |
+| zimageturbo | 256 | 8 | 34.81 | 8 | 4.34 | 62.25 |
+| zimageturbo | 512 | 8 | 115.11 | 8 | 14.37 | 281.40 |
+
+**sd3.5l 在本 16GB 8 Gen 5 上无法运行**：HTP packed 权重需约 15.3GB RPCMEM，
+加载阶段内核 OOM 直接重启（z-image 的 11.7GB 可以跑，本机上限在两者之间）。
+脚本默认用 `MAX_PACKED_MB=13000` 跳过 sd3.5l；如需强制测试可设
+`ALLOW_BIG_MODELS=1`（会重启设备）。8 Gen 4（24GB）可运行 sd3.5l。
+
 ## 限制
 
 本目录预编译的 skel 来自 `htp-ops-lib-sd.cpp@20f5248`，包含 8 个算子

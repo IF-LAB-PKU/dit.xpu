@@ -35,8 +35,14 @@ SSHc=(ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o
 stamp() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
 
 mkdir -p "$RESULT_DIR"
-: > "$SUMMARY"
-printf 'model\tsize\tsteps\tsampling_s\tbranches\tsum_compute_ms\tavg_branch_ms\tgenerate_s\texit\n' >> "$SUMMARY"
+if [ ! -s "$SUMMARY" ]; then
+  printf 'model\tsize\tsteps\tsampling_s\tbranches\tsum_compute_ms\tavg_branch_ms\tgenerate_s\texit\n' > "$SUMMARY"
+fi
+
+# 设备侧 HTP packed 权重的 RPCMEM 占用（MB）。16GB 级 8 Gen 5 上
+# 12GB 左右可跑，sd3.5l 的 15.3GB 会触发内核 OOM/重启，默认跳过。
+MAX_PACKED_MB=${MAX_PACKED_MB:-13000}
+packed_mb_for() { case "$1" in sd3.5m) echo 4249;; sd3.5l) echo 15311;; flux2) echo 7290;; zimage) echo 11734;; zimageturbo) echo 11734;; *) echo 0;; esac; }
 
 # ---- HTP 运行环境 ----
 PRE="cd $DEV; export LD_LIBRARY_PATH=$DEV/bin; export DSP_LIBRARY_PATH=$DEV/bin; export ADSP_LIBRARY_PATH=$DEV/bin; export SD_PRELOAD_BACKENDS=htp; export SD_HTP_OPS=1; export SD_HTP_COMPUTE=1; export SD_HTP_ATTENTION=1; export SD_HTP_DENOISE_STEP_TRACE=1; export GGML_HTP_CPU_FALLBACK_THREADS=4;"
@@ -137,6 +143,11 @@ run_case() { # $1=model $2=W
 
 # ---- 主流程 ----
 for model in $MODELS; do
+  packed=$(packed_mb_for "$model")
+  if [ "$packed" -gt "$MAX_PACKED_MB" ] && [ "${ALLOW_BIG_MODELS:-0}" != "1" ]; then
+    stamp "[skip] $model: HTP packed ${packed}MB > MAX_PACKED_MB=${MAX_PACKED_MB} (set ALLOW_BIG_MODELS=1 to force; this device reboots)"
+    continue
+  fi
   ensure_model "$model" || continue
   for W in $SIZES; do
     run_case "$model" "$W"
