@@ -7,10 +7,6 @@
 #include "ggml-cuda.h"
 #endif
 
-#ifdef GGML_USE_METAL
-#include "ggml-metal.h"
-#endif
-
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,16 +25,6 @@ int main(int /*argc*/, const char** /*argv*/) {
             backend = ggml_backend_cuda_init(0);
             if (!backend) {
                 fprintf(stderr, "%s: ggml_backend_cuda_init() failed\n", __func__);
-            }
-        }
-        #endif
-
-        #ifdef GGML_USE_METAL
-        if (!backend) {
-            fprintf(stderr, "%s: using Metal backend\n", __func__);
-            backend = ggml_backend_metal_init();
-            if (!backend) {
-                fprintf(stderr, "%s: ggml_backend_metal_init() failed\n", __func__);
             }
         }
         #endif

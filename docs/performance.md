@@ -6,7 +6,7 @@ eg.:
  - SD2 768x768 ~1400mb
 
 For most backends, it slows things down, but for cuda it generally speeds it up too.
-At the moment, it is only supported for some models and some backends (like cpu, cuda/rocm, metal).
+At the moment, it is only supported for some models and some backends (like CPU and CUDA).
 
 Run by adding `--diffusion-fa` to the arguments and watch for:
 ```

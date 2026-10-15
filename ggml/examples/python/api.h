@@ -4,7 +4,6 @@
 */
 
 #include "ggml.h"
-#include "ggml-metal.h"
 #include "ggml-opencl.h"
 
 // Headers below are currently only present in the llama.cpp repository, comment them out if you don't have them.

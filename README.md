@@ -62,10 +62,8 @@ API and command-line option may change frequently.***
 - Supported backends
   - CPU (AVX, AVX2 and AVX512 support for x86 architectures)
   - CUDA
-  - Vulkan
-  - Metal
   - OpenCL
-  - SYCL
+  - HTP (Qualcomm Hexagon DSP/NPU)
 - Supported weight formats
   - Pytorch checkpoint (`.ckpt` or `.pth` or `.pt`)
   - Safetensors (`.safetensors`)
