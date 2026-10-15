@@ -24,10 +24,10 @@ docker build -t sd .
 
 ## Building variants using Docker
 
-Vulkan:
+CUDA:
 
 ```shell
-docker build -f Dockerfile.vulkan -t sd .
+docker build -f Dockerfile.cuda -t sd .
 ```
 
 ## Run locally built image's CLI

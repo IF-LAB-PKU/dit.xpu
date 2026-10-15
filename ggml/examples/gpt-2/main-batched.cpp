@@ -7,10 +7,6 @@
 #include "ggml-cuda.h"
 #endif
 
-#ifdef GGML_USE_METAL
-#include "ggml-metal.h"
-#endif
-
 #include "common.h"
 #include "common-ggml.h"
 
@@ -298,16 +294,6 @@ bool gpt2_model_load(const std::string & fname, gpt2_model & model, gpt_vocab & 
     }
 #endif
 
-#ifdef GGML_USE_METAL
-    if (n_gpu_layers > 0) {
-        fprintf(stderr, "%s: using Metal backend\n", __func__);
-        model.backend = ggml_backend_metal_init();
-        if (!model.backend) {
-            fprintf(stderr, "%s: ggml_backend_metal_init() failed\n", __func__);
-        }
-    }
-#endif
-
     if (!model.backend) {
         // fallback to CPU backend
         fprintf(stderr, "%s: using CPU backend\n", __func__);
@@ -498,9 +484,6 @@ bool gpt2_model_load(const std::string & fname, gpt2_model & model, gpt_vocab & 
             ggml_tallocr_alloc(&alloc, tensor);
 
             if (ggml_backend_is_cpu  (model.backend)
-#ifdef GGML_USE_METAL
-                || ggml_backend_is_metal(model.backend)
-#endif
                 ) {
                 // for the CPU and Metal backend, we can read directly into the tensor
                 fin.read(reinterpret_cast<char *>(tensor->data), ggml_nbytes(tensor));
@@ -592,7 +575,6 @@ struct ggml_cgraph * gpt2_graph(
     struct ggml_tensor * KQ_mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_kv, n_tokens, 1);
     ggml_set_name(KQ_mask, "KQ_mask");
     ggml_set_input(KQ_mask);
-
 
     for (int il = 0; il < n_layer; ++il) {
         struct ggml_tensor * cur;

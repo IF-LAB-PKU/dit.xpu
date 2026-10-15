@@ -390,7 +390,7 @@ ArgOptions SDContextParams::get_options() {
          &esrgan_path},
         {"",
          "--backend",
-         "runtime backend assignment, e.g. cpu or clip=cpu,vae=cuda0,diffusion=vulkan0",
+         "runtime backend assignment, e.g. cpu or clip=cpu,vae=cpu,diffusion=cuda0",
          &backend},
         {"",
          "--params-backend",
