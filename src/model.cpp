@@ -513,12 +513,12 @@ bool ModelLoader::init_from_torch_zip_file(const std::string& file_path, const s
 /*================================================= DiffusersModelLoader ==================================================*/
 
 bool ModelLoader::init_from_diffusers_file(const std::string& file_path, const std::string& prefix) {
-    std::string unet_path   = path_join(file_path, "unet/diffusion_pytorch_model.safetensors");
+    std::string transformer_path = path_join(file_path, "transformer/diffusion_pytorch_model.safetensors");
     std::string vae_path    = path_join(file_path, "vae/diffusion_pytorch_model.safetensors");
     std::string clip_path   = path_join(file_path, "text_encoder/model.safetensors");
     std::string clip_g_path = path_join(file_path, "text_encoder_2/model.safetensors");
 
-    if (!init_from_safetensors_file(unet_path, "unet.")) {
+    if (!init_from_safetensors_file(transformer_path, "transformer.")) {
         return false;
     }
 
@@ -537,22 +537,13 @@ bool ModelLoader::init_from_diffusers_file(const std::string& file_path, const s
 }
 
 SDVersion ModelLoader::get_sd_version() {
-    TensorStorage token_embedding_weight, input_block_weight, context_ebedding_weight;
-
-    bool has_multiple_encoders = false;
-    bool is_unet               = false;
-
-    bool is_xl                       = false;
-    bool is_flux                     = false;
-    bool is_flux2                    = false;
-    bool has_single_block_47         = false;
-    bool is_wan                      = false;
+    TensorStorage input_block_weight, context_ebedding_weight;
+    bool is_flux = false;
+    bool is_flux2 = false;
+    bool has_single_block_47 = false;
+    bool is_wan = false;
     int64_t patch_embedding_channels = 0;
-    bool has_img_emb                 = false;
-    bool has_middle_block_1          = false;
-    bool has_output_block_311        = false;
-    bool has_output_block_71         = false;
-    bool has_attn_1024               = false;
+    bool has_img_emb = false;
 
     for (auto& [name, tensor_storage] : tensor_storage_map) {
         if (tensor_storage.name.find("model.diffusion_model.double_blocks.") != std::string::npos ||
@@ -602,52 +593,7 @@ SDVersion ModelLoader::get_sd_version() {
         if (tensor_storage.name.find("model.diffusion_model.img_emb") != std::string::npos) {
             has_img_emb = true;
         }
-        if (tensor_storage.name.find("model.diffusion_model.input_blocks.") != std::string::npos ||
-            tensor_storage.name.find("unet.down_blocks.") != std::string::npos) {
-            is_unet = true;
-            if (has_multiple_encoders) {
-                is_xl = true;
-            }
-        }
-        if (tensor_storage.name.find("conditioner.embedders.1") != std::string::npos ||
-            tensor_storage.name.find("cond_stage_model.1") != std::string::npos ||
-            tensor_storage.name.find("te.1") != std::string::npos) {
-            has_multiple_encoders = true;
-            if (is_unet) {
-                is_xl = true;
-            }
-        }
-        if (tensor_storage.name.find("model.diffusion_model.input_blocks.8.0.time_mixer.mix_factor") != std::string::npos) {
-            return VERSION_SVD;
-        }
-        if (tensor_storage.name.find("model.diffusion_model.middle_block.1.") != std::string::npos ||
-            tensor_storage.name.find("unet.mid_block.resnets.1.") != std::string::npos) {
-            has_middle_block_1 = true;
-        }
-        if (tensor_storage.name.find("model.diffusion_model.output_blocks.3.1.transformer_blocks.1") != std::string::npos ||
-            tensor_storage.name.find("unet.up_blocks.1.attentions.0.transformer_blocks.1") != std::string::npos) {
-            has_output_block_311 = true;
-        }
-        if (tensor_storage.name.find("model.diffusion_model.output_blocks.7.1") != std::string::npos ||
-            tensor_storage.name.find("unet.up_blocks.2.attentions.1") != std::string::npos) {
-            has_output_block_71 = true;
-            if (tensor_storage.name.find("model.diffusion_model.output_blocks.7.1.transformer_blocks.0.attn1.to_k.weight") != std::string::npos) {
-                if (tensor_storage.ne[0] == 1024)
-                    has_attn_1024 = true;
-            }
-        }
-        if (tensor_storage.name == "cond_stage_model.transformer.text_model.embeddings.token_embedding.weight" ||
-            tensor_storage.name == "cond_stage_model.model.token_embedding.weight" ||
-            tensor_storage.name == "text_model.embeddings.token_embedding.weight" ||
-            tensor_storage.name == "te.text_model.embeddings.token_embedding.weight" ||
-            tensor_storage.name == "conditioner.embedders.0.model.token_embedding.weight" ||
-            tensor_storage.name == "conditioner.embedders.0.transformer.text_model.embeddings.token_embedding.weight") {
-            token_embedding_weight = tensor_storage;
-            // break;
-        }
-        if (tensor_storage.name == "model.diffusion_model.input_blocks.0.0.weight" ||
-            tensor_storage.name == "model.diffusion_model.img_in.weight" ||
-            tensor_storage.name == "unet.conv_in.weight") {
+        if (tensor_storage.name == "model.diffusion_model.img_in.weight") {
             input_block_weight = tensor_storage;
         }
         if (tensor_storage.name == "model.diffusion_model.txt_in.weight" || tensor_storage.name == "model.diffusion_model.context_embedder.weight") {
@@ -664,24 +610,6 @@ SDVersion ModelLoader::get_sd_version() {
         }
         return VERSION_WAN2;
     }
-    bool is_inpaint = input_block_weight.ne[2] == 9;
-    bool is_ip2p    = input_block_weight.ne[2] == 8;
-    if (is_xl) {
-        if (is_inpaint) {
-            return VERSION_SDXL_INPAINT;
-        }
-        if (is_ip2p) {
-            return VERSION_SDXL_PIX2PIX;
-        }
-        if (!has_middle_block_1) {
-            if (!has_output_block_311) {
-                return VERSION_SDXL_VEGA;
-            }
-            return VERSION_SDXL_SSD1B;
-        }
-        return VERSION_SDXL;
-    }
-
     if (is_flux && !is_flux2) {
         if (context_ebedding_weight.ne[0] == 3584) {
             return VERSION_LONGCAT;
@@ -706,29 +634,6 @@ SDVersion ModelLoader::get_sd_version() {
         return VERSION_FLUX2_KLEIN;
     }
 
-    if (token_embedding_weight.ne[0] == 768) {
-        if (is_inpaint) {
-            return VERSION_SD1_INPAINT;
-        }
-        if (is_ip2p) {
-            return VERSION_SD1_PIX2PIX;
-        }
-        if (!has_middle_block_1) {
-            if (!has_output_block_71) {
-                return VERSION_SDXS_512_DS;
-            }
-            return VERSION_SD1_TINY_UNET;
-        }
-        return VERSION_SD1;
-    } else if (token_embedding_weight.ne[0] == 1024) {
-        if (is_inpaint) {
-            return VERSION_SD2_INPAINT;
-        }
-        if (!has_middle_block_1) {
-            return has_attn_1024 ? VERSION_SDXS_09 : VERSION_SD2_TINY_UNET;
-        }
-        return VERSION_SD2;
-    }
     return VERSION_COUNT;
 }
 

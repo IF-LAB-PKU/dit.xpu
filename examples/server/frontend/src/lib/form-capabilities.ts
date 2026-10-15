@@ -17,7 +17,6 @@ function assignSampleParams(
     target.sample_method = sample.sample_method || "default";
     target.sample_steps = finiteOrFallback(sample.sample_steps, fallbackSteps);
     target.eta = sample.eta == null ? "" : sample.eta;
-    target.shifted_timestep = finiteOrFallback(sample.shifted_timestep, 0);
     target.flow_shift = sample.flow_shift == null ? "" : sample.flow_shift;
 
     target.guidance.txt_cfg = finiteOrFallback(guidance.txt_cfg, 7);
@@ -48,7 +47,6 @@ export function formFromCapabilities(capabilities: Capabilities): GenerationForm
     form.seed = typeof defaults.seed === "number" ? defaults.seed : -1;
     form.clip_skip = typeof defaults.clip_skip === "number" ? defaults.clip_skip : -1;
     form.strength = finiteOrFallback(defaults.strength, 0.75);
-    form.control_strength = finiteOrFallback(defaults.control_strength, 0.9);
     form.moe_boundary = finiteOrFallback(defaults.moe_boundary, 0.875);
     form.vace_strength = finiteOrFallback(defaults.vace_strength, 1.0);
     form.output_format = defaults.output_format || "png";

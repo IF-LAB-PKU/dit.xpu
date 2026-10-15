@@ -47,7 +47,6 @@ int main(int argc, const char* argv[]) {
 
     if (!ctx_params.resolve_and_validate(IMG_GEN) ||
         !gen_params.resolve_and_validate(IMG_GEN,
-                                         ctx_params.lora_model_dir,
                                          ctx_params.hires_upscalers_dir,
                                          true)) {
         print_usage(argv[0], options);

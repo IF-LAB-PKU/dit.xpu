@@ -16,8 +16,6 @@ enum class SDBackendModule {
     TE,
     CLIP_VISION,
     VAE,
-    CONTROL_NET,
-    PHOTOMAKER,
     UPSCALER,
 };
 
@@ -55,7 +53,6 @@ public:
               bool offload_params_to_cpu,
               bool keep_clip_on_cpu,
               bool keep_vae_on_cpu,
-              bool keep_control_net_on_cpu,
               std::string* error);
     void reset();
 

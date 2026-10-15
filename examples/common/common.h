@@ -16,13 +16,12 @@
 #define BOOL_STR(b) ((b) ? "true" : "false")
 
 extern const char* const modes_str[];
-#define SD_ALL_MODES_STR "img_gen, vid_gen, convert, upscale, metadata"
+#define SD_ALL_MODES_STR "img_gen, vid_gen, convert, metadata"
 
 enum SDMode {
     IMG_GEN,
     VID_GEN,
     CONVERT,
-    UPSCALE,
     METADATA,
     MODE_COUNT
 };
@@ -96,17 +95,9 @@ struct SDContextParams {
     std::string vae_path;
     std::string audio_vae_path;
     std::string taesd_path;
-    std::string esrgan_path;
-    std::string control_net_path;
-    std::string embedding_dir;
-    std::string photo_maker_path;
     sd_type_t wtype = SD_TYPE_COUNT;
     std::string tensor_type_rules;
-    std::string lora_model_dir = ".";
     std::string hires_upscalers_dir;
-
-    std::map<std::string, std::string> embedding_map;
-    std::vector<sd_embedding_t> embedding_vec;
 
     rng_type_t rng_type         = CUDA_RNG;
     rng_type_t sampler_rng_type = RNG_TYPE_COUNT;
@@ -115,7 +106,6 @@ struct SDContextParams {
     std::string backend;
     std::string params_backend;
     bool enable_mmap           = false;
-    bool control_net_cpu       = false;
     bool clip_on_cpu           = false;
     bool vae_on_cpu            = false;
     bool flash_attn            = false;
@@ -134,13 +124,9 @@ struct SDContextParams {
     bool qwen_image_zero_cond_t = false;
 
     prediction_t prediction           = PREDICTION_COUNT;
-    lora_apply_mode_t lora_apply_mode = LORA_APPLY_AUTO;
-
-    bool force_sdxl_vae_conv_scale = false;
 
     float flow_shift = INFINITY;
     ArgOptions get_options();
-    void build_embedding_map();
     bool resolve(SDMode mode);
     bool validate(SDMode mode);
     bool resolve_and_validate(SDMode mode);
@@ -161,7 +147,6 @@ struct SDGenerationParams {
     int batch_count            = 1;
     int64_t seed               = 42;
     float strength             = 0.75f;
-    float control_strength     = 0.9f;
     bool auto_resize_ref_image = true;
     bool increase_ref_index    = false;
     bool embed_image_metadata  = true;
@@ -195,13 +180,6 @@ struct SDGenerationParams {
     sd_tiling_params_t vae_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
     std::string extra_tiling_args;
 
-    std::string pm_id_images_dir;
-    std::string pm_id_embed_path;
-    float pm_style_strength = 20.f;
-
-    int upscale_repeats   = 1;
-    int upscale_tile_size = 128;
-
     bool hires_enabled         = false;
     std::string hires_upscaler = "Latent";
     std::string hires_upscaler_model_path;
@@ -210,15 +188,9 @@ struct SDGenerationParams {
     int hires_height               = 0;
     int hires_steps                = 0;
     float hires_denoising_strength = 0.7f;
-    int hires_upscale_tile_size    = 128;
     std::vector<float> hires_custom_sigmas;
 
-    std::map<std::string, float> lora_map;
-    std::map<std::string, float> high_noise_lora_map;
-
     // Derived and normalized fields.
-    std::string prompt_with_lora;  // for metadata record only
-    std::vector<sd_lora_t> lora_vec;
     sd_hires_upscaler_t resolved_hires_upscaler;
 
     // Owned execution payload.
@@ -227,12 +199,10 @@ struct SDGenerationParams {
     std::vector<SDImageOwner> ref_images;
     SDImageOwner mask_image;
     SDImageOwner control_image;
-    std::vector<SDImageOwner> pm_id_images;
     std::vector<SDImageOwner> control_frames;
 
     // Backing storage for sd_img_gen_params_t view fields.
     std::vector<sd_image_t> ref_image_views;
-    std::vector<sd_image_t> pm_id_image_views;
     std::vector<sd_image_t> control_frame_views;
 
     SDGenerationParams();
@@ -241,18 +211,15 @@ struct SDGenerationParams {
     SDGenerationParams(SDGenerationParams&& other) noexcept            = default;
     SDGenerationParams& operator=(SDGenerationParams&& other) noexcept = default;
     ArgOptions get_options();
-    bool from_json_str(const std::string& json_str,
-                       const std::function<std::string(const std::string&)>& lora_path_resolver = {});
+    bool from_json_str(const std::string& json_str);
     bool initialize_cache_params();
-    void extract_and_remove_lora(const std::string& lora_model_dir);
     bool width_and_height_are_set() const;
     void set_width_and_height_if_unset(int w, int h);
     int get_resolved_width() const;
     int get_resolved_height() const;
-    bool resolve(const std::string& lora_model_dir, const std::string& hires_upscalers_dir, bool strict = false);
+    bool resolve(const std::string& hires_upscalers_dir, bool strict = false);
     bool validate(SDMode mode);
     bool resolve_and_validate(SDMode mode,
-                              const std::string& lora_model_dir,
                               const std::string& hires_upscalers_dir,
                               bool strict = false);
     sd_img_gen_params_t to_sd_img_gen_params_t();

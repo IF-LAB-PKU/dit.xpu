@@ -61,7 +61,6 @@ enum scheduler_t {
     DISCRETE_SCHEDULER,
     KARRAS_SCHEDULER,
     EXPONENTIAL_SCHEDULER,
-    AYS_SCHEDULER,
     GITS_SCHEDULER,
     SGM_UNIFORM_SCHEDULER,
     SIMPLE_SCHEDULER,
@@ -145,13 +144,6 @@ enum preview_t {
     PREVIEW_COUNT
 };
 
-enum lora_apply_mode_t {
-    LORA_APPLY_AUTO,
-    LORA_APPLY_IMMEDIATELY,
-    LORA_APPLY_AT_RUNTIME,
-    LORA_APPLY_MODE_COUNT,
-};
-
 typedef struct {
     bool enabled;
     bool temporal_tiling;
@@ -162,11 +154,6 @@ typedef struct {
     float rel_size_y;
     const char* extra_tiling_args;
 } sd_tiling_params_t;
-
-typedef struct {
-    const char* name;
-    const char* path;
-} sd_embedding_t;
 
 typedef struct {
     const char* model_path;
@@ -182,10 +169,6 @@ typedef struct {
     const char* vae_path;
     const char* audio_vae_path;
     const char* taesd_path;
-    const char* control_net_path;
-    const sd_embedding_t* embeddings;
-    uint32_t embedding_count;
-    const char* photo_maker_path;
     const char* tensor_type_rules;
     bool vae_decode_only;
     bool free_params_immediately;
@@ -195,11 +178,9 @@ typedef struct {
     enum rng_type_t rng_type;
     enum rng_type_t sampler_rng_type;
     enum prediction_t prediction;
-    enum lora_apply_mode_t lora_apply_mode;
     bool offload_params_to_cpu;
     bool enable_mmap;
     bool keep_clip_on_cpu;
-    bool keep_control_net_on_cpu;
     bool keep_vae_on_cpu;
     bool flash_attn;
     bool diffusion_flash_attn;
@@ -208,7 +189,6 @@ typedef struct {
     bool vae_conv_direct;
     bool circular_x;
     bool circular_y;
-    bool force_sdxl_vae_conv_scale;
     bool chroma_use_dit_mask;
     bool chroma_use_t5_mask;
     int chroma_t5_mask_pad;
@@ -253,24 +233,15 @@ typedef struct {
     enum sample_method_t sample_method;
     int sample_steps;
     float eta;
-    int shifted_timestep;
     float* custom_sigmas;
     int custom_sigmas_count;
     float flow_shift;
     const char* extra_sample_args;
 } sd_sample_params_t;
 
-typedef struct {
-    sd_image_t* id_images;
-    int id_images_count;
-    const char* id_embed_path;
-    float style_strength;
-} sd_pm_params_t;  // photo maker
-
 enum sd_cache_mode_t {
     SD_CACHE_DISABLED = 0,
     SD_CACHE_EASYCACHE,
-    SD_CACHE_UCACHE,
     SD_CACHE_DBCACHE,
     SD_CACHE_TAYLORSEER,
     SD_CACHE_CACHE_DIT,
@@ -304,12 +275,6 @@ typedef struct {
     float spectrum_stop_percent;
 } sd_cache_params_t;
 
-typedef struct {
-    bool is_high_noise;
-    float multiplier;
-    const char* path;
-} sd_lora_t;
-
 enum sd_hires_upscaler_t {
     SD_HIRES_UPSCALER_NONE,
     SD_HIRES_UPSCALER_LATENT,
@@ -333,14 +298,11 @@ typedef struct {
     int target_height;
     int steps;
     float denoising_strength;
-    int upscale_tile_size;
     float* custom_sigmas;
     int custom_sigmas_count;
 } sd_hires_params_t;
 
 typedef struct {
-    const sd_lora_t* loras;
-    uint32_t lora_count;
     const char* prompt;
     const char* negative_prompt;
     int clip_skip;
@@ -357,16 +319,12 @@ typedef struct {
     int64_t seed;
     int batch_count;
     sd_image_t control_image;
-    float control_strength;
-    sd_pm_params_t pm_params;
     sd_tiling_params_t vae_tiling_params;
     sd_cache_params_t cache;
     sd_hires_params_t hires;
 } sd_img_gen_params_t;
 
 typedef struct {
-    const sd_lora_t* loras;
-    uint32_t lora_count;
     const char* prompt;
     const char* negative_prompt;
     int clip_skip;
@@ -415,8 +373,6 @@ SD_API const char* sd_prediction_name(enum prediction_t prediction);
 SD_API enum prediction_t str_to_prediction(const char* str);
 SD_API const char* sd_preview_name(enum preview_t preview);
 SD_API enum preview_t str_to_preview(const char* str);
-SD_API const char* sd_lora_apply_mode_name(enum lora_apply_mode_t mode);
-SD_API enum lora_apply_mode_t str_to_lora_apply_mode(const char* str);
 SD_API const char* sd_hires_upscaler_name(enum sd_hires_upscaler_t upscaler);
 SD_API enum sd_hires_upscaler_t str_to_sd_hires_upscaler(const char* str);
 
@@ -448,23 +404,6 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            sd_image_t** frames_out,
                            int* num_frames_out,
                            sd_audio_t** audio_out);
-
-typedef struct upscaler_ctx_t upscaler_ctx_t;
-
-SD_API upscaler_ctx_t* new_upscaler_ctx(const char* esrgan_path,
-                                        bool offload_params_to_cpu,
-                                        bool direct,
-                                        int n_threads,
-                                        int tile_size,
-                                        const char* backend,
-                                        const char* params_backend);
-SD_API void free_upscaler_ctx(upscaler_ctx_t* upscaler_ctx);
-
-SD_API sd_image_t upscale(upscaler_ctx_t* upscaler_ctx,
-                          sd_image_t input_image,
-                          uint32_t upscale_factor);
-
-SD_API int get_upscale_factor(upscaler_ctx_t* upscaler_ctx);
 
 SD_API bool convert(const char* input_path,
                     const char* vae_path,

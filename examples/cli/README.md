@@ -24,7 +24,7 @@ CLI Options:
   --metadata-raw                include raw hex previews for unparsed metadata payloads
   --metadata-brief              truncate long metadata text values in text output
   --metadata-all                include structural/container entries such as IHDR, IDAT, and non-metadata JPEG segments
-  -M, --mode                    run mode, one of [img_gen, vid_gen, upscale, convert, metadata], default: img_gen
+  -M, --mode                    run mode, one of [img_gen, vid_gen, convert, metadata], default: img_gen
   --preview                     preview method. must be one of the following [none, proj, tae, vae] (default is none)
   -h, --help                    show this help message and exit
 
@@ -44,24 +44,17 @@ Context Options:
   --vae <string>                           path to standalone vae model
   --taesd <string>                         path to taesd. Using Tiny AutoEncoder for fast decoding (low quality)
   --tae <string>                           alias of --taesd
-  --control-net <string>                   path to control net model
-  --embd-dir <string>                      embeddings directory
-  --lora-model-dir <string>                lora model directory
   --hires-upscalers-dir <string>           highres fix upscaler model directory
   --tensor-type-rules <string>             weight type per tensor pattern (example: "^vae\.=f16,model\.=q8_0")
-  --photo-maker <string>                   path to PHOTOMAKER model
-  --upscale-model <string>                 path to esrgan model.
   -t, --threads <int>                      number of threads to use during computation (default: -1). If threads <= 0,
                                            then threads will be set to the number of CPU physical cores
   --chroma-t5-mask-pad <int>               t5 mask pad size of chroma
   --max-vram <float>                       maximum VRAM budget in GiB for graph-cut segmented execution. 0 disables
                                            graph splitting; a negative value auto-detects free VRAM, sparing the
                                            specified value (e.g. -0.5 will keep at least 0.5 GiB free)
-  --force-sdxl-vae-conv-scale              force use of conv scale on sdxl vae
   --offload-to-cpu                         place the weights in RAM to save VRAM, and automatically load them into VRAM
                                            when needed
   --mmap                                   whether to memory-map model
-  --control-net-cpu                        keep controlnet in cpu (for low vram)
   --clip-on-cpu                            keep clip in cpu (for low vram)
   --vae-on-cpu                             keep vae in cpu (for low vram)
   --fa                                     use flash attention
@@ -80,13 +73,6 @@ Context Options:
   --sampler-rng                            sampler RNG, one of [std_default, cuda, cpu]. If not specified, use --rng
   --prediction                             prediction type override, one of [eps, v, edm_v, sd3_flow, flux_flow,
                                            flux2_flow]
-  --lora-apply-mode                        the way to apply LoRA, one of [auto, immediately, at_runtime], default is
-                                           auto. In auto mode, if the model weights contain any quantized parameters,
-                                           the at_runtime mode will be used; otherwise, immediately will be used.The
-                                           immediately mode may have precision and compatibility issues with quantized
-                                           parameters, but it usually offers faster inference speed and, in some cases,
-                                           lower memory usage. The at_runtime mode, on the other hand, is exactly the
-                                           opposite.
 
 Generation Options:
   -p, --prompt <string>                    the prompt to render
@@ -94,13 +80,11 @@ Generation Options:
   -i, --init-img <string>                  path to the init image
   --end-img <string>                       path to the end image, required by flf2v
   --mask <string>                          path to the mask image
-  --control-image <string>                 path to control image, control net
+  --control-image <string>                 path to a native DiT control image
   --control-video <string>                 path to control video frames, It must be a directory path. The video frames
                                            inside should be stored as images in lexicographical (character) order. For
                                            example, if the control video path is `frames`, the directory contain images
                                            such as 00.png, 01.png, ... etc.
-  --pm-id-images-dir <string>              path to PHOTOMAKER input id images dir
-  --pm-id-embed-path <string>              path to PHOTOMAKER v2 id embed
   --hires-upscaler <string>                highres fix upscaler, Lanczos, Nearest, Latent, Latent (nearest), Latent
                                            (nearest-exact), Latent (antialiased), Latent (bicubic), Latent (bicubic
                                            antialiased), or a model name under --hires-upscalers-dir (default: Latent)
@@ -114,14 +98,12 @@ Generation Options:
   --steps <int>                            number of sample steps (default: 20)
   --high-noise-steps <int>                 (high noise) number of sample steps (default: -1 = auto)
   --clip-skip <int>                        ignore last layers of CLIP network; 1 ignores none, 2 ignores one layer
-                                           (default: -1). <= 0 represents unspecified, will be 1 for SD1.x, 2 for SD2.x
+                                           (default: -1). <= 0 represents the model default
   -b, --batch-count <int>                  batch count
   --video-frames <int>                     video frames (default: 1)
   --fps <int>                              fps (default: 24)
   --timestep-shift <int>                   shift timestep for NitroFusion models (default: 0). recommended N for
                                            NitroSD-Realism around 250 and 500 for NitroSD-Vibrant
-  --upscale-repeats <int>                  Run the ESRGAN upscaler this many times (default: 1)
-  --upscale-tile-size <int>                tile size for ESRGAN upscaling (default: 128)
   --hires-width <int>                      highres fix target width, 0 to use --hires-scale (default: 0)
   --hires-height <int>                     highres fix target height, 0 to use --hires-scale (default: 0)
   --hires-steps <int>                      highres fix second pass sample steps, 0 to reuse --steps (default: 0)
@@ -150,9 +132,6 @@ Generation Options:
   --high-noise-eta <float>                 (high noise) noise multiplier (default: 0 for ddim_trailing, tcd,
                                            res_multistep and res_2s; 1 for euler_a, er_sde and dpm++2s_a)
   --strength <float>                       strength for noising/unnoising (default: 0.75)
-  --pm-style-strength <float>              
-  --control-strength <float>               strength to apply Control Net (default: 0.9). 1.0 corresponds to full
-                                           destruction of information in init image
   --moe-boundary <float>                   timestep boundary for Wan2.2 MoE model. (default: 0.875). Only enabled if
                                            `--high-noise-steps` is set to -1
   --vace-strength <float>                  wan vace strength
@@ -173,7 +152,7 @@ Generation Options:
   --high-noise-sampling-method             (high noise) sampling method, one of [euler, euler_a, heun, dpm2, dpm++2s_a,
                                            dpm++2m, dpm++2mv2, ipndm, ipndm_v, lcm, ddim_trailing, tcd, res_multistep,
                                            res_2s, er_sde, euler_cfg_pp, euler_a_cfg_pp] default: euler for Flux/SD3/Wan, euler_a otherwise
-  --scheduler                              denoiser sigma scheduler, one of [discrete, karras, exponential, ays, gits,
+  --scheduler                              denoiser sigma scheduler, one of [discrete, karras, exponential, gits,
                                            smoothstep, sgm_uniform, simple, kl_optimal, lcm, bong_tangent, ltx2], default:
                                            model-specific
   --sigmas                                 custom sigma values for the sampler, comma-separated (e.g.,
@@ -183,10 +162,10 @@ Generation Options:
   --skip-layers                            layers to skip for SLG steps (default: [7,8,9])
   --high-noise-skip-layers                 (high noise) layers to skip for SLG steps (default: [7,8,9])
   -r, --ref-image                          reference image for Flux Kontext models (can be used multiple times)
-  --cache-mode                             caching method: 'easycache' (DiT), 'ucache' (UNET),
-                                           'dbcache'/'taylorseer'/'cache-dit' (DiT block-level), 'spectrum' (UNET/DiT
+  --cache-mode                             caching method: 'easycache' (DiT),
+                                           'dbcache'/'taylorseer'/'cache-dit' (DiT block-level), 'spectrum' (DiT
                                            Chebyshev+Taylor forecasting)
-  --cache-option                           named cache params (key=value format, comma-separated). easycache/ucache:
+  --cache-option                           named cache params (key=value format, comma-separated). easycache:
                                            threshold=,start=,end=,decay=,relative=,reset=; dbcache/taylorseer/cache-dit:
                                            Fn=,Bn=,threshold=,warmup=; spectrum: w=,m=,lam=,window=,flex=,warmup=,stop=.
                                            Examples: "threshold=0.25" or "threshold=1.5,reset=0"
