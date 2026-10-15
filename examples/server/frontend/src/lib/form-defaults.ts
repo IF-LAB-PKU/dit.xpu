@@ -3,7 +3,6 @@ import type { GenerationForm } from "./types";
 export const CACHE_MODES = [
     "disabled",
     "easycache",
-    "ucache",
     "dbcache",
     "taylorseer",
     "cache-dit",
@@ -22,7 +21,6 @@ export function createBlankForm(): GenerationForm {
         seed: -1,
         clip_skip: -1,
         strength: 0.75,
-        control_strength: 0.9,
         moe_boundary: 0.875,
         vace_strength: 1.0,
         output_format: "png",
@@ -32,7 +30,6 @@ export function createBlankForm(): GenerationForm {
             sample_method: "default",
             sample_steps: 20,
             eta: "",
-            shifted_timestep: 0,
             flow_shift: "",
             guidance: {
                 txt_cfg: 7,
@@ -49,7 +46,6 @@ export function createBlankForm(): GenerationForm {
             sample_method: "default",
             sample_steps: -1,
             eta: "",
-            shifted_timestep: 0,
             flow_shift: "",
             guidance: {
                 txt_cfg: 7,
@@ -67,7 +63,6 @@ export function createBlankForm(): GenerationForm {
         control_frames: [],
         mask_image: null,
         control_image: null,
-        lora: [],
         vae_tiling_params: {
             enabled: false,
             tile_size_x: 0,

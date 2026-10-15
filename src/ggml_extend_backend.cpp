@@ -66,15 +66,7 @@ static bool parse_backend_module(const std::string& raw_name, SDBackendModule* m
         *module = SDBackendModule::VAE;
         return true;
     }
-    if (name == "controlnet" || name == "control") {
-        *module = SDBackendModule::CONTROL_NET;
-        return true;
-    }
-    if (name == "photomaker" || name == "photomakerid" || name == "pmid" || name == "photo") {
-        *module = SDBackendModule::PHOTOMAKER;
-        return true;
-    }
-    if (name == "upscaler" || name == "esrgan" || name == "hires") {
+    if (name == "upscaler" || name == "hires") {
         *module = SDBackendModule::UPSCALER;
         return true;
     }
@@ -283,10 +275,6 @@ static std::string sd_resolve_backend_name(const std::string& name) {
     return "";
 }
 
-static bool backend_name_exists(const std::string& name) {
-    return !sd_resolve_backend_name(name).empty();
-}
-
 static ggml_backend_t init_named_backend(const std::string& name) {
     ggml_backend_load_all_once();
     LOG_DEBUG("Initializing backend: %s", name.c_str());
@@ -317,28 +305,7 @@ static ggml_backend_t sd_get_default_backend() {
         }
     });
 
-    ggml_backend_t backend   = nullptr;
-    const char* SD_VK_DEVICE = getenv("SD_VK_DEVICE");
-    if (SD_VK_DEVICE != nullptr) {
-        std::string sd_vk_device_str = SD_VK_DEVICE;
-        try {
-            unsigned long long device  = std::stoull(sd_vk_device_str);
-            std::string vk_device_name = "Vulkan" + std::to_string(device);
-            if (backend_name_exists(vk_device_name)) {
-                LOG_INFO("Selecting %s as main device by env var SD_VK_DEVICE", vk_device_name.c_str());
-                backend = init_named_backend(vk_device_name);
-                if (!backend) {
-                    LOG_WARN("Device %s requested by SD_VK_DEVICE failed to init. Falling back to the default device.", vk_device_name.c_str());
-                }
-            } else {
-                LOG_WARN("Device %s requested by SD_VK_DEVICE was not found. Falling back to the default device.", vk_device_name.c_str());
-            }
-        } catch (const std::invalid_argument&) {
-            LOG_WARN("SD_VK_DEVICE environment variable is not a valid integer (%s). Falling back to the default device.", SD_VK_DEVICE);
-        } catch (const std::out_of_range&) {
-            LOG_WARN("SD_VK_DEVICE environment variable value is out of range for `unsigned long long` type (%s). Falling back to the default device.", SD_VK_DEVICE);
-        }
-    }
+    ggml_backend_t backend = nullptr;
 
     if (!backend) {
         std::string dev_name = get_default_backend_name();
@@ -482,7 +449,6 @@ bool SDBackendManager::init(const char* backend_spec,
                             bool offload_params_to_cpu,
                             bool keep_clip_on_cpu,
                             bool keep_vae_on_cpu,
-                            bool keep_control_net_on_cpu,
                             std::string* error) {
     reset();
 
@@ -499,9 +465,6 @@ bool SDBackendManager::init(const char* backend_spec,
         }
         if (keep_vae_on_cpu) {
             runtime_assignment_.set_module(SDBackendModule::VAE, "cpu");
-        }
-        if (keep_control_net_on_cpu) {
-            runtime_assignment_.set_module(SDBackendModule::CONTROL_NET, "cpu");
         }
     }
 
@@ -658,10 +621,6 @@ const char* sd_backend_module_name(SDBackendModule module) {
             return "clip_vision";
         case SDBackendModule::VAE:
             return "vae";
-        case SDBackendModule::CONTROL_NET:
-            return "controlnet";
-        case SDBackendModule::PHOTOMAKER:
-            return "photomaker";
         case SDBackendModule::UPSCALER:
             return "upscaler";
     }

@@ -280,3 +280,9 @@ add_test(NAME test-htp-host-release-build-contract
                  ${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-htp/test-release-build-contract.sh
                  ${CMAKE_BINARY_DIR}/CMakeCache.txt
                  ${CMAKE_BINARY_DIR}/compile_commands.json)
+
+set(TEST_TARGET test-model-families)
+add_executable(${TEST_TARGET} test-model-families.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../src)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)

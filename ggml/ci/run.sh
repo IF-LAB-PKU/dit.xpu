@@ -10,9 +10,6 @@
 # # with CUDA support
 # GG_BUILD_CUDA=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
-# # With SYCL support
-# GG_BUILD_SYCL=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
-#
 
 if [ -z "$2" ]; then
     echo "usage: $0 <output-dir> <mnt-dir>"
@@ -36,10 +33,6 @@ SRC=`pwd`
 CMAKE_EXTRA=""
 CTEST_EXTRA=""
 
-if [ ! -z ${GG_BUILD_METAL} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_METAL=ON"
-fi
-
 if [ ! -z ${GG_BUILD_CUDA} ]; then
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_CUDA=ON"
 
@@ -55,51 +48,6 @@ if [ ! -z ${GG_BUILD_CUDA} ]; then
         echo "Error: nvidia-smi not found, cannot build with CUDA"
         exit 1
     fi
-fi
-
-if [ ! -z ${GG_BUILD_ROCM} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_HIP=ON"
-    if [ -z ${GG_BUILD_AMDGPU_TARGETS} ]; then
-        echo "Missing GG_BUILD_AMDGPU_TARGETS, please set it to your GPU architecture (e.g. gfx90a, gfx1100, etc.)"
-        exit 1
-    fi
-
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DAMDGPU_TARGETS=${GG_BUILD_AMDGPU_TARGETS}"
-fi
-
-if [ ! -z ${GG_BUILD_SYCL} ]; then
-    if [ -z ${ONEAPI_ROOT} ]; then
-        echo "Not detected ONEAPI_ROOT, please install oneAPI base toolkit and enable it by:"
-        echo "source /opt/intel/oneapi/setvars.sh"
-        exit 1
-    fi
-    # Use only main GPU
-    export ONEAPI_DEVICE_SELECTOR="level_zero:0"
-    # Enable sysman for correct memory reporting
-    export ZES_ENABLE_SYSMAN=1
-    # to circumvent precision issues on CPY operations
-    export SYCL_PROGRAM_COMPILE_OPTIONS="-cl-fp32-correctly-rounded-divide-sqrt"
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_SYCL=1 -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SYCL_F16=ON"
-fi
-
-if [ ! -z ${GG_BUILD_VULKAN} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_VULKAN=1"
-
-    # if on Mac, disable METAL
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_METAL=OFF -DGGML_BLAS=OFF"
-    fi
-
-fi
-
-if [ ! -z ${GG_BUILD_WEBGPU} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_WEBGPU=1"
-fi
-
-if [ ! -z ${GG_BUILD_MUSA} ]; then
-    # Use qy1 by default (MTT S80)
-    MUSA_ARCH=${MUSA_ARCH:-21}
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_MUSA=ON -DMUSA_ARCHITECTURES=${MUSA_ARCH}"
 fi
 
 if [ ! -z ${GG_BUILD_NO_SVE} ]; then

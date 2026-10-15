@@ -17,40 +17,20 @@
 
 #include "auto_encoder_kl.hpp"
 #include "conditioner.hpp"
-#include "control.hpp"
 #include "denoiser.hpp"
 #include "diffusion_model.hpp"
-#include "esrgan.hpp"
 #include "guidance.h"
-#include "lora.hpp"
 #include "ltx_audio_vae.h"
 #include "ltx_latent_upscaler.hpp"
 #include "ltx_vae.hpp"
-#include "pmid.hpp"
 #include "sample-cache.h"
 #include "tae.hpp"
-#include "upscaler.h"
 #include "vae.hpp"
 
 #include "latent-preview.h"
 #include "name_conversion.h"
 
 const char* model_version_to_str[] = {
-    "SD 1.x",
-    "SD 1.x Inpaint",
-    "Instruct-Pix2Pix",
-    "SD 1.x Tiny UNet",
-    "SD 2.x",
-    "SD 2.x Inpaint",
-    "SD 2.x Tiny UNet",
-    "SDXS (512-DS)",
-    "SDXS (09)",
-    "SDXL",
-    "SDXL Inpaint",
-    "SDXL Instruct-Pix2Pix",
-    "SDXL (Vega)",
-    "SDXL (SSD1B)",
-    "SVD",
     "SD3.x",
     "Flux",
     "Flux Fill",
@@ -222,8 +202,6 @@ static float get_cache_reuse_threshold(const sd_cache_params_t& params) {
     if (reuse_threshold == INFINITY) {
         if (params.mode == SD_CACHE_EASYCACHE) {
             reuse_threshold = 0.2f;
-        } else if (params.mode == SD_CACHE_UCACHE) {
-            reuse_threshold = 1.0f;
         }
     }
     return std::max(0.0f, reuse_threshold);
@@ -259,31 +237,20 @@ public:
     float default_flow_shift         = INFINITY;
 
     std::shared_ptr<Conditioner> cond_stage_model;
-    std::shared_ptr<FrozenCLIPVisionEmbedder> clip_vision;  // for svd or wan2.1 i2v
+    std::shared_ptr<FrozenCLIPVisionEmbedder> clip_vision;  // for Wan 2.1 I2V
     std::shared_ptr<DiffusionModel> diffusion_model;
     std::shared_ptr<DiffusionModel> high_noise_diffusion_model;
     std::shared_ptr<VAE> first_stage_model;
     std::shared_ptr<VAE> preview_vae;
     std::shared_ptr<LTXV::LTXAudioVAERunner> audio_vae_model;
-    std::shared_ptr<ControlNet> control_net;
-    std::shared_ptr<PhotoMakerIDEncoder> pmid_model;
-    std::shared_ptr<LoraModel> pmid_lora;
-    std::shared_ptr<PhotoMakerIDEmbed> pmid_id_embeds;
-    std::vector<std::shared_ptr<LoraModel>> cond_stage_lora_models;
-    std::vector<std::shared_ptr<LoraModel>> diffusion_lora_models;
-    std::vector<std::shared_ptr<LoraModel>> first_stage_lora_models;
-    bool apply_lora_immediately = false;
 
     std::string taesd_path;
     sd_tiling_params_t vae_tiling_params = {false, false, 0, 0, 0.5f, 0, 0, nullptr};
     bool offload_params_to_cpu           = false;
     float max_vram                       = 0.f;
-    bool use_pmid                        = false;
     std::string backend_spec;
     std::string params_backend_spec;
 
-    bool is_using_v_parameterization     = false;
-    bool is_using_edm_v_parameterization = false;
 
     std::map<std::string, ggml_tensor*> tensors;
     std::map<std::string, ggml_tensor*> conditioner_tensors;
@@ -291,9 +258,6 @@ public:
     std::map<std::string, ggml_tensor*> vae_tensors;
     std::unique_ptr<ModelLoader> retained_model_loader;
     WeightStage loaded_weight_stage = WeightStage::NONE;
-
-    // lora_name => multiplier
-    std::unordered_map<std::string, float> curr_lora_state;
 
     std::shared_ptr<Denoiser> denoiser = std::make_shared<CompVisDenoiser>();
 
@@ -331,7 +295,6 @@ public:
                                   sd_ctx_params->offload_params_to_cpu,
                                   sd_ctx_params->keep_clip_on_cpu,
                                   sd_ctx_params->keep_vae_on_cpu,
-                                  sd_ctx_params->keep_control_net_on_cpu,
                                   &error)) {
             LOG_ERROR("backend config failed: %s", error.c_str());
             return false;
@@ -412,10 +375,6 @@ public:
                 if (cond_stage_model) {
                     cond_stage_model->alloc_params_buffer();
                 }
-                if (use_pmid && pmid_model && !pmid_model->alloc_params_buffer()) {
-                    LOG_ERROR("PhotoMaker params buffer allocation failed");
-                    return false;
-                }
                 return true;
             case WeightStage::DIFFUSION:
                 if (diffusion_model) {
@@ -452,9 +411,6 @@ public:
                 }
                 if (cond_stage_model) {
                     cond_stage_model->free_params_buffer();
-                }
-                if (pmid_model) {
-                    pmid_model->free_params_buffer();
                 }
                 break;
             case WeightStage::DIFFUSION:
@@ -593,11 +549,9 @@ public:
             }
         }
 
-        bool is_unet = sd_version_is_unet(model_loader.get_sd_version());
-
         if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
             LOG_INFO("loading clip_l from '%s'", sd_ctx_params->clip_l_path);
-            std::string prefix = is_unet ? "cond_stage_model.transformer." : "text_encoders.clip_l.transformer.";
+            std::string prefix = "text_encoders.clip_l.transformer.";
             if (!model_loader.init_from_file(sd_ctx_params->clip_l_path, prefix)) {
                 LOG_WARN("loading clip_l from '%s' failed", sd_ctx_params->clip_l_path);
             }
@@ -605,7 +559,7 @@ public:
 
         if (strlen(SAFE_STR(sd_ctx_params->clip_g_path)) > 0) {
             LOG_INFO("loading clip_g from '%s'", sd_ctx_params->clip_g_path);
-            std::string prefix = is_unet ? "cond_stage_model.1.transformer." : "text_encoders.clip_g.transformer.";
+            std::string prefix = "text_encoders.clip_g.transformer.";
             if (!model_loader.init_from_file(sd_ctx_params->clip_g_path, prefix)) {
                 LOG_WARN("loading clip_g from '%s' failed", sd_ctx_params->clip_g_path);
             }
@@ -677,7 +631,7 @@ public:
 
         version = model_loader.get_sd_version();
         if (version == VERSION_COUNT) {
-            LOG_ERROR("get sd version from file failed: '%s'", SAFE_STR(sd_ctx_params->model_path));
+            LOG_ERROR("Unsupported model; a DiT diffusion model is required: '%s'", SAFE_STR(sd_ctx_params->model_path));
             return false;
         }
 
@@ -718,33 +672,6 @@ public:
 
         LOG_DEBUG("ggml tensor size = %d bytes", (int)sizeof(ggml_tensor));
 
-        if (sd_ctx_params->lora_apply_mode == LORA_APPLY_AUTO) {
-            bool have_quantized_weight = false;
-            if (wtype != GGML_TYPE_COUNT && ggml_is_quantized(wtype)) {
-                have_quantized_weight = true;
-            } else {
-                for (const auto& [type, _] : wtype_stat) {
-                    if (ggml_is_quantized(type)) {
-                        have_quantized_weight = true;
-                        break;
-                    }
-                }
-            }
-            if (have_quantized_weight) {
-                apply_lora_immediately = false;
-            } else {
-                apply_lora_immediately = true;
-            }
-        } else if (sd_ctx_params->lora_apply_mode == LORA_APPLY_IMMEDIATELY) {
-            apply_lora_immediately = true;
-        } else {
-            apply_lora_immediately = false;
-        }
-        if (staged_params_loading && apply_lora_immediately) {
-            LOG_INFO("staged parameter loading uses runtime LoRA adapters");
-            apply_lora_immediately = false;
-        }
-
         std::map<std::string, ggml_tensor*> mmap_able_tensors;
         bool enable_mmap_tensors = false;
         bool needs_writable_mmap = false;
@@ -753,10 +680,6 @@ public:
             LOG_INFO("mmap is disabled while staged parameter loading is enabled");
         }
         if (enable_model_mmap) {
-            if (apply_lora_immediately) {
-                needs_writable_mmap = true;
-                LOG_INFO("in mode 'immediately', LoRAs will cause extra memory usage with mmap");
-            }
             enable_mmap_tensors = true;
         }
 
@@ -806,10 +729,6 @@ public:
             vae_decode_only = false;
         }
         bool tae_preview_only = sd_ctx_params->tae_preview_only;
-        if (version == VERSION_SDXS_512_DS || version == VERSION_SDXS_09) {
-            tae_preview_only = false;
-            use_tae          = true;
-        }
 
         if (sd_ctx_params->circular_x || sd_ctx_params->circular_y) {
             LOG_INFO("Using circular padding for convolutions");
@@ -990,33 +909,9 @@ public:
                                                                     params_backend_for(SDBackendModule::DIFFUSION),
                                                                     tensor_storage_map,
                                                                     "model.diffusion_model");
-            } else {  // SD1.x SD2.x SDXL
-                std::map<std::string, std::string> embbeding_map;
-                for (uint32_t i = 0; i < sd_ctx_params->embedding_count; i++) {
-                    embbeding_map.emplace(SAFE_STR(sd_ctx_params->embeddings[i].name), SAFE_STR(sd_ctx_params->embeddings[i].path));
-                }
-                if (strstr(SAFE_STR(sd_ctx_params->photo_maker_path), "v2")) {
-                    cond_stage_model = std::make_shared<FrozenCLIPEmbedderWithCustomWords>(backend_for(SDBackendModule::TE),
-                                                                                           params_backend_for(SDBackendModule::TE),
-                                                                                           tensor_storage_map,
-                                                                                           embbeding_map,
-                                                                                           version,
-                                                                                           PM_VERSION_2);
-                } else {
-                    cond_stage_model = std::make_shared<FrozenCLIPEmbedderWithCustomWords>(backend_for(SDBackendModule::TE),
-                                                                                           params_backend_for(SDBackendModule::TE),
-                                                                                           tensor_storage_map,
-                                                                                           embbeding_map,
-                                                                                           version);
-                }
-                diffusion_model = std::make_shared<UNetModel>(backend_for(SDBackendModule::DIFFUSION),
-                                                              params_backend_for(SDBackendModule::DIFFUSION),
-                                                              tensor_storage_map,
-                                                              version);
-                if (sd_ctx_params->diffusion_conv_direct) {
-                    LOG_INFO("Using Conv2d direct in the diffusion model");
-                    std::dynamic_pointer_cast<UNetModel>(diffusion_model)->unet.set_conv2d_direct_enabled(true);
-                }
+            } else {
+                LOG_ERROR("Only DiT diffusion models are supported");
+                return false;
             }
 
             cond_stage_model->set_max_graph_vram_bytes(max_graph_vram_bytes);
@@ -1028,10 +923,6 @@ public:
             get_param_tensors(diffusion_model,
                               module_can_mmap(SDBackendModule::DIFFUSION),
                               &diffusion_tensors);
-
-            if (sd_version_is_unet_edit(version)) {
-                vae_decode_only = false;
-            }
 
             if (high_noise_diffusion_model) {
                 high_noise_diffusion_model->set_max_graph_vram_bytes(max_graph_vram_bytes);
@@ -1055,7 +946,6 @@ public:
                                                                   "decoder",
                                                                   vae_decode_only,
                                                                   version);
-
                 } else {
                     auto model = std::make_shared<TinyImageAutoEncoder>(backend_for(SDBackendModule::VAE),
                                                                         params_backend_for(SDBackendModule::VAE),
@@ -1090,17 +980,7 @@ public:
                                                                  tensor_storage_map,
                                                                  "first_stage_model",
                                                                  vae_decode_only,
-                                                                 false,
                                                                  version);
-                    if (sd_version_is_sdxl(version) &&
-                        (strlen(SAFE_STR(sd_ctx_params->vae_path)) == 0 || sd_ctx_params->force_sdxl_vae_conv_scale || external_vae_is_invalid)) {
-                        float vae_conv_2d_scale = 1.f / 32.f;
-                        LOG_WARN(
-                            "No valid VAE specified with --vae or --force-sdxl-vae-conv-scale flag set, "
-                            "using Conv2D scale %.3f",
-                            vae_conv_2d_scale);
-                        model->set_conv2d_scale(vae_conv_2d_scale);
-                    }
                     return model;
                 }
             };
@@ -1148,69 +1028,6 @@ public:
                 }
             }
 
-            if (strlen(SAFE_STR(sd_ctx_params->control_net_path)) > 0) {
-                if (!ensure_backend_pair(SDBackendModule::CONTROL_NET)) {
-                    return false;
-                }
-                control_net = std::make_shared<ControlNet>(backend_for(SDBackendModule::CONTROL_NET),
-                                                           params_backend_for(SDBackendModule::CONTROL_NET),
-                                                           tensor_storage_map,
-                                                           version);
-                if (sd_ctx_params->diffusion_conv_direct) {
-                    LOG_INFO("Using Conv2d direct in the control net");
-                    control_net->set_conv2d_direct_enabled(true);
-                }
-            }
-
-            if (strlen(SAFE_STR(sd_ctx_params->photo_maker_path)) > 0) {
-                if (!ensure_backend_pair(SDBackendModule::PHOTOMAKER)) {
-                    return false;
-                }
-                if (strstr(SAFE_STR(sd_ctx_params->photo_maker_path), "v2")) {
-                    pmid_model = std::make_shared<PhotoMakerIDEncoder>(backend_for(SDBackendModule::PHOTOMAKER),
-                                                                       params_backend_for(SDBackendModule::PHOTOMAKER),
-                                                                       tensor_storage_map,
-                                                                       "pmid",
-                                                                       version,
-                                                                       PM_VERSION_2);
-                    LOG_INFO("using PhotoMaker Version 2");
-                } else {
-                    pmid_model = std::make_shared<PhotoMakerIDEncoder>(backend_for(SDBackendModule::PHOTOMAKER),
-                                                                       params_backend_for(SDBackendModule::PHOTOMAKER),
-                                                                       tensor_storage_map,
-                                                                       "pmid",
-                                                                       version);
-                }
-                pmid_lora               = std::make_shared<LoraModel>("pmid",
-                                                        backend_for(SDBackendModule::PHOTOMAKER),
-                                                        params_backend_for(SDBackendModule::PHOTOMAKER),
-                                                        sd_ctx_params->photo_maker_path,
-                                                        "",
-                                                        version);
-                auto lora_tensor_filter = [&](const std::string& tensor_name) {
-                    if (starts_with(tensor_name, "lora.model")) {
-                        return true;
-                    }
-                    return false;
-                };
-                if (!pmid_lora->load_from_file(n_threads, lora_tensor_filter)) {
-                    LOG_WARN("load photomaker lora tensors from %s failed", sd_ctx_params->photo_maker_path);
-                    return false;
-                }
-                LOG_INFO("loading stacked ID embedding (PHOTOMAKER) model file from '%s'", sd_ctx_params->photo_maker_path);
-                if (!model_loader.init_from_file_and_convert_name(sd_ctx_params->photo_maker_path, "pmid.")) {
-                    LOG_WARN("loading stacked ID embedding from '%s' failed", sd_ctx_params->photo_maker_path);
-                } else {
-                    use_pmid = true;
-                }
-            }
-            if (use_pmid) {
-                get_param_tensors_p(pmid_model,
-                                    module_can_mmap(SDBackendModule::PHOTOMAKER),
-                                    "pmid",
-                                    &conditioner_tensors);
-            }
-
             if (sd_ctx_params->flash_attn) {
                 LOG_INFO("Using flash attention");
                 cond_stage_model->set_flash_attention_enabled(true);
@@ -1236,9 +1053,6 @@ public:
             diffusion_model->set_circular_axes(sd_ctx_params->circular_x, sd_ctx_params->circular_y);
             if (high_noise_diffusion_model) {
                 high_noise_diffusion_model->set_circular_axes(sd_ctx_params->circular_x, sd_ctx_params->circular_y);
-            }
-            if (control_net) {
-                control_net->set_circular_axes(sd_ctx_params->circular_x, sd_ctx_params->circular_y);
             }
             circular_x = sd_ctx_params->circular_x;
             circular_y = sd_ctx_params->circular_y;
@@ -1268,7 +1082,7 @@ public:
         params.mem_buffer = nullptr;
         params.no_alloc   = false;
         // LOG_DEBUG("mem_size %u ", params.mem_size);
-        ggml_context* ctx = ggml_init(params);  // for  alphas_cumprod and is_using_v_parameterization check
+        ggml_context* ctx = ggml_init(params);  // for alphas_cumprod
         GGML_ASSERT(ctx != nullptr);
         ggml_tensor* alphas_cumprod_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, TIMESTEPS);
         calculate_alphas_cumprod((float*)alphas_cumprod_tensor->data);
@@ -1280,9 +1094,6 @@ public:
         tensors["alphas_cumprod"] = alphas_cumprod_tensor;
         if (use_tae && !tae_preview_only) {
             ignore_tensors.insert("first_stage_model.");
-        }
-        if (use_pmid) {
-            ignore_tensors.insert("pmid.unet.");
         }
         ignore_tensors.insert("model.diffusion_model.__x0__");
         ignore_tensors.insert("model.diffusion_model.__32x32__");
@@ -1302,9 +1113,6 @@ public:
             ignore_tensors.insert("text_encoders.llm.vision_model.");
             ignore_tensors.insert("text_encoders.llm.visual_tokenizer.");
             ignore_tensors.insert("text_encoders.llm.vte.");
-        }
-        if (version == VERSION_SVD) {
-            ignore_tensors.insert("conditioner.embedders.3");
         }
         if (sd_version_is_ernie_image(version)) {
             ignore_tensors.insert("text_encoders.llm.vision_tower.");
@@ -1388,11 +1196,6 @@ public:
                 ggml_free(ctx);
                 return false;
             }
-            if (use_pmid && pmid_model && !pmid_model->alloc_params_buffer()) {
-                LOG_ERROR("PhotoMaker params buffer allocation failed");
-                ggml_free(ctx);
-                return false;
-            }
 
             bool success = model_loader.load_tensors(tensors, ignore_tensors, n_threads, enable_model_mmap);
             if (!success) {
@@ -1408,9 +1211,9 @@ public:
 
         {
             size_t clip_params_mem_size = cond_stage_model->get_params_buffer_size();
-            size_t unet_params_mem_size = diffusion_model->get_params_buffer_size();
+            size_t diffusion_params_mem_size = diffusion_model->get_params_buffer_size();
             if (high_noise_diffusion_model) {
-                unet_params_mem_size += high_noise_diffusion_model->get_params_buffer_size();
+                diffusion_params_mem_size += high_noise_diffusion_model->get_params_buffer_size();
             }
             size_t vae_params_mem_size = 0;
             vae_params_mem_size        = first_stage_model->get_params_buffer_size();
@@ -1419,18 +1222,6 @@ public:
             }
             if (audio_vae_model) {
                 vae_params_mem_size += audio_vae_model->get_params_buffer_size();
-            }
-            size_t control_net_params_mem_size = 0;
-            if (control_net) {
-                if (!control_net->load_from_file(SAFE_STR(sd_ctx_params->control_net_path), n_threads)) {
-                    ggml_free(ctx);
-                    return false;
-                }
-                control_net_params_mem_size = control_net->get_params_buffer_size();
-            }
-            size_t pmid_params_mem_size = 0;
-            if (use_pmid) {
-                pmid_params_mem_size = pmid_model->get_params_buffer_size();
             }
 
             size_t total_params_ram_size  = 0;
@@ -1462,31 +1253,24 @@ public:
             };
 
             if (!add_params_memory(clip_params_mem_size, SDBackendModule::TE) ||
-                !add_params_memory(pmid_params_mem_size, SDBackendModule::PHOTOMAKER) ||
-                !add_params_memory(unet_params_mem_size, SDBackendModule::DIFFUSION) ||
-                !add_params_memory(vae_params_mem_size, SDBackendModule::VAE) ||
-                !add_params_memory(control_net_params_mem_size, SDBackendModule::CONTROL_NET)) {
+                !add_params_memory(diffusion_params_mem_size, SDBackendModule::DIFFUSION) ||
+                !add_params_memory(vae_params_mem_size, SDBackendModule::VAE)) {
                 ggml_free(ctx);
                 return false;
             }
-
             size_t total_params_size = total_params_ram_size + total_params_vram_size;
             LOG_INFO(
                 "total params memory size = %.2fMB (VRAM %.2fMB, RAM %.2fMB): "
-                "text_encoders %.2fMB(%s), diffusion_model %.2fMB(%s), vae %.2fMB(%s), controlnet %.2fMB(%s), pmid %.2fMB(%s)",
+                "text_encoders %.2fMB(%s), diffusion_model %.2fMB(%s), vae %.2fMB(%s)",
                 total_params_size / 1024.0 / 1024.0,
                 total_params_vram_size / 1024.0 / 1024.0,
                 total_params_ram_size / 1024.0 / 1024.0,
                 clip_params_mem_size / 1024.0 / 1024.0,
                 params_memory_location(clip_params_mem_size, SDBackendModule::TE),
-                unet_params_mem_size / 1024.0 / 1024.0,
-                params_memory_location(unet_params_mem_size, SDBackendModule::DIFFUSION),
+                diffusion_params_mem_size / 1024.0 / 1024.0,
+                params_memory_location(diffusion_params_mem_size, SDBackendModule::DIFFUSION),
                 vae_params_mem_size / 1024.0 / 1024.0,
-                params_memory_location(vae_params_mem_size, SDBackendModule::VAE),
-                control_net_params_mem_size / 1024.0 / 1024.0,
-                params_memory_location(control_net_params_mem_size, SDBackendModule::CONTROL_NET),
-                pmid_params_mem_size / 1024.0 / 1024.0,
-                params_memory_location(pmid_params_mem_size, SDBackendModule::PHOTOMAKER));
+                params_memory_location(vae_params_mem_size, SDBackendModule::VAE));
         }
 
         // init denoiser
@@ -1494,32 +1278,7 @@ public:
             prediction_t pred_type = sd_ctx_params->prediction;
 
             if (pred_type == PREDICTION_COUNT) {
-                if (sd_version_is_sd2(version)) {
-                    // check is_using_v_parameterization_for_sd2
-                    if (staged_params_loading && !ensure_weight_stage(WeightStage::DIFFUSION)) {
-                        ggml_free(ctx);
-                        return false;
-                    }
-                    if (is_using_v_parameterization_for_sd2(sd_version_is_inpaint(version))) {
-                        pred_type = V_PRED;
-                    } else {
-                        pred_type = EPS_PRED;
-                    }
-                    if (staged_params_loading && !ensure_weight_stage(WeightStage::CONDITIONER)) {
-                        ggml_free(ctx);
-                        return false;
-                    }
-                } else if (sd_version_is_sdxl(version)) {
-                    if (tensor_storage_map.find("edm_vpred.sigma_max") != tensor_storage_map.end()) {
-                        // CosXL models
-                        // TODO: get sigma_min and sigma_max values from file
-                        pred_type = EDM_V_PRED;
-                    } else if (tensor_storage_map.find("v_pred") != tensor_storage_map.end()) {
-                        pred_type = V_PRED;
-                    } else {
-                        pred_type = EPS_PRED;
-                    }
-                } else if (sd_version_is_sd3(version) ||
+                if (sd_version_is_sd3(version) ||
                            sd_version_is_ltxav(version) ||
                            sd_version_is_wan(version) ||
                            sd_version_is_qwen_image(version) ||
@@ -1607,369 +1366,6 @@ public:
 
         ggml_free(ctx);
         return true;
-    }
-
-    bool is_using_v_parameterization_for_sd2(bool is_inpaint = false) {
-        sd::Tensor<float> x_t   = sd::full<float>({8, 8, 4, 1}, 0.5f);
-        sd::Tensor<float> c     = sd::full<float>({1024, 2, 1, 1}, 0.5f);
-        sd::Tensor<float> steps = sd::full<float>({1}, 999.0f);
-        sd::Tensor<float> concat;
-        if (is_inpaint) {
-            concat = sd::zeros<float>({8, 8, 5, 1});
-        }
-
-        int64_t t0 = ggml_time_ms();
-        sd::Tensor<float> out;
-        DiffusionParams diffusion_params;
-        diffusion_params.x         = &x_t;
-        diffusion_params.timesteps = &steps;
-        diffusion_params.context   = &c;
-        if (!concat.empty()) {
-            diffusion_params.c_concat = &concat;
-        }
-        auto out_opt = diffusion_model->compute(n_threads, diffusion_params);
-        GGML_ASSERT(!out_opt.empty());
-        out = std::move(out_opt);
-        diffusion_model->free_compute_buffer();
-
-        double result = static_cast<double>((out - x_t).mean());
-        int64_t t1    = ggml_time_ms();
-        LOG_DEBUG("check is_using_v_parameterization_for_sd2, taking %.2fs", (t1 - t0) * 1.0f / 1000);
-        return result < -1;
-    }
-
-    std::shared_ptr<LoraModel> load_lora_model_from_file(const std::string& lora_id,
-                                                         float multiplier,
-                                                         SDBackendModule module,
-                                                         LoraModel::filter_t lora_tensor_filter = nullptr) {
-        std::string lora_path             = lora_id;
-        static std::string high_noise_tag = "|high_noise|";
-        bool is_high_noise                = false;
-        if (starts_with(lora_path, high_noise_tag)) {
-            lora_path     = lora_path.substr(high_noise_tag.size());
-            is_high_noise = true;
-            LOG_DEBUG("high noise lora: %s", lora_path.c_str());
-        }
-        if (!ensure_backend_pair(module)) {
-            return nullptr;
-        }
-        auto lora = std::make_shared<LoraModel>(lora_id,
-                                                backend_for(module),
-                                                backend_for(module),
-                                                lora_path,
-                                                is_high_noise ? "model.high_noise_" : "",
-                                                version);
-        if (!lora->load_from_file(n_threads, lora_tensor_filter)) {
-            LOG_WARN("load lora tensors from %s failed", lora_path.c_str());
-            return nullptr;
-        }
-
-        lora->multiplier = multiplier;
-        return lora;
-    }
-
-    void apply_loras_immediately(const std::unordered_map<std::string, float>& lora_state) {
-        std::unordered_map<std::string, float> lora_state_diff;
-        for (auto& kv : lora_state) {
-            const std::string& lora_name = kv.first;
-            float multiplier             = kv.second;
-            lora_state_diff[lora_name] += multiplier;
-        }
-        for (auto& kv : curr_lora_state) {
-            const std::string& lora_name = kv.first;
-            float curr_multiplier        = kv.second;
-            lora_state_diff[lora_name] -= curr_multiplier;
-        }
-
-        if (lora_state_diff.empty()) {
-            return;
-        }
-
-        LOG_INFO("apply lora immediately");
-
-        size_t rm = lora_state_diff.size() - lora_state.size();
-        if (rm != 0) {
-            LOG_INFO("attempting to apply %lu LoRAs (removing %lu applied LoRAs)", lora_state.size(), rm);
-        } else {
-            LOG_INFO("attempting to apply %lu LoRAs", lora_state.size());
-        }
-
-        for (auto& kv : lora_state_diff) {
-            int64_t t0 = ggml_time_ms();
-
-            auto lora = load_lora_model_from_file(kv.first, kv.second, SDBackendModule::DIFFUSION);
-            if (!lora || lora->lora_tensors.empty()) {
-                continue;
-            }
-            lora->apply(tensors, version, n_threads);
-            lora->free_params_buffer();
-
-            int64_t t1 = ggml_time_ms();
-
-            LOG_INFO("lora '%s' applied, taking %.2fs", kv.first.c_str(), (t1 - t0) * 1.0f / 1000);
-        }
-
-        curr_lora_state = lora_state;
-    }
-
-    void apply_loras_at_runtime(const std::unordered_map<std::string, float>& lora_state) {
-        cond_stage_lora_models.clear();
-        diffusion_lora_models.clear();
-        first_stage_lora_models.clear();
-        if (cond_stage_model) {
-            cond_stage_model->set_weight_adapter(nullptr);
-        }
-        if (diffusion_model) {
-            diffusion_model->set_weight_adapter(nullptr);
-        }
-        if (high_noise_diffusion_model) {
-            high_noise_diffusion_model->set_weight_adapter(nullptr);
-        }
-        if (first_stage_model) {
-            first_stage_model->set_weight_adapter(nullptr);
-        }
-        if (lora_state.empty()) {
-            return;
-        }
-        LOG_INFO("apply lora at runtime");
-        if (cond_stage_model) {
-            std::vector<std::shared_ptr<LoraModel>> lora_models;
-            auto lora_state_diff = lora_state;
-            for (auto& lora_model : cond_stage_lora_models) {
-                auto iter = lora_state_diff.find(lora_model->lora_id);
-
-                if (iter != lora_state_diff.end()) {
-                    lora_model->multiplier = iter->second;
-                    lora_models.push_back(lora_model);
-                    lora_state_diff.erase(iter);
-                }
-            }
-            cond_stage_lora_models  = lora_models;
-            auto lora_tensor_filter = [&](const std::string& tensor_name) {
-                if (is_cond_stage_model_name(tensor_name)) {
-                    return true;
-                }
-                return false;
-            };
-            for (auto& kv : lora_state_diff) {
-                const std::string& lora_id = kv.first;
-                float multiplier           = kv.second;
-
-                auto lora = load_lora_model_from_file(lora_id, multiplier, SDBackendModule::TE, lora_tensor_filter);
-                if (lora && !lora->lora_tensors.empty()) {
-                    lora->preprocess_lora_tensors(tensors);
-                    cond_stage_lora_models.push_back(lora);
-                }
-            }
-            // Only attach the adapter when there are LoRAs targeting the cond_stage model.
-            // An empty MultiLoraAdapter still routes every linear/conv through
-            // forward_with_lora() instead of the direct kernel path — slower for no benefit.
-            if (!cond_stage_lora_models.empty()) {
-                auto multi_lora_adapter = std::make_shared<MultiLoraAdapter>(cond_stage_lora_models);
-                cond_stage_model->set_weight_adapter(multi_lora_adapter);
-            }
-        }
-        if (diffusion_model) {
-            std::vector<std::shared_ptr<LoraModel>> lora_models;
-            auto lora_state_diff = lora_state;
-            for (auto& lora_model : diffusion_lora_models) {
-                auto iter = lora_state_diff.find(lora_model->lora_id);
-
-                if (iter != lora_state_diff.end()) {
-                    lora_model->multiplier = iter->second;
-                    lora_models.push_back(lora_model);
-                    lora_state_diff.erase(iter);
-                }
-            }
-            diffusion_lora_models   = lora_models;
-            auto lora_tensor_filter = [&](const std::string& tensor_name) {
-                if (is_diffusion_model_name(tensor_name)) {
-                    return true;
-                }
-                return false;
-            };
-            for (auto& kv : lora_state_diff) {
-                const std::string& lora_name = kv.first;
-                float multiplier             = kv.second;
-
-                auto lora = load_lora_model_from_file(lora_name, multiplier, SDBackendModule::DIFFUSION, lora_tensor_filter);
-                if (lora && !lora->lora_tensors.empty()) {
-                    lora->preprocess_lora_tensors(tensors);
-                    diffusion_lora_models.push_back(lora);
-                }
-            }
-            if (!diffusion_lora_models.empty()) {
-                auto multi_lora_adapter = std::make_shared<MultiLoraAdapter>(diffusion_lora_models);
-                diffusion_model->set_weight_adapter(multi_lora_adapter);
-                if (high_noise_diffusion_model) {
-                    high_noise_diffusion_model->set_weight_adapter(multi_lora_adapter);
-                }
-            }
-        }
-
-        if (first_stage_model) {
-            std::vector<std::shared_ptr<LoraModel>> lora_models;
-            auto lora_state_diff = lora_state;
-            for (auto& lora_model : first_stage_lora_models) {
-                auto iter = lora_state_diff.find(lora_model->lora_id);
-
-                if (iter != lora_state_diff.end()) {
-                    lora_model->multiplier = iter->second;
-                    lora_models.push_back(lora_model);
-                    lora_state_diff.erase(iter);
-                }
-            }
-            first_stage_lora_models = lora_models;
-            auto lora_tensor_filter = [&](const std::string& tensor_name) {
-                if (is_first_stage_model_name(tensor_name)) {
-                    return true;
-                }
-                return false;
-            };
-            for (auto& kv : lora_state_diff) {
-                const std::string& lora_name = kv.first;
-                float multiplier             = kv.second;
-
-                auto lora = load_lora_model_from_file(lora_name, multiplier, SDBackendModule::VAE, lora_tensor_filter);
-                if (lora && !lora->lora_tensors.empty()) {
-                    lora->preprocess_lora_tensors(tensors);
-                    first_stage_lora_models.push_back(lora);
-                }
-            }
-            if (!first_stage_lora_models.empty()) {
-                auto multi_lora_adapter = std::make_shared<MultiLoraAdapter>(first_stage_lora_models);
-                first_stage_model->set_weight_adapter(multi_lora_adapter);
-            }
-        }
-    }
-
-    void lora_stat() {
-        if (!cond_stage_lora_models.empty()) {
-            LOG_INFO("cond_stage_lora_models:");
-            for (auto& lora_model : cond_stage_lora_models) {
-                lora_model->stat();
-            }
-        }
-
-        if (!diffusion_lora_models.empty()) {
-            LOG_INFO("diffusion_lora_models:");
-            for (auto& lora_model : diffusion_lora_models) {
-                lora_model->stat();
-            }
-        }
-
-        if (!first_stage_lora_models.empty()) {
-            LOG_INFO("first_stage_lora_models:");
-            for (auto& lora_model : first_stage_lora_models) {
-                lora_model->stat();
-            }
-        }
-    }
-
-    void apply_loras(const sd_lora_t* loras, uint32_t lora_count) {
-        std::unordered_map<std::string, float> lora_f2m;
-        for (uint32_t i = 0; i < lora_count; i++) {
-            std::string lora_id = SAFE_STR(loras[i].path);
-            if (loras[i].is_high_noise) {
-                lora_id = "|high_noise|" + lora_id;
-            }
-            lora_f2m[lora_id] = loras[i].multiplier;
-            LOG_DEBUG("lora %s:%.2f", lora_id.c_str(), loras[i].multiplier);
-        }
-        int64_t t0 = ggml_time_ms();
-        if (apply_lora_immediately) {
-            apply_loras_immediately(lora_f2m);
-        } else {
-            apply_loras_at_runtime(lora_f2m);
-        }
-        int64_t t1 = ggml_time_ms();
-        if (!lora_f2m.empty()) {
-            LOG_INFO("apply_loras completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
-        }
-    }
-
-    SDCondition get_pmid_conditon(sd_pm_params_t pm_params,
-                                  ConditionerParams& condition_params) {
-        SDCondition id_cond;
-        if (use_pmid) {
-            if (!pmid_lora->applied) {
-                int64_t t0 = ggml_time_ms();
-                pmid_lora->apply(tensors, version, n_threads);
-                int64_t t1         = ggml_time_ms();
-                pmid_lora->applied = true;
-                LOG_INFO("pmid_lora apply completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
-                if (free_params_immediately) {
-                    pmid_lora->free_params_buffer();
-                }
-            }
-            // preprocess input id images
-            bool pmv2 = pmid_model->get_version() == PM_VERSION_2;
-            if (pm_params.id_images_count > 0) {
-                int clip_image_size        = 224;
-                pmid_model->style_strength = pm_params.style_strength;
-                sd::Tensor<float> id_image_tensor;
-                for (int i = 0; i < pm_params.id_images_count; i++) {
-                    auto id_image           = sd_image_to_tensor(pm_params.id_images[i]);
-                    auto processed_id_image = clip_preprocess(id_image, clip_image_size, clip_image_size);
-                    if (id_image_tensor.empty()) {
-                        id_image_tensor = processed_id_image;
-                    } else {
-                        id_image_tensor = sd::ops::concat(id_image_tensor, processed_id_image, 3);
-                    }
-                }
-
-                int64_t t0                      = ggml_time_ms();
-                condition_params.num_input_imgs = pm_params.id_images_count;
-                auto cond_tup                   = cond_stage_model->get_learned_condition_with_trigger(n_threads,
-                                                                                                       condition_params);
-                id_cond                         = std::get<0>(cond_tup);
-                auto class_tokens_mask          = std::get<1>(cond_tup);
-                sd::Tensor<float> id_embeds;
-                if (pmv2 && pm_params.id_embed_path != nullptr) {
-                    try {
-                        id_embeds = sd::load_tensor_from_file_as_tensor<float>(pm_params.id_embed_path);
-                    } catch (const std::exception&) {
-                        id_embeds = {};
-                    }
-                }
-                if (pmv2 && id_embeds.empty()) {
-                    LOG_WARN("Provided PhotoMaker images, but NO valid ID embeds file for PM v2");
-                    LOG_WARN("Turn off PhotoMaker");
-                    use_pmid = false;
-                } else {
-                    if (pmv2 && pm_params.id_images_count != id_embeds.shape()[1]) {
-                        LOG_WARN("PhotoMaker image count (%d) does NOT match ID embeds (%d). You should run face_detect.py again.", pm_params.id_images_count, static_cast<int>(id_embeds.shape()[1]));
-                        LOG_WARN("Turn off PhotoMaker");
-                        use_pmid = false;
-                    } else {
-                        auto res = pmid_model->compute(n_threads,
-                                                       id_image_tensor,
-                                                       id_cond.c_crossattn,
-                                                       id_embeds,
-                                                       class_tokens_mask);
-                        if (res.empty()) {
-                            LOG_ERROR("Photomaker ID Stacking failed");
-                            LOG_WARN("Turn off PhotoMaker");
-                            use_pmid = false;
-                        } else {
-                            id_cond.c_crossattn = std::move(res);
-                            int64_t t1          = ggml_time_ms();
-                            LOG_INFO("Photomaker ID Stacking, taking %" PRId64 " ms", t1 - t0);
-                            // Encode input prompt without the trigger word for delayed conditioning
-                            condition_params.text = cond_stage_model->remove_trigger_from_prompt(condition_params.text);
-                        }
-                        if (free_params_immediately) {
-                            pmid_model->free_params_buffer();
-                        }
-                    }
-                }
-            } else {
-                LOG_WARN("Provided PhotoMaker model file, but NO input ID images");
-                LOG_WARN("Turn off PhotoMaker");
-                use_pmid = false;
-            }
-        }
-        return id_cond;
     }
 
     sd::Tensor<float> get_clip_vision_output(const sd::Tensor<float>& image,
@@ -2097,17 +1493,6 @@ public:
                     LOG_WARN("No latent to RGB projection known for this model");
                     return;
                 }
-            } else if (channels == 4) {
-                if (sd_version_is_sdxl(version)) {
-                    latent_rgb_proj = sdxl_latent_rgb_proj;
-                    latent_rgb_bias = sdxl_latent_rgb_bias;
-                } else if (sd_version_is_sd1(version) || sd_version_is_sd2(version)) {
-                    latent_rgb_proj = sd_latent_rgb_proj;
-                    latent_rgb_bias = sd_latent_rgb_bias;
-                } else {
-                    LOG_WARN("No latent to RGB projection known for this model");
-                    return;
-                }
             } else if (channels != 3) {
                 LOG_WARN("No latent to RGB projection known for this model (dim = %d)", dim);
                 return;
@@ -2169,16 +1554,8 @@ public:
         }
     }
 
-    std::vector<float> prepare_sample_timesteps(float sigma,
-                                                int shifted_timestep) {
+    std::vector<float> prepare_sample_timesteps(float sigma) {
         float t = denoiser->sigma_to_t(sigma);
-        if (shifted_timestep > 0) {
-            float shifted_t_float = t * (float(shifted_timestep) / float(TIMESTEPS));
-            int64_t shifted_t     = static_cast<int64_t>(roundf(shifted_t_float));
-            shifted_t             = std::max((int64_t)0, std::min((int64_t)(TIMESTEPS - 1), shifted_t));
-            LOG_DEBUG("shifting timestep from %.2f to %" PRId64 " (sigma: %.4f)", t, shifted_t, sigma);
-            return std::vector<float>{(float)shifted_t};
-        }
         if (sd_version_is_anima(version)) {
             return std::vector<float>{t / static_cast<float>(TIMESTEPS)};
         }
@@ -2189,28 +1566,6 @@ public:
             return std::vector<float>{1000.f - t};
         }
         return std::vector<float>{t};
-    }
-
-    void adjust_sample_step_scalings(int shifted_timestep,
-                                     const std::vector<float>& timesteps_vec,
-                                     float c_in,
-                                     float* c_skip,
-                                     float* c_out) {
-        GGML_ASSERT(c_skip != nullptr);
-        GGML_ASSERT(c_out != nullptr);
-        if (shifted_timestep <= 0) {
-            return;
-        }
-
-        int64_t shifted_t_idx              = static_cast<int64_t>(roundf(timesteps_vec[0]));
-        float shifted_sigma                = denoiser->t_to_sigma((float)shifted_t_idx);
-        std::vector<float> shifted_scaling = denoiser->get_scalings(shifted_sigma);
-        float shifted_c_skip               = shifted_scaling[0];
-        float shifted_c_out                = shifted_scaling[1];
-        float shifted_c_in                 = shifted_scaling[2];
-
-        *c_skip = shifted_c_skip * c_in / shifted_c_in;
-        *c_out  = shifted_c_out;
     }
 
     struct SamplePreviewContext {
@@ -2233,31 +1588,6 @@ public:
         }
     }
 
-    void compute_sample_controls(const sd::Tensor<float>& control_image,
-                                 const sd::Tensor<float>& noised_input,
-                                 const sd::Tensor<float>& timesteps_tensor,
-                                 const SDCondition& condition,
-                                 std::vector<sd::Tensor<float>>* controls) {
-        GGML_ASSERT(controls != nullptr);
-        controls->clear();
-        if (control_image.empty() || control_net == nullptr) {
-            return;
-        }
-
-        auto control_result = control_net->compute(n_threads,
-                                                   noised_input,
-                                                   control_image,
-                                                   timesteps_tensor,
-                                                   condition.c_crossattn,
-                                                   condition.c_vector);
-        if (!control_result.has_value()) {
-            LOG_ERROR("controlnet compute failed");
-            return;
-        }
-
-        *controls = std::move(*control_result);
-    }
-
     sd::Tensor<float> sample(const std::shared_ptr<DiffusionModel>& work_diffusion_model,
                              bool inverse_noise_scaling,
                              const sd::Tensor<float>& init_latent,
@@ -2265,17 +1595,12 @@ public:
                              const SDCondition& cond,
                              const SDCondition& uncond,
                              const SDCondition& img_cond,
-                             const SDCondition& id_cond,
-                             const sd::Tensor<float>& control_image,
-                             float control_strength,
                              const sd_guidance_params_t& guidance,
                              float eta,
-                             int shifted_timestep,
                              sample_method_t method,
                              bool is_flow_denoiser,
                              const char* extra_sample_args,
                              const std::vector<float>& sigmas,
-                             int start_merge_step,
                              const std::vector<sd::Tensor<float>>& ref_latents,
                              bool increase_ref_index,
                              const sd::Tensor<float>& denoise_mask,
@@ -2448,7 +1773,7 @@ public:
             float c_out  = scaling[1];
             float c_in   = scaling[2];
 
-            std::vector<float> base_timesteps_vec = prepare_sample_timesteps(sigma, shifted_timestep);
+            std::vector<float> base_timesteps_vec = prepare_sample_timesteps(sigma);
             std::vector<float> timesteps_vec      = base_timesteps_vec;
             sd::Tensor<float> audio_timesteps_tensor;
             if (sd_version_is_ltxav(version) && !denoise_mask.empty()) {
@@ -2457,10 +1782,6 @@ public:
             } else {
                 timesteps_vec = process_timesteps(timesteps_vec, init_latent, denoise_mask);
             }
-            const std::vector<float>& scaling_timesteps_vec = (sd_version_is_ltxav(version) && !denoise_mask.empty())
-                                                                  ? base_timesteps_vec
-                                                                  : timesteps_vec;
-            adjust_sample_step_scalings(shifted_timestep, scaling_timesteps_vec, c_in, &c_skip, &c_out);
 
             sd::Tensor<float> timesteps_tensor({static_cast<int64_t>(timesteps_vec.size())}, timesteps_vec);
             sd::Tensor<float> guidance_tensor({1}, std::vector<float>{guidance.distilled_guidance});
@@ -2491,7 +1812,6 @@ public:
             sd::Tensor<float> uncond_out;
             sd::Tensor<float> img_cond_out;
             sd_sample::SampleStepCacheDispatcher step_cache(cache_runtime, step, sigma);
-            std::vector<sd::Tensor<float>> controls;
             DiffusionParams diffusion_params;
             diffusion_params.x                  = &noised_input;
             diffusion_params.timesteps          = &timesteps_tensor;
@@ -2505,20 +1825,12 @@ public:
             diffusion_params.guidance           = &guidance_tensor;
             diffusion_params.ref_latents        = &ref_latents;
             diffusion_params.increase_ref_index = increase_ref_index;
-            diffusion_params.controls           = &controls;
-            diffusion_params.control_strength   = control_strength;
             diffusion_params.vace_context       = vace_context.empty() ? nullptr : &vace_context;
             diffusion_params.vace_strength      = vace_strength;
             diffusion_params.audio_length       = audio_length;
             diffusion_params.frame_rate         = frame_rate;
             diffusion_params.video_positions    = video_positions.empty() ? nullptr : &video_positions;
             diffusion_params.skip_layers        = nullptr;
-
-            compute_sample_controls(control_image,
-                                    noised_input,
-                                    timesteps_tensor,
-                                    cond,
-                                    &controls);
 
             auto run_condition = [&](const SDCondition& condition,
                                      int block_sparse_residual_branch_index,
@@ -2566,29 +1878,12 @@ public:
                 return output_opt;
             };
 
-            if (start_merge_step == -1 || step <= start_merge_step) {
-                cond_out = run_condition(cond, 0);
-                if (cond_out.empty()) {
-                    return {};
-                }
-            } else {
-                GGML_ASSERT(!id_cond.empty());
-                cond_out = run_condition(id_cond,
-                                         0,
-                                         cond.c_concat.empty() ? nullptr : &cond.c_concat);
-                if (cond_out.empty()) {
-                    return {};
-                }
+            cond_out = run_condition(cond, 0);
+            if (cond_out.empty()) {
+                return {};
             }
 
             if (!uncond.empty()) {
-                if (!step_cache.is_step_skipped()) {
-                    compute_sample_controls(control_image,
-                                            noised_input,
-                                            timesteps_tensor,
-                                            uncond,
-                                            &controls);
-                }
                 uncond_out = run_condition(uncond, 1);
                 if (uncond_out.empty()) {
                     return {};
@@ -2660,10 +1955,6 @@ public:
         }
         if (x0_opt.empty()) {
             LOG_ERROR("Diffusion model sampling failed");
-            if (control_net) {
-                control_net->free_control_ctx();
-                control_net->free_compute_buffer();
-            }
             if (work_diffusion_model) {
                 work_diffusion_model->free_compute_buffer();
             }
@@ -2676,10 +1967,6 @@ public:
             x0 = denoiser->inverse_noise_scaling(sigmas[sigmas.size() - 1], x0);
         }
 
-        if (control_net) {
-            control_net->free_control_ctx();
-            control_net->free_compute_buffer();
-        }
         if (work_diffusion_model) {
             work_diffusion_model->free_compute_buffer();
         }
@@ -2691,7 +1978,7 @@ public:
     }
 
     int get_diffusion_model_down_factor() {
-        int down_factor = 8;  // unet
+        int down_factor = 8;
         if (sd_version_is_dit(version)) {
             if (sd_version_is_wan(version)) {
                 down_factor = 2;
@@ -2786,9 +2073,7 @@ public:
         if (latents.empty()) {
             return {};
         }
-        if (version != VERSION_SD1_PIX2PIX) {
-            latents = first_stage_model->vae_to_diffusion_latents(latents);
-        }
+        latents = first_stage_model->vae_to_diffusion_latents(latents);
         return latents;
     }
 
@@ -2930,7 +2215,6 @@ const char* scheduler_to_str[] = {
     "discrete",
     "karras",
     "exponential",
-    "ays",
     "gits",
     "sgm_uniform",
     "simple",
@@ -3005,28 +2289,6 @@ enum preview_t str_to_preview(const char* str) {
     return PREVIEW_COUNT;
 }
 
-const char* lora_apply_mode_to_str[] = {
-    "auto",
-    "immediately",
-    "at_runtime",
-};
-
-const char* sd_lora_apply_mode_name(enum lora_apply_mode_t mode) {
-    if (mode < LORA_APPLY_MODE_COUNT) {
-        return lora_apply_mode_to_str[mode];
-    }
-    return NONE_STR;
-}
-
-enum lora_apply_mode_t str_to_lora_apply_mode(const char* str) {
-    for (int i = 0; i < LORA_APPLY_MODE_COUNT; i++) {
-        if (!strcmp(str, lora_apply_mode_to_str[i])) {
-            return (enum lora_apply_mode_t)i;
-        }
-    }
-    return LORA_APPLY_MODE_COUNT;
-}
-
 const char* hires_upscaler_to_str[] = {
     "None",
     "Latent",
@@ -3094,7 +2356,6 @@ void sd_hires_params_init(sd_hires_params_t* hires_params) {
     hires_params->target_height       = 0;
     hires_params->steps               = 0;
     hires_params->denoising_strength  = 0.7f;
-    hires_params->upscale_tile_size   = 128;
     hires_params->custom_sigmas       = nullptr;
     hires_params->custom_sigmas_count = 0;
 }
@@ -3109,12 +2370,10 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->rng_type                = CUDA_RNG;
     sd_ctx_params->sampler_rng_type        = RNG_TYPE_COUNT;
     sd_ctx_params->prediction              = PREDICTION_COUNT;
-    sd_ctx_params->lora_apply_mode         = LORA_APPLY_AUTO;
     sd_ctx_params->offload_params_to_cpu   = false;
     sd_ctx_params->max_vram                = 0.f;
     sd_ctx_params->enable_mmap             = false;
     sd_ctx_params->keep_clip_on_cpu        = false;
-    sd_ctx_params->keep_control_net_on_cpu = false;
     sd_ctx_params->keep_vae_on_cpu         = false;
     sd_ctx_params->diffusion_flash_attn    = false;
     sd_ctx_params->circular_x              = false;
@@ -3146,8 +2405,6 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "vae_path: %s\n"
              "audio_vae_path: %s\n"
              "taesd_path: %s\n"
-             "control_net_path: %s\n"
-             "photo_maker_path: %s\n"
              "tensor_type_rules: %s\n"
              "vae_decode_only: %s\n"
              "free_params_immediately: %s\n"
@@ -3162,7 +2419,6 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "backend: %s\n"
              "params_backend: %s\n"
              "keep_clip_on_cpu: %s\n"
-             "keep_control_net_on_cpu: %s\n"
              "keep_vae_on_cpu: %s\n"
              "flash_attn: %s\n"
              "diffusion_flash_attn: %s\n"
@@ -3184,8 +2440,6 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              SAFE_STR(sd_ctx_params->vae_path),
              SAFE_STR(sd_ctx_params->audio_vae_path),
              SAFE_STR(sd_ctx_params->taesd_path),
-             SAFE_STR(sd_ctx_params->control_net_path),
-             SAFE_STR(sd_ctx_params->photo_maker_path),
              SAFE_STR(sd_ctx_params->tensor_type_rules),
              BOOL_STR(sd_ctx_params->vae_decode_only),
              BOOL_STR(sd_ctx_params->free_params_immediately),
@@ -3200,7 +2454,6 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              SAFE_STR(sd_ctx_params->backend),
              SAFE_STR(sd_ctx_params->params_backend),
              BOOL_STR(sd_ctx_params->keep_clip_on_cpu),
-             BOOL_STR(sd_ctx_params->keep_control_net_on_cpu),
              BOOL_STR(sd_ctx_params->keep_vae_on_cpu),
              BOOL_STR(sd_ctx_params->flash_attn),
              BOOL_STR(sd_ctx_params->diffusion_flash_attn),
@@ -3250,7 +2503,6 @@ char* sd_sample_params_to_str(const sd_sample_params_t* sample_params) {
              "sample_method: %s, "
              "sample_steps: %d, "
              "eta: %.2f, "
-             "shifted_timestep: %d, "
              "flow_shift: %.2f, "
              "extra_sample_args: %s)",
              sample_params->guidance.txt_cfg,
@@ -3266,7 +2518,6 @@ char* sd_sample_params_to_str(const sd_sample_params_t* sample_params) {
              sd_sample_method_name(sample_params->sample_method),
              sample_params->sample_steps,
              sample_params->eta,
-             sample_params->shifted_timestep,
              sample_params->flow_shift,
              SAFE_STR(sample_params->extra_sample_args));
 
@@ -3283,8 +2534,6 @@ void sd_img_gen_params_init(sd_img_gen_params_t* sd_img_gen_params) {
     sd_img_gen_params->strength          = 0.75f;
     sd_img_gen_params->seed              = -1;
     sd_img_gen_params->batch_count       = 1;
-    sd_img_gen_params->control_strength  = 0.9f;
-    sd_img_gen_params->pm_params         = {nullptr, 0, nullptr, 20.f};
     sd_img_gen_params->vae_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
     sd_cache_params_init(&sd_img_gen_params->cache);
     sd_hires_params_init(&sd_img_gen_params->hires);
@@ -3312,8 +2561,6 @@ char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params) {
              "ref_images_count: %d\n"
              "auto_resize_ref_image: %s\n"
              "increase_ref_index: %s\n"
-             "control_strength: %.2f\n"
-             "photo maker: {style_strength = %.2f, id_images_count = %d, id_embed_path = %s}\n"
              "VAE tiling: %s (temporal=%s, extra_tiling_args=%s)\n"
              "hires: {enabled=%s, upscaler=%s, model_path=%s, scale=%.2f, target=%dx%d, steps=%d, denoising_strength=%.2f}\n",
              SAFE_STR(sd_img_gen_params->prompt),
@@ -3328,10 +2575,6 @@ char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params) {
              sd_img_gen_params->ref_images_count,
              BOOL_STR(sd_img_gen_params->auto_resize_ref_image),
              BOOL_STR(sd_img_gen_params->increase_ref_index),
-             sd_img_gen_params->control_strength,
-             sd_img_gen_params->pm_params.style_strength,
-             sd_img_gen_params->pm_params.id_images_count,
-             SAFE_STR(sd_img_gen_params->pm_params.id_embed_path),
              BOOL_STR(sd_img_gen_params->vae_tiling_params.enabled),
              BOOL_STR(sd_img_gen_params->vae_tiling_params.temporal_tiling),
              SAFE_STR(sd_img_gen_params->vae_tiling_params.extra_tiling_args),
@@ -3346,8 +2589,6 @@ char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params) {
     const char* cache_mode_str = "disabled";
     if (sd_img_gen_params->cache.mode == SD_CACHE_EASYCACHE) {
         cache_mode_str = "easycache";
-    } else if (sd_img_gen_params->cache.mode == SD_CACHE_UCACHE) {
-        cache_mode_str = "ucache";
     }
     snprintf(buf + strlen(buf), 4096 - strlen(buf),
              "cache: %s (threshold=%.3f, start=%.2f, end=%.2f)\n",
@@ -3380,7 +2621,6 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->hires.target_height                   = 0;
     sd_vid_gen_params->hires.steps                           = 0;
     sd_vid_gen_params->hires.denoising_strength              = 0.7f;
-    sd_vid_gen_params->hires.upscale_tile_size               = 128;
     sd_vid_gen_params->hires.custom_sigmas                   = nullptr;
     sd_vid_gen_params->hires.custom_sigmas_count             = 0;
     sd_cache_params_init(&sd_vid_gen_params->cache);
@@ -3391,7 +2631,7 @@ struct sd_ctx_t {
 };
 
 static bool sd_version_supports_video_generation(SDVersion version) {
-    return version == VERSION_SVD || sd_version_is_wan(version) || sd_version_is_ltxav(version);
+    return sd_version_is_wan(version) || sd_version_is_ltxav(version);
 }
 
 static bool sd_version_supports_image_generation(SDVersion version) {
@@ -3601,15 +2841,12 @@ struct GenerationRequest {
     bool use_high_noise_img_cond             = false;
     const sd_cache_params_t* cache_params    = nullptr;
     int batch_count                          = 1;
-    int shifted_timestep                     = 0;
     float strength                           = 1.f;
-    float control_strength                   = 0.f;
     float eta                                = 0.f;
     bool increase_ref_index                  = false;
     bool auto_resize_ref_image               = false;
     sd_guidance_params_t guidance            = {};
     sd_guidance_params_t high_noise_guidance = {};
-    sd_pm_params_t pm_params                 = {};
     sd_hires_params_t hires                  = {};
     int frames                               = -1;
     int requested_frames                     = -1;
@@ -3627,14 +2864,11 @@ struct GenerationRequest {
         seed                        = sd_img_gen_params->seed;
         batch_count                 = sd_img_gen_params->batch_count;
         clip_skip                   = sd_img_gen_params->clip_skip;
-        shifted_timestep            = sd_img_gen_params->sample_params.shifted_timestep;
         strength                    = sd_img_gen_params->strength;
-        control_strength            = sd_img_gen_params->control_strength;
         eta                         = sd_img_gen_params->sample_params.eta;
         increase_ref_index          = sd_img_gen_params->increase_ref_index;
         auto_resize_ref_image       = sd_img_gen_params->auto_resize_ref_image;
         guidance                    = sd_img_gen_params->sample_params.guidance;
-        pm_params                   = sd_img_gen_params->pm_params;
         hires                       = sd_img_gen_params->hires;
         cache_params                = &sd_img_gen_params->cache;
         resolve(sd_ctx);
@@ -3796,7 +3030,7 @@ struct GenerationRequest {
             guidance->img_cfg = guidance->txt_cfg;
         }
 
-        if (!sd_version_is_inpaint_or_unet_edit(sd_ctx->sd->version)) {
+        if (!sd_version_is_inpaint_or_control(sd_ctx->sd->version)) {
             guidance->img_cfg = guidance->txt_cfg;
         }
 
@@ -3833,11 +3067,6 @@ struct GenerationRequest {
                              &use_high_noise_img_cond,
                              "high noise: ");
         }
-
-        if (shifted_timestep > 0 && !sd_version_is_sdxl(sd_ctx->sd->version)) {
-            LOG_WARN("timestep shifting is only supported for SDXL models!");
-            shifted_timestep = 0;
-        }
     }
 };
 
@@ -3852,7 +3081,6 @@ struct SamplePlan {
     int high_noise_sample_steps                   = 0;
     int total_steps                               = 0;
     float moe_boundary                            = 0.f;
-    int start_merge_step                          = -1;
     std::vector<float> sigmas;
 
     SamplePlan(sd_ctx_t* sd_ctx,
@@ -3936,11 +3164,6 @@ struct SamplePlan {
                                                              high_noise_sample_method);
             high_noise_eta           = resolve_eta(sd_ctx, high_noise_eta, high_noise_sample_method);
             LOG_INFO("sampling(high noise) using %s method", sampling_methods_str[high_noise_sample_method]);
-        }
-
-        if (sd_ctx->sd->use_pmid) {
-            start_merge_step = int(sd_ctx->sd->pmid_model->style_strength / 100.f * total_steps);
-            LOG_INFO("PHOTOMAKER: start_merge_step: %d", start_merge_step);
         }
     }
 };
@@ -4272,7 +3495,6 @@ struct ImageGenerationEmbeds {
     SDCondition cond;
     SDCondition uncond;
     SDCondition img_cond;
-    SDCondition id_cond;
 };
 
 struct CircularAxesState {
@@ -4426,12 +3648,6 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
         ref_images.push_back(sd_image_to_tensor(sd_img_gen_params->ref_images[i]));
     }
 
-    if (ref_images.empty() && sd_version_is_unet_edit(sd_ctx->sd->version)) {
-        LOG_WARN("This model needs at least one reference image; using an empty reference");
-        ref_images.push_back(sd::zeros<float>({request->width, request->height, 3, 1}));
-        request->guidance.img_cfg = request->guidance.txt_cfg;
-    }
-
     if (!ref_images.empty()) {
         LOG_INFO("EDIT mode");
     }
@@ -4515,14 +3731,7 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
 
             uncond_concat_latent = sd::ops::concat(uncond_masked_init_latent, latent_mask, 2);
             uncond_concat_latent = sd::ops::concat(uncond_concat_latent, sd::Tensor<float>::zeros_like(masked_init_latent), 2);
-        } else {  // SD1.x SD2.x SDXL inpaint
-            concat_latent        = sd::ops::concat(latent_mask, masked_init_latent, 2);
-            uncond_concat_latent = sd::ops::concat(latent_mask, uncond_masked_init_latent, 2);
         }
-    }
-    if (sd_version_is_unet_edit(sd_ctx->sd->version)) {
-        concat_latent        = sd::ops::interpolate<float>(ref_latents[0], init_latent.shape());
-        uncond_concat_latent = sd::Tensor<float>::zeros_like(concat_latent);
     }
     if (sd_version_is_control(sd_ctx->sd->version)) {
         if (!control_latent.empty()) {
@@ -4573,7 +3782,6 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     condition_params.ref_images      = &latents->ref_images;
     condition_params.adm_in_channels = static_cast<int>(sd_ctx->sd->diffusion_model->get_adm_in_channels());
 
-    auto id_cond                     = sd_ctx->sd->get_pmid_conditon(request->pm_params, condition_params);
     int64_t prepare_start_ms         = ggml_time_ms();
     condition_params.zero_out_masked = false;
     auto cond                        = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
@@ -4585,11 +3793,6 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     SDCondition uncond;
     if (request->use_uncond || request->use_high_noise_uncond) {
         bool zero_out_masked = false;
-        if (sd_version_is_sdxl(sd_ctx->sd->version) &&
-            request->negative_prompt.empty() &&
-            !sd_ctx->sd->is_using_edm_v_parameterization) {
-            zero_out_masked = true;
-        }
         condition_params.text            = request->negative_prompt;
         condition_params.zero_out_masked = zero_out_masked;
         uncond                           = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
@@ -4612,7 +3815,6 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     }
     embeds.cond    = std::move(cond);
     embeds.uncond  = std::move(uncond);
-    embeds.id_cond = std::move(id_cond);
 
     return embeds;
 }
@@ -4668,8 +3870,7 @@ static sd_image_t* decode_image_outputs(sd_ctx_t* sd_ctx,
 
 static sd::Tensor<float> upscale_hires_latent(sd_ctx_t* sd_ctx,
                                               const sd::Tensor<float>& latent,
-                                              const GenerationRequest& request,
-                                              UpscalerGGML* upscaler) {
+                                              const GenerationRequest& request) {
     auto get_hires_latent_target_shape = [&]() {
         std::vector<int64_t> target_shape = latent.shape();
         if (target_shape.size() < 2) {
@@ -4728,16 +3929,11 @@ static sd::Tensor<float> upscale_hires_latent(sd_ctx_t* sd_ctx,
                  target_shape[1]);
 
         return sd::ops::interpolate(latent, target_shape, mode, false, antialias);
-    } else if (request.hires.upscaler == SD_HIRES_UPSCALER_MODEL ||
-               request.hires.upscaler == SD_HIRES_UPSCALER_LANCZOS ||
+    } else if (request.hires.upscaler == SD_HIRES_UPSCALER_LANCZOS ||
                request.hires.upscaler == SD_HIRES_UPSCALER_NEAREST) {
         if (sd_ctx->sd->vae_decode_only) {
             LOG_ERROR("hires %s upscaler requires VAE encoder weights; create the context with vae_decode_only=false",
                       sd_hires_upscaler_name(request.hires.upscaler));
-            return {};
-        }
-        if (request.hires.upscaler == SD_HIRES_UPSCALER_MODEL && upscaler == nullptr) {
-            LOG_ERROR("hires model upscaler context is null");
             return {};
         }
 
@@ -4749,39 +3945,23 @@ static sd::Tensor<float> upscale_hires_latent(sd_ctx_t* sd_ctx,
         }
 
         sd::Tensor<float> upscaled_tensor;
-        if (request.hires.upscaler == SD_HIRES_UPSCALER_MODEL) {
-            upscaled_tensor = upscaler->upscale_tensor(decoded);
-            if (upscaled_tensor.empty()) {
-                LOG_ERROR("hires model upscale failed");
-                return {};
-            }
 
-            if (upscaled_tensor.shape()[0] != request.hires.target_width ||
-                upscaled_tensor.shape()[1] != request.hires.target_height) {
-                upscaled_tensor = sd::ops::interpolate(upscaled_tensor,
-                                                       {request.hires.target_width,
-                                                        request.hires.target_height,
-                                                        upscaled_tensor.shape()[2],
-                                                        upscaled_tensor.shape()[3]});
-            }
-        } else {
-            sd::ops::InterpolateMode mode = request.hires.upscaler == SD_HIRES_UPSCALER_LANCZOS
-                                                ? sd::ops::InterpolateMode::Lanczos
-                                                : sd::ops::InterpolateMode::Nearest;
-            LOG_INFO("hires %s image upscale %" PRId64 "x%" PRId64 " -> %dx%d",
-                     sd_hires_upscaler_name(request.hires.upscaler),
-                     decoded.shape()[0],
-                     decoded.shape()[1],
-                     request.hires.target_width,
-                     request.hires.target_height);
-            upscaled_tensor = sd::ops::interpolate(decoded,
-                                                   {request.hires.target_width,
-                                                    request.hires.target_height,
-                                                    decoded.shape()[2],
-                                                    decoded.shape()[3]},
-                                                   mode);
-            upscaled_tensor = sd::ops::clamp(upscaled_tensor, 0.0f, 1.0f);
-        }
+        sd::ops::InterpolateMode mode = request.hires.upscaler == SD_HIRES_UPSCALER_LANCZOS
+                                            ? sd::ops::InterpolateMode::Lanczos
+                                            : sd::ops::InterpolateMode::Nearest;
+        LOG_INFO("hires %s image upscale %" PRId64 "x%" PRId64 " -> %dx%d",
+                 sd_hires_upscaler_name(request.hires.upscaler),
+                 decoded.shape()[0],
+                 decoded.shape()[1],
+                 request.hires.target_width,
+                 request.hires.target_height);
+        upscaled_tensor = sd::ops::interpolate(decoded,
+                                               {request.hires.target_width,
+                                                request.hires.target_height,
+                                                decoded.shape()[2],
+                                                decoded.shape()[3]},
+                                               mode);
+        upscaled_tensor = sd::ops::clamp(upscaled_tensor, 0.0f, 1.0f);
 
         sd::Tensor<float> upscaled_latent = sd_ctx->sd->encode_first_stage(upscaled_tensor);
         if (upscaled_latent.empty()) {
@@ -4855,7 +4035,6 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
     sd_ctx->sd->rng->manual_seed(request.seed);
     sd_ctx->sd->sampler_rng->manual_seed(request.seed);
     sd_ctx->sd->set_flow_shift(sd_img_gen_params->sample_params.flow_shift);
-    sd_ctx->sd->apply_loras(sd_img_gen_params->loras, sd_img_gen_params->lora_count);
 
     ImageVaeAxesGuard axes_guard(sd_ctx, sd_img_gen_params, request);
 
@@ -4901,17 +4080,12 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
                                                    embeds.cond,
                                                    embeds.uncond,
                                                    embeds.img_cond,
-                                                   embeds.id_cond,
-                                                   latents.control_image,
-                                                   request.control_strength,
                                                    request.guidance,
                                                    plan.eta,
-                                                   request.shifted_timestep,
                                                    plan.sample_method,
                                                    sd_ctx->sd->is_flow_denoiser(),
                                                    plan.extra_sample_args,
                                                    plan.sigmas,
-                                                   plan.start_merge_step,
                                                    latents.ref_latents,
                                                    request.increase_ref_index,
                                                    latents.denoise_mask,
@@ -4951,27 +4125,6 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
     if (request.hires.enabled && request.hires.target_width > 0) {
         LOG_INFO("hires fix: upscaling to %dx%d", request.hires.target_width, request.hires.target_height);
 
-        std::unique_ptr<UpscalerGGML> hires_upscaler;
-        if (request.hires.upscaler == SD_HIRES_UPSCALER_MODEL) {
-            LOG_INFO("hires fix: loading model upscaler from '%s'", request.hires.model_path);
-            hires_upscaler                    = std::make_unique<UpscalerGGML>(sd_ctx->sd->n_threads,
-                                                            false,
-                                                            request.hires.upscale_tile_size,
-                                                            sd_ctx->sd->backend_spec,
-                                                            sd_ctx->sd->params_backend_spec);
-            const size_t max_graph_vram_bytes = sd::ggml_graph_cut::max_vram_gib_to_bytes(sd_ctx->sd->max_vram);
-            hires_upscaler->set_max_graph_vram_bytes(max_graph_vram_bytes);
-            if (!hires_upscaler->load_from_file(request.hires.model_path,
-                                                sd_ctx->sd->offload_params_to_cpu,
-                                                sd_ctx->sd->n_threads)) {
-                LOG_ERROR("load hires model upscaler failed");
-                if (sd_ctx->sd->free_params_immediately) {
-                    sd_ctx->sd->diffusion_model->free_params_buffer();
-                }
-                return nullptr;
-            }
-        }
-
         int hires_scheduler_steps = 0;
         std::vector<float> hires_sigma_sched =
             make_hires_sigma_schedule(sd_ctx,
@@ -4996,8 +4149,7 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
 
             sd::Tensor<float> upscaled = upscale_hires_latent(sd_ctx,
                                                               final_latents[b],
-                                                              request,
-                                                              hires_upscaler.get());
+                                                              request);
             if (upscaled.empty()) {
                 if (sd_ctx->sd->free_params_immediately) {
                     sd_ctx->sd->diffusion_model->free_params_buffer();
@@ -5025,17 +4177,12 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
                                                             embeds.cond,
                                                             embeds.uncond,
                                                             embeds.img_cond,
-                                                            embeds.id_cond,
-                                                            latents.control_image,
-                                                            request.control_strength,
                                                             request.guidance,
                                                             plan.eta,
-                                                            request.shifted_timestep,
                                                             plan.sample_method,
                                                             sd_ctx->sd->is_flow_denoiser(),
                                                             plan.extra_sample_args,
                                                             hires_sigma_sched,
-                                                            plan.start_merge_step,
                                                             latents.ref_latents,
                                                             request.increase_ref_index,
                                                             hires_denoise_mask,
@@ -5080,8 +4227,6 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
         return nullptr;
     }
 
-    sd_ctx->sd->lora_stat();
-
     int64_t t1 = ggml_time_ms();
     LOG_INFO("generate_image completed in %.2fs", (t1 - t0) * 1.0f / 1000);
     return result;
@@ -5099,7 +4244,6 @@ SD_API bool denoise_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_ge
     sd_ctx->sd->rng->manual_seed(request.seed);
     sd_ctx->sd->sampler_rng->manual_seed(request.seed);
     sd_ctx->sd->set_flow_shift(sd_img_gen_params->sample_params.flow_shift);
-    sd_ctx->sd->apply_loras(sd_img_gen_params->loras, sd_img_gen_params->lora_count);
 
     ImageVaeAxesGuard axes_guard(sd_ctx, sd_img_gen_params, request);
 
@@ -5143,17 +4287,12 @@ SD_API bool denoise_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_ge
                                                    embeds.cond,
                                                    embeds.uncond,
                                                    embeds.img_cond,
-                                                   embeds.id_cond,
-                                                   latents.control_image,
-                                                   request.control_strength,
                                                    request.guidance,
                                                    plan.eta,
-                                                   request.shifted_timestep,
                                                    plan.sample_method,
                                                    sd_ctx->sd->is_flow_denoiser(),
                                                    plan.extra_sample_args,
                                                    plan.sigmas,
-                                                   plan.start_merge_step,
                                                    latents.ref_latents,
                                                    request.increase_ref_index,
                                                    latents.denoise_mask,
@@ -5183,7 +4322,6 @@ SD_API bool denoise_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_ge
         sd_ctx->sd->diffusion_model->free_params_buffer();
     }
 
-    sd_ctx->sd->lora_stat();
     return true;
 }
 
@@ -5785,7 +4923,6 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
     sd_ctx->sd->rng->manual_seed(request.seed);
     sd_ctx->sd->sampler_rng->manual_seed(request.seed);
     sd_ctx->sd->set_flow_shift(sd_vid_gen_params->sample_params.flow_shift);
-    sd_ctx->sd->apply_loras(sd_vid_gen_params->loras, sd_vid_gen_params->lora_count);
 
     SamplePlan plan(sd_ctx, sd_vid_gen_params, request);
     auto latent_inputs_opt = prepare_video_generation_latents(sd_ctx, sd_vid_gen_params, &request);
@@ -5832,17 +4969,12 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                                                            embeds.cond,
                                                            request.use_high_noise_uncond ? embeds.uncond : SDCondition(),
                                                            embeds.img_cond,
-                                                           embeds.id_cond,
-                                                           sd::Tensor<float>(),
-                                                           0.f,
                                                            request.high_noise_guidance,
                                                            plan.high_noise_eta,
-                                                           request.shifted_timestep,
                                                            plan.high_noise_sample_method,
                                                            sd_ctx->sd->is_flow_denoiser(),
                                                            plan.high_noise_extra_sample_args,
                                                            high_noise_sigmas,
-                                                           -1,
                                                            std::vector<sd::Tensor<float>>{},
                                                            false,
                                                            latents.denoise_mask,
@@ -5878,17 +5010,12 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                                                         embeds.cond,
                                                         request.use_uncond ? embeds.uncond : SDCondition(),
                                                         embeds.img_cond,
-                                                        embeds.id_cond,
-                                                        sd::Tensor<float>(),
-                                                        0.f,
                                                         sd_vid_gen_params->sample_params.guidance,
                                                         plan.eta,
-                                                        sd_vid_gen_params->sample_params.shifted_timestep,
                                                         plan.sample_method,
                                                         sd_ctx->sd->is_flow_denoiser(),
                                                         plan.extra_sample_args,
                                                         plan.sigmas,
-                                                        -1,
                                                         std::vector<sd::Tensor<float>>{},
                                                         false,
                                                         latents.denoise_mask,
@@ -6022,17 +5149,12 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                                             embeds.cond,
                                           hires_request.use_uncond ? embeds.uncond : SDCondition(),
                                             embeds.img_cond,
-                                            embeds.id_cond,
-                                            sd::Tensor<float>(),
-                                            0.f,
                                             sd_vid_gen_params->sample_params.guidance,
                                             hires_eta,
-                                            sd_vid_gen_params->sample_params.shifted_timestep,
                                             hires_sample_method,
                                             sd_ctx->sd->is_flow_denoiser(),
                                             plan.extra_sample_args,
                                             hires_sigma_sched,
-                                            -1,
                                             std::vector<sd::Tensor<float>>{},
                                             false,
                                             hires_denoise_mask,
@@ -6101,8 +5223,6 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
         free_sd_audio(generated_audio);
         return false;
     }
-
-    sd_ctx->sd->lora_stat();
 
     int64_t t1 = ggml_time_ms();
     LOG_INFO("generate_video completed in %.2fs", (t1 - t0) * 1.0f / 1000);

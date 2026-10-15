@@ -38,10 +38,7 @@ Using formats of different precisions will yield results of varying quality.
 | **Memory** | 12068.09 MB  | 6394.53 MB | 6395.17 MB | 4888.16 MB  | 3735.73 MB |
 | **Result** | ![](../assets/flux/flux1-dev-q8_0.png) |![](../assets/flux/flux1-dev-q4_0.png) |![](../assets/flux/flux1-dev-q4_k.png) |![](../assets/flux/flux1-dev-q3_k.png) |![](../assets/flux/flux1-dev-q2_k.png)|
 
-
-
 ### Flux-schnell
-
 
 ```
  .\bin\Release\sd-cli.exe --diffusion-model  ..\models\flux1-schnell-q8_0.gguf --vae ..\models\ae.sft --clip_l ..\models\clip_l.safetensors --t5xxl ..\models\t5xxl_fp16.safetensors  -p "a lovely cat holding a sign says 'flux.cpp'" --cfg-scale 1.0 --sampling-method euler -v --steps 4 --clip-on-cpu
@@ -50,17 +47,3 @@ Using formats of different precisions will yield results of varying quality.
 | q8_0  |
 | ----  |
 |![](../assets/flux/flux1-schnell-q8_0.png) |
-
-## Run with LoRA
-
-Since many flux LoRA training libraries have used various LoRA naming formats, it is possible that not all flux LoRA naming formats are supported. It is recommended to use LoRA with naming formats compatible with ComfyUI.
-
-### Flux-dev q8_0 with LoRA
-
-- LoRA model from https://huggingface.co/XLabs-AI/flux-lora-collection/tree/main (using comfy converted version!!!)
-
-```
-.\bin\Release\sd-cli.exe --diffusion-model  ..\models\flux1-dev-q8_0.gguf --vae ...\models\ae.sft --clip_l ..\models\clip_l.safetensors --t5xxl ..\models\t5xxl_fp16.safetensors  -p "a lovely cat holding a sign says 'flux.cpp'<lora:realism_lora_comfy_converted:1>" --cfg-scale 1.0 --sampling-method euler -v --lora-model-dir ../models --clip-on-cpu
-```
-
-![output](../assets/flux/flux1-dev-q8_0%20with%20lora.png)

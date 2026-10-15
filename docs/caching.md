@@ -6,38 +6,11 @@ Caching methods accelerate diffusion inference by reusing intermediate computati
 
 | Mode | Target | Description |
 |------|--------|-------------|
-| `ucache` | UNET models | Condition-level caching with error tracking |
 | `easycache` | DiT models | Condition-level cache |
 | `dbcache` | DiT models | Block-level L1 residual threshold |
 | `taylorseer` | DiT models | Taylor series approximation |
 | `cache-dit` | DiT models | Combined DBCache + TaylorSeer |
-| `spectrum` | UNET and DiT models | Chebyshev + Taylor output forecasting |
-
-### UCache (UNET Models)
-
-UCache caches the residual difference (output - input) and reuses it when input changes are below threshold.
-
-```bash
-sd-cli -m model.safetensors -p "a cat" --cache-mode ucache --cache-option "threshold=1.5"
-```
-
-#### Parameters
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `threshold` | Error threshold for reuse decision | 1.0 |
-| `start` | Start caching at this percent of steps | 0.15 |
-| `end` | Stop caching at this percent of steps | 0.95 |
-| `decay` | Error decay rate (0-1) | 1.0 |
-| `relative` | Scale threshold by output norm (0/1) | 1 |
-| `reset` | Reset error after computing (0/1) | 1 |
-
-#### Reset Parameter
-
-The `reset` parameter controls error accumulation behavior:
-
-- `reset=1` (default): Resets accumulated error after each computed step. More aggressive caching, works well with most samplers.
-- `reset=0`: Keeps error accumulated. More conservative, recommended for `euler_a` sampler.
+| `spectrum` | DiT models | Chebyshev + Taylor output forecasting |
 
 ### EasyCache (DiT Models)
 
@@ -111,7 +84,7 @@ Mask values: `1` = compute, `0` = can cache.
 --scm-policy dynamic
 ```
 
-### Spectrum (UNET and DiT Models)
+### Spectrum (DiT Models)
 
 Spectrum uses Chebyshev polynomial fitting blended with Taylor extrapolation to predict denoised outputs, skipping entire forward passes. Based on the paper [Spectrum: Adaptive Spectral Feature Forecasting for Efficient Diffusion Sampling](https://github.com/tingyu215/Spectrum).
 

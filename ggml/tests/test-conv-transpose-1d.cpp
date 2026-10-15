@@ -7,10 +7,6 @@
 #include "ggml-cuda.h"
 #endif
 
-#ifdef GGML_USE_METAL
-#include "ggml-metal.h"
-#endif
-
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -43,14 +39,12 @@ struct test_model {
     struct ggml_tensor * a_4;
     struct ggml_tensor * b_4;
 
-
     ggml_backend_t backend = NULL;
     ggml_backend_buffer_t buffer;
     struct ggml_context * ctx;
 };
 
 void load_model(test_model & model, bool use_gpu = false) {
-
 
     float adata_0[] = {1,2,3};
     float bdata_0[] = {1,2};
@@ -65,9 +59,6 @@ void load_model(test_model & model, bool use_gpu = false) {
     for (int i = 0; i < 16*32*32; ++i) {
         data[i] = (float)(i%1024);
     }
-
-
-
 
     size_t buffer_size = 0;
     {
@@ -112,16 +103,6 @@ void load_model(test_model & model, bool use_gpu = false) {
     }
 #endif
 
-#ifdef GGML_USE_METAL
-    if (use_gpu) {
-        fprintf(stderr, "%s: using Metal backend\n", __func__);
-        model.backend = ggml_backend_metal_init();
-        if (!model.backend) {
-            fprintf(stderr, "%s: ggml_backend_metal_init() failed\n", __func__);
-        }
-    }
-#endif
-
     if(!model.backend) {
         // fallback to CPU backend
         model.backend = ggml_backend_cpu_init();
@@ -136,7 +117,6 @@ void load_model(test_model & model, bool use_gpu = false) {
     model.a_0 = ggml_new_tensor_1d(model.ctx, GGML_TYPE_F32, 3);
     model.b_0 = ggml_new_tensor_1d(model.ctx, GGML_TYPE_F32, 2);
 
-
     model.a_1 = ggml_new_tensor_3d(model.ctx, GGML_TYPE_F32, 3,1,2);
     model.b_1 = ggml_new_tensor_2d(model.ctx, GGML_TYPE_F32, 3,2);
 
@@ -148,7 +128,6 @@ void load_model(test_model & model, bool use_gpu = false) {
 
     model.a_4 = ggml_new_tensor_3d(model.ctx, GGML_TYPE_F32, 16,32,32);
     model.b_4 = ggml_new_tensor_2d(model.ctx, GGML_TYPE_F32, 197,32);
-
 
     // create a allocator
     ggml_tallocr alloc = ggml_tallocr_new(model.buffer);
@@ -162,7 +141,6 @@ void load_model(test_model & model, bool use_gpu = false) {
     } else {
         ggml_backend_tensor_set(model.a_0, adata_0, 0, ggml_nbytes(model.a_0));
     }
-
 
     // alloc memory
     ggml_tallocr_alloc(&alloc, model.a_1);
@@ -194,7 +172,6 @@ void load_model(test_model & model, bool use_gpu = false) {
         ggml_backend_tensor_set(model.a_3, data, 0, ggml_nbytes(model.a_3));
     }
 
-
       // alloc memory
     ggml_tallocr_alloc(&alloc, model.a_4);
 
@@ -205,15 +182,10 @@ void load_model(test_model & model, bool use_gpu = false) {
         ggml_backend_tensor_set(model.a_4, data, 0, ggml_nbytes(model.a_4));
     }
 
-
-
     // alloc memory
     ggml_tallocr_alloc(&alloc, model.b_0);
 
     if(ggml_backend_is_cpu(model.backend)
-#ifdef GGML_USE_METAL
-                || ggml_backend_is_metal(model.backend)
-#endif
     ) {
         memcpy(model.b_0->data, bdata_0, ggml_nbytes(model.b_0));
     } else {
@@ -224,9 +196,6 @@ void load_model(test_model & model, bool use_gpu = false) {
     ggml_tallocr_alloc(&alloc, model.b_1);
 
     if(ggml_backend_is_cpu(model.backend)
-#ifdef GGML_USE_METAL
-                || ggml_backend_is_metal(model.backend)
-#endif
     ) {
         memcpy(model.b_1->data, bdata_1, ggml_nbytes(model.b_1));
     } else {
@@ -237,9 +206,6 @@ void load_model(test_model & model, bool use_gpu = false) {
     ggml_tallocr_alloc(&alloc, model.b_2);
 
     if(ggml_backend_is_cpu(model.backend)
-#ifdef GGML_USE_METAL
-                || ggml_backend_is_metal(model.backend)
-#endif
     ) {
         memcpy(model.b_2->data, bdata_2, ggml_nbytes(model.b_2));
     } else {
@@ -250,29 +216,21 @@ void load_model(test_model & model, bool use_gpu = false) {
     ggml_tallocr_alloc(&alloc, model.b_3);
 
     if(ggml_backend_is_cpu(model.backend)
-#ifdef GGML_USE_METAL
-                || ggml_backend_is_metal(model.backend)
-#endif
     ) {
         memcpy(model.b_3->data, data, ggml_nbytes(model.b_3));
     } else {
         ggml_backend_tensor_set(model.b_3, data, 0, ggml_nbytes(model.b_3));
     }
 
-
    // alloc memory
     ggml_tallocr_alloc(&alloc, model.b_4);
 
     if(ggml_backend_is_cpu(model.backend)
-#ifdef GGML_USE_METAL
-                || ggml_backend_is_metal(model.backend)
-#endif
     ) {
         memcpy(model.b_4->data, data, ggml_nbytes(model.b_4));
     } else {
         ggml_backend_tensor_set(model.b_4, data, 0, ggml_nbytes(model.b_4));
     }
-
 
 }
 
@@ -298,7 +256,6 @@ struct ggml_cgraph * build_graph(const test_model& model) {
     struct ggml_tensor* conv1d_transpose_res_0 = ggml_conv_transpose_1d(ctx0, model.a_0, model.b_0, s0, p0, d0);
     ggml_set_name(conv1d_transpose_res_0, "conv1d_transpose_res_0");
     ggml_build_forward_expand(gf, conv1d_transpose_res_0);
-
 
     s0 = 1;
     p0 = 0;
@@ -348,7 +305,6 @@ struct ggml_cgraph * build_graph(const test_model& model) {
     ggml_set_name(conv1d_transpose_res_6, "conv1d_transpose_res_6");
     ggml_build_forward_expand(gf, conv1d_transpose_res_6);
 
-
     s0 = 8;
     p0 = 0;
     d0 = 1;
@@ -356,8 +312,6 @@ struct ggml_cgraph * build_graph(const test_model& model) {
     struct ggml_tensor* conv1d_transpose_res_7 = ggml_conv_transpose_1d(ctx0, model.a_4, model.b_4, s0, p0, d0);
     ggml_set_name(conv1d_transpose_res_7, "conv1d_transpose_res_7");
     ggml_build_forward_expand(gf, conv1d_transpose_res_7);
-
-
 
     // delete the temporally context used to build the graph
     ggml_free(ctx0);
@@ -423,7 +377,6 @@ int main(void)
        1.00f,4.00f,7.00f,6.00f
     };
 
-
     struct ggml_tensor * conv1d_transpose_res_1 = NULL;
 
     for(int i = 0; i < ggml_graph_n_nodes(gf_res); i++) {
@@ -436,15 +389,10 @@ int main(void)
 
     ggml_backend_tensor_get(conv1d_transpose_res_1, conv1d_transpose_data_1.data(), 0, ggml_nbytes(conv1d_transpose_res_1));
 
-
-
-
-
     const int n_conv_transpose_1d_test_1 = 5;
 
     float expected_conv1d_1[n_conv_transpose_1d_test_1] =
        {5.0f, 18.0f, 26.0f, 18.0f,  5.0f};
-
 
     struct ggml_tensor * conv1d_transpose_res_2 = NULL;
 
@@ -457,7 +405,6 @@ int main(void)
     std::vector<float> conv1d_transpose_data_2(ggml_nelements(conv1d_transpose_res_2));
 
     ggml_backend_tensor_get(conv1d_transpose_res_2, conv1d_transpose_data_2.data(), 0, ggml_nbytes(conv1d_transpose_res_2));
-
 
     const int n_conv_transpose_1d_test_2 = 10;
 
@@ -477,13 +424,11 @@ int main(void)
 
     ggml_backend_tensor_get(conv1d_transpose_res_3, conv1d_transpose_data_3.data(), 0, ggml_nbytes(conv1d_transpose_res_3));
 
-
     const int n_conv_transpose_1d_test_3 = 14;
 
     float expected_conv1d_3[n_conv_transpose_1d_test_3] =
        {7.0f,  6.0f, 17.0f, 12.0f, 17.0f,  6.0f,  7.0f
          ,5.0f,  6.0f, 19.0f, 12.0f, 19.0f,  6.0f,  5.0f};
-
 
     struct ggml_tensor * conv1d_transpose_res_4 = NULL;
 
@@ -496,7 +441,6 @@ int main(void)
     std::vector<float> conv1d_transpose_data_4(ggml_nelements(conv1d_transpose_res_4));
 
     ggml_backend_tensor_get(conv1d_transpose_res_4, conv1d_transpose_data_4.data(), 0, ggml_nbytes(conv1d_transpose_res_4));
-
 
     const int n_conv_transpose_1d_test_4 = 12;
 
@@ -518,7 +462,6 @@ int main(void)
 
     ggml_backend_tensor_get(conv1d_transpose_res_5, conv1d_transpose_data_5.data(), 0, ggml_nbytes(conv1d_transpose_res_5));
 
-
     const int n_conv_transpose_1d_test_5 = 18;
 
     float expected_conv1d_5[3*6] = {
@@ -539,15 +482,12 @@ int main(void)
 
     ggml_backend_tensor_get(conv1d_transpose_res_6, conv1d_transpose_data_6.data(), 0, ggml_nbytes(conv1d_transpose_res_6));
 
-
     const int n_conv_transpose_1d_test_6 = 24;
 
     float expected_conv1d_6[3*8] = {
         18.0, 21.0, 0.0, 24.0, 29.0, 0.0, 30.0, 37.0,
         24.0, 27.0, 0.0, 34.0, 39.0, 0.0, 44.0, 51.0,
         30.0, 33.0, 0.0, 44.0, 49.0, 0.0, 58.0, 65.0};
-
-
 
     struct ggml_tensor * conv1d_transpose_res_7 = NULL;
 
@@ -560,7 +500,6 @@ int main(void)
     std::vector<float> conv1d_transpose_data_7(ggml_nelements(conv1d_transpose_res_7));
 
     ggml_backend_tensor_get(conv1d_transpose_res_7, conv1d_transpose_data_7.data(), 0, ggml_nbytes(conv1d_transpose_res_7));
-
 
     const int n_conv_transpose_1d_test_7 = 32*1584;
 
@@ -607,7 +546,6 @@ int main(void)
     }
 
     printf("ggml_conv_1d_transpose (%d): %s\n", (int) ggml_nelements(conv1d_transpose_res_2), passed && (ggml_nelements(conv1d_transpose_res_2) == n_conv_transpose_1d_test_2) ? "\033[32mPASSED\033[0m" : "\033[31mFAILED\033[0m");
-
 
     passed = true;
     for(int i = 0; i < n_conv_transpose_1d_test_3; i++) {
@@ -659,9 +597,7 @@ int main(void)
         }
     }
 
-
     printf("ggml_conv_1d_transpose (%d): %s\n", (int) ggml_nelements(conv1d_transpose_res_6), passed && (ggml_nelements(conv1d_transpose_res_6) == n_conv_transpose_1d_test_6) ? "\033[32mPASSED\033[0m" : "\033[31mFAILED\033[0m");
-
 
     passed = true;
     for(int i = 0; i < n_conv_transpose_1d_test_7; i++) {
@@ -674,9 +610,7 @@ int main(void)
         }
     }
 
-
     printf("ggml_conv_1d_transpose (%d): %s\n", (int) ggml_nelements(conv1d_transpose_res_7), passed && (ggml_nelements(conv1d_transpose_res_7) == n_conv_transpose_1d_test_7) ? "\033[32mPASSED\033[0m" : "\033[31mFAILED\033[0m");
-
 
     ggml_free(model.ctx);
 

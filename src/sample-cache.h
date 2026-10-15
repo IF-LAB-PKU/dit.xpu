@@ -9,7 +9,6 @@
 #include "model.h"
 #include "spectrum.hpp"
 #include "tensor.hpp"
-#include "ucache.hpp"
 #include "util.h"
 
 namespace sd_sample {
@@ -17,7 +16,6 @@ namespace sd_sample {
     enum class SampleCacheMode {
         NONE,
         EASYCACHE,
-        UCACHE,
         CACHEDIT,
     };
 
@@ -25,14 +23,12 @@ namespace sd_sample {
         SampleCacheMode mode = SampleCacheMode::NONE;
 
         EasyCacheState easycache;
-        UCacheState ucache;
         CacheDitConditionState cachedit;
         SpectrumState spectrum;
 
         bool spectrum_enabled = false;
 
         bool easycache_enabled() const;
-        bool ucache_enabled() const;
         bool cachedit_enabled() const;
     };
 

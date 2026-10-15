@@ -7,14 +7,9 @@
 #include "ggml-cuda.h"
 #endif
 
-#ifdef GGML_USE_METAL
-#include "ggml-metal.h"
-#endif
-
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-
 
 static void ggml_log_callback_default(ggml_log_level level, const char * text, void * user_data) {
     (void) level;
@@ -66,16 +61,6 @@ void test_pad_reflect_1d(bool use_gpu) {
         backend = ggml_backend_cuda_init(0);
         if (!backend) {
             fprintf(stderr, "%s: ggml_backend_cuda_init() failed\n", __func__);
-        }
-    }
-#endif
-
-#ifdef GGML_USE_METAL
-    if (use_gpu) {
-        fprintf(stderr, "%s: using Metal backend\n", __func__);
-        backend = ggml_backend_metal_init();
-        if (!backend) {
-            fprintf(stderr, "%s: ggml_backend_metal_init() failed\n", __func__);
         }
     }
 #endif
