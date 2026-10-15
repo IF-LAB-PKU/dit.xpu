@@ -581,7 +581,7 @@ public:
     int z_channels = 4;
 
 public:
-    TAESD(bool decode_only = true, SDVersion version = VERSION_SD1)
+    TAESD(bool decode_only = true, SDVersion version = VERSION_SD3)
         : decode_only(decode_only) {
         bool use_midblock_gn = false;
         taef2                = sd_version_is_flux2(version);
@@ -627,7 +627,7 @@ struct TinyImageAutoEncoder : public VAE {
                          const String2TensorStorage& tensor_storage_map,
                          const std::string prefix,
                          bool decoder_only = true,
-                         SDVersion version = VERSION_SD1)
+                         SDVersion version = VERSION_SD3)
         : decode_only(decoder_only),
           taesd(decoder_only, version),
           VAE(version, backend, params_backend) {

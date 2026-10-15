@@ -14,7 +14,6 @@ function nullable(value: unknown): unknown {
 
 interface SampleParamsRequest {
     sample_steps: number;
-    shifted_timestep: number;
     custom_sigmas: number[];
     guidance: {
         txt_cfg: number;
@@ -40,7 +39,6 @@ function buildSampleParams(sample: SampleParams, defaultSteps: number): SamplePa
 
     const sampleParams: SampleParamsRequest = {
         sample_steps: parseNumber(sample.sample_steps, defaultSteps),
-        shifted_timestep: parseNumber(sample.shifted_timestep, 0),
         custom_sigmas: [],
         guidance: {
             txt_cfg: parseNumber(sample.guidance.txt_cfg, 7),
@@ -86,15 +84,6 @@ function buildSampleParams(sample: SampleParams, defaultSteps: number): SamplePa
     return sampleParams;
 }
 
-function buildLoraRequest(form: GenerationForm) {
-    return form.lora
-        .filter((item) => String(item.path || "").trim())
-        .map((item) => ({
-            path: String(item.path).trim(),
-            multiplier: parseNumber(item.multiplier, 1.0),
-            is_high_noise: Boolean(item.is_high_noise),
-        }));
-}
 
 function buildTilingRequest(form: GenerationForm) {
     return {
@@ -117,7 +106,6 @@ export function buildRequestBody(form: GenerationForm) {
         strength: parseNumber(form.strength, 0.75),
         seed: parseNumber(form.seed, -1),
         sample_params: buildSampleParams(form.sample_params, 20),
-        lora: buildLoraRequest(form),
         vae_tiling_params: buildTilingRequest(form),
         cache_mode: form.cache.mode || "disabled",
         cache_option: String(form.cache.option || ""),
@@ -140,7 +128,6 @@ export function buildImageRequestBody(form: GenerationForm) {
         batch_count: parseNumber(form.batch_count, 1),
         auto_resize_ref_image: true,
         increase_ref_index: false,
-        control_strength: parseNumber(form.control_strength, 0.9),
         init_image: form.init_image ? form.init_image.dataUrl : null,
         ref_images: form.ref_images.map((item) => item.dataUrl),
         mask_image: form.mask_image ? form.mask_image.dataUrl : null,

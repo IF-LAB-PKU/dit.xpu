@@ -41,13 +41,11 @@ sd-cli -m model.safetensors -p "a cat" --backend all=cuda0,te=cpu
 
 | Module | Purpose | Accepted names |
 | --- | --- | --- |
-| `diffusion` | UNet, DiT, MMDiT, Flux, Wan, Qwen Image, and other diffusion models | `diffusion`, `model`, `unet`, `dit` |
+| `diffusion` | DiT, MMDiT, Flux, Wan, Qwen Image, and other diffusion models | `diffusion`, `model`, `unet`, `dit` |
 | `te` | Text encoders and conditioners | `te`, `clip`, `text`, `textencoder`, `textencoders`, `conditioner`, `cond`, `llm`, `t5`, `t5xxl` |
 | `clip_vision` | CLIP vision encoder | `clip_vision`, `clipvision`, `clip-vision`, `vision` |
 | `vae` | VAE and TAE | `vae`, `firststage`, `autoencoder`, `tae` |
-| `controlnet` | ControlNet | `controlnet`, `control` |
-| `photomaker` | PhotoMaker ID encoder and PhotoMaker LoRA | `photomaker`, `photomakerid`, `pmid`, `photo` |
-| `upscaler` | ESRGAN upscaler | `upscaler`, `esrgan`, `hires` |
+| `upscaler` | LTX latent upscaler | `upscaler`, `hires` |
 
 `te` is the preferred module name for text encoders. `clip` is kept as an accepted alias because many existing commands and model names use CLIP terminology.
 
@@ -108,10 +106,9 @@ The older CPU placement flags are still supported:
 
 - `--clip-on-cpu`
 - `--vae-on-cpu`
-- `--control-net-cpu`
 - `--offload-to-cpu`
 
-`--clip-on-cpu`, `--vae-on-cpu`, and `--control-net-cpu` affect runtime backend assignment only when `--backend` is not set. They map to `te=cpu`, `vae=cpu`, and `controlnet=cpu`.
+`--clip-on-cpu` and `--vae-on-cpu` affect runtime backend assignment only when `--backend` is not set. They map to `te=cpu`, `vae=cpu`.
 
 `--offload-to-cpu` affects parameter backend assignment only when `--params-backend` is not set. It is equivalent to:
 

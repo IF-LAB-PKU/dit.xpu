@@ -10,7 +10,6 @@
 #include "mmdit.hpp"
 #include "qwen_image.hpp"
 #include "tensor_ggml.hpp"
-#include "unet.hpp"
 #include "wan.hpp"
 #include "z_image.hpp"
 
@@ -34,8 +33,6 @@ struct DiffusionParams {
     const std::vector<std::pair<int, sd::Tensor<float>>>* image_embeds = nullptr;
     bool increase_ref_index                                            = false;
     int num_video_frames                                               = -1;
-    const std::vector<sd::Tensor<float>>* controls                     = nullptr;
-    float control_strength                                             = 0.f;
     const sd::Tensor<float>* vace_context                              = nullptr;
     float vace_strength                                                = 1.f;
     int audio_length                                                   = 0;
@@ -66,7 +63,7 @@ struct DiffusionModel {
     virtual void free_compute_buffer()                                           = 0;
     virtual void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) = 0;
     virtual size_t get_params_buffer_size()                                      = 0;
-    virtual void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter){};
+;
     // 统一给各个 diffusion runner 透传 HTP backend，避免在 stable-diffusion.cpp 里感知具体模型类型。
     virtual void set_htp_backend(ggml_backend_t backend)                         {
         (void)backend;
@@ -87,86 +84,6 @@ struct DiffusionModel {
     virtual void set_flash_attention_enabled(bool enabled)           = 0;
     virtual void set_max_graph_vram_bytes(size_t max_vram_bytes)     = 0;
     virtual void set_circular_axes(bool circular_x, bool circular_y) = 0;
-};
-
-struct UNetModel : public DiffusionModel {
-    UNetModelRunner unet;
-
-    UNetModel(ggml_backend_t backend,
-              ggml_backend_t params_backend,
-              const String2TensorStorage& tensor_storage_map = {},
-              SDVersion version                              = VERSION_SD1)
-        : unet(backend, params_backend, tensor_storage_map, "model.diffusion_model", version) {
-    }
-
-    std::string get_desc() override {
-        return unet.get_desc();
-    }
-
-    void alloc_params_buffer() override {
-        unet.alloc_params_buffer();
-    }
-
-    void free_params_buffer() override {
-        unet.free_params_buffer();
-    }
-
-    void free_compute_buffer() override {
-        unet.free_compute_buffer();
-    }
-
-    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
-        unet.get_param_tensors(tensors, "model.diffusion_model");
-    }
-
-    size_t get_params_buffer_size() override {
-        return unet.get_params_buffer_size();
-    }
-
-    void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
-        unet.set_weight_adapter(adapter);
-    }
-
-    void set_htp_backend(ggml_backend_t backend) override {
-        // 把预加载的 HTP backend 透传到具体 runner，图分配和执行阶段都会依赖它做判断。
-        unet.set_htp_backend(backend);
-    }
-
-    void set_htp_packed_staging_loader(ModelLoader* loader) override {
-        unet.set_htp_packed_staging_loader(loader);
-    }
-
-    int64_t get_adm_in_channels() override {
-        return unet.unet.adm_in_channels;
-    }
-
-    void set_flash_attention_enabled(bool enabled) {
-        unet.set_flash_attention_enabled(enabled);
-    }
-
-    void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
-        unet.set_max_graph_vram_bytes(max_vram_bytes);
-    }
-
-    void set_circular_axes(bool circular_x, bool circular_y) override {
-        unet.set_circular_axes(circular_x, circular_y);
-    }
-
-    sd::Tensor<float> compute(int n_threads,
-                              const DiffusionParams& diffusion_params) override {
-        GGML_ASSERT(diffusion_params.x != nullptr);
-        GGML_ASSERT(diffusion_params.timesteps != nullptr);
-        static const std::vector<sd::Tensor<float>> empty_controls;
-        return unet.compute(n_threads,
-                            *diffusion_params.x,
-                            *diffusion_params.timesteps,
-                            tensor_or_empty(diffusion_params.context),
-                            tensor_or_empty(diffusion_params.c_concat),
-                            tensor_or_empty(diffusion_params.y),
-                            diffusion_params.num_video_frames,
-                            diffusion_params.controls ? *diffusion_params.controls : empty_controls,
-                            diffusion_params.control_strength);
-    }
 };
 
 struct MMDiTModel : public DiffusionModel {
@@ -200,10 +117,6 @@ struct MMDiTModel : public DiffusionModel {
 
     size_t get_params_buffer_size() override {
         return mmdit.get_params_buffer_size();
-    }
-
-    void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
-        mmdit.set_weight_adapter(adapter);
     }
 
     void set_htp_backend(ggml_backend_t backend) override {
@@ -295,10 +208,6 @@ struct FluxModel : public DiffusionModel {
 
     size_t get_params_buffer_size() override {
         return flux.get_params_buffer_size();
-    }
-
-    void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
-        flux.set_weight_adapter(adapter);
     }
 
     void set_htp_backend(ggml_backend_t backend) override {
@@ -396,10 +305,6 @@ struct AnimaModel : public DiffusionModel {
         return anima.get_params_buffer_size();
     }
 
-    void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
-        anima.set_weight_adapter(adapter);
-    }
-
     void set_htp_backend(ggml_backend_t backend) override {
         anima.set_htp_backend(backend);
     }
@@ -471,10 +376,6 @@ struct WanModel : public DiffusionModel {
 
     size_t get_params_buffer_size() override {
         return wan.get_params_buffer_size();
-    }
-
-    void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
-        wan.set_weight_adapter(adapter);
     }
 
     void set_htp_backend(ggml_backend_t backend) override {
@@ -554,10 +455,6 @@ struct QwenImageModel : public DiffusionModel {
         return qwen_image.get_params_buffer_size();
     }
 
-    void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
-        qwen_image.set_weight_adapter(adapter);
-    }
-
     void set_htp_backend(ggml_backend_t backend) override {
         qwen_image.set_htp_backend(backend);
     }
@@ -629,10 +526,6 @@ struct HiDreamO1Model : public DiffusionModel {
 
     size_t get_params_buffer_size() override {
         return hidream_o1.get_params_buffer_size();
-    }
-
-    void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
-        hidream_o1.set_weight_adapter(adapter);
     }
 
     void set_htp_backend(ggml_backend_t backend) override {
@@ -714,10 +607,6 @@ struct ZImageModel : public DiffusionModel {
 
     size_t get_params_buffer_size() override {
         return z_image.get_params_buffer_size();
-    }
-
-    void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
-        z_image.set_weight_adapter(adapter);
     }
 
     void set_htp_backend(ggml_backend_t backend) override {
@@ -811,10 +700,6 @@ struct ErnieImageModel : public DiffusionModel {
         return ernie_image.get_params_buffer_size();
     }
 
-    void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
-        ernie_image.set_weight_adapter(adapter);
-    }
-
     void set_htp_backend(ggml_backend_t backend) override {
         ernie_image.set_htp_backend(backend);
     }
@@ -883,10 +768,6 @@ struct LTXAVModel : public DiffusionModel {
 
     size_t get_params_buffer_size() override {
         return ltxav.get_params_buffer_size();
-    }
-
-    void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
-        ltxav.set_weight_adapter(adapter);
     }
 
     void set_htp_backend(ggml_backend_t backend) override {

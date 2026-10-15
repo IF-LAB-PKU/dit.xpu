@@ -177,224 +177,6 @@ std::string convert_cond_stage_model_name(std::string name, std::string prefix) 
 }
 
 // ref: https://github.com/huggingface/diffusers/blob/main/scripts/convert_diffusers_to_original_stable_diffusion.py
-std::string convert_diffusers_unet_to_original_sd1(std::string name) {
-    // (stable-diffusion, HF Diffusers)
-    static const std::vector<std::pair<std::string, std::string>> unet_conversion_map = {
-        {"time_embed.0.weight", "time_embedding.linear_1.weight"},
-        {"time_embed.0.bias", "time_embedding.linear_1.bias"},
-        {"time_embed.2.weight", "time_embedding.linear_2.weight"},
-        {"time_embed.2.bias", "time_embedding.linear_2.bias"},
-        {"input_blocks.0.0.weight", "conv_in.weight"},
-        {"input_blocks.0.0.bias", "conv_in.bias"},
-        {"out.0.weight", "conv_norm_out.weight"},
-        {"out.0.bias", "conv_norm_out.bias"},
-        {"out.2.weight", "conv_out.weight"},
-        {"out.2.bias", "conv_out.bias"},
-    };
-
-    static const std::vector<std::pair<std::string, std::string>> unet_conversion_map_resnet = {
-        {"in_layers.0", "norm1"},
-        {"in_layers.2", "conv1"},
-        {"out_layers.0", "norm2"},
-        {"out_layers.3", "conv2"},
-        {"emb_layers.1", "time_emb_proj"},
-        {"skip_connection", "conv_shortcut"},
-    };
-
-    static std::vector<std::pair<std::string, std::string>> unet_conversion_map_layer;
-    if (unet_conversion_map_layer.empty()) {
-        for (int i = 0; i < 4; ++i) {
-            // down_blocks
-            for (int j = 0; j < 2; ++j) {
-                std::string hf_down_res_prefix = "down_blocks." + std::to_string(i) + ".resnets." + std::to_string(j) + ".";
-                std::string sd_down_res_prefix = "input_blocks." + std::to_string(3 * i + j + 1) + ".0.";
-                unet_conversion_map_layer.emplace_back(sd_down_res_prefix, hf_down_res_prefix);
-
-                if (i < 3) {
-                    std::string hf_down_atn_prefix = "down_blocks." + std::to_string(i) + ".attentions." + std::to_string(j) + ".";
-                    std::string sd_down_atn_prefix = "input_blocks." + std::to_string(3 * i + j + 1) + ".1.";
-                    unet_conversion_map_layer.emplace_back(sd_down_atn_prefix, hf_down_atn_prefix);
-                }
-            }
-
-            // up_blocks
-            for (int j = 0; j < 3; ++j) {
-                std::string hf_up_res_prefix = "up_blocks." + std::to_string(i) + ".resnets." + std::to_string(j) + ".";
-                std::string sd_up_res_prefix = "output_blocks." + std::to_string(3 * i + j) + ".0.";
-                unet_conversion_map_layer.emplace_back(sd_up_res_prefix, hf_up_res_prefix);
-
-                if (/*i > 0*/ true) {  // for tiny unet
-                    std::string hf_up_atn_prefix = "up_blocks." + std::to_string(i) + ".attentions." + std::to_string(j) + ".";
-                    std::string sd_up_atn_prefix = "output_blocks." + std::to_string(3 * i + j) + ".1.";
-                    unet_conversion_map_layer.emplace_back(sd_up_atn_prefix, hf_up_atn_prefix);
-                }
-            }
-
-            if (i < 3) {
-                std::string hf_downsample_prefix = "down_blocks." + std::to_string(i) + ".downsamplers.0.conv.";
-                std::string sd_downsample_prefix = "input_blocks." + std::to_string(3 * (i + 1)) + ".0.op.";
-                unet_conversion_map_layer.emplace_back(sd_downsample_prefix, hf_downsample_prefix);
-
-                std::string hf_upsample_prefix = "up_blocks." + std::to_string(i) + ".upsamplers.0.";
-                std::string sd_upsample_prefix = "output_blocks." + std::to_string(3 * i + 2) + "." + std::to_string(i == 0 ? 1 : 2) + ".";
-                unet_conversion_map_layer.emplace_back(sd_upsample_prefix, hf_upsample_prefix);
-            }
-        }
-
-        // mid block
-        unet_conversion_map_layer.emplace_back("middle_block.1.", "mid_block.attentions.0.");
-        for (int j = 0; j < 2; ++j) {
-            std::string hf_mid_res_prefix = "mid_block.resnets." + std::to_string(j) + ".";
-            std::string sd_mid_res_prefix = "middle_block." + std::to_string(2 * j) + ".";
-            unet_conversion_map_layer.emplace_back(sd_mid_res_prefix, hf_mid_res_prefix);
-        }
-    }
-
-    std::string result = name;
-
-    for (const auto& p : unet_conversion_map) {
-        if (result == p.second) {
-            result = p.first;
-            return result;
-        }
-    }
-
-    if (contains(result, "resnets")) {
-        for (const auto& p : unet_conversion_map_resnet) {
-            size_t pos = result.find(p.second);
-            if (pos != std::string::npos) {
-                result.replace(pos, p.second.size(), p.first);
-            }
-        }
-    }
-
-    for (const auto& p : unet_conversion_map_layer) {
-        size_t pos = result.find(p.second);
-        if (pos != std::string::npos) {
-            result.replace(pos, p.second.size(), p.first);
-        }
-    }
-
-    return result;
-}
-
-// ref: https://github.com/huggingface/diffusers/blob/main/scripts/convert_diffusers_to_original_sdxl.py
-
-std::string convert_diffusers_unet_to_original_sdxl(std::string name) {
-    // (stable-diffusion, HF Diffusers)
-    static const std::vector<std::pair<std::string, std::string>> unet_conversion_map = {
-        {"time_embed.0.weight", "time_embedding.linear_1.weight"},
-        {"time_embed.0.bias", "time_embedding.linear_1.bias"},
-        {"time_embed.2.weight", "time_embedding.linear_2.weight"},
-        {"time_embed.2.bias", "time_embedding.linear_2.bias"},
-        {"input_blocks.0.0.weight", "conv_in.weight"},
-        {"input_blocks.0.0.bias", "conv_in.bias"},
-        {"out.0.weight", "conv_norm_out.weight"},
-        {"out.0.bias", "conv_norm_out.bias"},
-        {"out.2.weight", "conv_out.weight"},
-        {"out.2.bias", "conv_out.bias"},
-
-        // --- SDXL add_embedding mappings ---
-        {"label_emb.0.0.weight", "add_embedding.linear_1.weight"},
-        {"label_emb.0.0.bias", "add_embedding.linear_1.bias"},
-        {"label_emb.0.2.weight", "add_embedding.linear_2.weight"},
-        {"label_emb.0.2.bias", "add_embedding.linear_2.bias"},
-    };
-
-    static const std::vector<std::pair<std::string, std::string>> unet_conversion_map_resnet = {
-        {"in_layers.0", "norm1"},
-        {"in_layers.2", "conv1"},
-        {"out_layers.0", "norm2"},
-        {"out_layers.3", "conv2"},
-        {"emb_layers.1", "time_emb_proj"},
-        {"skip_connection", "conv_shortcut"},
-    };
-
-    static std::vector<std::pair<std::string, std::string>> unet_conversion_map_layer;
-    if (unet_conversion_map_layer.empty()) {
-        for (int i = 0; i < 3; ++i) {
-            // --- down_blocks ---
-            for (int j = 0; j < 2; ++j) {
-                std::string hf_down_res_prefix = "down_blocks." + std::to_string(i) + ".resnets." + std::to_string(j) + ".";
-                std::string sd_down_res_prefix = "input_blocks." + std::to_string(3 * i + j + 1) + ".0.";
-                unet_conversion_map_layer.emplace_back(sd_down_res_prefix, hf_down_res_prefix);
-
-                if (i > 0) {
-                    std::string hf_down_atn_prefix = "down_blocks." + std::to_string(i) + ".attentions." + std::to_string(j) + ".";
-                    std::string sd_down_atn_prefix = "input_blocks." + std::to_string(3 * i + j + 1) + ".1.";
-                    unet_conversion_map_layer.emplace_back(sd_down_atn_prefix, hf_down_atn_prefix);
-                }
-            }
-
-            // --- up_blocks ---
-            for (int j = 0; j < 4; ++j) {
-                std::string hf_up_res_prefix = "up_blocks." + std::to_string(i) + ".resnets." + std::to_string(j) + ".";
-                std::string sd_up_res_prefix = "output_blocks." + std::to_string(3 * i + j) + ".0.";
-                unet_conversion_map_layer.emplace_back(sd_up_res_prefix, hf_up_res_prefix);
-
-                if (i < 2) {
-                    std::string hf_up_atn_prefix = "up_blocks." + std::to_string(i) + ".attentions." + std::to_string(j) + ".";
-                    std::string sd_up_atn_prefix = "output_blocks." + std::to_string(3 * i + j) + ".1.";
-                    unet_conversion_map_layer.emplace_back(sd_up_atn_prefix, hf_up_atn_prefix);
-                }
-            }
-
-            if (i < 3) {
-                std::string hf_downsample_prefix = "down_blocks." + std::to_string(i) + ".downsamplers.0.conv.";
-                std::string sd_downsample_prefix = "input_blocks." + std::to_string(3 * (i + 1)) + ".0.op.";
-                unet_conversion_map_layer.emplace_back(sd_downsample_prefix, hf_downsample_prefix);
-
-                std::string hf_upsample_prefix = "up_blocks." + std::to_string(i) + ".upsamplers.0.";
-                std::string sd_upsample_prefix =
-                    "output_blocks." + std::to_string(3 * i + 2) + "." + std::to_string(i == 0 ? 1 : 2) + ".";
-                unet_conversion_map_layer.emplace_back(sd_upsample_prefix, hf_upsample_prefix);
-            }
-        }
-
-        unet_conversion_map_layer.emplace_back("output_blocks.2.2.conv.", "output_blocks.2.1.conv.");
-
-        // mid block
-        unet_conversion_map_layer.emplace_back("middle_block.1.", "mid_block.attentions.0.");
-        for (int j = 0; j < 2; ++j) {
-            std::string hf_mid_res_prefix = "mid_block.resnets." + std::to_string(j) + ".";
-            std::string sd_mid_res_prefix = "middle_block." + std::to_string(2 * j) + ".";
-            unet_conversion_map_layer.emplace_back(sd_mid_res_prefix, hf_mid_res_prefix);
-        }
-    }
-
-    std::string result = name;
-
-    for (const auto& p : unet_conversion_map) {
-        if (result == p.second) {
-            result = p.first;
-            return result;
-        }
-    }
-
-    if (contains(result, "resnets")) {
-        for (const auto& p : unet_conversion_map_resnet) {
-            size_t pos = result.find(p.second);
-            if (pos != std::string::npos) {
-                result.replace(pos, p.second.size(), p.first);
-            }
-        }
-    }
-
-    for (const auto& p : unet_conversion_map_layer) {
-        size_t pos = result.find(p.second);
-        if (pos != std::string::npos) {
-            result.replace(pos, p.second.size(), p.first);
-        }
-    }
-
-    static const std::vector<std::pair<std::string, std::string>> name_map{
-        {"to_out.weight", "to_out.0.weight"},
-        {"to_out.bias", "to_out.0.bias"},
-    };
-    replace_with_name_map(result, name_map);
-
-    return result;
-}
 
 std::string convert_diffusers_dit_to_original_sd3(std::string name) {
     int num_layers = 38;
@@ -676,11 +458,7 @@ std::string convert_other_dit_to_original_anima(std::string name) {
 }
 
 std::string convert_diffusion_model_name(std::string name, std::string prefix, SDVersion version) {
-    if (sd_version_is_sd1(version) || sd_version_is_sd2(version)) {
-        name = convert_diffusers_unet_to_original_sd1(name);
-    } else if (sd_version_is_sdxl(version)) {
-        name = convert_diffusers_unet_to_original_sdxl(name);
-    } else if (sd_version_is_sd3(version)) {
+    if (sd_version_is_sd3(version)) {
         name = convert_diffusers_dit_to_original_sd3(name);
     } else if (sd_version_is_flux(version) || sd_version_is_flux2(version) || sd_version_is_longcat(version)) {
         name = convert_diffusers_dit_to_original_flux(name);
@@ -692,7 +470,7 @@ std::string convert_diffusion_model_name(std::string name, std::string prefix, S
     return name;
 }
 
-std::string convert_diffusers_vae_to_original_sd1(std::string name) {
+std::string convert_diffusers_vae_to_original_kl(std::string name) {
     static const std::vector<std::pair<std::string, std::string>> vae_conversion_map_base = {
         {"nin_shortcut", "conv_shortcut"},
         {"norm_out", "conv_norm_out"},
@@ -793,50 +571,7 @@ std::string convert_first_stage_model_name(std::string name, std::string prefix)
         {"encoder.quant_conv.", "quant_conv."},
     };
     replace_with_prefix_map(name, vae_name_map);
-    name = convert_diffusers_vae_to_original_sd1(name);
-    return name;
-}
-
-std::string convert_pmid_name(const std::string& name) {
-    static std::unordered_map<std::string, std::string> pmid_name_map = {
-        {"pmid.vision_model.visual_projection.weight", "pmid.visual_projection.weight"},
-    };
-    if (pmid_name_map.find(name) != pmid_name_map.end()) {
-        return pmid_name_map[name];
-    }
-    return name;
-}
-
-std::string convert_pmid_v2_name(const std::string& name) {
-    static std::unordered_map<std::string, std::string> pmid_v2_name_map = {
-        {"pmid.qformer_perceiver.perceiver_resampler.layers.0.1.1.weight",
-         "pmid.qformer_perceiver.perceiver_resampler.layers.0.1.1.fc1.weight"},
-        {"pmid.qformer_perceiver.perceiver_resampler.layers.0.1.3.weight",
-         "pmid.qformer_perceiver.perceiver_resampler.layers.0.1.1.fc2.weight"},
-        {"pmid.qformer_perceiver.perceiver_resampler.layers.1.1.1.weight",
-         "pmid.qformer_perceiver.perceiver_resampler.layers.1.1.1.fc1.weight"},
-        {"pmid.qformer_perceiver.perceiver_resampler.layers.1.1.3.weight",
-         "pmid.qformer_perceiver.perceiver_resampler.layers.1.1.1.fc2.weight"},
-        {"pmid.qformer_perceiver.perceiver_resampler.layers.2.1.1.weight",
-         "pmid.qformer_perceiver.perceiver_resampler.layers.2.1.1.fc1.weight"},
-        {"pmid.qformer_perceiver.perceiver_resampler.layers.2.1.3.weight",
-         "pmid.qformer_perceiver.perceiver_resampler.layers.2.1.1.fc2.weight"},
-        {"pmid.qformer_perceiver.perceiver_resampler.layers.3.1.1.weight",
-         "pmid.qformer_perceiver.perceiver_resampler.layers.3.1.1.fc1.weight"},
-        {"pmid.qformer_perceiver.perceiver_resampler.layers.3.1.3.weight",
-         "pmid.qformer_perceiver.perceiver_resampler.layers.3.1.1.fc2.weight"},
-        {"pmid.qformer_perceiver.token_proj.0.bias",
-         "pmid.qformer_perceiver.token_proj.fc1.bias"},
-        {"pmid.qformer_perceiver.token_proj.2.bias",
-         "pmid.qformer_perceiver.token_proj.fc2.bias"},
-        {"pmid.qformer_perceiver.token_proj.0.weight",
-         "pmid.qformer_perceiver.token_proj.fc1.weight"},
-        {"pmid.qformer_perceiver.token_proj.2.weight",
-         "pmid.qformer_perceiver.token_proj.fc2.weight"},
-    };
-    if (pmid_v2_name_map.find(name) != pmid_v2_name_map.end()) {
-        return pmid_v2_name_map[name];
-    }
+    name = convert_diffusers_vae_to_original_kl(name);
     return name;
 }
 
@@ -865,22 +600,6 @@ std::string convert_sep_to_dot(std::string name) {
         "first_stage_model",
         "conv_in",
         "conv_out",
-        "lora_down",
-        "lora_mid",
-        "lora_up",
-        "diff_b",
-        "hada_w1_a",
-        "hada_w1_b",
-        "hada_w2_a",
-        "hada_w2_b",
-        "hada_t1",
-        "hada_t2",
-        ".lokr_w1",
-        ".lokr_w1_a",
-        ".lokr_w1_b",
-        ".lokr_w2",
-        ".lokr_w2_a",
-        ".lokr_w2_b",
         "time_emb_proj",
         "conv_shortcut",
         "time_embedding",
@@ -957,7 +676,7 @@ std::vector<std::string> first_stage_model_prefix_vec = {
 
 bool is_cond_stage_model_name(const std::string& name) {
     for (const auto& prefix : cond_stage_model_prefix_vec) {
-        if (starts_with(name, prefix) || starts_with(name, "lora." + prefix)) {
+        if (starts_with(name, prefix)) {
             return true;
         }
     }
@@ -966,7 +685,7 @@ bool is_cond_stage_model_name(const std::string& name) {
 
 bool is_diffusion_model_name(const std::string& name) {
     for (const auto& prefix : diffuison_model_prefix_vec) {
-        if (starts_with(name, prefix) || starts_with(name, "lora." + prefix)) {
+        if (starts_with(name, prefix)) {
             return true;
         }
     }
@@ -975,7 +694,7 @@ bool is_diffusion_model_name(const std::string& name) {
 
 bool is_first_stage_model_name(const std::string& name) {
     for (const auto& prefix : first_stage_model_prefix_vec) {
-        if (starts_with(name, prefix) || starts_with(name, "lora." + prefix)) {
+        if (starts_with(name, prefix)) {
             return true;
         }
     }
@@ -983,106 +702,6 @@ bool is_first_stage_model_name(const std::string& name) {
 }
 
 std::string convert_tensor_name(std::string name, SDVersion version) {
-    bool is_lora                             = false;
-    bool is_lycoris_underline                = false;
-    bool is_underline                        = false;
-    std::vector<std::string> lora_prefix_vec = {
-        "lora.lora.",
-        "lora.lora_",
-        "lora.lycoris_",
-        "lora.lycoris.",
-        "lora.",
-    };
-    std::vector<std::string> underline_lora_prefix_vec = {
-        "unet_",
-        "te_",
-        "te1_",
-        "te2_",
-        "te3_",
-        "vae_",
-    };
-    for (const auto& prefix : lora_prefix_vec) {
-        if (starts_with(name, prefix)) {
-            is_lora = true;
-            name    = name.substr(prefix.size());
-            if (contains(prefix, "lycoris_")) {
-                is_lycoris_underline = true;
-            } else {
-                for (const auto& underline_lora_prefix : underline_lora_prefix_vec) {
-                    if (starts_with(name, underline_lora_prefix)) {
-                        is_underline = true;
-                        break;
-                    }
-                }
-            }
-            break;
-        }
-    }
-    // preprocess lora tensor name
-    if (is_lora) {
-        std::map<std::string, std::string> lora_suffix_map = {
-            {".lora_down.weight", ".weight.lora_down"},
-            {".lora_mid.weight", ".weight.lora_mid"},
-            {".lora_up.weight", ".weight.lora_up"},
-            {".lora.down.weight", ".weight.lora_down"},
-            {".lora.mid.weight", ".weight.lora_mid"},
-            {".lora.up.weight", ".weight.lora_up"},
-            {"_lora.down.weight", ".weight.lora_down"},
-            {"_lora.mid.weight", ".weight.lora_mid"},
-            {"_lora.up.weight", ".weight.lora_up"},
-            {".lora_A.weight", ".weight.lora_down"},
-            {".lora_B.weight", ".weight.lora_up"},
-            {".lora_A.default.weight", ".weight.lora_down"},
-            {".lora_B.default.weight", ".weight.lora_up"},
-            {".lora_linear", ".weight.alpha"},
-            {".alpha", ".weight.alpha"},
-            {".scale", ".weight.scale"},
-            {".diff", ".weight.diff"},
-            {".diff_b", ".bias.diff"},
-            {".hada_w1_a", ".weight.hada_w1_a"},
-            {".hada_w1_b", ".weight.hada_w1_b"},
-            {".hada_w2_a", ".weight.hada_w2_a"},
-            {".hada_w2_b", ".weight.hada_w2_b"},
-            {".hada_t1", ".weight.hada_t1"},
-            {".hada_t2", ".weight.hada_t2"},
-            {".lokr_w1", ".weight.lokr_w1"},
-            {".lokr_w1_a", ".weight.lokr_w1_a"},
-            {".lokr_w1_b", ".weight.lokr_w1_b"},
-            {".lokr_w2", ".weight.lokr_w2"},
-            {".lokr_w2_a", ".weight.lokr_w2_a"},
-            {".lokr_w2_b", ".weight.lokr_w2_b"},
-        };
-
-        for (const auto& [old_suffix, new_suffix] : lora_suffix_map) {
-            if (ends_with(name, old_suffix)) {
-                name.replace(name.size() - old_suffix.size(), old_suffix.size(), new_suffix);
-                break;
-            }
-        }
-
-        size_t pos = name.find(".processor");
-        if (pos != std::string::npos) {
-            name.replace(pos, strlen(".processor"), "");
-        }
-
-        std::vector<std::string> dit_prefix_vec = {
-            "transformer_blocks",
-            "single_transformer_blocks",
-        };
-        for (const auto& prefix : dit_prefix_vec) {
-            if (starts_with(name, prefix)) {
-                name = "transformer." + name;
-                break;
-            }
-        }
-
-        // LOG_DEBUG("name %s %d", name.c_str(), version);
-
-        if (sd_version_is_unet(version) || is_underline || is_lycoris_underline) {
-            name = convert_sep_to_dot(name);
-        }
-    }
-
     std::unordered_map<std::string, std::string> prefix_map = {
         {"diffusion_model.", "model.diffusion_model."},
         {"unet.", "model.diffusion_model."},
@@ -1134,38 +753,10 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
         for (const auto& prefix : first_stage_model_prefix_vec) {
             if (starts_with(name, prefix)) {
                 name = convert_first_stage_model_name(name.substr(prefix.size()), prefix);
-                if (version == VERSION_SDXS_512_DS || version == VERSION_SDXS_09) {
-                    name = "tae." + name;
-                } else {
-                    name = prefix + name;
-                }
+                name = prefix + name;
                 break;
             }
         }
-    }
-
-    // pmid
-    {
-        if (starts_with(name, "pmid.")) {
-            name = convert_pmid_name(name);
-        }
-        if (starts_with(name, "pmid.qformer_perceiver")) {
-            name = convert_pmid_v2_name(name);
-        }
-    }
-
-    // controlnet
-    {
-        if (starts_with(name, "control_model.")) {  // for controlnet pth models
-            size_t pos = name.find('.');
-            if (pos != std::string::npos) {
-                name = name.substr(pos + 1);
-            }
-        }
-    }
-
-    if (is_lora) {
-        name = "lora." + name;
     }
 
     return name;

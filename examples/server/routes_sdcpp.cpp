@@ -18,10 +18,6 @@ static bool parse_cache_mode(const std::string& mode_str, sd_cache_mode_t& mode_
         mode_out = SD_CACHE_EASYCACHE;
         return true;
     }
-    if (mode_str == "ucache") {
-        mode_out = SD_CACHE_UCACHE;
-        return true;
-    }
     if (mode_str == "dbcache") {
         mode_out = SD_CACHE_DBCACHE;
         return true;
@@ -84,7 +80,6 @@ static json make_sample_params_json(const sd_sample_params_t& sample_params, con
         {"sample_method", capability_sample_method_name(sample_params.sample_method)},
         {"sample_steps", sample_params.sample_steps},
         {"eta", finite_number_or_null(sample_params.eta)},
-        {"shifted_timestep", sample_params.shifted_timestep},
         {"flow_shift", finite_number_or_null(sample_params.flow_shift)},
         {"guidance",
          {
@@ -112,7 +107,6 @@ static json make_hires_json(const SDGenerationParams& defaults) {
         {"steps", defaults.hires_steps},
         {"denoising_strength", defaults.hires_denoising_strength},
         {"custom_sigmas", defaults.hires_custom_sigmas},
-        {"upscale_tile_size", defaults.hires_upscale_tile_size},
     };
 }
 
@@ -128,7 +122,6 @@ static json make_img_gen_defaults_json(const SDGenerationParams& defaults, const
         {"batch_count", defaults.batch_count},
         {"auto_resize_ref_image", defaults.auto_resize_ref_image},
         {"increase_ref_index", defaults.increase_ref_index},
-        {"control_strength", defaults.control_strength},
         {"sample_params", make_sample_params_json(defaults.sample_params, defaults.skip_layers)},
         {"hires", make_hires_json(defaults)},
         {"vae_tiling_params", make_vae_tiling_json(defaults.vae_tiling_params)},
@@ -173,7 +166,6 @@ static json make_img_gen_features_json() {
         {"mask_image", true},
         {"control_image", true},
         {"ref_images", true},
-        {"lora", true},
         {"vae_tiling", true},
         {"hires", true},
         {"cache", true},
@@ -188,7 +180,6 @@ static json make_vid_gen_features_json() {
         {"end_image", true},
         {"control_frames", true},
         {"high_noise_sample_params", true},
-        {"lora", true},
         {"vae_tiling", true},
         {"cache", true},
         {"cancel_queued", true},
@@ -197,7 +188,6 @@ static json make_vid_gen_features_json() {
 }
 
 static json make_capabilities_json(ServerRuntime& runtime) {
-    refresh_lora_cache(runtime);
     refresh_upscaler_cache(runtime);
 
     AsyncJobManager& manager  = *runtime.async_job_manager;
@@ -209,7 +199,6 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     json schedulers           = json::array();
     json image_output_formats = supported_img_output_formats();
     json video_output_formats = supported_vid_output_formats();
-    json available_loras      = json::array();
     json available_upscalers  = json::array();
     json supported_modes      = json::array();
 
@@ -219,16 +208,6 @@ static json make_capabilities_json(ServerRuntime& runtime) {
 
     for (int i = 0; i < SCHEDULER_COUNT; ++i) {
         schedulers.push_back(sd_scheduler_name((scheduler_t)i));
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(*runtime.lora_mutex);
-        for (const auto& entry : *runtime.lora_cache) {
-            available_loras.push_back({
-                {"name", entry.name},
-                {"path", entry.path},
-            });
-        }
     }
 
     available_upscalers.push_back({
@@ -340,7 +319,6 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     result["output_formats_by_mode"] = output_formats_by_mode;
     result["features"]               = top_level_features;
     result["features_by_mode"]       = features_by_mode;
-    result["loras"]                  = available_loras;
     result["upscalers"]              = available_upscalers;
     return result;
 }
@@ -351,10 +329,7 @@ static bool parse_img_gen_request(const json& body,
                                   std::string& error_message) {
     request.gen_params = *runtime.default_gen_params;
 
-    refresh_lora_cache(runtime);
-    if (!request.gen_params.from_json_str(body.dump(), [&](const std::string& path) {
-            return get_lora_full_path(runtime, path);
-        })) {
+    if (!request.gen_params.from_json_str(body.dump())) {
         error_message = "invalid generation parameters";
         return false;
     }
@@ -364,8 +339,7 @@ static bool parse_img_gen_request(const json& body,
     if (!assign_output_options(request, output_format, output_compression, true, error_message)) {
         return false;
     }
-    // Intentionally disable prompt-embedded LoRA tag parsing for server APIs.
-    if (!request.gen_params.resolve_and_validate(IMG_GEN, "", runtime.ctx_params->hires_upscalers_dir, true)) {
+    if (!request.gen_params.resolve_and_validate(IMG_GEN, runtime.ctx_params->hires_upscalers_dir, true)) {
         error_message = "invalid generation parameters";
         return false;
     }
@@ -378,10 +352,7 @@ static bool parse_vid_gen_request(const json& body,
                                   std::string& error_message) {
     request.gen_params = *runtime.default_gen_params;
 
-    refresh_lora_cache(runtime);
-    if (!request.gen_params.from_json_str(body.dump(), [&](const std::string& path) {
-            return get_lora_full_path(runtime, path);
-        })) {
+    if (!request.gen_params.from_json_str(body.dump())) {
         error_message = "invalid generation parameters";
         return false;
     }
@@ -391,8 +362,7 @@ static bool parse_vid_gen_request(const json& body,
     if (!assign_output_options(request, output_format, output_compression, error_message)) {
         return false;
     }
-    // Intentionally disable prompt-embedded LoRA tag parsing for server APIs.
-    if (!request.gen_params.resolve_and_validate(VID_GEN, "", runtime.ctx_params->hires_upscalers_dir, true)) {
+    if (!request.gen_params.resolve_and_validate(VID_GEN, runtime.ctx_params->hires_upscalers_dir, true)) {
         error_message = "invalid generation parameters";
         return false;
     }

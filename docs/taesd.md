@@ -2,19 +2,9 @@
 
 You can use TAESD to accelerate the decoding of latent images by following these steps:
 
-- Download the model [weights](https://huggingface.co/madebyollin/taesd/blob/main/diffusion_pytorch_model.safetensors).
-
-Or curl
-
-```bash
-curl -L -O https://huggingface.co/madebyollin/taesd/resolve/main/diffusion_pytorch_model.safetensors
-```
-
-- Specify the model path using the `--taesd PATH` parameter. example:
-
-```bash
-sd-cli -m ../models/v1-5-pruned-emaonly.safetensors -p "a lovely cat" --taesd ../models/diffusion_pytorch_model.safetensors
-```
+Choose a tiny autoencoder compatible with your DiT model's latent format
+(for example TAEF1 for FLUX.1 or TAESD3 for SD3), and pass its weights with
+`--taesd PATH`. The original SD1/SDXL tiny autoencoders are not supported.
 
 ### Qwen-Image and wan (TAEHV)
 

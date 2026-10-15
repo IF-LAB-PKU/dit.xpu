@@ -157,38 +157,6 @@ static bool build_sdapi_img_gen_request(const json& j,
         request.gen_params.sample_params.scheduler = scheduler;
     }
 
-    if (j.contains("lora") && j["lora"].is_array()) {
-        request.gen_params.lora_map.clear();
-        request.gen_params.high_noise_lora_map.clear();
-
-        for (const auto& item : j["lora"]) {
-            if (!item.is_object()) {
-                continue;
-            }
-
-            std::string path   = item.value("path", "");
-            float multiplier   = item.value("multiplier", 1.0f);
-            bool is_high_noise = item.value("is_high_noise", false);
-
-            if (path.empty()) {
-                error_message = "lora.path required";
-                return false;
-            }
-
-            std::string fullpath = get_lora_full_path(runtime, path);
-            if (fullpath.empty()) {
-                error_message = "invalid lora path: " + path;
-                return false;
-            }
-
-            if (is_high_noise) {
-                request.gen_params.high_noise_lora_map[fullpath] += multiplier;
-            } else {
-                request.gen_params.lora_map[fullpath] += multiplier;
-            }
-        }
-    }
-
     if (img2img) {
         const int expected_width  = request.gen_params.width_and_height_are_set() ? request.gen_params.width : 0;
         const int expected_height = request.gen_params.width_and_height_are_set() ? request.gen_params.height : 0;
@@ -250,8 +218,7 @@ static bool build_sdapi_img_gen_request(const json& j,
         }
     }
 
-    // Intentionally disable prompt-embedded LoRA tag parsing for server APIs.
-    if (!request.gen_params.resolve_and_validate(IMG_GEN, "", runtime.ctx_params->hires_upscalers_dir, true)) {
+    if (!request.gen_params.resolve_and_validate(IMG_GEN, runtime.ctx_params->hires_upscalers_dir, true)) {
         error_message = "invalid params";
         return false;
     }
@@ -351,23 +318,6 @@ void register_sdapi_endpoints(httplib::Server& svr, ServerRuntime& rt) {
 
     svr.Post("/sdapi/v1/img2img", [sdapi_any2img](const httplib::Request& req, httplib::Response& res) {
         sdapi_any2img(req, res, true);
-    });
-
-    svr.Get("/sdapi/v1/loras", [runtime](const httplib::Request&, httplib::Response& res) {
-        refresh_lora_cache(*runtime);
-
-        json result = json::array();
-        {
-            std::lock_guard<std::mutex> lock(*runtime->lora_mutex);
-            for (const auto& e : *runtime->lora_cache) {
-                json item;
-                item["name"] = e.name;
-                item["path"] = e.path;
-                result.push_back(item);
-            }
-        }
-
-        res.set_content(result.dump(), "application/json");
     });
 
     svr.Get("/sdapi/v1/upscalers", [runtime](const httplib::Request&, httplib::Response& res) {

@@ -37,7 +37,6 @@ const sectionState = reactive<Record<string, boolean>>({
     highNoiseGuidance: true,
     conditioning: false,
     auxiliaryImages: false,
-    lora: false,
     vaeTiling: false,
     cache: false,
 });
@@ -84,7 +83,6 @@ const videoOutputFormats = computed(() => {
 const outputFormats = computed(() => generationMode.value === "video" ? videoOutputFormats.value : imageOutputFormats.value);
 const samplers = computed(() => capabilities.value?.samplers || ["default"]);
 const schedulers = computed(() => capabilities.value?.schedulers || ["default"]);
-const availableLoras = computed(() => capabilities.value?.loras || []);
 const currentImageInputs = computed(() => generationMode.value === "video" ? VIDEO_IMAGE_INPUTS : IMAGE_INPUTS);
 const gridImageInputs = computed(() => currentImageInputs.value.filter((input) => input.layout === "grid"));
 const fullImageInputs = computed(() => currentImageInputs.value.filter((input) => input.layout === "full"));
@@ -175,12 +173,7 @@ const guidanceSummary = computed(() => buildGuidanceSummary(form.sample_params))
 const highNoiseSummary = computed(() => {
     return `moe ${formatSummaryNumber(form.moe_boundary)} · ${buildSampleSummary(form.high_noise_sample_params)} · ${buildGuidanceSummary(form.high_noise_sample_params)}`;
 });
-const loraSummary = computed(() => {
-    if (!form.lora.length) {
-        return "No LoRA";
-    }
-    return `${form.lora.length} configured`;
-});
+
 const imageInputsSummary = computed(() => {
     const parts: string[] = [];
     if (form.init_image) parts.push(generationMode.value === "video" ? "start" : "init");
@@ -214,8 +207,7 @@ const conditioningSummary = computed(() => {
     if (generationMode.value === "video") {
         return `clip_skip ${clipSkip} · strength ${strength} · vace ${formatSummaryNumber(form.vace_strength)}`;
     }
-    const controlStrength = formatSummaryNumber(form.control_strength);
-    return `clip_skip ${clipSkip} · img ${strength} · control ${controlStrength}`;
+    return `clip_skip ${clipSkip} · img ${strength}`;
 });
 
 function defaultOutputFormatForMode(mode: GenerationMode): string {
@@ -392,17 +384,7 @@ async function cancelCurrentJob(): Promise<void> {
     }
 }
 
-function addLora(): void {
-    form.lora.push({
-        path: availableLoras.value[0]?.path || "",
-        multiplier: 1,
-        is_high_noise: false,
-    });
-}
 
-function removeLora(index: number): void {
-    form.lora.splice(index, 1);
-}
 
 async function assignImages(target: ImageTarget, files: FileList): Promise<void> {
     const images = await filesToImageEntries(files);
@@ -648,7 +630,6 @@ onBeforeUnmount(() => {
                     </div>
                     <div v-if="sectionState.sampleAdvanced" class="fields">
                         <div class="field"><label>Eta</label><input v-model="form.sample_params.eta" type="number" step="0.01" placeholder="blank = default" /></div>
-                        <div class="field"><label>Shifted Timestep</label><input v-model.number="form.sample_params.shifted_timestep" type="number" /></div>
                     </div>
                 </CollapsibleSection>
 
@@ -695,7 +676,6 @@ onBeforeUnmount(() => {
                             </div>
                             <div class="field"><label>Steps</label><input v-model.number="form.high_noise_sample_params.sample_steps" type="number" /></div>
                             <div class="field"><label>Eta</label><input v-model="form.high_noise_sample_params.eta" type="number" step="0.01" placeholder="blank = auto" /></div>
-                            <div class="field"><label>Shifted Timestep</label><input v-model.number="form.high_noise_sample_params.shifted_timestep" type="number" /></div>
                         </div>
                     </CollapsibleSection>
                     <CollapsibleSection class="stack-top" eyebrow="Guidance" :summary="buildGuidanceSummary(form.high_noise_sample_params)" :open="sectionState.highNoiseGuidance" variant="plain" @toggle="toggleSection('highNoiseGuidance')">
@@ -715,37 +695,11 @@ onBeforeUnmount(() => {
                     <div class="fields">
                         <div class="field"><label>CLIP Skip</label><input v-model.number="form.clip_skip" type="number" /></div>
                         <div class="field"><label>Strength</label><input v-model.number="form.strength" type="number" step="0.01" /></div>
-                        <div v-if="generationMode === 'image'" class="field"><label>Control Strength</label><input v-model.number="form.control_strength" type="number" step="0.01" /></div>
                         <div v-if="generationMode === 'video'" class="field"><label>VACE Strength</label><input v-model.number="form.vace_strength" type="number" step="0.01" /></div>
                     </div>
                 </CollapsibleSection>
 
-                <CollapsibleSection class="stack-top" eyebrow="LoRA" :summary="loraSummary" :open="sectionState.lora" @toggle="toggleSection('lora')">
-                    <div v-if="!availableLoras.length" class="hint">No LoRA entries were returned by capabilities.</div>
-                    <div v-else-if="!form.lora.length" class="hint">No LoRA overrides configured.</div>
-                    <div v-else class="list-editor">
-                        <div class="list-row list-row--header">
-                            <div>LoRA</div>
-                            <div>Multiplier</div>
-                            <div>High Noise</div>
-                            <div></div>
-                        </div>
-                        <div v-for="(item, index) in form.lora" :key="index" class="list-row">
-                            <select v-model="item.path">
-                                <option v-for="lora in availableLoras" :key="lora.path" :value="lora.path">
-                                    {{ lora.name }} ({{ lora.path }})
-                                </option>
-                            </select>
-                            <input v-model.number="item.multiplier" type="number" step="0.1" />
-                            <label class="checkbox list-row__checkbox">
-                                <input v-model="item.is_high_noise" type="checkbox" />
-                                <span>{{ item.is_high_noise ? "On" : "Off" }}</span>
-                            </label>
-                            <button class="btn-ghost" type="button" @click="removeLora(index)">Remove</button>
-                        </div>
-                    </div>
-                    <div><button class="btn-ghost" type="button" @click="addLora" :disabled="!availableLoras.length">Add LoRA</button></div>
-                </CollapsibleSection>
+
 
                 <CollapsibleSection class="stack-top" eyebrow="Image Inputs" :summary="imageInputsSummary" :open="sectionState.auxiliaryImages" @toggle="toggleSection('auxiliaryImages')">
                     <div class="upload-grid">

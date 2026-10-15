@@ -66,15 +66,7 @@ static bool parse_backend_module(const std::string& raw_name, SDBackendModule* m
         *module = SDBackendModule::VAE;
         return true;
     }
-    if (name == "controlnet" || name == "control") {
-        *module = SDBackendModule::CONTROL_NET;
-        return true;
-    }
-    if (name == "photomaker" || name == "photomakerid" || name == "pmid" || name == "photo") {
-        *module = SDBackendModule::PHOTOMAKER;
-        return true;
-    }
-    if (name == "upscaler" || name == "esrgan" || name == "hires") {
+    if (name == "upscaler" || name == "hires") {
         *module = SDBackendModule::UPSCALER;
         return true;
     }
@@ -457,7 +449,6 @@ bool SDBackendManager::init(const char* backend_spec,
                             bool offload_params_to_cpu,
                             bool keep_clip_on_cpu,
                             bool keep_vae_on_cpu,
-                            bool keep_control_net_on_cpu,
                             std::string* error) {
     reset();
 
@@ -474,9 +465,6 @@ bool SDBackendManager::init(const char* backend_spec,
         }
         if (keep_vae_on_cpu) {
             runtime_assignment_.set_module(SDBackendModule::VAE, "cpu");
-        }
-        if (keep_control_net_on_cpu) {
-            runtime_assignment_.set_module(SDBackendModule::CONTROL_NET, "cpu");
         }
     }
 
@@ -633,10 +621,6 @@ const char* sd_backend_module_name(SDBackendModule module) {
             return "clip_vision";
         case SDBackendModule::VAE:
             return "vae";
-        case SDBackendModule::CONTROL_NET:
-            return "controlnet";
-        case SDBackendModule::PHOTOMAKER:
-            return "photomaker";
         case SDBackendModule::UPSCALER:
             return "upscaler";
     }

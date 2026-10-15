@@ -16,7 +16,7 @@ export const IMAGE_INPUTS: readonly ImageInputConfig[] = [
     {
         target: "control_image",
         label: "Control Image",
-        description: "ControlNet-style guidance image.",
+        description: "Native DiT control image.",
         layout: "full",
     },
 ];

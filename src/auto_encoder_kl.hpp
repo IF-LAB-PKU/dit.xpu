@@ -159,109 +159,6 @@ public:
     }
 };
 
-class AE3DConv : public Conv2d {
-public:
-    AE3DConv(int64_t in_channels,
-             int64_t out_channels,
-             std::pair<int, int> kernel_size,
-             int video_kernel_size        = 3,
-             std::pair<int, int> stride   = {1, 1},
-             std::pair<int, int> padding  = {0, 0},
-             std::pair<int, int> dilation = {1, 1},
-             bool bias                    = true)
-        : Conv2d(in_channels, out_channels, kernel_size, stride, padding, dilation, bias) {
-        int kernel_padding      = video_kernel_size / 2;
-        blocks["time_mix_conv"] = std::shared_ptr<GGMLBlock>(new Conv3d(out_channels,
-                                                                        out_channels,
-                                                                        {video_kernel_size, 1, 1},
-                                                                        {1, 1, 1},
-                                                                        {kernel_padding, 0, 0}));
-    }
-
-    ggml_tensor* forward(GGMLRunnerContext* ctx,
-                         ggml_tensor* x) override {
-        // timesteps always None
-        // skip_video always False
-        // x: [N, IC, IH, IW]
-        // result: [N, OC, OH, OW]
-        auto time_mix_conv = std::dynamic_pointer_cast<Conv3d>(blocks["time_mix_conv"]);
-
-        x = Conv2d::forward(ctx, x);
-        // timesteps = x.shape[0]
-        // x = rearrange(x, "(b t) c h w -> b c t h w", t=timesteps)
-        // x = conv3d(x)
-        // return rearrange(x, "b c t h w -> (b t) c h w")
-        int64_t T = x->ne[3];
-        int64_t B = x->ne[3] / T;
-        int64_t C = x->ne[2];
-        int64_t H = x->ne[1];
-        int64_t W = x->ne[0];
-
-        x = ggml_reshape_4d(ctx->ggml_ctx, x, W * H, C, T, B);                     // (b t) c h w -> b t c (h w)
-        x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 0, 2, 1, 3));  // b t c (h w) -> b c t (h w)
-        x = time_mix_conv->forward(ctx, x);                                        // [B, OC, T, OH * OW]
-        x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 0, 2, 1, 3));  // b c t (h w) -> b t c (h w)
-        x = ggml_reshape_4d(ctx->ggml_ctx, x, W, H, C, T * B);                     // b t c (h w) -> (b t) c h w
-        return x;                                                                  // [B*T, OC, OH, OW]
-    }
-};
-
-class VideoResnetBlock : public ResnetBlock {
-protected:
-    void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
-        enum ggml_type wtype = get_type(prefix + "mix_factor", tensor_storage_map, GGML_TYPE_F32);
-        params["mix_factor"] = ggml_new_tensor_1d(ctx, wtype, 1);
-    }
-
-    float get_alpha() {
-        float alpha = ggml_ext_backend_tensor_get_f32(params["mix_factor"]);
-        return sigmoid(alpha);
-    }
-
-public:
-    VideoResnetBlock(int64_t in_channels,
-                     int64_t out_channels,
-                     int video_kernel_size = 3)
-        : ResnetBlock(in_channels, out_channels) {
-        // merge_strategy is always learned
-        blocks["time_stack"] = std::shared_ptr<GGMLBlock>(new ResBlock(out_channels, 0, out_channels, {video_kernel_size, 1}, 3, false, true));
-    }
-
-    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
-        // x: [N, in_channels, h, w] aka [b*t, in_channels, h, w]
-        // return: [N, out_channels, h, w] aka [b*t, out_channels, h, w]
-        // t_emb is always None
-        // skip_video is always False
-        // timesteps is always None
-        auto time_stack = std::dynamic_pointer_cast<ResBlock>(blocks["time_stack"]);
-
-        x = ResnetBlock::forward(ctx, x);  // [N, out_channels, h, w]
-        // return x;
-
-        int64_t T = x->ne[3];
-        int64_t B = x->ne[3] / T;
-        int64_t C = x->ne[2];
-        int64_t H = x->ne[1];
-        int64_t W = x->ne[0];
-
-        x          = ggml_reshape_4d(ctx->ggml_ctx, x, W * H, C, T, B);                     // (b t) c h w -> b t c (h w)
-        x          = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 0, 2, 1, 3));  // b t c (h w) -> b c t (h w)
-        auto x_mix = x;
-
-        x = time_stack->forward(ctx, x);  // b t c (h w)
-
-        float alpha = get_alpha();
-        x           = ggml_add(ctx->ggml_ctx,
-                               ggml_ext_scale(ctx->ggml_ctx, x, alpha),
-                               ggml_ext_scale(ctx->ggml_ctx, x_mix, 1.0f - alpha));
-
-        x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 0, 2, 1, 3));  // b c t (h w) -> b t c (h w)
-        x = ggml_reshape_4d(ctx->ggml_ctx, x, W, H, C, T * B);                     // b t c (h w) -> (b t) c h w
-
-        return x;
-    }
-};
-
 // ldm.modules.diffusionmodules.model.Encoder
 class Encoder : public GGMLBlock {
 protected:
@@ -371,28 +268,18 @@ protected:
     std::vector<int> ch_mult = {1, 2, 4, 4};
     int num_res_blocks       = 2;
     int z_channels           = 4;
-    bool video_decoder       = false;
-    int video_kernel_size    = 3;
 
     virtual std::shared_ptr<GGMLBlock> get_conv_out(int64_t in_channels,
                                                     int64_t out_channels,
                                                     std::pair<int, int> kernel_size,
                                                     std::pair<int, int> stride  = {1, 1},
                                                     std::pair<int, int> padding = {0, 0}) {
-        if (video_decoder) {
-            return std::shared_ptr<GGMLBlock>(new AE3DConv(in_channels, out_channels, kernel_size, video_kernel_size, stride, padding));
-        } else {
-            return std::shared_ptr<GGMLBlock>(new Conv2d(in_channels, out_channels, kernel_size, stride, padding));
-        }
+        return std::shared_ptr<GGMLBlock>(new Conv2d(in_channels, out_channels, kernel_size, stride, padding));
     }
 
     virtual std::shared_ptr<GGMLBlock> get_resnet_block(int64_t in_channels,
                                                         int64_t out_channels) {
-        if (video_decoder) {
-            return std::shared_ptr<GGMLBlock>(new VideoResnetBlock(in_channels, out_channels, video_kernel_size));
-        } else {
-            return std::shared_ptr<GGMLBlock>(new ResnetBlock(in_channels, out_channels));
-        }
+        return std::shared_ptr<GGMLBlock>(new ResnetBlock(in_channels, out_channels));
     }
 
 public:
@@ -401,16 +288,12 @@ public:
             std::vector<int> ch_mult,
             int num_res_blocks,
             int z_channels,
-            bool use_linear_projection = false,
-            bool video_decoder         = false,
-            int video_kernel_size      = 3)
+            bool use_linear_projection = false)
         : ch(ch),
           out_ch(out_ch),
           ch_mult(ch_mult),
           num_res_blocks(num_res_blocks),
-          z_channels(z_channels),
-          video_decoder(video_decoder),
-          video_kernel_size(video_kernel_size) {
+          z_channels(z_channels) {
         int num_resolutions = static_cast<int>(ch_mult.size());
         int block_in        = ch * ch_mult[num_resolutions - 1];
 
@@ -441,10 +324,6 @@ public:
 
     virtual ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* z) {
         // z: [N, z_channels, h, w]
-        // alpha is always 0
-        // merge_strategy is always learned
-        // time_mode is always conv-only, so we need to replace conv_out_op/resnet_op to AE3DConv/VideoResBlock
-        // AttnVideoBlock will not be used
         auto conv_in     = std::dynamic_pointer_cast<Conv2d>(blocks["conv_in"]);
         auto mid_block_1 = std::dynamic_pointer_cast<ResnetBlock>(blocks["mid.block_1"]);
         auto mid_attn_1  = std::dynamic_pointer_cast<AttnBlock>(blocks["mid.attn_1"]);
@@ -495,7 +374,6 @@ class AutoEncoderKLModel : public GGMLBlock {
 protected:
     SDVersion version;
     bool decode_only       = true;
-    bool use_video_decoder = false;
     bool use_quant         = true;
     int embed_dim          = 4;
     struct {
@@ -533,13 +411,12 @@ protected:
     }
 
 public:
-    AutoEncoderKLModel(SDVersion version                              = VERSION_SD1,
+    AutoEncoderKLModel(SDVersion version                              = VERSION_SD3,
                        bool decode_only                               = true,
                        bool use_linear_projection                     = false,
-                       bool use_video_decoder                         = false,
                        const String2TensorStorage& tensor_storage_map = {},
                        const std::string& prefix                      = "")
-        : version(version), decode_only(decode_only), use_video_decoder(use_video_decoder) {
+        : version(version), decode_only(decode_only) {
         if (sd_version_is_dit(version)) {
             if (sd_version_uses_flux2_vae(version)) {
                 dd_config.z_channels = 32;
@@ -549,9 +426,6 @@ public:
                 dd_config.z_channels = 16;
             }
         }
-        if (use_video_decoder) {
-            use_quant = false;
-        }
         int decoder_ch = dd_config.ch;
         detect_decoder_ch(tensor_storage_map, prefix, decoder_ch);
         blocks["decoder"] = std::shared_ptr<GGMLBlock>(new Decoder(decoder_ch,
@@ -559,8 +433,7 @@ public:
                                                                    dd_config.ch_mult,
                                                                    dd_config.num_res_blocks,
                                                                    dd_config.z_channels,
-                                                                   use_linear_projection,
-                                                                   use_video_decoder));
+                                                                   use_linear_projection));
         if (use_quant) {
             blocks["post_quant_conv"] = std::shared_ptr<GGMLBlock>(new Conv2d(dd_config.z_channels,
                                                                               embed_dim,
@@ -668,16 +541,9 @@ struct AutoEncoderKL : public VAE {
                   const String2TensorStorage& tensor_storage_map,
                   const std::string prefix,
                   bool decode_only       = false,
-                  bool use_video_decoder = false,
-                  SDVersion version      = VERSION_SD1)
+                  SDVersion version      = VERSION_SD3)
         : decode_only(decode_only), VAE(version, backend, params_backend) {
-        if (sd_version_is_sd1(version) || sd_version_is_sd2(version)) {
-            scale_factor = 0.18215f;
-            shift_factor = 0.f;
-        } else if (sd_version_is_sdxl(version)) {
-            scale_factor = 0.13025f;
-            shift_factor = 0.f;
-        } else if (sd_version_is_sd3(version)) {
+        if (sd_version_is_sd3(version)) {
             scale_factor = 1.5305f;
             shift_factor = 0.0609f;
         } else if (sd_version_is_flux(version) || sd_version_is_z_image(version) || sd_version_is_longcat(version)) {
@@ -699,7 +565,7 @@ struct AutoEncoderKL : public VAE {
                 break;
             }
         }
-        ae = AutoEncoderKLModel(version, decode_only, use_linear_projection, use_video_decoder, tensor_storage_map, prefix);
+        ae = AutoEncoderKLModel(version, decode_only, use_linear_projection, tensor_storage_map, prefix);
         ae.init(params_ctx, tensor_storage_map, prefix);
     }
 
@@ -759,8 +625,6 @@ struct AutoEncoderKL : public VAE {
     sd::Tensor<float> vae_output_to_latents(const sd::Tensor<float>& vae_output, std::shared_ptr<RNG> rng) override {
         if (sd_version_uses_flux2_vae(version)) {
             return vae_output;
-        } else if (version == VERSION_SD1_PIX2PIX) {
-            return sd::ops::chunk(vae_output, 2, 2)[0];
         } else {
             return gaussian_latent_sample(vae_output, rng);
         }

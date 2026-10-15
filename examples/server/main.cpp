@@ -49,7 +49,6 @@ static void parse_args(int argc,
     if (!svr_params.resolve_and_validate() ||
         !ctx_params.resolve_and_validate(IMG_GEN) ||
         !default_gen_params.resolve_and_validate(IMG_GEN,
-                                                 ctx_params.lora_model_dir,
                                                  ctx_params.hires_upscalers_dir)) {
         print_usage(argv[0], options_vec);
         exit(1);
@@ -95,8 +94,6 @@ int main(int argc, const char** argv) {
 
     std::mutex sd_ctx_mutex;
 
-    std::vector<LoraEntry> lora_cache;
-    std::mutex lora_mutex;
     std::vector<UpscalerEntry> upscaler_cache;
     std::mutex upscaler_mutex;
     AsyncJobManager async_job_manager;
@@ -106,8 +103,6 @@ int main(int argc, const char** argv) {
         &svr_params,
         &ctx_params,
         &default_gen_params,
-        &lora_cache,
-        &lora_mutex,
         &upscaler_cache,
         &upscaler_mutex,
         &async_job_manager,

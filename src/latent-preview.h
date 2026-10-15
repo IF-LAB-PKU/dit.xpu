@@ -283,20 +283,6 @@ const float sd3_latent_rgb_proj[16][3] = {
 };
 float sd3_latent_rgb_bias[3] = {0, 0, 0};
 
-const float sdxl_latent_rgb_proj[4][3] = {
-    {0.258303f, 0.277640f, 0.329699f},
-    {-0.299701f, 0.105446f, 0.014194f},
-    {0.050522f, 0.186163f, -0.143257f},
-    {-0.211938f, -0.149892f, -0.080036f}};
-float sdxl_latent_rgb_bias[3] = {0.144381f, -0.033313f, 0.007061f};
-
-const float sd_latent_rgb_proj[4][3] = {
-    {0.337366f, 0.216344f, 0.257386f},
-    {0.165636f, 0.386828f, 0.046994f},
-    {-0.267803f, 0.237036f, 0.223517f},
-    {-0.178022f, -0.200862f, -0.678514f}};
-float sd_latent_rgb_bias[3] = {-0.017478f, -0.055834f, -0.105825f};
-
 void preview_latent_video(uint8_t* buffer, ggml_tensor* latents, const float (*latent_rgb_proj)[3], const float latent_rgb_bias[3], int patch_size) {
     size_t buffer_head = 0;
 

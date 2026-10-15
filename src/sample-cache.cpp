@@ -7,8 +7,6 @@ namespace sd_sample {
         if (reuse_threshold == INFINITY) {
             if (params.mode == SD_CACHE_EASYCACHE) {
                 reuse_threshold = 0.2f;
-            } else if (params.mode == SD_CACHE_UCACHE) {
-                reuse_threshold = 1.0f;
             }
         }
         return std::max(0.0f, reuse_threshold);
@@ -18,16 +16,12 @@ namespace sd_sample {
         return mode == SampleCacheMode::EASYCACHE;
     }
 
-    bool SampleCacheRuntime::ucache_enabled() const {
-        return mode == SampleCacheMode::UCACHE;
-    }
-
     bool SampleCacheRuntime::cachedit_enabled() const {
         return mode == SampleCacheMode::CACHEDIT;
     }
 
     static bool has_valid_cache_percent_range(const sd_cache_params_t& cache_params) {
-        if (cache_params.mode != SD_CACHE_EASYCACHE && cache_params.mode != SD_CACHE_UCACHE) {
+        if (cache_params.mode != SD_CACHE_EASYCACHE) {
             return true;
         }
 
@@ -64,42 +58,6 @@ namespace sd_sample {
                  config.reuse_threshold,
                  config.start_percent,
                  config.end_percent);
-    }
-
-    static void init_ucache_runtime(SampleCacheRuntime& runtime,
-                                    SDVersion version,
-                                    const sd_cache_params_t& cache_params,
-                                    Denoiser* denoiser,
-                                    const std::vector<float>& sigmas) {
-        if (!sd_version_is_unet(version)) {
-            LOG_WARN("UCache requested but not supported for this model type (only UNET models)");
-            return;
-        }
-
-        UCacheConfig config;
-        config.enabled                = true;
-        config.reuse_threshold        = get_cache_reuse_threshold(cache_params);
-        config.start_percent          = cache_params.start_percent;
-        config.end_percent            = cache_params.end_percent;
-        config.error_decay_rate       = std::max(0.0f, std::min(1.0f, cache_params.error_decay_rate));
-        config.use_relative_threshold = cache_params.use_relative_threshold;
-        config.reset_error_on_compute = cache_params.reset_error_on_compute;
-
-        runtime.ucache.init(config, denoiser);
-        if (!runtime.ucache.enabled()) {
-            LOG_WARN("UCache requested but could not be initialized for this run");
-            return;
-        }
-
-        runtime.ucache.set_sigmas(sigmas);
-        runtime.mode = SampleCacheMode::UCACHE;
-        LOG_INFO("UCache enabled - threshold: %.3f, start: %.2f, end: %.2f, decay: %.2f, relative: %s, reset: %s",
-                 config.reuse_threshold,
-                 config.start_percent,
-                 config.end_percent,
-                 config.error_decay_rate,
-                 config.use_relative_threshold ? "true" : "false",
-                 config.reset_error_on_compute ? "true" : "false");
     }
 
     static void init_cachedit_runtime(SampleCacheRuntime& runtime,
@@ -149,8 +107,8 @@ namespace sd_sample {
                                       SDVersion version,
                                       const sd_cache_params_t& cache_params,
                                       const std::vector<float>& sigmas) {
-        if (!sd_version_is_unet(version) && !sd_version_is_dit(version)) {
-            LOG_WARN("Spectrum requested but not supported for this model type (only UNET and DiT models)");
+        if (!sd_version_is_dit(version)) {
+            LOG_WARN("Spectrum requested but not supported for this model type (only DiT models)");
             return;
         }
 
@@ -193,9 +151,6 @@ namespace sd_sample {
             case SD_CACHE_EASYCACHE:
                 init_easycache_runtime(runtime, version, *cache_params, denoiser);
                 break;
-            case SD_CACHE_UCACHE:
-                init_ucache_runtime(runtime, version, *cache_params, denoiser, sigmas);
-                break;
             case SD_CACHE_DBCACHE:
             case SD_CACHE_TAYLORSEER:
             case SD_CACHE_CACHE_DIT:
@@ -221,9 +176,6 @@ namespace sd_sample {
             case SampleCacheMode::EASYCACHE:
                 runtime.easycache.begin_step(step_index, sigma);
                 break;
-            case SampleCacheMode::UCACHE:
-                runtime.ucache.begin_step(step_index, sigma);
-                break;
             case SampleCacheMode::CACHEDIT:
                 runtime.cachedit.begin_step(step_index, sigma);
                 break;
@@ -242,8 +194,6 @@ namespace sd_sample {
         switch (runtime.mode) {
             case SampleCacheMode::EASYCACHE:
                 return runtime.easycache.before_condition(condition, input, output, sigma, step_index);
-            case SampleCacheMode::UCACHE:
-                return runtime.ucache.before_condition(condition, input, output, sigma, step_index);
             case SampleCacheMode::CACHEDIT:
                 return runtime.cachedit.before_condition(condition, input, output, sigma, step_index);
             case SampleCacheMode::NONE:
@@ -264,9 +214,6 @@ namespace sd_sample {
             case SampleCacheMode::EASYCACHE:
                 runtime.easycache.after_condition(condition, input, output);
                 break;
-            case SampleCacheMode::UCACHE:
-                runtime.ucache.after_condition(condition, input, output);
-                break;
             case SampleCacheMode::CACHEDIT:
                 runtime.cachedit.after_condition(condition, input, output);
                 break;
@@ -279,8 +226,6 @@ namespace sd_sample {
         switch (runtime.mode) {
             case SampleCacheMode::EASYCACHE:
                 return runtime.easycache.is_step_skipped();
-            case SampleCacheMode::UCACHE:
-                return runtime.ucache.is_step_skipped();
             case SampleCacheMode::CACHEDIT:
                 return runtime.cachedit.is_step_skipped();
             case SampleCacheMode::NONE:
@@ -307,25 +252,6 @@ namespace sd_sample {
                 }
             } else if (total_steps > 0) {
                 LOG_INFO("EasyCache completed without skipping steps");
-            }
-        }
-
-        if (runtime.ucache_enabled()) {
-            if (runtime.ucache.total_steps_skipped > 0 && total_steps > 0) {
-                if (runtime.ucache.total_steps_skipped < static_cast<int>(total_steps)) {
-                    double speedup = static_cast<double>(total_steps) /
-                                     static_cast<double>(total_steps - runtime.ucache.total_steps_skipped);
-                    LOG_INFO("UCache skipped %d/%zu steps (%.2fx estimated speedup)",
-                             runtime.ucache.total_steps_skipped,
-                             total_steps,
-                             speedup);
-                } else {
-                    LOG_INFO("UCache skipped %d/%zu steps",
-                             runtime.ucache.total_steps_skipped,
-                             total_steps);
-                }
-            } else if (total_steps > 0) {
-                LOG_INFO("UCache completed without skipping steps");
             }
         }
 
@@ -357,5 +283,4 @@ namespace sd_sample {
                      speedup);
         }
     }
-
 }  // namespace sd_sample

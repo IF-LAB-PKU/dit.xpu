@@ -187,7 +187,7 @@ struct SDCliParams {
         options.manual_options = {
             {"-M",
              "--mode",
-             "run mode, one of [img_gen, vid_gen, upscale, convert, metadata], default: img_gen",
+             "run mode, one of [img_gen, vid_gen, convert, metadata], default: img_gen",
              on_mode_arg},
             {"",
              "--preview",
@@ -290,7 +290,6 @@ void parse_args(int argc, const char** argv, SDCliParams& cli_params, SDContextP
     if (valid && cli_params.mode != METADATA) {
         valid = ctx_params.resolve_and_validate(cli_params.mode) &&
                 gen_params.resolve_and_validate(cli_params.mode,
-                                                ctx_params.lora_model_dir,
                                                 ctx_params.hires_upscalers_dir);
     }
 
@@ -735,18 +734,6 @@ int main(int argc, const char* argv[]) {
         }
     }
 
-    if (!gen_params.pm_id_images_dir.empty()) {
-        gen_params.pm_id_images.clear();
-        if (!load_images_from_dir(gen_params.pm_id_images_dir,
-                                  gen_params.pm_id_images,
-                                  0,
-                                  0,
-                                  0,
-                                  cli_params.verbose)) {
-            return 1;
-        }
-    }
-
     if (cli_params.mode == VID_GEN) {
         vae_decode_only = false;
     }
@@ -768,79 +755,42 @@ int main(int argc, const char* argv[]) {
     int num_results             = 0;
     sd_audio_t* generated_audio = nullptr;
 
-    if (cli_params.mode == UPSCALE) {
-        num_results = 1;
-        results.push_back(gen_params.init_image.release());
-    } else {
-        SDCtxPtr sd_ctx(new_sd_ctx(&sd_ctx_params));
+    SDCtxPtr sd_ctx(new_sd_ctx(&sd_ctx_params));
 
-        if (sd_ctx == nullptr) {
-            LOG_INFO("new_sd_ctx_t failed");
-            return 1;
-        }
-
-        if (gen_params.sample_params.sample_method == SAMPLE_METHOD_COUNT) {
-            gen_params.sample_params.sample_method = sd_get_default_sample_method(sd_ctx.get());
-        }
-
-        if (gen_params.high_noise_sample_params.sample_method == SAMPLE_METHOD_COUNT) {
-            gen_params.high_noise_sample_params.sample_method = sd_get_default_sample_method(sd_ctx.get());
-        }
-
-        if (gen_params.sample_params.scheduler == SCHEDULER_COUNT) {
-            gen_params.sample_params.scheduler = sd_get_default_scheduler(sd_ctx.get(), gen_params.sample_params.sample_method);
-        }
-
-        if (cli_params.mode == IMG_GEN) {
-            sd_img_gen_params_t img_gen_params = gen_params.to_sd_img_gen_params_t();
-
-            num_results = gen_params.batch_count;
-            results.adopt(generate_image(sd_ctx.get(), &img_gen_params), num_results);
-        } else if (cli_params.mode == VID_GEN) {
-            sd_vid_gen_params_t vid_gen_params = gen_params.to_sd_vid_gen_params_t();
-            sd_image_t* generated_video        = nullptr;
-            if (!generate_video(sd_ctx.get(), &vid_gen_params, &generated_video, &num_results, &generated_audio)) {
-                generated_video = nullptr;
-            }
-            results.adopt(generated_video, num_results);
-        }
-
-        if (!results) {
-            LOG_ERROR("generate failed");
-            return 1;
-        }
+    if (sd_ctx == nullptr) {
+        LOG_INFO("new_sd_ctx_t failed");
+        return 1;
     }
 
-    int upscale_factor = 4;  // unused for RealESRGAN_x4plus_anime_6B.pth
-    if (ctx_params.esrgan_path.size() > 0 && gen_params.upscale_repeats > 0) {
-        UpscalerCtxPtr upscaler_ctx(new_upscaler_ctx(ctx_params.esrgan_path.c_str(),
-                                                     ctx_params.offload_params_to_cpu,
-                                                     ctx_params.diffusion_conv_direct,
-                                                     ctx_params.n_threads,
-                                                     gen_params.upscale_tile_size,
-                                                     ctx_params.backend.c_str(),
-                                                     ctx_params.params_backend.c_str()));
+    if (gen_params.sample_params.sample_method == SAMPLE_METHOD_COUNT) {
+        gen_params.sample_params.sample_method = sd_get_default_sample_method(sd_ctx.get());
+    }
 
-        if (upscaler_ctx == nullptr) {
-            LOG_ERROR("new_upscaler_ctx failed");
-        } else {
-            for (int i = 0; i < num_results; i++) {
-                if (results[i].data == nullptr) {
-                    continue;
-                }
-                SDImageOwner current_image(results[i]);
-                results[i] = {0, 0, 0, nullptr};
-                for (int u = 0; u < gen_params.upscale_repeats; ++u) {
-                    SDImageOwner upscaled_image(upscale(upscaler_ctx.get(), current_image.get(), upscale_factor));
-                    if (upscaled_image.get().data == nullptr) {
-                        LOG_ERROR("upscale failed");
-                        break;
-                    }
-                    current_image = std::move(upscaled_image);
-                }
-                results[i] = current_image.release();  // Set the final upscaled image as the result
-            }
+    if (gen_params.high_noise_sample_params.sample_method == SAMPLE_METHOD_COUNT) {
+        gen_params.high_noise_sample_params.sample_method = sd_get_default_sample_method(sd_ctx.get());
+    }
+
+    if (gen_params.sample_params.scheduler == SCHEDULER_COUNT) {
+        gen_params.sample_params.scheduler = sd_get_default_scheduler(sd_ctx.get(), gen_params.sample_params.sample_method);
+    }
+
+    if (cli_params.mode == IMG_GEN) {
+        sd_img_gen_params_t img_gen_params = gen_params.to_sd_img_gen_params_t();
+
+        num_results = gen_params.batch_count;
+        results.adopt(generate_image(sd_ctx.get(), &img_gen_params), num_results);
+    } else if (cli_params.mode == VID_GEN) {
+        sd_vid_gen_params_t vid_gen_params = gen_params.to_sd_vid_gen_params_t();
+        sd_image_t* generated_video        = nullptr;
+        if (!generate_video(sd_ctx.get(), &vid_gen_params, &generated_video, &num_results, &generated_audio)) {
+            generated_video = nullptr;
         }
+        results.adopt(generated_video, num_results);
+    }
+
+    if (!results) {
+        LOG_ERROR("generate failed");
+        return 1;
     }
 
     if (!save_results(cli_params, ctx_params, gen_params, results.data(), num_results, generated_audio)) {

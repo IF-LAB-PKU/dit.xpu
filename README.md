@@ -8,7 +8,7 @@
 <a href="https://trendshift.io/repositories/9714" target="_blank"><img src="https://trendshift.io/api/badge/repositories/9714" alt="leejet%2Fstable-diffusion.cpp | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </div>
 
-Diffusion model(SD,Flux,Wan,...) inference in pure C/C++
+DiT diffusion model (SD3, Flux, Wan, ...) inference in pure C/C++
 
 ***Note that this project is under active development. \
 API and command-line option may change frequently.***
@@ -27,13 +27,14 @@ API and command-line option may change frequently.***
 
 ## Features
 
+This fork retains DiT model families and their text encoders, VAEs, and native image/video conditioning.
+UNet models, LoRA/LyCORIS, ControlNet, PhotoMaker, and ESRGAN have been removed.
+The public C API and CLI reflect this reduced scope.
+
 - Plain C/C++ implementation based on [ggml](https://github.com/ggml-org/ggml), working in the same way as [llama.cpp](https://github.com/ggml-org/llama.cpp)
 - Super lightweight and without external dependencies
 - Supported models
   - Image Models
-    - SD1.x, SD2.x, [SD-Turbo](https://huggingface.co/stabilityai/sd-turbo)
-    - SDXL, [SDXL-Turbo](https://huggingface.co/stabilityai/sdxl-turbo)
-    - [Some SD1.x and SDXL distilled models](./docs/distilled_sd.md)
     - [SD3/SD3.5](./docs/sd3.md)
     - [FLUX.1-dev/FLUX.1-schnell](./docs/flux.md)
     - [FLUX.2-dev/FLUX.2-klein](./docs/flux2.md)
@@ -53,12 +54,7 @@ API and command-line option may change frequently.***
   - Video Models
     - [Wan2.1/Wan2.2](./docs/wan.md)
     - [LTX-2.3](./docs/ltx2.md)
-  - [PhotoMaker](https://github.com/TencentARC/PhotoMaker) support.
-  - Control Net support with SD 1.5
-  - LoRA support, same as [stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui/wiki/Features#lora)
-  - Latent Consistency Models support (LCM/LCM-LoRA)
   - Faster and memory efficient latent decoding with [TAESD](https://github.com/madebyollin/taesd)
-  - Upscale images generated with [ESRGAN](https://github.com/xinntao/Real-ESRGAN)
 - Supported backends
   - CPU (AVX, AVX2 and AVX512 support for x86 architectures)
   - CUDA
@@ -100,20 +96,11 @@ API and command-line option may change frequently.***
 - Download pre-built binaries from the [releases page](https://github.com/leejet/stable-diffusion.cpp/releases)
 - Or build from source by following the [build guide](./docs/build.md)
 
-### Download model weights
+### Download weights and generate an image
 
-- download weights(.ckpt or .safetensors or .gguf). For example
-    - Stable Diffusion v1.5 from https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5 
-
-    ```sh
-    curl -L -O https://huggingface.co/runwayml/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors
-    ```
-
-### Generate an image with just one command
-
-```sh
-./bin/sd-cli -m ../models/v1-5-pruned-emaonly.safetensors -p "a lovely cat"
-```
+Follow a retained model guide, such as [SD3/SD3.5](./docs/sd3.md),
+[FLUX](./docs/flux.md), or [Z-Image](./docs/z_image.md), to download
+its diffusion weights, text encoder, and VAE and run the matching command.
 
 ***For detailed command-line arguments, check out [cli doc](./examples/cli/README.md).***
 
@@ -125,7 +112,6 @@ For runtime and parameter backend placement, see the [backend selection guide](.
 ## More Guides
 
 - [Backend selection](./docs/backend.md)
-- [SD1.x/SD2.x/SDXL](./docs/sd.md)
 - [SD3/SD3.5](./docs/sd3.md)
 - [FLUX.1-dev/FLUX.1-schnell](./docs/flux.md)
 - [FLUX.2-dev/FLUX.2-klein](./docs/flux2.md)
@@ -141,10 +127,6 @@ For runtime and parameter backend placement, see the [backend selection guide](.
 - [Anima](./docs/anima.md)
 - [ERNIE-Image](./docs/ernie_image.md)
 - [HiDream-O1-Image](./docs/hidream_o1_image.md)
-- [LoRA](./docs/lora.md)
-- [LCM/LCM-LoRA](./docs/lcm.md)
-- [Using PhotoMaker to personalize image generation](./docs/photo_maker.md)
-- [Using ESRGAN to upscale results](./docs/esrgan.md)
 - [Using TAESD to faster decoding](./docs/taesd.md)
 - [Docker](./docs/docker.md)
 - [Quantization and GGUF](./docs/quantization_and_gguf.md)
@@ -197,6 +179,5 @@ Thank you to all the people who have already contributed to stable-diffusion.cpp
 - [k-diffusion](https://github.com/crowsonkb/k-diffusion)
 - [latent-consistency-model](https://github.com/luosiallen/latent-consistency-model)
 - [generative-models](https://github.com/Stability-AI/generative-models/)
-- [PhotoMaker](https://github.com/TencentARC/PhotoMaker)
 - [Wan2.1](https://github.com/Wan-Video/Wan2.1)
 - [Wan2.2](https://github.com/Wan-Video/Wan2.2)

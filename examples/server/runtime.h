@@ -31,12 +31,6 @@ struct SDSvrParams {
     std::string to_string() const;
 };
 
-struct LoraEntry {
-    std::string name;
-    std::string path;
-    std::string fullpath;
-};
-
 struct UpscalerEntry {
     std::string name;
     std::string path;
@@ -51,8 +45,6 @@ struct ServerRuntime {
     const SDSvrParams* svr_params;
     const SDContextParams* ctx_params;
     const SDGenerationParams* default_gen_params;
-    std::vector<LoraEntry>* lora_cache;
-    std::mutex* lora_mutex;
     std::vector<UpscalerEntry>* upscaler_cache;
     std::mutex* upscaler_mutex;
     AsyncJobManager* async_job_manager;
@@ -94,7 +86,5 @@ bool assign_output_options(VidGenJobRequest& request,
 std::string video_mime_type(const std::string& output_format);
 bool runtime_supports_generation_mode(const ServerRuntime& runtime, SDMode mode);
 std::string unsupported_generation_mode_error(SDMode mode);
-void refresh_lora_cache(ServerRuntime& rt);
-std::string get_lora_full_path(ServerRuntime& rt, const std::string& path);
 void refresh_upscaler_cache(ServerRuntime& rt);
 int64_t unix_timestamp_now();
