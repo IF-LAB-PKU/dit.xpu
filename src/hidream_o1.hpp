@@ -489,10 +489,6 @@ namespace HiDreamO1 {
             vision_runner->set_flash_attention_enabled(enabled);
         }
 
-        void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
-            vision_runner->set_weight_adapter(adapter);
-        }
-
         SDCondition get_learned_condition(int n_threads,
                                           const ConditionerParams& conditioner_params) override {
             SDCondition result;

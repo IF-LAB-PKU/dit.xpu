@@ -11,12 +11,6 @@ The server currently exposes three API families:
 The `sdcpp API` is the native API surface.
 Its request schema is the same schema used by `sd_cpp_extra_args`.
 
-Global LoRA rule:
-
-- Server APIs do not parse LoRA tags embedded inside `prompt`.
-- `<lora:...>` prompt syntax is intentionally unsupported in `OpenAI API`, `sdapi`, and `sdcpp API`.
-- LoRA must be passed through structured API fields when the API supports it.
-
 ## Overview
 
 ### OpenAI API
@@ -37,7 +31,6 @@ Current generation-related endpoints include:
 
 - `POST /sdapi/v1/txt2img`
 - `POST /sdapi/v1/img2img`
-- `GET /sdapi/v1/loras`
 - `GET /sdapi/v1/upscalers`
 - `GET /sdapi/v1/latent-upscale-modes`
 - `GET /sdapi/v1/samplers`
@@ -179,7 +172,6 @@ Response fields:
 
 - `OpenAI API` is synchronous from the HTTP client's perspective.
 - Native async job polling is not exposed through this family.
-- Prompt-embedded `<lora:...>` tags are intentionally unsupported.
 
 ## Stable Diffusion WebUI API
 
@@ -216,7 +208,6 @@ Currently supported request fields:
 | `clip_skip` | `integer` | Optional |
 | `sampler_name` | `string` | WebUI sampler name |
 | `scheduler` | `string` | Scheduler name |
-| `lora` | `array<object>` | Structured LoRA list |
 | `extra_images` | `array<string>` | Base64 or data URL images |
 | `enable_hr` | `boolean` | Enable highres fix for `txt2img` |
 | `hr_upscaler` | `string` | `Lanczos`, `Nearest`, a latent mode such as `Latent (nearest-exact)`, or an upscaler model name from `/sdapi/v1/upscalers` |
@@ -268,7 +259,6 @@ Response fields:
 
 Currently exposed:
 
-- `GET /sdapi/v1/loras`
 - `GET /sdapi/v1/upscalers`
 - `GET /sdapi/v1/latent-upscale-modes`
 - `GET /sdapi/v1/samplers`
@@ -277,13 +267,6 @@ Currently exposed:
 - `GET /sdapi/v1/options`
 
 Response fields:
-
-`GET /sdapi/v1/loras`
-
-| Field | Type | Notes |
-| --- | --- | --- |
-| `[].name` | `string` | Display name derived from file stem |
-| `[].path` | `string` | Relative path under the configured LoRA directory |
 
 `GET /sdapi/v1/upscalers`
 
@@ -341,7 +324,6 @@ Built-in latent modes include `Latent`, `Latent (nearest)`, `Latent (nearest-exa
 ### Notes
 
 - `sdapi` is synchronous from the HTTP client's perspective.
-- Prompt-embedded `<lora:...>` tags are intentionally unsupported.
 
 ## sdcpp API
 
@@ -420,7 +402,6 @@ Top-level fields:
 | `features_by_mode` | `object` | Explicit feature flags for each supported mode |
 | `samplers` | `array<string>` | Available sampling methods |
 | `schedulers` | `array<string>` | Available schedulers |
-| `loras` | `array<object>` | Available LoRA entries |
 | `upscalers` | `array<object>` | Available model-backed highres upscalers |
 | `limits` | `object` | Shared queue and size limits |
 
@@ -450,13 +431,6 @@ Mode-aware objects:
 | `features_by_mode.vid_gen` | `object` |
 
 Shared nested fields:
-
-`loras`
-
-| Field | Type |
-| --- | --- |
-| `loras[].name` | `string` |
-| `loras[].path` | `string` |
 
 `upscalers`
 
@@ -493,7 +467,6 @@ Shared default fields used by both `img_gen` and `vid_gen`:
 | `sample_params.sample_method` | `string` |
 | `sample_params.sample_steps` | `integer` |
 | `sample_params.eta` | `number \| null` |
-| `sample_params.shifted_timestep` | `integer` |
 | `sample_params.flow_shift` | `number \| null` |
 | `sample_params.guidance.txt_cfg` | `number` |
 | `sample_params.guidance.img_cfg` | `number \| null` |
@@ -527,7 +500,6 @@ Shared default fields used by both `img_gen` and `vid_gen`:
 | `batch_count` | `integer` |
 | `auto_resize_ref_image` | `boolean` |
 | `increase_ref_index` | `boolean` |
-| `control_strength` | `number` |
 | `hires` | `object` |
 | `hires.enabled` | `boolean` |
 | `hires.upscaler` | `string` |
@@ -537,7 +509,6 @@ Shared default fields used by both `img_gen` and `vid_gen`:
 | `hires.steps` | `integer` |
 | `hires.denoising_strength` | `number` |
 | `hires.custom_sigmas` | `array<number>` |
-| `hires.upscale_tile_size` | `integer` |
 
 `vid_gen`-specific default fields:
 
@@ -552,7 +523,6 @@ Shared default fields used by both `img_gen` and `vid_gen`:
 | `high_noise_sample_params.sample_method` | `string` |
 | `high_noise_sample_params.sample_steps` | `integer` |
 | `high_noise_sample_params.eta` | `number \| null` |
-| `high_noise_sample_params.shifted_timestep` | `integer` |
 | `high_noise_sample_params.flow_shift` | `number \| null` |
 | `high_noise_sample_params.guidance.txt_cfg` | `number` |
 | `high_noise_sample_params.guidance.img_cfg` | `number \| null` |
@@ -568,7 +538,6 @@ Fields returned in `features_by_mode.img_gen`:
 - `mask_image`
 - `control_image`
 - `ref_images`
-- `lora`
 - `vae_tiling`
 - `hires`
 - `cache`
@@ -581,7 +550,6 @@ Fields returned in `features_by_mode.vid_gen`:
 - `end_image`
 - `control_frames`
 - `high_noise_sample_params`
-- `lora`
 - `vae_tiling`
 - `cache`
 - `cancel_queued`
@@ -652,7 +620,6 @@ Example:
   "batch_count": 1,
   "auto_resize_ref_image": true,
   "increase_ref_index": false,
-  "control_strength": 0.9,
   "embed_image_metadata": true,
 
   "init_image": null,
@@ -665,7 +632,6 @@ Example:
     "sample_method": "euler_a",
     "sample_steps": 28,
     "eta": 1.0,
-    "shifted_timestep": 0,
     "custom_sigmas": [],
     "flow_shift": 0.0,
     "guidance": {
@@ -681,7 +647,6 @@ Example:
     }
   },
 
-  "lora": [],
   "hires": {
     "enabled": false,
     "upscaler": "Latent",
@@ -690,8 +655,7 @@ Example:
     "target_height": 0,
     "steps": 0,
     "denoising_strength": 0.7,
-    "custom_sigmas": [],
-    "upscale_tile_size": 128
+    "custom_sigmas": []
   },
 
   "vae_tiling_params": {
@@ -714,12 +678,6 @@ Example:
   "output_compression": 100
 }
 ```
-
-### LoRA Rules
-
-- The server only accepts explicit LoRA entries from the `lora` field.
-- Prompt-embedded `<lora:...>` tags are intentionally unsupported.
-- Clients should resolve LoRA usage through the structured `lora` array.
 
 ### Image Encoding Rules
 
@@ -756,7 +714,6 @@ Top-level scalar fields:
 | `batch_count` | `integer` |
 | `auto_resize_ref_image` | `boolean` |
 | `increase_ref_index` | `boolean` |
-| `control_strength` | `number` |
 | `embed_image_metadata` | `boolean` |
 
 Image fields:
@@ -768,14 +725,6 @@ Image fields:
 | `mask_image` | `string \| null` |
 | `control_image` | `string \| null` |
 
-LoRA fields:
-
-| Field | Type |
-| --- | --- |
-| `lora[].path` | `string` |
-| `lora[].multiplier` | `number` |
-| `lora[].is_high_noise` | `boolean` |
-
 Sampling fields:
 
 | Field | Type |
@@ -784,7 +733,6 @@ Sampling fields:
 | `sample_params.sample_method` | `string` |
 | `sample_params.sample_steps` | `integer` |
 | `sample_params.eta` | `number` |
-| `sample_params.shifted_timestep` | `integer` |
 | `sample_params.custom_sigmas` | `array<number>` |
 | `sample_params.flow_shift` | `number` |
 | `sample_params.guidance.txt_cfg` | `number` |
@@ -808,7 +756,6 @@ Other native fields:
 | `hires.steps` | `integer` |
 | `hires.denoising_strength` | `number` |
 | `hires.custom_sigmas` | `array<number>` |
-| `hires.upscale_tile_size` | `integer` |
 | `vae_tiling_params` | `object` |
 | `vae_tiling_params.enabled` | `boolean` |
 | `vae_tiling_params.temporal_tiling` | `boolean` |
@@ -958,7 +905,6 @@ Response fields:
 Compared with `img_gen`, the `vid_gen` request body:
 
 - `vid_gen` is a single video sequence job, so `batch_count` is not part of the request schema
-- `ref_images`, `mask_image`, `control_image`, `control_strength`, and `embed_image_metadata` are not part of the request schema
 - `vid_gen` adds `end_image`, `control_frames`, `high_noise_sample_params`, `video_frames`, `fps`, `moe_boundary`, and `vace_strength`
 
 Example:
@@ -986,7 +932,6 @@ Example:
     "sample_method": "euler",
     "sample_steps": 28,
     "eta": 1.0,
-    "shifted_timestep": 0,
     "custom_sigmas": [],
     "flow_shift": 0.0,
     "guidance": {
@@ -1007,7 +952,6 @@ Example:
     "sample_method": "euler",
     "sample_steps": -1,
     "eta": 1.0,
-    "shifted_timestep": 0,
     "flow_shift": 0.0,
     "guidance": {
       "txt_cfg": 7.0,
@@ -1021,8 +965,6 @@ Example:
       }
     }
   },
-
-  "lora": [],
 
   "vae_tiling_params": {
     "enabled": false,
@@ -1044,12 +986,6 @@ Example:
   "output_compression": 100
 }
 ```
-
-### LoRA Rules
-
-- The server only accepts explicit LoRA entries from the `lora` field.
-- Prompt-embedded `<lora:...>` tags are intentionally unsupported.
-- `lora[].is_high_noise` controls whether a LoRA applies only to the high-noise stage.
 
 ### Image and Frame Encoding Rules
 
@@ -1100,14 +1036,6 @@ Image and frame fields:
 | `end_image` | `string \| null` |
 | `control_frames` | `array<string>` |
 
-LoRA fields:
-
-| Field | Type |
-| --- | --- |
-| `lora[].path` | `string` |
-| `lora[].multiplier` | `number` |
-| `lora[].is_high_noise` | `boolean` |
-
 Sampling fields:
 
 | Field | Type |
@@ -1116,7 +1044,6 @@ Sampling fields:
 | `sample_params.sample_method` | `string` |
 | `sample_params.sample_steps` | `integer` |
 | `sample_params.eta` | `number` |
-| `sample_params.shifted_timestep` | `integer` |
 | `sample_params.custom_sigmas` | `array<number>` |
 | `sample_params.flow_shift` | `number` |
 | `sample_params.guidance.txt_cfg` | `number` |
@@ -1135,7 +1062,6 @@ High-noise sampling fields:
 | `high_noise_sample_params.sample_method` | `string` |
 | `high_noise_sample_params.sample_steps` | `integer` |
 | `high_noise_sample_params.eta` | `number` |
-| `high_noise_sample_params.shifted_timestep` | `integer` |
 | `high_noise_sample_params.flow_shift` | `number` |
 | `high_noise_sample_params.guidance.txt_cfg` | `number` |
 | `high_noise_sample_params.guidance.img_cfg` | `number` |

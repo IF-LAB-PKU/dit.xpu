@@ -7,10 +7,6 @@
 #include "ggml-cuda.h"
 #endif
 
-#ifdef GGML_USE_METAL
-#include "ggml-metal.h"
-#endif
-
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,16 +100,6 @@ int main(int argc, const char** argv) {
         }
         #endif
 
-        #ifdef GGML_USE_METAL
-        if (use_gpu) {
-            fprintf(stderr, "%s: using Metal backend\n", __func__);
-            backend = ggml_backend_metal_init();
-            if (!backend) {
-                fprintf(stderr, "%s: ggml_backend_metal_init() failed\n", __func__);
-            }
-        }
-        #endif
-
         const int num_tensors = 2;
 
         struct ggml_init_params params = {
@@ -128,7 +114,6 @@ int main(int argc, const char** argv) {
         }
 
         struct ggml_context * ctx = ggml_init(params);
-
 
         struct ggml_tensor * timesteps = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ts.size());
 

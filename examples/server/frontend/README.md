@@ -24,8 +24,7 @@ The current UI supports:
 - width, height, seed, batch count, video frames, and fps
 - sampler and scheduler selection
 - guidance controls, including the video high-noise stage
-- conditioning controls such as `clip_skip`, `strength`, `control_strength`, `moe_boundary`, and `vace_strength`
-- LoRA selection from server capabilities
+- conditioning controls such as `clip_skip`, `strength`, `moe_boundary`, and `vace_strength`
 - init image, end image, mask image, control image, control frames, and reference images
 - VAE tiling controls
 - cache controls

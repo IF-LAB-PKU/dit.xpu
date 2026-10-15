@@ -249,48 +249,6 @@ std::string SDSvrParams::to_string() const {
     return oss.str();
 }
 
-void refresh_lora_cache(ServerRuntime& rt) {
-    std::vector<LoraEntry> new_cache;
-
-    fs::path lora_dir = rt.ctx_params->lora_model_dir;
-    if (fs::exists(lora_dir) && fs::is_directory(lora_dir)) {
-        for (auto& entry : fs::recursive_directory_iterator(lora_dir)) {
-            if (!entry.is_regular_file()) {
-                continue;
-            }
-            const fs::path& p = entry.path();
-            if (!is_supported_model_ext(p)) {
-                continue;
-            }
-
-            LoraEntry lora_entry;
-            lora_entry.name     = p.stem().u8string();
-            lora_entry.fullpath = p.u8string();
-            std::string rel     = p.lexically_relative(lora_dir).u8string();
-            std::replace(rel.begin(), rel.end(), '\\', '/');
-            lora_entry.path = rel;
-
-            new_cache.push_back(std::move(lora_entry));
-        }
-    }
-
-    std::sort(new_cache.begin(), new_cache.end(), [](const LoraEntry& a, const LoraEntry& b) {
-        return a.path < b.path;
-    });
-
-    {
-        std::lock_guard<std::mutex> lock(*rt.lora_mutex);
-        *rt.lora_cache = std::move(new_cache);
-    }
-}
-
-std::string get_lora_full_path(ServerRuntime& rt, const std::string& path) {
-    std::lock_guard<std::mutex> lock(*rt.lora_mutex);
-    auto it = std::find_if(rt.lora_cache->begin(), rt.lora_cache->end(),
-                           [&](const LoraEntry& entry) { return entry.path == path; });
-    return it != rt.lora_cache->end() ? it->fullpath : "";
-}
-
 void refresh_upscaler_cache(ServerRuntime& rt) {
     std::vector<UpscalerEntry> new_cache;
 
@@ -308,7 +266,7 @@ void refresh_upscaler_cache(ServerRuntime& rt) {
             UpscalerEntry upscaler_entry;
             upscaler_entry.name       = p.stem().u8string();
             upscaler_entry.fullpath   = fs::absolute(p).lexically_normal().u8string();
-            upscaler_entry.model_name = "ESRGAN_4x";
+            upscaler_entry.model_name = "LTX latent upscaler";
             upscaler_entry.path       = p.filename().u8string();
 
             new_cache.push_back(std::move(upscaler_entry));

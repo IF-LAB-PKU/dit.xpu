@@ -9,11 +9,9 @@
 // Quick start for adding a new GGML op: Go to section 2 and create a struct that inherits from test_case,
 // then go to section 3 and add an instantiation of your struct.
 
-
 // ##############################
 // ## Section 1: General Setup ##
 // ##############################
-
 
 #include <ggml.h>
 #include <ggml-alloc.h>
@@ -441,13 +439,7 @@ static std::string var_to_str(ggml_scale_mode mode) {
 #define VARS_TO_STR15(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) VAR_TO_STR(a) + "," + VARS_TO_STR14(b, c, d, e, f, g, h, i, j, k, l, m, n, o)
 #define VARS_TO_STR16(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) VAR_TO_STR(a) + "," + VARS_TO_STR15(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p)
 
-#ifdef GGML_USE_SYCL
-static bool inline _isinf(float f) {
-    return (*(uint32_t *)&f & 0x7fffffff) == 0x7f800000;
-}
-#else
 static bool inline _isinf(float f) { return std::isinf(f); }
-#endif
 
 // accept FLT_MAX as infinity
 static bool isinf_or_max(float f) {
@@ -1709,7 +1701,6 @@ struct test_case {
             return true;
         }
 
-
         if (!ggml_is_scalar(out)) {
             out = ggml_sum(ctx.get(), out);
             ggml_set_name(out, "sum_of_out");
@@ -1886,11 +1877,9 @@ struct test_case {
     }
 };
 
-
 // ####################################
 // ## Section 2: GGML Op Definitions ##
 // ####################################
-
 
 // The following is an example showing the bare minimum for creating a test for a GGML op.
 
@@ -1936,7 +1925,6 @@ struct test_example : public test_case {
     // immediately after you create the tensors.
     // This is optional and only makes sense if a backward pass has actually been implemented for the new op.
 };
-
 
 // GGML_OP_UNARY
 struct test_unary : public test_case {
@@ -2975,7 +2963,6 @@ struct test_cont : public test_case {
         ggml_tensor * src = ggml_new_tensor(ctx, type, 4, ne.data());
         ggml_set_param(src);
         ggml_set_name(src, "src");
-
 
         ggml_tensor * dst;
         if (use_view_slice) {
@@ -6939,7 +6926,6 @@ static std::string var_to_str(const std::array<int32_t, GGML_MAX_OP_PARAMS / siz
     return oss.str();
 }
 
-
 struct test_generic_op : public test_case {
     const ggml_op op;
     const ggml_type type;
@@ -7118,7 +7104,6 @@ struct test_generic_op : public test_case {
         }
     }
 };
-
 
 enum llm_norm_type {
     LLM_NORM,
@@ -7508,7 +7493,6 @@ struct test_falcon : public test_llm {
         return cur;
     }
 };
-
 
 // ###########################################
 // ## Section 3: GGML Op Test Instantiation ##
@@ -9128,7 +9112,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {768, 1024, 256, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, GGML_TYPE_BF16, {768, 1024, 256, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
 
-
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {4096, 4096, 5, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {12888, 256, 5, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {77, 4096, 5, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
@@ -9204,7 +9187,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
@@ -9261,7 +9243,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, {256, 256, 3, 1}));
-
 
     for (int n_token : {1, 512}) {
         test_cases.emplace_back(new test_add_id(GGML_TYPE_F32, GGML_TYPE_F32, 2880, 128, 4, n_token));

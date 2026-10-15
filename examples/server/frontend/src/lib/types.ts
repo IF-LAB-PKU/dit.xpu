@@ -46,7 +46,6 @@ export interface SampleParams {
   sample_method: string;
   sample_steps: number;
   eta: string | number;
-  shifted_timestep: number;
   flow_shift: string | number;
   guidance: GuidanceParams;
 }
@@ -67,11 +66,6 @@ export interface CacheParams {
   scm_policy_dynamic: boolean;
 }
 
-export interface FormLoraEntry {
-  path: string;
-  multiplier: number;
-  is_high_noise: boolean;
-}
 
 export interface GenerationForm {
   prompt: string;
@@ -84,7 +78,6 @@ export interface GenerationForm {
   seed: number;
   clip_skip: number;
   strength: number;
-  control_strength: number;
   moe_boundary: number;
   vace_strength: number;
   output_format: string;
@@ -97,19 +90,13 @@ export interface GenerationForm {
   control_frames: ImageEntry[];
   mask_image: ImageEntry | null;
   control_image: ImageEntry | null;
-  lora: FormLoraEntry[];
   vae_tiling_params: VaeTilingParams;
   cache: CacheParams;
 }
 
 // ---------------------------------------------------------------------------
-// LoRA
 // ---------------------------------------------------------------------------
 
-export interface AvailableLora {
-  name: string;
-  path: string;
-}
 
 // ---------------------------------------------------------------------------
 // Capabilities (API response)
@@ -126,7 +113,6 @@ export interface Capabilities {
   output_formats_by_mode?: Partial<Record<"img_gen" | "vid_gen", string[]>>;
   samplers?: string[];
   schedulers?: string[];
-  loras?: AvailableLora[];
   limits?: {
     max_queue_size?: number;
   };

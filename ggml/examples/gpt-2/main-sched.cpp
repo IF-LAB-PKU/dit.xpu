@@ -7,14 +7,6 @@
 #include "ggml-cuda.h"
 #endif
 
-#ifdef GGML_USE_METAL
-#include "ggml-metal.h"
-#endif
-
-#ifdef GGML_USE_BLAS
-#include "ggml-blas.h"
-#endif
-
 #include "common.h"
 #include "common-ggml.h"
 
@@ -122,28 +114,9 @@ void init_backends(gpt2_model & model, const gpt_params & params) {
     }
 #endif
 
-#ifdef GGML_USE_METAL
-    if (params.n_gpu_layers > 0) {
-        fprintf(stderr, "%s: using Metal backend\n", __func__);
-        gpu_backend = ggml_backend_metal_init();
-        if (!gpu_backend) {
-            fprintf(stderr, "%s: ggml_backend_metal_init() failed\n", __func__);
-        }
-    }
-#endif
     if (gpu_backend) {
         model.backends.push_back(gpu_backend);
     }
-
-#ifdef GGML_USE_BLAS
-    ggml_backend_t blas_backend = ggml_backend_blas_init();
-    if (!blas_backend) {
-        fprintf(stderr, "%s: failed to initialize BLAS backend\n", __func__);
-    } else {
-        ggml_backend_blas_set_n_threads(blas_backend, params.n_threads);
-        model.backends.push_back(blas_backend);
-    }
-#endif
 
     // always add the CPU backend as a fallback
     ggml_backend_t cpu_backend = ggml_backend_cpu_init();
@@ -487,9 +460,6 @@ bool gpt2_model_load(const std::string & fname, gpt2_model & model, gpt_vocab & 
             //printf("%s: [%5.5s] %s\n", __func__, ggml_backend_name(backend), name.c_str());
 
             if (ggml_backend_is_cpu(backend)
-#ifdef GGML_USE_METAL
-                || ggml_backend_is_metal(backend)
-#endif
                 ) {
                 // for the CPU and Metal backend, we can read directly into the tensor
                 fin.read(reinterpret_cast<char *>(tensor->data), ggml_nbytes(tensor));
@@ -955,7 +925,6 @@ int main(int argc, char ** argv) {
         struct ggml_cgraph * gf = gpt2_graph(model, n_past, std::vector<gpt_vocab::id>(n_tokens, 0));
 
         ggml_backend_sched_reserve(sched, gf);
-
 
         // compute the required memory
         size_t mem_size = 0;
