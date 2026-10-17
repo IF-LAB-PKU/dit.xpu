@@ -1,183 +1,145 @@
-<p align="center">
-  <img src="./assets/logo.png" width="360x">
-</p>
+# sd.cpp-npu
 
-# stable-diffusion.cpp
+支持以下 5 个模型：
 
-<div align="center">
-<a href="https://trendshift.io/repositories/9714" target="_blank"><img src="https://trendshift.io/api/badge/repositories/9714" alt="leejet%2Fstable-diffusion.cpp | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</div>
+- SD3.5 Medium
+- SD3.5 Large
+- FLUX.2 Klein 4B
+- Z-Image Turbo
+- Z-Image Base
 
-DiT diffusion model (SD3, Flux, Wan, ...) inference in pure C/C++
+以下以 SD3.5 Medium 为例，介绍容器编译、模型准备及 HTP sparse 推理流程。
 
-***Note that this project is under active development. \
-API and command-line option may change frequently.***
+## 1. 准备环境
 
-## 🔥Important News
+安装 Docker、Git、curl、ADB，手机开启 USB 调试。准备 Linux 版 [Hexagon SDK 6.7.0.0](https://www.qualcomm.com/developer/software/hexagon-sdk)（Tools 21.0.04、NDK r27d、CMake 3.28.3）。以下命令在宿主机同一个终端执行。
 
-* **2026/05/17** 🚀 stable-diffusion.cpp now supports **LTX-2.3**
-* **2026/04/11** 🚀 stable-diffusion.cpp now uses a brand-new embedded web UI.  
-* **2026/01/18** 🚀 stable-diffusion.cpp now supports **FLUX.2-klein**  
-* **2025/12/01** 🚀 stable-diffusion.cpp now supports **Z-Image**  
-* **2025/11/30** 🚀 stable-diffusion.cpp now supports **FLUX.2-dev**  
-* **2025/10/13** 🚀 stable-diffusion.cpp now supports **Qwen-Image-Edit / Qwen-Image-Edit 2509**  
-* **2025/10/12** 🚀 stable-diffusion.cpp now supports **Qwen-Image**  
-* **2025/09/14** 🚀 stable-diffusion.cpp now supports **Wan2.1 Vace**  
-* **2025/09/06** 🚀 stable-diffusion.cpp now supports **Wan2.1 / Wan2.2**  
+## 2. 克隆仓库，获取手机 OpenCL 库
 
-## Features
+```bash
+mkdir sdcpp-work
+cd sdcpp-work
+git clone https://github.com/destined555/sd.cpp-npu.git sdcpp
+git clone https://github.com/destined555/htp-ops-lib-sd.cpp.git htp-ops-lib
+git -C htp-ops-lib checkout --detach 9e122149185295b7ef4517b40465d0445bd52b9a
+git clone --depth 1 --branch v2024.10.24 \
+  https://github.com/KhronosGroup/OpenCL-Headers.git OpenCL-Headers
 
-This fork retains DiT model families and their text encoders, VAEs, and native image/video conditioning.
-UNet models, LoRA/LyCORIS, ControlNet, PhotoMaker, and ESRGAN have been removed.
-The public C API and CLI reflect this reduced scope.
+adb devices -l
+adb pull /vendor/lib64/libOpenCL.so ./libOpenCL.so
+```
 
-- Plain C/C++ implementation based on [ggml](https://github.com/ggml-org/ggml), working in the same way as [llama.cpp](https://github.com/ggml-org/llama.cpp)
-- Super lightweight and without external dependencies
-- Supported models
-  - Image Models
-    - [SD3/SD3.5](./docs/sd3.md)
-    - [FLUX.1-dev/FLUX.1-schnell](./docs/flux.md)
-    - [FLUX.2-dev/FLUX.2-klein](./docs/flux2.md)
-    - [Chroma](./docs/chroma.md)
-    - [Chroma1-Radiance](./docs/chroma_radiance.md)
-    - [Qwen Image](./docs/qwen_image.md)
-    - [LongCat Image](./docs/longcat_image.md)
-    - [Z-Image](./docs/z_image.md)
-    - [Ovis-Image](./docs/ovis_image.md)
-    - [Anima](./docs/anima.md)
-    - [ERNIE-Image](./docs/ernie_image.md)
-    - [HiDream-O1-Image](./docs/hidream_o1_image.md)
-  - Image Edit Models
-    - [FLUX.1-Kontext-dev](./docs/kontext.md)
-    - [Qwen Image Edit series](./docs/qwen_image_edit.md)
-    - [LongCat Image Edit](./docs/longcat_image.md)
-  - Video Models
-    - [Wan2.1/Wan2.2](./docs/wan.md)
-    - [LTX-2.3](./docs/ltx2.md)
-  - Faster and memory efficient latent decoding with [TAESD](https://github.com/madebyollin/taesd)
-- Supported backends
-  - CPU (AVX, AVX2 and AVX512 support for x86 architectures)
-  - CUDA
-  - OpenCL
-  - HTP (Qualcomm Hexagon DSP/NPU)
-- Supported weight formats
-  - Pytorch checkpoint (`.ckpt` or `.pth` or `.pt`)
-  - Safetensors (`.safetensors`)
-  - GGUF (`.gguf`)
-- Convert mode supports converting model weights to `.gguf` or `.safetensors`
-- Supported platforms
-    - Linux
-    - Mac OS
-    - Windows
-    - Android (via Termux, [Local Diffusion](https://github.com/rmatif/Local-Diffusion))
-- Flash Attention for memory usage optimization
-- Negative prompt
-- [stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui) style tokenizer (not all the features, only token weighting for now)
-- VAE tiling processing for reduce memory usage
-- Sampling method
-    - `Euler A`
-    - `Euler`
-    - `Heun`
-    - `DPM2`
-    - `DPM++ 2M`
-    - [`DPM++ 2M v2`](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/8457)
-    - `DPM++ 2S a`
-    - `ER-SDE`
-    - [`LCM`](https://github.com/AUTOMATIC1111/stable-diffusion-webui/issues/13952)
-- Cross-platform reproducibility
-    - `--rng cuda`, default, consistent with the `stable-diffusion-webui GPU RNG`
-    - `--rng cpu`, consistent with the `comfyui RNG`
-- Embedds generation parameters into png output as webui-compatible text string
+## 3. 创建容器，安装依赖和 SDK
 
-## Quick Start
+将 `SDK_DIR` 改为完整的 Linux SDK 安装目录。
 
-### Get the sd executable
+```bash
+SDK_DIR=/absolute/path/to/Hexagon_SDK/6.7.0.0
 
-- Download pre-built binaries from the [releases page](https://github.com/leejet/stable-diffusion.cpp/releases)
-- Or build from source by following the [build guide](./docs/build.md)
+docker run -d --name sdcpp-build --platform linux/amd64 \
+  ubuntu:22.04 sleep infinity
 
-### Download weights and generate an image
+docker exec sdcpp-build bash -c '
+  set -e
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates git build-essential ninja-build cmake python3 \
+    python-is-python3 curl unzip pkg-config libglib2.0-0 libncurses5 libtinfo5 libxml2
+  mkdir -p /work /opt/Hexagon_SDK
+'
 
-Follow a retained model guide, such as [SD3/SD3.5](./docs/sd3.md),
-[FLUX](./docs/flux.md), or [Z-Image](./docs/z_image.md), to download
-its diffusion weights, text encoder, and VAE and run the matching command.
+docker cp "$SDK_DIR" sdcpp-build:/opt/Hexagon_SDK/6.7.0.0
+docker cp sdcpp sdcpp-build:/work/sdcpp
+docker cp htp-ops-lib sdcpp-build:/work/htp-ops-lib
+docker cp OpenCL-Headers sdcpp-build:/work/OpenCL-Headers
+docker cp libOpenCL.so sdcpp-build:/work/libOpenCL.so
+docker exec sdcpp-build bash -c '
+  git config --global --add safe.directory /work/sdcpp
+  git config --global --add safe.directory /work/htp-ops-lib
+'
+```
 
-***For detailed command-line arguments, check out [cli doc](./examples/cli/README.md).***
+## 4. 编译并收集运行文件
 
-## Performance
+编译 Android host 库、DSP v75 库和启用 CPU / HTP / OpenCL 的 sd-cli。
 
-If you want to improve performance or reduce VRAM/RAM usage, please refer to [performance guide](./docs/performance.md).
-For runtime and parameter backend placement, see the [backend selection guide](./docs/backend.md).
+```bash
+docker exec sdcpp-build bash /work/sdcpp/script/build.sh
+docker cp sdcpp-build:/work/output ./output
+```
 
-## More Guides
+## 5. 下载模型
 
-- [Backend selection](./docs/backend.md)
-- [SD3/SD3.5](./docs/sd3.md)
-- [FLUX.1-dev/FLUX.1-schnell](./docs/flux.md)
-- [FLUX.2-dev/FLUX.2-klein](./docs/flux2.md)
-- [FLUX.1-Kontext-dev](./docs/kontext.md)
-- [Chroma](./docs/chroma.md)
-- [🔥Qwen Image](./docs/qwen_image.md)
-- [🔥Qwen Image Edit series](./docs/qwen_image_edit.md)
-- [🔥LongCat Image / LongCat Image Edit](./docs/longcat_image.md)
-- [🔥Wan2.1/Wan2.2](./docs/wan.md)
-- [🔥LTX-2.3](./docs/ltx2.md)
-- [🔥Z-Image](./docs/z_image.md)
-- [Ovis-Image](./docs/ovis_image.md)
-- [Anima](./docs/anima.md)
-- [ERNIE-Image](./docs/ernie_image.md)
-- [HiDream-O1-Image](./docs/hidream_o1_image.md)
-- [Using TAESD to faster decoding](./docs/taesd.md)
-- [Docker](./docs/docker.md)
-- [Quantization and GGUF](./docs/quantization_and_gguf.md)
-- [Inference acceleration via caching](./docs/caching.md)
+从 Hugging Face 下载独立的 DiT、VAE 和文本编码器，保存到以下位置：
 
-## Bindings
+- [DiT：sd3.5_medium-F16.gguf](https://huggingface.co/city96/stable-diffusion-3.5-medium-gguf/tree/main) → `models/sd3.5-medium/sd3.5_medium-F16.gguf`
+- [VAE：vae/diffusion_pytorch_model.safetensors](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium/tree/main/vae) → `models/sd3.5-medium/sd3.5vae.safetensors`
+- [文本编码器](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium/tree/main/text_encoders)：`clip_l.safetensors`、`clip_g.safetensors`、`t5xxl_fp8_e4m3fn.safetensors` → `models/sd3.5-medium/` 下，保留原文件名。
 
-These projects wrap `stable-diffusion.cpp` for easier use in other languages/frameworks.
+## 6. 部署到手机，转换 HTP GGUF
 
-* Golang (non-cgo): [seasonjs/stable-diffusion](https://github.com/seasonjs/stable-diffusion)
-* Golang (cgo): [Binozo/GoStableDiffusion](https://github.com/Binozo/GoStableDiffusion)
-* Golang (non-cgo): [l8bloom/gosd](https://github.com/l8bloom/gosd)
-* C#: [DarthAffe/StableDiffusion.NET](https://github.com/DarthAffe/StableDiffusion.NET)
-* Python: [william-murray1204/stable-diffusion-cpp-python](https://github.com/william-murray1204/stable-diffusion-cpp-python)
-* Rust: [newfla/diffusion-rs](https://github.com/newfla/diffusion-rs)
-* Flutter/Dart: [rmatif/Local-Diffusion](https://github.com/rmatif/Local-Diffusion)
+手机预留至少 20 GB 存储空间。
 
-## UIs
+```bash
+adb shell 'mkdir -p /data/local/tmp/sdcpp/model'
+adb push output/bin /data/local/tmp/sdcpp/
+adb push models/sd3.5-medium /data/local/tmp/sdcpp/model/
+adb shell 'chmod +x /data/local/tmp/sdcpp/bin/sd-cli'
 
-These projects use `stable-diffusion.cpp` as a backend for their image generation.
+adb shell '
+  cd /data/local/tmp/sdcpp || exit 1
+  export LD_LIBRARY_PATH="$PWD/bin"
+  ./bin/sd-cli -M convert \
+    -m model/sd3.5-medium/sd3.5_medium-F16.gguf \
+    --type f16 --convert-name --htp-pack-dit \
+    -o model/sd3.5-medium/sd3.5_medium_htp_w16a32.gguf
+'
+```
 
-- [Jellybox](https://jellybox.com)
-- [Stable Diffusion GUI](https://github.com/fszontagh/sd.cpp.gui.wx)
-- [Stable Diffusion CLI-GUI](https://github.com/piallai/stable-diffusion.cpp)
-- [Local Diffusion](https://github.com/rmatif/Local-Diffusion)
-- [sd.cpp-webui](https://github.com/daniandtheweb/sd.cpp-webui)
-- [LocalAI](https://github.com/mudler/LocalAI)
-- [Neural-Pixel](https://github.com/Luiz-Alcantara/Neural-Pixel)
-- [KoboldCpp](https://github.com/LostRuins/koboldcpp)
+## 7. 运行
 
-## Contributors
 
-Thank you to all the people who have already contributed to stable-diffusion.cpp!
+```bash
+adb shell '
+  cd /data/local/tmp/sdcpp || exit 1
+  export LD_LIBRARY_PATH="$PWD/bin"
+  export DSP_LIBRARY_PATH="$PWD/bin;/vendor/lib/rfsa/adsp;/vendor/dsp/cdsp"
+  export ADSP_LIBRARY_PATH="$DSP_LIBRARY_PATH"
+  export SD_PRELOAD_BACKENDS=htp
+  export SD_HTP_OPS=1
+  export SD_HTP_COMPUTE=1
+  export SD_HTP_ATTENTION=1
+  export SD_HTP_BLOCK_SPARSE_ATTN=1
+  export SD_HTP_BLOCK_SPARSE_KEEP_RATIO=0
+  export SD_HTP_BLOCK_SPARSE_PATCH_HALO=1
+  export SD_HTP_BLOCK_SPARSE_WARMUP_RATIO=0.2
+  export SD_HTP_BLOCK_SPARSE_DENSE_TAIL_RATIO=0
+  export SD_HTP_BLOCK_SPARSE_DENSE_EVERY_N_SPARSE_STEPS=5
+  export SD_HTP_BLOCK_SPARSE_RESIDUAL_CACHE=1
+  export SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO=1
+  export SD_HTP_SPARSE_OPENCL=1
+  export SD_HTP_SPARSE_OPENCL_RESIDUAL=1
+  export SD_HTP_SPARSE_OPENCL_LIFETIME_MODE=reuse
+  export SD_HTP_HALO_KV_LOAD=l2fetch
+  export SD_HTP_PACKED_ATTENTION=1
+  export GGML_HTP_CPU_FALLBACK_THREADS=4
 
-[![Contributors](https://contrib.rocks/image?repo=leejet/stable-diffusion.cpp)](https://github.com/leejet/stable-diffusion.cpp/graphs/contributors)
+  ./bin/sd-cli -v -t 4 --backend cpu --params-backend cpu \
+    --clip_l model/sd3.5-medium/clip_l.safetensors \
+    --clip_g model/sd3.5-medium/clip_g.safetensors \
+    --t5xxl model/sd3.5-medium/t5xxl_fp8_e4m3fn.safetensors \
+    --diffusion-model model/sd3.5-medium/sd3.5_medium_htp_w16a32.gguf \
+    --vae model/sd3.5-medium/sd3.5vae.safetensors \
+    --clip-on-cpu --diffusion-fa -p cat --steps 20 --cfg-scale 4.5 \
+    --guidance 3.5 --sampling-method euler -W 256 -H 256 -s 42 \
+    -o sdcpp-sparse-256.png > sdcpp-sparse-256.log 2>&1
+  status=$?
+  echo "EXIT:$status" >> sdcpp-sparse-256.log
+  tail -n 8 sdcpp-sparse-256.log
+  exit "$status"
+'
 
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=leejet/stable-diffusion.cpp&type=Date)](https://star-history.com/#leejet/stable-diffusion.cpp&Date)
-
-## References
-
-- [ggml](https://github.com/ggml-org/ggml)
-- [diffusers](https://github.com/huggingface/diffusers)
-- [stable-diffusion](https://github.com/CompVis/stable-diffusion)
-- [sd3-ref](https://github.com/Stability-AI/sd3-ref)
-- [stable-diffusion-stability-ai](https://github.com/Stability-AI/stablediffusion)
-- [stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui)
-- [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
-- [k-diffusion](https://github.com/crowsonkb/k-diffusion)
-- [latent-consistency-model](https://github.com/luosiallen/latent-consistency-model)
-- [generative-models](https://github.com/Stability-AI/generative-models/)
-- [Wan2.1](https://github.com/Wan-Video/Wan2.1)
-- [Wan2.2](https://github.com/Wan-Video/Wan2.2)
+mkdir -p results
+adb pull /data/local/tmp/sdcpp/sdcpp-sparse-256.png results/
+adb pull /data/local/tmp/sdcpp/sdcpp-sparse-256.log results/
+```
