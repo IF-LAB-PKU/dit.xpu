@@ -39,7 +39,7 @@ Run the following commands in the same terminal on the host.
 ```bash
 mkdir sdcpp-work
 cd sdcpp-work
-git clone https://github.com/destined555/sd.cpp-npu.git sdcpp
+git clone https://github.com/IF-LAB-PKU/dit.xpu.git sdcpp
 git clone https://github.com/destined555/htp-ops-lib-sd.cpp.git htp-ops-lib
 git -C htp-ops-lib checkout --detach 9e122149185295b7ef4517b40465d0445bd52b9a
 git clone --depth 1 --branch v2024.10.24 \
