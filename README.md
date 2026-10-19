@@ -1,20 +1,40 @@
-# sd.cpp-npu
+# sd.cpp-npu ⚡
 
-支持以下 5 个模型：
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform: Android](https://img.shields.io/badge/Platform-Android-3DDC84?logo=android&logoColor=white)](#quick-start)
+[![Backends: CPU / OpenCL / HTP](https://img.shields.io/badge/Backends-CPU%20%7C%20OpenCL%20%7C%20HTP-7C3AED)](#quick-start)
 
-- SD3.5 Medium
-- SD3.5 Large
-- FLUX.2 Klein 4B
-- Z-Image Turbo
-- Z-Image Base
+A C/C++ inference runtime for DiT image generation on Qualcomm Snapdragon devices. Built on stable-diffusion.cpp, htp-ops-lib, and ggml, it supports CPU, OpenCL, and HTP backends, including an HTP sparse attention inference path.
 
-以下以 SD3.5 Medium 为例，介绍容器编译、模型准备及 HTP sparse 推理流程。
+[🧩 Supported Models](#supported-models) · [🚀 Quick Start](#quick-start) · [🐛 Issues](#issues) · [🙏 Foundational projects](#foundational-projects-this-build-depends-on)
 
-## 1. 准备环境
+<a id="supported-models"></a>
 
-安装 Docker、Git、curl、ADB，手机开启 USB 调试。准备 Linux 版 [Hexagon SDK 6.7.0.0](https://www.qualcomm.com/developer/software/hexagon-sdk)（Tools 21.0.04、NDK r27d、CMake 3.28.3）。以下命令在宿主机同一个终端执行。
+## 🧩 Supported Models
 
-## 2. 克隆仓库，获取手机 OpenCL 库
+| Model | Guide |
+| --- | --- |
+| SD3.5 Medium | [SD3 / SD3.5](docs/sd3.md) |
+| SD3.5 Large | [SD3 / SD3.5](docs/sd3.md) |
+| FLUX.2 Klein 4B | [FLUX.2](docs/flux2.md) |
+| Z-Image Turbo | [Z-Image](docs/z_image.md) |
+| Z-Image Base | [Z-Image](docs/z_image.md) |
+
+<a id="quick-start"></a>
+
+## 🚀 Quick Start
+
+This example uses **SD3.5 Medium** to build in Docker and run **256×256 HTP sparse inference with 20 sampling steps** on an Android phone.
+
+### 1. 🛠️ Prerequisites
+
+- Install Docker, Git, and ADB on the host, and enable USB debugging on the phone.
+- Prepare the Linux version of [Hexagon SDK 6.7.0.0](https://www.qualcomm.com/developer/software/hexagon-sdk), including Tools 21.0.04, NDK r27d, and CMake 3.28.3.
+- Use a phone with HTP and OpenCL support and at least 20 GB of free storage. The build below targets DSP v75.
+
+Run the following commands in the same terminal on the host.
+
+### 2. 📦 Clone the Repositories and Retrieve the OpenCL Library
 
 ```bash
 mkdir sdcpp-work
@@ -29,9 +49,9 @@ adb devices -l
 adb pull /vendor/lib64/libOpenCL.so ./libOpenCL.so
 ```
 
-## 3. 创建容器，安装依赖和 SDK
+### 3. 🐳 Set Up the Container, Dependencies, and SDK
 
-将 `SDK_DIR` 改为完整的 Linux SDK 安装目录。
+Set `SDK_DIR` to the absolute path of your Linux SDK installation.
 
 ```bash
 SDK_DIR=/absolute/path/to/Hexagon_SDK/6.7.0.0
@@ -59,26 +79,30 @@ docker exec sdcpp-build bash -c '
 '
 ```
 
-## 4. 编译并收集运行文件
+### 4. 🔨 Build and Collect Runtime Files
 
-编译 Android host 库、DSP v75 库和启用 CPU / HTP / OpenCL 的 sd-cli。
+Use [script/build.sh](script/build.sh) to build the Android host library, DSP v75 library, and `sd-cli` with CPU / HTP / OpenCL enabled. Runtime files are collected in `output/bin/`.
 
 ```bash
 docker exec sdcpp-build bash /work/sdcpp/script/build.sh
 docker cp sdcpp-build:/work/output ./output
 ```
 
-## 5. 下载模型
+### 5. 📥 Download Model Files
 
-从 Hugging Face 下载独立的 DiT、VAE 和文本编码器，保存到以下位置：
+Download the following five files from Hugging Face and save them in `models/sd3.5-medium/` on the host.
 
-- [DiT：sd3.5_medium-F16.gguf](https://huggingface.co/city96/stable-diffusion-3.5-medium-gguf/tree/main) → `models/sd3.5-medium/sd3.5_medium-F16.gguf`
-- [VAE：vae/diffusion_pytorch_model.safetensors](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium/tree/main/vae) → `models/sd3.5-medium/sd3.5vae.safetensors`
-- [文本编码器](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium/tree/main/text_encoders)：`clip_l.safetensors`、`clip_g.safetensors`、`t5xxl_fp8_e4m3fn.safetensors` → `models/sd3.5-medium/` 下，保留原文件名。
+| Component | Download | Local Filename |
+| --- | --- | --- |
+| DiT | [sd3.5_medium-F16.gguf](https://huggingface.co/city96/stable-diffusion-3.5-medium-gguf/blob/main/sd3.5_medium-F16.gguf) | `sd3.5_medium-F16.gguf` |
+| VAE | [vae/diffusion_pytorch_model.safetensors](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium/blob/main/vae/diffusion_pytorch_model.safetensors) | `sd3.5vae.safetensors` |
+| CLIP-L | [text_encoders/clip_l.safetensors](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium/blob/main/text_encoders/clip_l.safetensors) | `clip_l.safetensors` |
+| CLIP-G | [text_encoders/clip_g.safetensors](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium/blob/main/text_encoders/clip_g.safetensors) | `clip_g.safetensors` |
+| T5-XXL | [text_encoders/t5xxl_fp8_e4m3fn.safetensors](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium/blob/main/text_encoders/t5xxl_fp8_e4m3fn.safetensors) | `t5xxl_fp8_e4m3fn.safetensors` |
 
-## 6. 部署到手机，转换 HTP GGUF
+### 6. 📱 Deploy to the Phone and Convert to HTP GGUF
 
-手机预留至少 20 GB 存储空间。
+Convert the DiT weights to the HTP layout, producing `sd3.5_medium_htp_w16a32.gguf`.
 
 ```bash
 adb shell 'mkdir -p /data/local/tmp/sdcpp/model'
@@ -96,8 +120,9 @@ adb shell '
 '
 ```
 
-## 7. 运行
+### 7. 🎨 Run Inference and Retrieve the Image
 
+Generate a 256×256 image with 20 sampling steps, the prompt `cat`, and seed 42. The text encoders and VAE run on the CPU; the DiT uses the HTP and OpenCL sparse path.
 
 ```bash
 adb shell '
@@ -143,3 +168,47 @@ mkdir -p results
 adb pull /data/local/tmp/sdcpp/sdcpp-sparse-256.png results/
 adb pull /data/local/tmp/sdcpp/sdcpp-sparse-256.log results/
 ```
+
+The generated image and runtime log are saved in `results/` on the host.
+
+<a id="issues"></a>
+
+## 🐛 Issues
+
+### FastRPC Mapping Limits on Snapdragon 8 Gen 3 and Earlier: Multi Session + Staging
+
+This issue affects phones with Snapdragon 8 Gen 3 or earlier SoCs. As discussed in [qualcomm/fastrpc#137](https://github.com/qualcomm/fastrpc/issues/137), DSP virtual address space is limited, and mappings may not be released immediately after unmapping. This can cause subsequent weight mappings to fail. On affected devices, use the following workarounds.
+
+**1. Multi Session**
+
+Distribute weight mappings across multiple FastRPC sessions. Add the following inside the `adb shell` block in Step 7, before running `sd-cli`. This example uses two sessions:
+
+```bash
+export SD_HTP_MULTI_SESSION=1
+export SD_HTP_MULTI_SESSION_COUNT=2
+```
+
+**2. Staging**
+
+Use graph segmentation to load packed weights on demand and reuse RPCMEM buffers. Add the following after the environment variables above:
+
+```bash
+export SD_HTP_PACKED_STAGING=1
+export SD_HTP_PACKED_STAGING_BUDGET_MB=20480
+```
+
+Also add `--max-vram 10` to the `sd-cli` command to enable graph segmentation. `SD_HTP_PACKED_STAGING_BUDGET_MB` sets the total staging buffer pool budget in MiB.
+
+For other problems, open a [GitHub issue](https://github.com/destined555/sd.cpp-npu/issues) with your device and SDK versions, repository commit, model filenames, full command, and logs.
+
+<a id="foundational-projects-this-build-depends-on"></a>
+
+## 🙏 Foundational projects this build depends on
+
+This project builds on the following projects and tools:
+
+- [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp): Upstream C/C++ diffusion model inference implementation.
+- [ggml](https://github.com/ggml-org/ggml): Tensor operations, computation graphs, and backend infrastructure.
+- [htp-ops-lib](https://github.com/haozixu/htp-ops-lib): Upstream Hexagon HTP operator library. This build uses our modified fork, [htp-ops-lib-sd.cpp](https://github.com/destined555/htp-ops-lib-sd.cpp).
+- [Qualcomm Hexagon SDK](https://www.qualcomm.com/developer/software/hexagon-sdk): Build and runtime tools for Hexagon DSP.
+- [OpenCL-Headers](https://github.com/KhronosGroup/OpenCL-Headers): Headers required to build the OpenCL backend.
