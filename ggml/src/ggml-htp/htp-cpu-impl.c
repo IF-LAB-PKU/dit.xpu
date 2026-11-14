@@ -3421,6 +3421,21 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const struct ggml_cgraph * cgraph = tp->cgraph;
     const struct ggml_cplan  * cplan  = tp->cplan;
 
+    const char * node_profile_env = getenv("SD_HTP_NODE_PROFILE");
+    const bool node_profile_enabled = node_profile_env != NULL &&
+        node_profile_env[0] != '\0' && strcmp(node_profile_env, "0") != 0;
+    struct node_profile_record {
+        int64_t elapsed_us;
+        int fused;
+        bool htp;
+    };
+    struct node_profile_record * node_profile = NULL;
+    if (node_profile_enabled && state->ith == 0) {
+        node_profile = calloc(cgraph->n_nodes, sizeof(*node_profile));
+        GGML_ASSERT(node_profile != NULL);
+    }
+    const int64_t node_profile_graph_begin_us = node_profile != NULL ? ggml_time_us() : 0;
+
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(state->ith);
 #else
@@ -3511,6 +3526,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+
+        const int profile_node_n = node_n;
+        const int64_t node_profile_begin_us = node_profile != NULL ? ggml_time_us() : 0;
+        const bool node_profile_htp = node_profile != NULL && htp_ops_support_op_runtime(node);
 
         if (state->ith == 0) {
             htp_ops_opencl_trace_next_node_begin(node);
@@ -3674,9 +3693,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_barrier(state->threadpool);
             end_of_node_barrier_completed = true;
         }
-        if (residual_profile_stage != NULL &&
+        if ((residual_profile_stage != NULL || node_profile_enabled) &&
             !end_of_node_barrier_completed) {
             ggml_barrier(state->threadpool);
+        }
+        if (node_profile != NULL) {
+            node_profile[profile_node_n].elapsed_us = ggml_time_us() - node_profile_begin_us;
+            node_profile[profile_node_n].fused = node_n - profile_node_n;
+            node_profile[profile_node_n].htp = n_fused == 0 && node_profile_htp;
         }
         if (residual_profile_stage != NULL && state->ith == 0) {
             const int64_t residual_profile_end_us = ggml_time_us();
@@ -3700,6 +3724,31 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+
+    // Buffer records until graph completion so per-node I/O cannot perturb dispatch.
+    if (node_profile != NULL) {
+        const int64_t graph_us = ggml_time_us() - node_profile_graph_begin_us;
+        fprintf(stderr, "htp_node_profile_graph nodes=%d total_us=%lld status=%d\n",
+                cgraph->n_nodes, (long long) graph_us, tp->ec);
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (node_profile[i].elapsed_us == 0) {
+                continue;
+            }
+            const struct ggml_tensor * node = cgraph->nodes[i];
+            fprintf(stderr,
+                    "htp_node_profile node=%d op=%s route=%s total_us=%lld fused=%d "
+                    "ne=%lld,%lld,%lld,%lld name=\"%s\" src0=\"%s\" src1=\"%s\"\n",
+                    i, ggml_op_name(node->op), node_profile[i].htp ? "htp" : "cpu",
+                    (long long) node_profile[i].elapsed_us, node_profile[i].fused,
+                    (long long) node->ne[0], (long long) node->ne[1],
+                    (long long) node->ne[2], (long long) node->ne[3],
+                    node->name, node->src[0] != NULL ? node->src[0]->name : "",
+                    node->src[1] != NULL ? node->src[1]->name : "");
+        }
+        fprintf(stderr, "htp_node_profile_end print_us=%lld\n",
+                (long long) (ggml_time_us() - node_profile_graph_begin_us - graph_us));
+        free(node_profile);
+    }
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);

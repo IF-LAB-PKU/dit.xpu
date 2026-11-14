@@ -6804,3 +6804,275 @@ void ggml_backend_opencl_htp_sidecar_test_fail_next_residual_wait(
     std::lock_guard<std::mutex> lock(sidecar->cache_mutex);
     sidecar->test_fail_next_residual_wait = true;
 }
+
+// Each group owns a disjoint 64x32 half tile. Its entire compact four-plane
+// stream is staged before any FP32 stores, including for partial M tiles.
+static const char * w8a8_epilogue_source = R"CLC(
+#pragma OPENCL FP_CONTRACT OFF
+__kernel void w8a8_epilogue(__global uchar * backing, ulong offset,
+                           __global const float * weights, __global const float * sa, ulong sa_offset, int n,
+                           int batch_m0, int batch_rows, int batch_n0, int columns) {
+    __global const float * sw=weights;
+    __global const int * sums=(__global const int *)(weights+n);
+    sa+=sa_offset/4;
+    __local uint raw[2048];
+    const int lid = get_local_id(0);
+    const int half_tile = get_group_id(0) % (columns*2);
+    const int tile = get_group_id(0) / (columns*2);
+    const int rows = min(64, batch_rows-tile*64);
+    const int m0 = batch_m0+tile*64;
+    const int n0 = batch_n0+half_tile*32;
+    __global uchar * out = backing+offset;
+    for (int i=lid; i<rows*8; i+=128) {
+        const uint4 words = vload4(0, (__global uint *)out+
+            (ulong)(m0+i/8)*n+n0+(i%8)*4);
+        vstore4(words,0,raw+i*4);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int i=lid; i<rows*8; i+=128) {
+        const int r=i/8, channel=n0+(i%8)*4;
+        const uint p0=raw[i], p1=raw[i+rows*8], p2=raw[i+rows*16], p3=raw[i+rows*24];
+        const uint4 shifts=(uint4)(0,8,16,24);
+        const uint4 bits = (((uint4)p0>>shifts)&255u) |
+            ((((uint4)p1>>shifts)&255u)<<8) | ((((uint4)p2>>shifts)&255u)<<16) |
+            ((((uint4)p3>>shifts)&255u)<<24);
+        const int4 value = as_int4(bits)-vload4(0,sums+channel)*128;
+        float4 y = convert_float4(value)*vload4(0,sw+channel);
+        y = y*sa[m0+r];
+        vstore4(y,0,(__global float *)out+(ulong)(m0+r)*n+channel);
+    }
+}
+)CLC";
+
+struct ggml_opencl_htp_w8a8 {
+    ggml_opencl_htp_sidecar * sidecar = nullptr;
+    cl_command_queue queue = nullptr;
+    cl_program program = nullptr;
+    cl_kernel kernel = nullptr;
+    cl_mem output = nullptr, weights = nullptr, sa = nullptr;
+    struct output_import { ggml_opencl_htp_import_descriptor descriptor; cl_mem memory; };
+    std::vector<output_import> imports;
+    std::mutex imports_mutex;
+    std::vector<uint8_t> weights_host;
+    size_t column_capacity = 0;
+    cl_ulong offset = 0, sa_offset = 0;
+    int m = 0, n = 0;
+    bool profiling = false;
+    std::vector<cl_event> events;
+    void release_dispatch() {
+        for (auto event : events) clReleaseEvent(event);
+        events.clear();
+        if (output) clReleaseMemObject(output);
+        if (sa) clReleaseMemObject(sa);
+        output = sa = nullptr;
+    }
+    ~ggml_opencl_htp_w8a8() {
+        if (queue) clFinish(queue);
+        release_dispatch();
+        for (const auto & imported : imports) clReleaseMemObject(imported.memory);
+        if (weights) clReleaseMemObject(weights);
+        if (kernel) clReleaseKernel(kernel);
+        if (program) clReleaseProgram(program);
+        if (queue) clReleaseCommandQueue(queue);
+    }
+};
+
+ggml_opencl_htp_w8a8 * ggml_backend_opencl_htp_w8a8_create(
+        ggml_opencl_htp_sidecar * sidecar, char * reason, size_t capacity) {
+    if (!sidecar) { set_reason(reason,capacity,"OpenCL sidecar unavailable"); return nullptr; }
+    std::unique_ptr<ggml_opencl_htp_w8a8> ep(new ggml_opencl_htp_w8a8);
+    ep->sidecar = sidecar;
+    const char * trace = std::getenv("SD_HTP_W8A8_GPU_TRACE");
+    ep->profiling = trace && trace[0] && std::strcmp(trace,"0") != 0;
+    cl_int err = CL_SUCCESS;
+    const cl_queue_properties props[] = {CL_QUEUE_PROPERTIES,
+        static_cast<cl_queue_properties>(ep->profiling ? CL_QUEUE_PROFILING_ENABLE : 0), 0};
+    ep->queue = clCreateCommandQueueWithProperties(sidecar->context,sidecar->device,props,&err);
+    if (err != CL_SUCCESS) { set_reason(reason,capacity,"W8A8 queue error %d",err); return nullptr; }
+    ep->program = clCreateProgramWithSource(sidecar->context,1,&w8a8_epilogue_source,nullptr,&err);
+    if (err != CL_SUCCESS) { set_reason(reason,capacity,"W8A8 program error %d",err); return nullptr; }
+    err = clBuildProgram(ep->program,1,&sidecar->device,"-cl-std=CL1.2",nullptr,nullptr);
+    if (err != CL_SUCCESS) {
+        size_t length = 0;
+        clGetProgramBuildInfo(ep->program,sidecar->device,CL_PROGRAM_BUILD_LOG,0,nullptr,&length);
+        std::vector<char> log(length+1,0);
+        clGetProgramBuildInfo(ep->program,sidecar->device,CL_PROGRAM_BUILD_LOG,length,log.data(),nullptr);
+        set_reason(reason,capacity,"W8A8 build error %d: %s",err,log.data()); return nullptr;
+    }
+    ep->kernel = clCreateKernel(ep->program,"w8a8_epilogue",&err);
+    size_t group_size = 0;
+    cl_ulong local_memory = 0;
+    cl_bool little_endian = CL_FALSE;
+    if (err == CL_SUCCESS) err = clGetKernelWorkGroupInfo(ep->kernel,sidecar->device,
+        CL_KERNEL_WORK_GROUP_SIZE,sizeof(group_size),&group_size,nullptr);
+    if (err == CL_SUCCESS) err = clGetDeviceInfo(sidecar->device,CL_DEVICE_LOCAL_MEM_SIZE,
+        sizeof(local_memory),&local_memory,nullptr);
+    if (err == CL_SUCCESS) err = clGetDeviceInfo(sidecar->device,CL_DEVICE_ENDIAN_LITTLE,
+        sizeof(little_endian),&little_endian,nullptr);
+    if (err != CL_SUCCESS || group_size < 128 || local_memory < 8192 || !little_endian) {
+        set_reason(reason,capacity,"W8A8 kernel limits/error %d group=%zu local=%llu",
+                   err,group_size,(unsigned long long)local_memory); return nullptr;
+    }
+    return ep.release();
+}
+
+void ggml_backend_opencl_htp_w8a8_free(ggml_opencl_htp_w8a8 * ep) { delete ep; }
+
+static bool w8a8_import_valid(const ggml_opencl_htp_w8a8 * ep,
+        const ggml_opencl_htp_import_descriptor * d) {
+    return d && d->base && d->fd >= 0 && d->logical_size > 0 &&
+        d->allocation_size >= d->logical_size &&
+        d->allocation_size-d->logical_size >= ep->sidecar->ext_mem_padding &&
+        d->logical_size <= ep->sidecar->max_mem_alloc_size &&
+        (uintptr_t)d->base%ep->sidecar->page_size == 0;
+}
+
+static cl_mem w8a8_import_memory(ggml_opencl_htp_w8a8 * ep,
+        const ggml_opencl_htp_import_descriptor * d, cl_mem_flags access, cl_int * err) {
+    cl_mem_dmabuf_host_ptr host = {};
+    host.ext_host_ptr.allocation_type = CL_MEM_DMABUF_HOST_PTR_QCOM;
+    host.ext_host_ptr.host_cache_policy = CL_MEM_HOST_UNCACHED_QCOM;
+    host.dmabuf_filedesc=d->fd;host.dmabuf_hostptr=d->base;
+    return clCreateBuffer(ep->sidecar->context,
+        access|CL_MEM_USE_HOST_PTR|CL_MEM_EXT_HOST_PTR_QCOM,d->logical_size,&host,err);
+}
+
+void ggml_backend_opencl_htp_w8a8_release_buffer(
+        ggml_opencl_htp_w8a8 * ep, ggml_backend_buffer_t backing) {
+    if (!ep) return;
+    std::lock_guard<std::mutex> lock(ep->imports_mutex);
+    for (auto it=ep->imports.begin();it!=ep->imports.end();++it) {
+        if (it->descriptor.backing==backing) {
+            const int fd=it->descriptor.fd;
+            clReleaseMemObject(it->memory);
+            ep->imports.erase(it);
+            if (ep->profiling) std::fprintf(stderr,"W8A8_GPU_IMPORT release fd=%d live=%zu\n",fd,ep->imports.size());
+            break;
+        }
+    }
+}
+
+bool ggml_backend_opencl_htp_w8a8_begin(ggml_opencl_htp_w8a8 * ep,
+        const ggml_opencl_htp_import_descriptor * d, size_t offset, int m, int n,
+        const float * sw, const int32_t * sums,
+        const ggml_opencl_htp_import_descriptor * scales, size_t scales_offset,
+        char * reason, size_t capacity) {
+    if (!ep || !sw || !sums || ep->output || !w8a8_import_valid(ep,d) || !d->backing ||
+        !w8a8_import_valid(ep,scales) || m <= 0 || n <= 0 || n%64 || offset%4 || scales_offset%4 ||
+        offset > d->logical_size || size_t(m)*n*4 > d->logical_size-offset ||
+        scales_offset > scales->logical_size || size_t(m)*4 > scales->logical_size-scales_offset) {
+        set_reason(reason,capacity,"invalid/unpadded W8A8 import"); return false;
+    }
+    ep->offset=offset;ep->sa_offset=scales_offset;ep->m=m;ep->n=n;
+    cl_int err=CL_SUCCESS;
+    {
+        // HTP's buffer-free callback evicts this entry before RPCMEM is freed.
+        // Retain a separate dispatch reference until the GPU has finished.
+        std::lock_guard<std::mutex> lock(ep->imports_mutex);
+        cl_mem memory=nullptr;
+        for (const auto & imported : ep->imports) {
+            if (imported.descriptor.backing==d->backing) {
+                const auto & before=imported.descriptor;
+                if (before.base!=d->base || before.fd!=d->fd || before.logical_size!=d->logical_size ||
+                    before.allocation_size!=d->allocation_size) {
+                    set_reason(reason,capacity,"W8A8 backing changed without buffer release");return false;
+                }
+                memory=imported.memory;break;
+            }
+        }
+        if (!memory) {
+            memory=w8a8_import_memory(ep,d,CL_MEM_READ_WRITE,&err);
+            if (err==CL_SUCCESS) {
+                ep->imports.push_back({*d,memory});
+                if (ep->profiling) std::fprintf(stderr,"W8A8_GPU_IMPORT create fd=%d live=%zu\n",d->fd,ep->imports.size());
+            }
+        }
+        if (err==CL_SUCCESS) err=clRetainMemObject(memory);
+        if (err==CL_SUCCESS) ep->output=memory;
+    }
+    // Import this call's control allocation, then read flushed scales directly.
+    // The caller retains it until finish. It is deliberately not cached because
+    // the thread-local metadata can be resized or remapped between calls.
+    if (err==CL_SUCCESS) ep->sa=w8a8_import_memory(ep,scales,CL_MEM_READ_ONLY,&err);
+    if (err==CL_SUCCESS && size_t(n)>ep->column_capacity) {
+        if (ep->weights) clReleaseMemObject(ep->weights);
+        ep->weights=nullptr;ep->column_capacity=0;
+        ep->weights=clCreateBuffer(ep->sidecar->context,CL_MEM_READ_ONLY,size_t(n)*8,nullptr,&err);
+        if (err==CL_SUCCESS) ep->column_capacity=n;
+    }
+    if (err==CL_SUCCESS) {
+        ep->weights_host.resize(size_t(n)*8);
+        std::memcpy(ep->weights_host.data(),sw,size_t(n)*4);
+        std::memcpy(ep->weights_host.data()+size_t(n)*4,sums,size_t(n)*4);
+        err=clEnqueueWriteBuffer(ep->queue,ep->weights,CL_FALSE,0,size_t(n)*8,
+            ep->weights_host.data(),0,nullptr,nullptr);
+    }
+    // These six arguments stay fixed for every batch of this dispatch.
+    int arg=0;
+    auto set=[&](size_t size,const void * value) {
+        if (err==CL_SUCCESS) err=clSetKernelArg(ep->kernel,arg,size,value);
+        ++arg;
+    };
+    set(sizeof(ep->output),&ep->output);set(sizeof(ep->offset),&ep->offset);
+    set(sizeof(ep->weights),&ep->weights);set(sizeof(ep->sa),&ep->sa);
+    set(sizeof(ep->sa_offset),&ep->sa_offset);set(sizeof(ep->n),&ep->n);
+    if (err==CL_SUCCESS) err=clFlush(ep->queue);
+    if (err!=CL_SUCCESS) {
+        clFinish(ep->queue);
+        ep->release_dispatch();set_reason(reason,capacity,"W8A8 buffer error %d",err);return false;
+    }
+    return true;
+}
+
+bool ggml_backend_opencl_htp_w8a8_submit(ggml_opencl_htp_w8a8 * ep,
+        int m0, int rows, int n0, int columns, char * reason, size_t capacity) {
+    if (!ep || !ep->output || !ep->sa || m0 < 0 || m0%64 || rows <= 0 || rows > ep->m-m0 ||
+        n0 < 0 || n0%64 || columns <= 0 || columns > (ep->n-n0)/64) {
+        set_reason(reason,capacity,"invalid W8A8 GPU batch"); return false;
+    }
+    // Only the kernel is queued per published batch: scales already live in
+    // the DSP control DMA-BUF, with producer flush before publication.
+    cl_int err = CL_SUCCESS;
+    int arg = 6;
+    auto set = [&](size_t size, const void * value) {
+        if (err == CL_SUCCESS) err = clSetKernelArg(ep->kernel,arg,size,value);
+        ++arg;
+    };
+    set(sizeof(m0),&m0); set(sizeof(rows),&rows);
+    set(sizeof(n0),&n0); set(sizeof(columns),&columns);
+    const size_t local = 128, global = size_t((rows+63)/64)*columns*2*local;
+    cl_event event = nullptr;
+    if (err == CL_SUCCESS) err = clEnqueueNDRangeKernel(ep->queue,ep->kernel,1,nullptr,
+        &global,&local,0,nullptr,ep->profiling ? &event : nullptr);
+    if (event) ep->events.push_back(event);
+    if (err == CL_SUCCESS) err = clFlush(ep->queue);
+    if (err != CL_SUCCESS) { set_reason(reason,capacity,"W8A8 submit error %d",err); return false; }
+    return true;
+}
+
+bool ggml_backend_opencl_htp_w8a8_finish(ggml_opencl_htp_w8a8 * ep,
+        ggml_opencl_htp_w8a8_stats * stats, char * reason, size_t capacity) {
+    if (!ep) { set_reason(reason,capacity,"W8A8 GPU unavailable"); return false; }
+    if (stats) *stats = {};
+    for (auto event : ep->events) {
+        cl_int status = 0;
+        if (clGetEventInfo(event,CL_EVENT_COMMAND_EXECUTION_STATUS,sizeof(status),&status,nullptr) == CL_SUCCESS &&
+            status == CL_COMPLETE && stats) ++stats->completed_at_finish_entry;
+    }
+    const cl_int err = clFinish(ep->queue);
+    if (stats && err == CL_SUCCESS && !ep->events.empty()) {
+        cl_ulong first = 0, last = 0;
+        for (auto event : ep->events) {
+            cl_ulong start = 0, end = 0;
+            clGetEventProfilingInfo(event,CL_PROFILING_COMMAND_START,sizeof(start),&start,nullptr);
+            clGetEventProfilingInfo(event,CL_PROFILING_COMMAND_END,sizeof(end),&end,nullptr);
+            stats->kernel_us += double(end-start)/1000;
+            if (!first || start < first) first=start;
+            last=std::max(last,end);
+        }
+        stats->span_us=double(last-first)/1000;
+    }
+    ep->release_dispatch();
+    if (err != CL_SUCCESS) { set_reason(reason,capacity,"W8A8 finish error %d",err); return false; }
+    return true;
+}

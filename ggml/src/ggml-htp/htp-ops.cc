@@ -20,11 +20,17 @@
 #include <unistd.h>
 
 #include <atomic>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <cerrno>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -35,6 +41,7 @@
 #include "dsprpc_interface.h"
 #include "message.h"
 #include "op_reg.h"
+#include "htp-w8a8.h"
 #include "rpcmem_session_route.h"
 
 #ifdef GGML_HTP_OPENCL_SIDECAR
@@ -42,6 +49,63 @@
 #endif
 
 namespace {
+
+// Opt-in calibration samples; capture after completion so output is the normal DSP result.
+void capture_linear_sample(const ggml_tensor *weight,const ggml_tensor *activation,const ggml_tensor *output) {
+    const char *dir=std::getenv("SD_HTP_LINEAR_CAPTURE_DIR");
+    if(dir==nullptr || dir[0]=='\0' || weight==nullptr || activation==nullptr || output==nullptr ||
+       activation->type!=GGML_TYPE_F32 || output->type!=GGML_TYPE_F32 ||
+       !ggml_is_contiguous(activation) || !ggml_is_contiguous(output)) return;
+    const std::string name=weight->name;
+    const char *mode=std::getenv("SD_HTP_LINEAR_CAPTURE_MODE");
+    const bool adaln=mode!=nullptr && std::strcmp(mode,"adaln")==0;
+    const bool all=mode!=nullptr && std::strcmp(mode,"all")==0;
+    const bool verify=mode!=nullptr && std::strcmp(mode,"verify")==0;
+    const bool benchmark=mode!=nullptr && std::strcmp(mode,"benchmark")==0;
+    if(benchmark && name.find("joint_blocks.0.")==std::string::npos &&
+       name!="model.diffusion_model.final_layer.adaLN_modulation.1.weight") return;
+    if(adaln) {
+        if(name.find("adaLN_modulation.1.weight")==std::string::npos) return;
+    } else if(all || verify || benchmark) {
+        if(name.find("joint_blocks.")==std::string::npos && name.find("final_layer.adaLN_modulation.")==std::string::npos) return;
+    } else {
+        if(name.find("joint_blocks.0.")==std::string::npos && name.find("joint_blocks.12.")==std::string::npos &&
+           name.find("joint_blocks.23.")==std::string::npos) return;
+        if(ggml_nrows(activation)<64) return;
+    }
+    static std::mutex mutex;
+    static std::unordered_map<std::string,int> calls;
+    std::lock_guard<std::mutex> guard(mutex);
+    const int call=calls[name]++;
+    if((verify || benchmark) && call!=0) return;
+    if(!adaln && call!=0 && call!=9 && call!=19) return;
+    std::string file_name=name;
+    for(char &c:file_name) if(!((c>='a' && c<='z') || (c>='A' && c<='Z') ||
+                              (c>='0' && c<='9') || c=='.' || c=='_')) c='_';
+    const std::string stem=std::string(dir)+"/"+file_name+".call"+std::to_string(call);
+    FILE *af=std::fopen((stem+".a.f32").c_str(),"wb");
+    FILE *yf=std::fopen((stem+".y.f32").c_str(),"wb");
+    FILE *meta=std::fopen((stem+".json").c_str(),"w");
+    if(af==nullptr || yf==nullptr || meta==nullptr) {
+        if(af)std::fclose(af);
+        if(yf)std::fclose(yf);
+        if(meta)std::fclose(meta);
+        std::fprintf(stderr,"[linear-capture] cannot open %s\n",stem.c_str());return;
+    }
+    const int m=(int)ggml_nrows(activation),k=(int)activation->ne[0],n=(int)output->ne[0];
+    const int sample_rows=(adaln || verify || benchmark)?m:(all?std::min(m,64):64);
+    if(sample_rows<1) {std::fclose(af);std::fclose(yf);std::fclose(meta);return;}
+    bool ok=true;
+    for(int r=0;r<sample_rows;++r) {
+        const int row=(adaln || verify || benchmark)?r:(sample_rows==1?0:r*(m-1)/(sample_rows-1));
+        ok=std::fwrite((const uint8_t *)activation->data+row*activation->nb[1],sizeof(float),k,af)==(size_t)k && ok;
+        ok=std::fwrite((const uint8_t *)output->data+row*output->nb[1],sizeof(float),n,yf)==(size_t)n && ok;
+    }
+    std::fprintf(meta,"{\"weight\":\"%s\",\"call\":%d,\"m\":%d,\"k\":%d,\"n\":%d,\"sample_rows\":%d,\"ok\":%s}\n",
+                 file_name.c_str(),call,m,k,n,sample_rows,ok?"true":"false");
+    std::fclose(af);std::fclose(yf);std::fclose(meta);
+    std::fprintf(stderr,"[linear-capture] weight=%s call=%d mkn=%d,%d,%d ok=%d\n",name.c_str(),call,m,k,n,ok?1:0);
+}
 
 bool packed_head_dim_supported(int head_dim) {
     return htp_packed_head_dim_supported(head_dim) != 0;
@@ -363,6 +427,55 @@ struct htp_independent_output {
         }
     }
 };
+
+// Gather raw planes from their final tensor positions before overwriting a
+// half tile. The CPU uses IEEE FP32 with two separate scale multiplies.
+void htp_w8a8_cpu_batch(float *output, const W8A8CpuBatch &batch, int m, int n,
+                         const W8A8CpuControl *control, const float *sw, const int32_t *sums) {
+    alignas(64) uint8_t raw[8192];
+    for (int tile = 0; tile < (batch.rows+63)/64; ++tile) {
+        const int m0 = batch.m0+tile*64;
+        const int rows = std::min(64, std::min(batch.m0+batch.rows, m)-m0);
+        for (int col = 0; col < batch.columns; ++col) for (int h = 0; h < 2; ++h) {
+            const int n0 = batch.n0+col*64+h*32;
+            for (int r = 0; r < rows; ++r)
+                std::memcpy(raw+r*128, output+(size_t)(m0+r)*n+n0, 128);
+            for (int r = 0; r < rows; ++r) for (int c = 0; c < 32; c += 16) {
+                const uint8_t *p = raw+r*32+c;
+#if defined(__aarch64__)
+                const uint8x16_t b0 = vld1q_u8(p), b1 = vld1q_u8(p+rows*32);
+                const uint8x16_t b2 = vld1q_u8(p+rows*64), b3 = vld1q_u8(p+rows*96);
+                const uint16x8_t lo01 = vreinterpretq_u16_u8(vzip1q_u8(b0,b1));
+                const uint16x8_t hi01 = vreinterpretq_u16_u8(vzip2q_u8(b0,b1));
+                const uint16x8_t lo23 = vreinterpretq_u16_u8(vzip1q_u8(b2,b3));
+                const uint16x8_t hi23 = vreinterpretq_u16_u8(vzip2q_u8(b2,b3));
+                const int32x4_t values[4] = {
+                    vreinterpretq_s32_u16(vzip1q_u16(lo01,lo23)),
+                    vreinterpretq_s32_u16(vzip2q_u16(lo01,lo23)),
+                    vreinterpretq_s32_u16(vzip1q_u16(hi01,hi23)),
+                    vreinterpretq_s32_u16(vzip2q_u16(hi01,hi23))};
+                const float32x4_t sa = vdupq_n_f32(control->scales[m0+r]);
+                for (int q = 0; q < 4; ++q) {
+                    const int channel = n0+c+q*4;
+                    const int32x4_t correction = vshlq_n_s32(vld1q_s32(sums+channel),7);
+                    float32x4_t y = vcvtq_f32_s32(vsubq_s32(values[q],correction));
+                    y = vmulq_f32(y,vld1q_f32(sw+channel));
+                    y = vmulq_f32(y,sa);
+                    vst1q_f32(output+(size_t)(m0+r)*n+channel,y);
+                }
+#else
+                for (int q = 0; q < 16; ++q) {
+                    const uint32_t bits = uint32_t(p[q]) | uint32_t(p[rows*32+q])<<8 |
+                                          uint32_t(p[rows*64+q])<<16 | uint32_t(p[rows*96+q])<<24;
+                    int32_t value; std::memcpy(&value,&bits,4);
+                    output[(size_t)(m0+r)*n+n0+c+q] =
+                        (float(value-sums[n0+c+q]*128)*sw[n0+c+q])*control->scales[m0+r];
+                }
+#endif
+            }
+        }
+    }
+}
 
 // Reserved-PD diagnostic: stage an activation in a dedicated RPCMEM
 // allocation before dispatch. This isolates the DSP input visibility path
@@ -1015,6 +1128,7 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                        max_bias == 0 && logit_softcap == 0;
             }
         case GGML_OP_CUSTOM:
+            if (htp_w8a8_is_node(dst)) return true;
             if (is_fused_anchor_attention_custom(dst)) {
                 return true;
             }
@@ -2164,6 +2278,28 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     int op_index  = -1;
     int args_size = 0;
     int dispatch_m = 0;
+    W8A8CpuControl *cpu_control = nullptr;
+    uint32_t cpu_consumed = 0;
+    uint32_t cpu_overlap_batches = 0;
+    int64_t cpu_epilogue_us = 0;
+    int64_t gpu_first_submit_us = -1;
+    std::vector<float> cpu_weight_scales;
+    std::vector<int32_t> cpu_weight_sums;
+    const bool gpu_dequant_requested = env_flag_enabled("SD_HTP_W8A8_GPU_DEQUANT");
+    bool gpu_dequant = false;
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    struct gpu_dispatch_guard {
+        ggml_opencl_htp_w8a8 * ep = nullptr;
+        ~gpu_dispatch_guard() {
+            if (ep) {
+                char reason[512] = {};
+                ggml_backend_opencl_htp_w8a8_finish(ep,nullptr,reason,sizeof(reason));
+            }
+        }
+    } gpu_guard;
+    bool gpu_failed = false;
+    char gpu_reason[512] = {};
+#endif
     int dispatch_k = 0;
     int dispatch_n = 0;
     const ggml_tensor * debug_weight = nullptr;
@@ -2281,6 +2417,10 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
 
                 if (dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F16 && activation->type == GGML_TYPE_F32) {
                     op_index = HTP_OPS_MAT_MUL_PERMUTED_W16A32;
+                    if (env_flag_enabled("SD_HTP_LINEAR_PROFILE")) {
+                        *reinterpret_cast<MatMulProfileParams *>(param_buf) = {op_params,-1};
+                        args_size = sizeof(MatMulProfileParams);
+                    }
                     debug_f16_matmul = true;
                     debug_weight = weight;
                     debug_activation = activation;
@@ -2510,6 +2650,34 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
 
         case GGML_OP_CUSTOM:
             {
+                if (htp_w8a8_is_node(dst)) {
+                    if (prepare_tensor_rpcmem_mapping(dst) != 0) return -EINVAL;
+                    auto &mapper = ctx->dispatch_mapper();
+                    auto out = mapper.get_tensor_mapping(dst);
+                    auto act = mapper.get_tensor_mapping(dst->src[0]);
+                    auto blob = mapper.get_tensor_mapping(dst->src[1]);
+                    NativeW8A8Params quant{
+                        .output={out.first,(int32_t)out.second},
+                        .activation={act.first,(int32_t)act.second},
+                        .constants={blob.first,(int32_t)blob.second},
+                        .m=(int32_t)ggml_nrows(dst->src[0]), .k=(int32_t)dst->src[0]->ne[0], .n=(int32_t)dst->ne[0],
+                    };
+                    *reinterpret_cast<NativeW8A8Params *>(param_buf) = quant;
+                    op_index = HTP_OPS_MAT_MUL_NATIVE_W8A8;
+                    args_size = sizeof(quant);
+                    const char *stage_profile = std::getenv("SD_HTP_W8A8_STAGE_PROFILE");
+                    if (stage_profile && (!std::strcmp(stage_profile,"1") || !std::strcmp(stage_profile,"2") || !std::strcmp(stage_profile,"3"))) {
+                        NativeW8A8ProfileParams profiled{};
+                        profiled.base = quant;
+                        profiled.profile.mode = (uint32_t)std::atoi(stage_profile);
+                        std::memcpy(param_buf, &profiled, sizeof(profiled));
+                        args_size = sizeof(profiled);
+                    }
+                    dispatch_m=quant.m; dispatch_k=quant.k; dispatch_n=quant.n;
+                    debug_weight=dst->src[1]; debug_activation=dst->src[0];
+                    debug_output_fd=out.first; debug_output_offset=out.second;
+                    break;
+                }
                 if (is_fused_anchor_attention_custom(dst)) {
                     prepare_tensor_rpcmem_mapping(dst);
                     auto mappings = get_all_rpcmem_mappings(dst);
@@ -2785,6 +2953,80 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                      ggml_op_name(dst->op),
                      dst->name[0] != '\0' ? dst->name : "<unnamed>");
         return -EINVAL;
+    }
+
+    if (op_index == HTP_OPS_MAT_MUL_NATIVE_W8A8 &&
+        (env_flag_enabled("SD_HTP_W8A8_CPU_DEQUANT") || gpu_dequant_requested)) {
+        // This mode needs the exact shared output backing while DSP runs.
+        if (env_flag_enabled("SD_HTP_MULTI_SESSION_INDEPENDENT_ALL_OUTPUT")) return -EINVAL;
+        static thread_local htp_independent_output metadata;
+        size_t control_allocation=sizeof(W8A8CpuControl);
+#ifdef GGML_HTP_OPENCL_SIDECAR
+        if (gpu_dequant_requested) control_allocation+=ctx->sparse_opencl_ext_mem_padding;
+#endif
+        if (!metadata.ensure(ctx->dispatch_mapper().domain(), control_allocation)) return -ENOMEM;
+        cpu_control = static_cast<W8A8CpuControl *>(metadata.ptr);
+        std::memset(cpu_control,0,128);
+        // GPU uses full weight residency with bounded activation batches when it fits;
+        // DSP selects the previous activation-first layout for other shapes.
+        // Keep an explicit zero override for comparisons and troubleshooting.
+        const char *weight_first_setting = std::getenv("SD_HTP_W8A8_WEIGHT_FIRST");
+        const bool weight_first_requested = weight_first_setting
+            ? env_flag_enabled("SD_HTP_W8A8_WEIGHT_FIRST") : gpu_dequant_requested;
+        cpu_control->flags = weight_first_requested ? W8A8_CONTROL_WEIGHT_FIRST : 0;
+        cpu_control->resident_batch_rows = 64;
+        // Measured on the M4096 image branch: retain full weights, but batch
+        // enough rows to amortize GPU commands without delaying the first batch.
+        if (gpu_dequant_requested && dispatch_m == 4096 && dispatch_k == 1536) {
+            if (dispatch_n == 1536) cpu_control->resident_batch_rows = 256;
+            else if (dispatch_n == 4608) cpu_control->resident_batch_rows = 128;
+        }
+        const char *batch_rows_setting = std::getenv("SD_HTP_W8A8_GPU_BATCH_ROWS");
+        if (gpu_dequant_requested && batch_rows_setting && batch_rows_setting[0]) {
+            char *end = nullptr;
+            const long batch_rows = std::strtol(batch_rows_setting,&end,10);
+            if (!end || *end || batch_rows < 64 || batch_rows > 4096 || batch_rows%64) {
+                std::fprintf(stderr,"[ggml-htp] SD_HTP_W8A8_GPU_BATCH_ROWS must be a multiple of 64 in [64,4096]\n");
+                return -EINVAL;
+            }
+            cpu_control->resident_batch_rows = (uint32_t)batch_rows;
+        }
+        __atomic_store_n(&cpu_control->produced, uint32_t{0}, __ATOMIC_RELEASE);
+        NativeW8A8CpuParams wire{};
+        std::memcpy(&wire.base,param_buf,sizeof(wire.base));
+        wire.control = {metadata.fd,0};
+        std::memcpy(param_buf,&wire,sizeof(wire));
+        args_size = sizeof(wire);
+        const auto *blob = static_cast<const uint8_t *>(dst->src[1]->data);
+        const auto *header = reinterpret_cast<const W8A8Header *>(blob);
+        const auto *sw = reinterpret_cast<const float *>(blob+header->scale_offset);
+        const auto *sums = reinterpret_cast<const int32_t *>(blob+header->sum_offset);
+        cpu_weight_scales.assign(sw,sw+dispatch_n);
+        cpu_weight_sums.assign(sums,sums+dispatch_n);
+        if (gpu_dequant_requested) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+            ggml_backend_htp_rpcmem_info info = {};
+            ggml_backend_buffer_t backing = dst->view_src ? dst->view_src->buffer : dst->buffer;
+            if (!ggml_backend_htp_get_rpcmem_info(backing,&info)) return -EINVAL;
+            ggml_opencl_htp_import_descriptor descriptor = {
+                backing,info.base,info.fd,info.logical_size,info.allocation_size};
+            ggml_opencl_htp_import_descriptor scale_descriptor = {
+                nullptr,metadata.ptr,metadata.fd,sizeof(W8A8CpuControl),metadata.size};
+            if (!ggml_backend_opencl_htp_w8a8_begin(ctx->w8a8_gpu_epilogue,&descriptor,
+                    static_cast<uint8_t *>(dst->data)-static_cast<uint8_t *>(info.base),
+                    dispatch_m,dispatch_n,cpu_weight_scales.data(),cpu_weight_sums.data(),
+                    &scale_descriptor,offsetof(W8A8CpuControl,scales),
+                    gpu_reason,sizeof(gpu_reason))) {
+                std::fprintf(stderr,"[ggml-htp] W8A8 GPU begin: %s\n",gpu_reason);
+                return -EIO;
+            }
+            gpu_guard.ep=ctx->w8a8_gpu_epilogue;
+            gpu_dequant=true;
+#else
+            std::fprintf(stderr,"[ggml-htp] W8A8 GPU requires linked OpenCL backend\n");
+            return -ENOTSUP;
+#endif
+        }
     }
 
     const bool isolate_all_outputs =
@@ -3071,6 +3313,33 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
 
     const int timeout_ms = htp_dispatch_timeout_ms();
     const int64_t wait_begin_ms = ggml_time_ms();
+    const int64_t wait_begin_us = ggml_time_us();
+    auto consume_cpu_batches = [&]() {
+        if (!cpu_control) return false;
+        const uint32_t produced = __atomic_load_n(&cpu_control->produced,__ATOMIC_ACQUIRE);
+        GGML_ASSERT(produced <= W8A8_CPU_MAX_BATCHES);
+        if (cpu_consumed == produced) return false;
+        const int64_t start = ggml_time_us();
+        while (cpu_consumed < produced) {
+            if (std::atomic_load_explicit(v1_ptr,std::memory_order_acquire) == 0) ++cpu_overlap_batches;
+            const W8A8CpuBatch batch = cpu_control->batches[cpu_consumed++];
+            if (gpu_dequant && gpu_first_submit_us < 0) gpu_first_submit_us = ggml_time_us()-wait_begin_us;
+            GGML_ASSERT(batch.m0 >= 0 && batch.rows > 0 && batch.m0+batch.rows <= dispatch_m &&
+                        batch.n0 >= 0 && batch.columns > 0 && batch.n0+batch.columns*64 <= dispatch_n);
+            if (gpu_dequant) {
+#ifdef GGML_HTP_OPENCL_SIDECAR
+                if (!gpu_failed && !ggml_backend_opencl_htp_w8a8_submit(
+                        gpu_guard.ep,batch.m0,batch.rows,batch.n0,batch.columns,
+                        gpu_reason,sizeof(gpu_reason))) gpu_failed=true;
+#endif
+            } else {
+                htp_w8a8_cpu_batch(static_cast<float *>(dst->data),batch,dispatch_m,dispatch_n,
+                                  cpu_control,cpu_weight_scales.data(),cpu_weight_sums.data());
+            }
+        }
+        cpu_epilogue_us += ggml_time_us()-start;
+        return true;
+    };
     while (std::atomic_load_explicit(v1_ptr, std::memory_order_acquire) == 0) {
         const int waited_ms = static_cast<int>(ggml_time_ms() - wait_begin_ms);
         if (timeout_ms > 0 && waited_ms >= timeout_ms) {
@@ -3081,8 +3350,42 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
             }
             return -ETIMEDOUT;
         }
-        usleep(1000);
+        if (!consume_cpu_batches()) usleep(100);
     }
+    consume_cpu_batches();
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    if (gpu_dequant) {
+        ggml_opencl_htp_w8a8_stats stats = {};
+        char finish_reason[512] = {};
+        const int64_t finish_begin = ggml_time_us();
+        const bool finished = ggml_backend_opencl_htp_w8a8_finish(
+            gpu_guard.ep,&stats,finish_reason,sizeof(finish_reason));
+        gpu_guard.ep=nullptr;
+        if (env_flag_enabled("SD_HTP_W8A8_GPU_TRACE"))
+            std::fprintf(stderr,"W8A8_GPU M=%d K=%d N=%d batches=%u overlap_batches=%u "
+                         "completed_at_dsp_observed=%u submit_us=%lld finish_us=%lld kernel_us=%.3f "
+                         "span_us=%.3f wait_us=%lld first_submit_us=%lld\n",dispatch_m,dispatch_k,dispatch_n,
+                         cpu_consumed,cpu_overlap_batches,stats.completed_at_finish_entry,
+                         (long long)cpu_epilogue_us,(long long)(ggml_time_us()-finish_begin),
+                         stats.kernel_us,stats.span_us,(long long)(ggml_time_us()-wait_begin_us),
+                         (long long)gpu_first_submit_us);
+        if (gpu_failed || !finished) {
+            std::fprintf(stderr,"[ggml-htp] W8A8 GPU failed: %s %s\n",gpu_reason,finish_reason);
+            d_ptr->store(0,std::memory_order_relaxed);
+            if (has_unmap_reqs) ctx->dispatch_mapper().unmap_all_pending_buffers();
+            return -EIO;
+        }
+    }
+#endif
+    if (cpu_control && env_flag_enabled("SD_HTP_W8A8_GPU_TRACE"))
+        std::fprintf(stderr,"W8A8_LAYOUT flags=%u vtcm_bytes=%u activation_rows=%u weight_columns=%u "
+                     "weight_loads=%u weight_loaded_bytes=%llu\n",cpu_control->flags,cpu_control->vtcm_bytes,
+                     cpu_control->activation_rows,cpu_control->weight_columns,cpu_control->weight_loads,
+                     (unsigned long long)cpu_control->weight_loaded_bytes);
+    if (cpu_control && !gpu_dequant && env_flag_enabled("SD_HTP_W8A8_CPU_TRACE"))
+        std::fprintf(stderr,"W8A8_CPU M=%d K=%d N=%d batches=%u overlap_batches=%u cpu_us=%lld wait_us=%lld\n",
+                     dispatch_m,dispatch_k,dispatch_n,cpu_consumed,cpu_overlap_batches,(long long)cpu_epilogue_us,
+                     (long long)(ggml_time_us()-wait_begin_us));
     d_ptr->store(0, std::memory_order_relaxed);
 
     if (has_unmap_reqs) {
@@ -3097,9 +3400,43 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     auto * completed_request = message_header_get_request_ptr(msg_hdr, 0);
     int ret = completed_request->state;
     auto * compute_request = reinterpret_cast<OpComputeRequest *>(completed_request->data);
+    int64_t linear_elapsed_us = -1;
+    if (ret == 0 && op_index == HTP_OPS_MAT_MUL_NATIVE_W8A8)
+        linear_elapsed_us = reinterpret_cast<const NativeW8A8Params *>(compute_request->payload)->elapsed_us;
+    else if (ret == 0 && op_index == HTP_OPS_MAT_MUL_PERMUTED_W16A32 && args_size == sizeof(MatMulProfileParams))
+        linear_elapsed_us = reinterpret_cast<const MatMulProfileParams *>(compute_request->payload)->elapsed_us;
+    ctx->last_linear_elapsed_us.store(linear_elapsed_us,std::memory_order_release);
+    if (ret == 0 && op_index == HTP_OPS_MAT_MUL_NATIVE_W8A8 && args_size == sizeof(NativeW8A8ProfileParams)) {
+        NativeW8A8Profile profile;
+        std::memcpy(&profile, compute_request->payload+sizeof(NativeW8A8Params), sizeof(profile));
+        if (profile.mode == 3) {
+            std::fprintf(stderr,"W8A8_DSP_LAYOUT M=%d K=%d N=%d table=%u activation_rows=%u weight_columns=%u weight_loads=%llu weight_loaded_bytes=%llu\n",
+                dispatch_m,dispatch_k,dispatch_n,profile.reserved >> 31,
+                (profile.reserved & 0xffffu)*64,(profile.reserved >> 16) & 0x7fffu,
+                (unsigned long long)profile.mac_ticks,(unsigned long long)profile.readout_ticks);
+        }
+        std::fprintf(stderr,"W8A8_STAGE mode=%u M=%d K=%d N=%d total_us=%lld setup_us=%.3f activation_us=%.3f weight_us=%.3f hmx_us=%.3f output_us=%.3f mac_us=%.3f readout_us=%.3f\n",
+            profile.mode,dispatch_m,dispatch_k,dispatch_n,(long long)linear_elapsed_us,
+            profile.setup_ticks/19.2,profile.activation_ticks/19.2,profile.weight_ticks/19.2,
+            profile.hmx_ticks/19.2,profile.output_ticks/19.2,
+            profile.mode == 3 ? 0.0 : profile.mac_ticks/19.2,
+            profile.mode == 3 ? 0.0 : profile.readout_ticks/19.2);
+    }
     if (ret == 0 && debug_f16_matmul) {
         (void) htp_host_dma_buf_sync_read(debug_output_fd);
         htp_host_cache_probe(debug_output_fd, debug_output_offset, dst->data, ggml_nbytes(dst));
+        const char *capture_mode = std::getenv("SD_HTP_LINEAR_CAPTURE_MODE");
+        if (capture_mode == nullptr || std::strcmp(capture_mode,"verify") != 0)
+            capture_linear_sample(debug_weight,debug_activation,dst);
+    }
+    if (ret == 0 && op_index == HTP_OPS_MAT_MUL_NATIVE_W8A8) {
+        (void)htp_host_dma_buf_sync_read(debug_output_fd);
+        capture_linear_sample(debug_weight,debug_activation,dst);
+        if (env_flag_enabled("SD_HTP_W8A8_TRACE")) {
+            const auto *quant = reinterpret_cast<const NativeW8A8Params *>(compute_request->payload);
+            std::fprintf(stderr,"[htp-w8a8] compute weight=%s m=%d k=%d n=%d dsp_us=%d\n",
+                debug_weight->name,dispatch_m,dispatch_k,dispatch_n,quant->elapsed_us);
+        }
     }
     if (env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE") && debug_f16_matmul && dst != nullptr &&
         dst->type == GGML_TYPE_F32 && dispatch_m == 768 && dispatch_k == 3072 &&

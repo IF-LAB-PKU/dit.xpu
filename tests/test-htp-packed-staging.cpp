@@ -115,6 +115,8 @@ int main() {
     deferred_param->flags |= SD_GGML_TENSOR_FLAG_HTP_MUL_MAT_WEIGHT |
                              SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32 |
                              SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM;
+    ggml_tensor* replaced_param = ggml_new_tensor_2d(params_ctx, GGML_TYPE_F16, 32, 64);
+    replaced_param->flags |= SD_GGML_TENSOR_FLAG_HTP_W8A8_REPLACED;
     ggml_backend_t cpu_backend = ggml_backend_cpu_init();
     CHECK(cpu_backend != nullptr);
     HtpNonDeferredParamsAllocation non_deferred_allocation;
@@ -122,15 +124,19 @@ int main() {
     CHECK(ordinary_param->buffer != nullptr && ordinary_param->data != nullptr);
     CHECK(deferred_param->buffer == nullptr && deferred_param->data == nullptr &&
           deferred_param->extra == nullptr);
+    CHECK(replaced_param->buffer == nullptr && replaced_param->data == nullptr &&
+          replaced_param->extra == nullptr);
     CHECK(non_deferred_allocation.logical_bytes() ==
-          ggml_nbytes(ordinary_param) + ggml_nbytes(deferred_param));
+          ggml_nbytes(ordinary_param) + ggml_nbytes(deferred_param) + ggml_nbytes(replaced_param));
     CHECK(non_deferred_allocation.host_backed_bytes() == ggml_nbytes(ordinary_param));
-    CHECK(non_deferred_allocation.deferred_bytes() == ggml_nbytes(deferred_param));
+    CHECK(non_deferred_allocation.deferred_bytes() == ggml_nbytes(deferred_param) + ggml_nbytes(replaced_param));
     non_deferred_allocation.clear();
     CHECK(ordinary_param->buffer == nullptr && ordinary_param->data == nullptr &&
           ordinary_param->extra == nullptr);
     CHECK(deferred_param->buffer == nullptr && deferred_param->data == nullptr &&
           deferred_param->extra == nullptr);
+    CHECK(replaced_param->buffer == nullptr && replaced_param->data == nullptr &&
+          replaced_param->extra == nullptr);
     ggml_backend_free(cpu_backend);
     ggml_free(params_ctx);
 

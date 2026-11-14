@@ -13,6 +13,7 @@ extern "C" {
 
 typedef struct ggml_opencl_htp_sidecar ggml_opencl_htp_sidecar;
 typedef struct ggml_opencl_htp_graph ggml_opencl_htp_graph;
+typedef struct ggml_opencl_htp_w8a8 ggml_opencl_htp_w8a8;
 
 struct ggml_opencl_htp_graph_lifetime_snapshot {
     size_t live_leases;
@@ -31,6 +32,33 @@ struct ggml_opencl_htp_import_descriptor {
     size_t logical_size;
     size_t allocation_size;
 };
+
+// Optional streaming, in-place W8A8 epilogue. The caller publishes disjoint
+// M chunks only after the DSP has flushed them and retains all host arrays
+// until finish. Output imports persist until release_buffer, which must be
+// called before freeing the backing. One instance serves one dispatch at a time.
+struct ggml_opencl_htp_w8a8_stats {
+    uint32_t completed_at_finish_entry;
+    double kernel_us;
+    double span_us;
+};
+GGML_BACKEND_API ggml_opencl_htp_w8a8 * ggml_backend_opencl_htp_w8a8_create(
+    ggml_opencl_htp_sidecar * sidecar, char * reason, size_t reason_capacity);
+GGML_BACKEND_API void ggml_backend_opencl_htp_w8a8_free(ggml_opencl_htp_w8a8 * epilogue);
+GGML_BACKEND_API bool ggml_backend_opencl_htp_w8a8_begin(
+    ggml_opencl_htp_w8a8 * epilogue, const struct ggml_opencl_htp_import_descriptor * output,
+    size_t offset, int m, int n, const float * sw, const int32_t * sums,
+    const struct ggml_opencl_htp_import_descriptor * scales, size_t scales_offset,
+    char * reason, size_t reason_capacity);
+GGML_BACKEND_API bool ggml_backend_opencl_htp_w8a8_submit(
+    ggml_opencl_htp_w8a8 * epilogue, int m0, int rows, int n0, int columns,
+    char * reason, size_t reason_capacity);
+GGML_BACKEND_API bool ggml_backend_opencl_htp_w8a8_finish(
+    ggml_opencl_htp_w8a8 * epilogue, struct ggml_opencl_htp_w8a8_stats * stats,
+    char * reason, size_t reason_capacity);
+// Release a cached output import before its RPCMEM backing is unmapped/freed.
+GGML_BACKEND_API void ggml_backend_opencl_htp_w8a8_release_buffer(
+    ggml_opencl_htp_w8a8 * epilogue, ggml_backend_buffer_t backing);
 
 enum ggml_opencl_htp_result {
     GGML_OPENCL_HTP_OK          = 0,

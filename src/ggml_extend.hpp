@@ -39,6 +39,7 @@
 
 #include "htp_tensor_flags.h"
 #include "htp_packed_staging.h"
+#include "htp_dense_mask.h"
 #include "ggml/src/ggml-htp/htp_param_placement.h"
 #include "ggml/src/ggml-htp/session_placement.h"
 #include "ggml/src/ggml-htp/session_ownership.h"
@@ -2044,7 +2045,13 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
     if (scale != 1.f) {
         x = ggml_ext_scale(ctx, x, scale);
     }
-    if (x->ne[2] * x->ne[3] > 1024) {
+    if ((w->flags & SD_GGML_TENSOR_FLAG_HTP_W8A8_REPLACED) != 0) {
+#ifdef GGML_USE_HTP
+        x = ggml_backend_htp_w8a8_linear(ctx,w,x);
+#else
+        GGML_ABORT("native W8A8 requires an HTP build");
+#endif
+    } else if (x->ne[2] * x->ne[3] > 1024) {
         // workaround: avoid ggml cuda error
         int64_t ne2 = x->ne[2];
         int64_t ne3 = x->ne[3];
@@ -2694,7 +2701,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                       const std::function<ggml_tensor*(const std::string&, ggml_tensor*)>* block_sparse_cache_tensor = nullptr,
                                                       int block_sparse_token_h = 0,
                                                       int block_sparse_token_w = 0,
-                                                      bool block_sparse_force_full_keep = false) {  // avoid overflow
+                                                      bool block_sparse_force_full_keep = false,
+                                                      const std::function<ggml_tensor*(int64_t, int64_t, int64_t)>* dense_mask_cache = nullptr) {  // avoid overflow
     auto packed_qkv_storage = [](ggml_tensor* tensor) -> ggml_tensor* {
         for (int depth = 0; tensor != nullptr && depth < 8; ++depth) {
             if (tensor->name[0] != '\0' &&
@@ -3020,6 +3028,17 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         if (prepare_dense_mask) {
             const int htp_dense_mask_pad =
                 kv_pad == 0 ? (GGML_PAD(L_k, 64) - static_cast<int>(L_k)) : 0;
+            if (dense_mask_in == nullptr && !block_sparse_attn && kv_pad == 0 &&
+                dense_mask_cache != nullptr && *dense_mask_cache) {
+                dense_mask_in = (*dense_mask_cache)(L_q, L_k, L_k + htp_dense_mask_pad);
+                if (dense_mask_in != nullptr) {
+                    inputs.q = q_in;
+                    inputs.k = k_in;
+                    inputs.v = v_in;
+                    inputs.dense_mask = dense_mask_in;
+                    return inputs;
+                }
+            }
             if (dense_mask_in != nullptr) {
                 dense_mask_in = dense_mask_to_kq_layout(dense_mask_in);
             }
@@ -6114,6 +6133,7 @@ struct GGMLRunnerContext {
     std::function<ggml_tensor*(const std::string&)> get_cache_tensor;
     std::function<ggml_tensor*(const std::string&, ggml_tensor*)> cache_tensor;
     std::function<void(const std::string&, ggml_tensor*)> bind_cache_tensor;
+    std::function<ggml_tensor*(int64_t, int64_t, int64_t)> dense_mask_cache;
 
     void capture_tensor(const std::string& name, ggml_tensor* tensor) {
         if (debug_tensors == nullptr || tensor == nullptr) {
@@ -6216,6 +6236,7 @@ protected:
     ggml_backend_t runtime_backend = nullptr;
     // 只有 diffusion 推理明确注入 HTP backend 后，runner 才会启用 RPCMEM 放置和 hybrid compute 判定。
     ggml_backend_t htp_backend     = nullptr;
+    HtpDenseMaskCache htp_dense_mask_cache_;
     std::unique_ptr<HtpPackedStagingPool> htp_packed_staging_pool_;
     HtpPackedStagingPool::TypedLoadFn htp_packed_staging_loader_;
     std::vector<HtpPackedStagingPool::Handle> htp_packed_staging_handles_;
@@ -6386,6 +6407,7 @@ protected:
     }
 
     void free_params_ctx() {
+        free_htp_param_placement();
         if (params_ctx != nullptr) {
             ggml_free(params_ctx);
             params_ctx = nullptr;
@@ -6396,7 +6418,6 @@ protected:
             offload_ctx = nullptr;
         }
         runtime_offload_pairs_.clear();
-        free_htp_param_placement();
         if (partial_offload_ctx != nullptr) {
             ggml_free(partial_offload_ctx);
             partial_offload_ctx = nullptr;
@@ -6864,7 +6885,9 @@ protected:
         GGML_ASSERT(gf_out != nullptr);
 
         reset_compute_ctx();
+        htp_dense_mask_cache_.begin_graph();
         ggml_cgraph* gf = get_compute_graph(get_graph);
+        htp_dense_mask_cache_.end_graph();
         if (gf == nullptr) {
             free_compute_ctx();
             return false;
@@ -7145,6 +7168,9 @@ protected:
         if (!htp_op_routing_enabled() || node == nullptr) {
             return false;
         }
+        if (node->op == GGML_OP_CUSTOM && std::strcmp(node->name,"htp_w8a8_linear") == 0) {
+            return ggml_backend_supports_op(htp_backend,node);
+        }
         if (is_htp_supported_packed_qkv(node)) {
             return true;
         }
@@ -7390,6 +7416,15 @@ protected:
     }
 
     bool allocate_htp_placed_params() {
+#ifdef GGML_USE_HTP
+        for (ggml_tensor* tensor = ggml_get_first_tensor(params_ctx); tensor != nullptr;
+             tensor = ggml_get_next_tensor(params_ctx, tensor)) {
+            if (ggml_backend_htp_w8a8_selected(tensor) &&
+                (!htp_op_routing_enabled() || sd_env_flag_enabled("SD_HTP_PACKED_STAGING"))) {
+                GGML_ABORT("selected W8A8 weights require HTP routing and direct shared RPCMEM placement");
+            }
+        }
+#endif
         if (!htp_op_routing_enabled() || htp_param_placement_buffer_ != nullptr ||
             sd_env_flag_enabled("SD_HTP_PACKED_STAGING")) {
             return true;
@@ -7426,7 +7461,18 @@ protected:
         std::vector<ggml_tensor*> htp_tensors;
         htp_tensors.reserve(tensors.size());
         for (ggml_tensor* tensor : tensors) {
-            ggml_tensor* htp_tensor = ggml_dup_tensor(htp_param_placement_ctx_, tensor);
+            ggml_tensor* htp_tensor = nullptr;
+#ifdef GGML_USE_HTP
+            if (ggml_backend_htp_w8a8_selected(tensor)) {
+                if (owner_aware || sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_ATTN") ||
+                    sd_env_flag_enabled("SD_HTP_PACKED_ATTENTION") || weight_adapter) {
+                    GGML_ABORT("native W8A8 replacement currently requires dense single-session inference without weight adapters");
+                }
+                htp_tensor = ggml_backend_htp_w8a8_create(htp_param_placement_ctx_,tensor);
+                tensor->flags |= SD_GGML_TENSOR_FLAG_HTP_W8A8_REPLACED;
+            }
+#endif
+            if (htp_tensor == nullptr) htp_tensor = ggml_dup_tensor(htp_param_placement_ctx_, tensor);
             ggml_set_name(htp_tensor, tensor->name);
             htp_tensors.push_back(htp_tensor);
             htp_param_placement_pairs_.push_back({tensor, htp_tensor});
@@ -7492,10 +7538,7 @@ protected:
             LOG_ERROR("%s alloc HTP packed-only params buffer failed, num_tensors = %zu",
                       get_desc().c_str(),
                       htp_param_placement_pairs_.size());
-            htp_param_placement_pairs_.clear();
-            htp_placed_param_tensors_.clear();
-            ggml_free(htp_param_placement_ctx_);
-            htp_param_placement_ctx_ = nullptr;
+            free_htp_param_placement();
             return false;
         }
         if (!owner_aware) {
@@ -7507,9 +7550,19 @@ protected:
         }
 
         size_t placed_bytes = 0;
+        size_t replaced_count = 0, skipped_f16_bytes = 0, native_bytes = 0;
         for (auto& pair : htp_param_placement_pairs_) {
             ggml_tensor* tensor     = pair.first;
             ggml_tensor* htp_tensor = pair.second;
+            if ((tensor->flags & SD_GGML_TENSOR_FLAG_HTP_W8A8_REPLACED) != 0) {
+                // Do not give the logical F16 tensor fake INT8 storage. It is
+                // excluded from allocation/loading and never appears in the graph.
+                ++replaced_count;
+                skipped_f16_bytes += ggml_nbytes(tensor);
+                native_bytes += ggml_nbytes(htp_tensor);
+                placed_bytes += ggml_nbytes(htp_tensor);
+                continue;
+            }
             if (!owner_aware) {
                 bind_tensor_allocation(tensor, htp_tensor);
             } else {
@@ -7521,10 +7574,25 @@ protected:
             placed_bytes += ggml_nbytes(tensor);
         }
 
-        LOG_INFO("%s placed packed-only HTP F16 params in RPCMEM (%6.2f MB, %zu tensors)",
+        LOG_INFO("%s placed HTP params in shared RPCMEM chunks (%6.2f MB, %zu tensors)",
                  get_desc().c_str(),
                  placed_bytes / (1024.f * 1024.f),
                  htp_placed_param_tensors_.size());
+        if (replaced_count) LOG_INFO("%s W8A8 replacement: weights=%zu skipped_f16_bytes=%zu native_bytes=%zu per_call_weight_copy=0",
+                                    get_desc().c_str(),replaced_count,skipped_f16_bytes,native_bytes);
+        if (replaced_count) {
+            std::unordered_set<ggml_backend_buffer_t> chunks;
+            size_t allocation_bytes = 0, largest_chunk = 0;
+            for (ggml_tensor* tensor : htp_tensors) {
+                if (chunks.insert(tensor->buffer).second) {
+                    const size_t bytes = ggml_backend_buffer_get_size(tensor->buffer);
+                    allocation_bytes += bytes;
+                    largest_chunk = std::max(largest_chunk, bytes);
+                }
+            }
+            LOG_INFO("%s W8A8 shared allocations: chunks=%zu bytes=%zu largest_chunk=%zu",
+                     get_desc().c_str(), chunks.size(), allocation_bytes, largest_chunk);
+        }
         return true;
     }
 
@@ -7541,6 +7609,7 @@ protected:
         }
         size_t self_registered_bytes = 0;
         for (ggml_tensor* tensor : tensors) {
+            if ((tensor->flags & SD_GGML_TENSOR_FLAG_HTP_W8A8_REPLACED) != 0) continue;
             if (!htp_packed_f16_weight_is_prepared(tensor)) {
                 sd_backend_htp_register_packed_f16_weight(tensor, tensor);
                 htp_packed_self_registered_weights_.push_back(tensor);
@@ -7570,6 +7639,11 @@ protected:
         for (auto& pair : htp_param_placement_pairs_) {
             ggml_tensor* tensor = pair.first;
             if (tensor != nullptr) {
+#ifdef GGML_USE_HTP
+                if ((tensor->flags & SD_GGML_TENSOR_FLAG_HTP_W8A8_REPLACED) != 0)
+                    ggml_backend_htp_w8a8_unregister(tensor);
+#endif
+                tensor->flags &= ~SD_GGML_TENSOR_FLAG_HTP_W8A8_REPLACED;
                 tensor->buffer = nullptr;
                 tensor->data   = nullptr;
                 tensor->extra  = nullptr;
@@ -7589,6 +7663,11 @@ protected:
             }
         }
         htp_param_placement_buffers_.clear();
+        if (htp_param_placement_ctx_ != nullptr &&
+            std::find(htp_param_placement_ctxs_.begin(), htp_param_placement_ctxs_.end(),
+                      htp_param_placement_ctx_) == htp_param_placement_ctxs_.end()) {
+            ggml_free(htp_param_placement_ctx_);
+        }
         for (ggml_context* ctx : htp_param_placement_ctxs_) {
             if (ctx != nullptr) {
                 ggml_free(ctx);
@@ -9574,6 +9653,14 @@ public:
         runner_ctx.circular_y_enabled    = circular_y_enabled;
         runner_ctx.weight_adapter        = weight_adapter;
         runner_ctx.debug_tensors         = &debug_tensors;
+        if (htp_op_routing_enabled() && sd_env_flag_enabled("SD_HTP_COMPUTE") &&
+            !can_attempt_graph_cut_segmented_compute() &&
+            sd_env_flag_enabled_default("SD_HTP_DENSE_MASK_CACHE", true)) {
+            runner_ctx.dense_mask_cache = [this](int64_t queries, int64_t keys, int64_t stride) {
+                return htp_dense_mask_cache_.get(compute_ctx,
+                    ggml_backend_get_default_buffer_type(htp_backend), queries, keys, stride);
+            };
+        }
         runner_ctx.get_cache_tensor      = [this](const std::string& name) {
             return this->get_cache_tensor_by_name(name);
         };
@@ -9618,7 +9705,9 @@ public:
                  tensor != nullptr;
                  tensor = ggml_get_next_tensor(params_ctx, tensor)) {
                 tensor->flags &= ~SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM;
-                if (htp_should_defer_packed_param(
+                if ((tensor->flags & SD_GGML_TENSOR_FLAG_HTP_W8A8_REPLACED) != 0) {
+                    ++deferred_tensor_count;
+                } else if (htp_should_defer_packed_param(
                         htp_op_routing_enabled(),
                         sd_env_flag_enabled("SD_HTP_PACKED_STAGING"),
                         max_graph_vram_bytes,
@@ -9690,6 +9779,7 @@ public:
     }
 
     void free_params_buffer() {
+        htp_dense_mask_cache_.clear();
         free_htp_param_placement();
         non_deferred_params_allocation_.clear();
         if (params_buffer != nullptr) {
@@ -9915,6 +10005,7 @@ public:
 
     // 由上层在模型初始化完成后注入 HTP backend，避免默认路径无意打开 HTP 逻辑。
     void set_htp_backend(ggml_backend_t backend) {
+        if (htp_backend != backend) htp_dense_mask_cache_.clear();
         htp_backend = backend;
     }
 
@@ -10140,6 +10231,8 @@ public:
             b = params["bias"];
         }
         if (ctx->weight_adapter) {
+            if ((w->flags & SD_GGML_TENSOR_FLAG_HTP_W8A8_REPLACED) != 0)
+                GGML_ABORT("weight adapters cannot read a replaced FP16 weight");
             WeightAdapter::ForwardParams forward_params;
             forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;
             forward_params.linear.force_prec_f32 = force_prec_f32;

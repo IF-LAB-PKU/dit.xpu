@@ -24,6 +24,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-htp-impl.h"
 #include "htp-ops.h"
+#include "htp-w8a8.h"
 #include "rpcmem_session_route.h"
 #include "session_placement.h"
 
@@ -742,7 +743,8 @@ ggml_backend_htp_context::ggml_backend_htp_context()
 
 #ifdef GGML_HTP_OPENCL_SIDECAR
     if (ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL") ||
-        ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL")) {
+        ggml_backend_htp_env_enabled("SD_HTP_SPARSE_OPENCL_RESIDUAL") ||
+        ggml_backend_htp_env_enabled("SD_HTP_W8A8_GPU_DEQUANT")) {
         ggml_opencl_qcom_requirements requirements = {};
         char reason[512] = {};
         sparse_opencl_sidecar =
@@ -757,6 +759,20 @@ ggml_backend_htp_context::ggml_backend_htp_context()
                 return;
             }
         }
+    }
+    if (ggml_backend_htp_env_enabled("SD_HTP_W8A8_GPU_DEQUANT")) {
+        char reason[512] = {};
+        w8a8_gpu_epilogue = ggml_backend_opencl_htp_w8a8_create(
+            sparse_opencl_sidecar, reason, sizeof(reason));
+        if (w8a8_gpu_epilogue == nullptr) {
+            runtime_error = std::string("W8A8 GPU epilogue initialization failed: ") +
+                (sparse_opencl_sidecar ? reason : sparse_opencl_error);
+            std::fprintf(stderr,"[ggml-htp] %s\n",runtime_error.c_str());
+            return;
+        }
+        std::fprintf(stderr, "[ggml-htp] W8A8 GPU epilogue device=%s padding=%zu\n",
+                     ggml_backend_opencl_htp_sidecar_device_name(sparse_opencl_sidecar),
+                     sparse_opencl_ext_mem_padding);
     }
 #endif
 
@@ -876,6 +892,8 @@ ggml_backend_htp_context::~ggml_backend_htp_context() {
     active_compute_arena_generation = 0;
     sparse_opencl_submission_thread_active = false;
     sparse_opencl_routed_nodes.clear();
+    ggml_backend_opencl_htp_w8a8_free(w8a8_gpu_epilogue);
+    w8a8_gpu_epilogue = nullptr;
     ggml_backend_opencl_htp_sidecar_free(sparse_opencl_sidecar);
     sparse_opencl_sidecar = nullptr;
 #endif
@@ -1129,6 +1147,9 @@ static void * ggml_backend_htp_buffer_get_base(ggml_backend_buffer_t buffer) {
 
 static void ggml_backend_htp_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<ggml_backend_htp_buffer_context *>(buffer->context);
+#ifdef GGML_HTP_OPENCL_SIDECAR
+    ggml_backend_opencl_htp_w8a8_release_buffer(ctx->owner->w8a8_gpu_epilogue,buffer);
+#endif
     if (ctx->is_rpcmem) {
         bool diagnostic_freed = false;
         auto mappers = htp_unique_rpcmem_session_mappers(ctx->owner->sessions);
@@ -1663,6 +1684,7 @@ void ggml_backend_htp_register_packed_f16_weight(const ggml_tensor * original, g
 }
 
 void ggml_backend_htp_unregister_packed_f16_weight(const ggml_tensor * original) {
+    htp_w8a8_release(original);
     if (original == nullptr) {
         return;
     }
@@ -2382,6 +2404,12 @@ int64_t ggml_backend_htp_get_last_attention_elapsed_us(ggml_backend_t backend) {
     }
     const auto * ctx = static_cast<const ggml_backend_htp_context *>(backend->context);
     return ctx->last_attention_elapsed_us.load(std::memory_order_acquire);
+}
+
+int64_t ggml_backend_htp_get_last_linear_elapsed_us(ggml_backend_t backend) {
+    if (!ggml_backend_is_htp(backend)) return -1;
+    const auto *ctx = static_cast<const ggml_backend_htp_context *>(backend->context);
+    return ctx->last_linear_elapsed_us.load(std::memory_order_acquire);
 }
 
 int64_t ggml_backend_htp_get_last_dispatch_doorbell_us(ggml_backend_t backend) {

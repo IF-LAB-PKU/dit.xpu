@@ -5,6 +5,8 @@ set(GGML_SOURCES_HTP
     ggml-htp.cc
     htp-cpu-impl.c
     htp-ops.cc
+    htp-w8a8.cc
+    htp-w8a8.h
     htp-ops.h
     htp_session_dispatch.cc
     htp_session_dispatch.h

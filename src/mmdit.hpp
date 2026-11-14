@@ -265,7 +265,9 @@ __STATIC_INLINE__ ggml_tensor* mmdit_residual_attention(GGMLRunnerContext* ctx,
                                   binding.cached_rho,
                                   &ctx->cache_tensor,
                                   ctx->block_sparse_token_h,
-                                  ctx->block_sparse_token_w);
+                                  ctx->block_sparse_token_w,
+                                  false,
+                                  &ctx->dense_mask_cache);
 }
 
 __STATIC_INLINE__ ggml_tensor* modulate(ggml_context* ctx,

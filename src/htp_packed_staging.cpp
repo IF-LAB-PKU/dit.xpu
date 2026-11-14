@@ -91,7 +91,8 @@ bool HtpNonDeferredParamsAllocation::allocate(ggml_context* source_ctx,
          tensor = ggml_get_next_tensor(source_ctx, tensor)) {
         const size_t bytes = ggml_nbytes(tensor);
         logical_bytes_ += bytes;
-        if ((tensor->flags & SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM) != 0) {
+        if ((tensor->flags & (SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM |
+                              SD_GGML_TENSOR_FLAG_HTP_W8A8_REPLACED)) != 0) {
             deferred_bytes_ += bytes;
             if (tensor->buffer != nullptr || tensor->data != nullptr || tensor->extra != nullptr) {
                 clear();

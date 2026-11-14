@@ -55,6 +55,8 @@ enum HtpOpsIndex {
   HTP_OPS_QKV_MUL_RMS_PACKED_ROPE_W16A32,
   HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_ROPE_W16A32,
   HTP_OPS_FUSED_ANCHOR_ATTN_QO_F32_KV_F16,
+  HTP_OPS_ATTN_REARRANGE_BENCH,
+  HTP_OPS_MAT_MUL_NATIVE_W8A8,
   HTP_OPS_COUNT,
 };
 
@@ -69,6 +71,62 @@ struct RmsNormF32Params {
     int32_t ne0;
     int32_t ne1;
 } __attribute__((packed));
+
+struct W8A8Header {
+    uint32_t magic, version, k, n;
+    uint32_t weight_offset, scale_offset, sum_offset, inverse_offset, bytes, reserved;
+    uint64_t original_f16_signature;
+    uint8_t padding[80];
+};
+static_assert(sizeof(W8A8Header) == 128);
+
+struct NativeW8A8Params {
+    struct RpcmemBufAddr output, activation, constants;
+    int32_t m, k, n, elapsed_us;
+} __attribute__((packed));
+static_assert(sizeof(NativeW8A8Params) == 40);
+
+// Optional diagnostic trailer, matching the DSP ABI. Mode 3 stores A64/W_N64
+// capacities and a table-hit bit in reserved, weight load count/bytes in the
+// mac_ticks/readout_ticks fields; the five complete phase timings stay valid.
+struct NativeW8A8Profile {
+    uint32_t mode, reserved;
+    uint64_t setup_ticks, activation_ticks, weight_ticks, hmx_ticks, output_ticks;
+    uint64_t mac_ticks, readout_ticks;
+};
+struct NativeW8A8ProfileParams {
+    NativeW8A8Params base;
+    NativeW8A8Profile profile;
+} __attribute__((packed));
+// Opt-in CPU epilogue experiment. Raw planes occupy the normal output tensor;
+// only progress descriptors and activation scales need an auxiliary buffer.
+#define W8A8_CPU_MAX_BATCHES 64
+#define W8A8_CONTROL_WEIGHT_FIRST 1u
+struct W8A8CpuBatch {
+  int32_t m0, rows, n0, columns;
+};
+struct W8A8CpuControl {
+  uint32_t produced;
+  uint32_t flags;
+  uint32_t vtcm_bytes, activation_rows, weight_columns, weight_loads;
+  uint64_t weight_loaded_bytes;
+  uint32_t resident_batch_rows; // Requested M batch size, clamped to VTCM capacity.
+  uint8_t padding[92];
+  float scales[4096];
+  struct W8A8CpuBatch batches[W8A8_CPU_MAX_BATCHES];
+};
+struct NativeW8A8CpuParams {
+  struct NativeW8A8Params base;
+  struct RpcmemBufAddr control;
+} __attribute__((packed));
+static_assert(sizeof(NativeW8A8CpuParams) == 48);
+static_assert(sizeof(W8A8CpuControl) == 17536);
+static_assert(offsetof(W8A8CpuControl, scales) == 128);
+static_assert(offsetof(W8A8CpuControl, batches) == 16512);
+
+static_assert(sizeof(NativeW8A8Profile) == 64);
+static_assert(sizeof(NativeW8A8ProfileParams) == 104);
+static_assert(HTP_OPS_MAT_MUL_NATIVE_W8A8 == 15);
 
 struct MatMulParams {
     struct RpcmemBufAddr output;
@@ -91,6 +149,12 @@ struct MatMulParams {
 } __attribute__((packed));
 
 static_assert(sizeof(MatMulParams) == 92);
+// Optional profiling trailer. The original 92-byte request remains supported.
+struct MatMulProfileParams {
+    MatMulParams matmul;
+    int32_t elapsed_us;
+} __attribute__((packed));
+static_assert(sizeof(MatMulProfileParams) == 96);
 
 struct QkvMulRmsPackedParams {
     struct RpcmemBufAddr q;

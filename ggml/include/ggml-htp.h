@@ -272,6 +272,7 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_htp_qkv_buffer_type(voi
 GGML_BACKEND_API void ggml_backend_htp_set_n_threads(ggml_backend_t backend, int n_threads);
 GGML_BACKEND_API void ggml_backend_htp_reset_attention_profile(ggml_backend_t backend);
 GGML_BACKEND_API int64_t ggml_backend_htp_get_last_attention_elapsed_us(ggml_backend_t backend);
+GGML_BACKEND_API int64_t ggml_backend_htp_get_last_linear_elapsed_us(ggml_backend_t backend);
 // Host wall clock (CLOCK_MONOTONIC microseconds, the same base ggml_time_us
 // uses) of the DSP doorbell of the last node dispatched after the last
 // ggml_backend_htp_reset_attention_profile: the node's host window splits into
@@ -391,6 +392,16 @@ GGML_BACKEND_API size_t ggml_backend_htp_opencl_cache_input_binding_count(
 
 GGML_BACKEND_API size_t ggml_backend_htp_opencl_live_cache_import_count(
     ggml_backend_t backend);
+
+// Non-owning bindings into the model's normal RPCMEM allocation chunks.
+GGML_BACKEND_API bool ggml_backend_htp_w8a8_selected(const struct ggml_tensor * weight);
+GGML_BACKEND_API struct ggml_tensor * ggml_backend_htp_w8a8_create(
+    struct ggml_context * ctx, const struct ggml_tensor * weight);
+GGML_BACKEND_API bool ggml_backend_htp_w8a8_load(
+    const struct ggml_tensor * weight, uint64_t source_signature);
+GGML_BACKEND_API struct ggml_tensor * ggml_backend_htp_w8a8_linear(
+    struct ggml_context * ctx, const struct ggml_tensor * weight, struct ggml_tensor * activation);
+GGML_BACKEND_API void ggml_backend_htp_w8a8_unregister(const struct ggml_tensor * weight);
 
 GGML_BACKEND_API size_t ggml_backend_htp_opencl_live_cache_event_count(
     ggml_backend_t backend);

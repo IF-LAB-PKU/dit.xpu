@@ -495,6 +495,10 @@ public:
                  load_stats.host_loaded_tensors,
                  load_stats.deferred_packed_bytes,
                  load_stats.deferred_packed_tensors);
+        if (load_stats.replaced_f16_tensors) {
+            LOG_INFO("weight stage %s skipped replaced FP16 storage: %zu bytes/%zu tensors (metadata and sampled signature only)",
+                     weight_stage_name(target),load_stats.replaced_f16_bytes,load_stats.replaced_f16_tensors);
+        }
         return true;
     }
 
@@ -1872,6 +1876,17 @@ public:
                 if (output_opt.empty()) {
                     LOG_ERROR("diffusion model compute failed");
                     return sd::Tensor<float>();
+                }
+
+                const char *capture_dir = std::getenv("SD_HTP_DENOISE_CAPTURE_DIR");
+                if (capture_dir != nullptr && capture_dir[0] != '\0') {
+                    const std::string path = std::string(capture_dir)+"/prediction-step"+std::to_string(step)+
+                                             "-branch"+std::to_string(block_sparse_residual_branch_index)+".f32";
+                    FILE *file = std::fopen(path.c_str(), "wb");
+                    if (file == nullptr || std::fwrite(output_opt.data(), sizeof(float), output_opt.numel(), file) !=
+                                           static_cast<size_t>(output_opt.numel()))
+                        LOG_WARN("denoise capture failed: %s", path.c_str());
+                    if (file != nullptr) std::fclose(file);
                 }
 
                 step_cache.after_condition(&condition, noised_input, output_opt);
@@ -4097,6 +4112,15 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
         int64_t sampling_end  = ggml_time_ms();
         if (!x_0.empty()) {
             LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+            const char *capture_dir = std::getenv("SD_HTP_DENOISE_CAPTURE_DIR");
+            if (capture_dir != nullptr && capture_dir[0] != '\0') {
+                const std::string path = std::string(capture_dir)+"/final-latent-"+std::to_string(b)+".f32";
+                FILE *file = std::fopen(path.c_str(), "wb");
+                if (file == nullptr || std::fwrite(x_0.data(), sizeof(float), x_0.numel(), file) !=
+                                       static_cast<size_t>(x_0.numel()))
+                    LOG_WARN("latent capture failed: %s", path.c_str());
+                if (file != nullptr) std::fclose(file);
+            }
             final_latents.push_back(std::move(x_0));
             continue;
         }

@@ -16,6 +16,16 @@ target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../s
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
+set(TEST_TARGET test-htp-dense-mask-cache)
+add_executable(${TEST_TARGET} test-htp-dense-mask-cache.cpp)
+if(GGML_HTP AND NOT GGML_BACKEND_DL)
+    target_compile_definitions(${TEST_TARGET} PRIVATE SD_TEST_HTP)
+endif()
+target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../src)
+target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
 set(TEST_TARGET test-backend-htp-packed-qkv-staging)
 add_executable(${TEST_TARGET} ../ggml/tests/${TEST_TARGET}.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
@@ -150,6 +160,15 @@ add_test(NAME ${TEST_TARGET}-sparse-residual-preflight
 set_property(TEST ${TEST_TARGET}-sparse-residual-preflight PROPERTY
              ENVIRONMENT "HTP_RESIDUAL_CACHE_TEST=sparse-residual-preflight;LLVM_PROFILE_FILE=${TEST_TARGET}-sparse-residual-preflight.profraw")
 set_property(TEST ${TEST_TARGET}-sparse-residual-preflight PROPERTY SKIP_RETURN_CODE 77)
+
+if(GGML_HTP AND NOT TARGET test-backend-htp-matmul-f16)
+    add_executable(test-backend-htp-linear-performance test-backend-htp-linear-performance.cpp)
+    target_link_libraries(test-backend-htp-linear-performance PRIVATE ggml Threads::Threads)
+    add_executable(test-backend-htp-matmul-f16
+                   ../ggml/tests/test-backend-htp-matmul-f16.cpp)
+    target_link_libraries(test-backend-htp-matmul-f16 PRIVATE ggml Threads::Threads)
+    add_test(NAME test-backend-htp-matmul-f16 COMMAND test-backend-htp-matmul-f16)
+endif()
 
 set(TEST_TARGET test-backend-htp-attention-correctness)
 add_executable(${TEST_TARGET}

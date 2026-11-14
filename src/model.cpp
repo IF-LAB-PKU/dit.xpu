@@ -24,6 +24,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-htp.h"
 #include "ggml.h"
 #include "ggml_extend_backend.h"
 #include "zip.h"
@@ -892,6 +893,8 @@ std::vector<MmapTensorStore> ModelLoader::mmap_tensors(std::map<std::string, ggm
             ggml_tensor* dst_tensor = it->second;
             if (dst_tensor == nullptr)
                 continue;
+            if ((dst_tensor->flags & SD_GGML_TENSOR_FLAG_HTP_W8A8_REPLACED) != 0)
+                continue;
 
             if (tensor_storage.type != dst_tensor->type)
                 continue;
@@ -1025,6 +1028,45 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                         t1 = ggml_time_ms();
                         read_time_ms.fetch_add(t1 - t0);
                         continue;
+                    }
+
+                    if ((dst_tensor->flags & SD_GGML_TENSOR_FLAG_HTP_W8A8_REPLACED) != 0) {
+#ifdef GGML_USE_HTP
+                        // Validate compatibility from sampled source bytes only. No F16
+                        // allocation or complete F16 tensor read is needed for this layer.
+                        if (is_zip || tensor_storage.type!=GGML_TYPE_F16 ||
+                            tensor_storage.layout!=TensorDataLayout::HTP_PERMUTED_W16A32 ||
+                            dst_tensor->data || dst_tensor->buffer || dst_tensor->extra) {
+                            LOG_ERROR("invalid source/storage for W8A8 replacement '%s'",tensor_storage.name.c_str());
+                            failed = true;
+                            break;
+                        }
+                        uint64_t signature = UINT64_C(14695981039346656037);
+                        const size_t bytes = tensor_storage.nbytes();
+                        for (size_t sample=0;sample<4096;++sample) {
+                            const size_t offset = tensor_storage.offset+sample*(bytes-1)/4095;
+                            uint8_t value = 0;
+                            if (mmapped) {
+                                if (!mmapped->copy_data(&value,1,offset)) { failed=true;break; }
+                            } else {
+                                file.seekg(offset);
+                                file.read(reinterpret_cast<char *>(&value),1);
+                                if (!file) { failed=true;break; }
+                            }
+                            signature = (signature^value)*UINT64_C(1099511628211);
+                        }
+                        if (failed || !ggml_backend_htp_w8a8_load(dst_tensor,signature)) {
+                            LOG_ERROR("W8A8 source signature or constants validation failed for '%s'",tensor_storage.name.c_str());
+                            failed = true;
+                            break;
+                        }
+                        read_time_ms.fetch_add(ggml_time_ms()-t0);
+                        continue;
+#else
+                        LOG_ERROR("W8A8 replacement requires an HTP build");
+                        failed = true;
+                        break;
+#endif
                     }
 
                     // skip mmapped tensors
@@ -1231,6 +1273,10 @@ bool ModelLoader::load_tensors(std::map<std::string, ggml_tensor*>& tensors,
         }
 
         *dst_tensor = real;
+        if ((real->flags & SD_GGML_TENSOR_FLAG_HTP_W8A8_REPLACED) != 0) {
+            *dst_tensor = real;
+            return true;
+        }
         if (tensor_storage.layout == TensorDataLayout::HTP_PERMUTED_W16A32) {
             // GGUF 元数据已声明该权重是离线 packed 布局；打上 HTP-only flag 后，
             // runner 会把它放进 RPCMEM 并禁止 CPU fallback 按 row-major 解释这块数据。
@@ -1300,6 +1346,15 @@ bool ModelLoader::load_tensor_subset(const std::map<std::string, ggml_tensor*>& 
             return false;
         }
 
+        if ((real->flags & SD_GGML_TENSOR_FLAG_HTP_W8A8_REPLACED) != 0) {
+            {
+                std::lock_guard<std::mutex> lock(tensor_names_mutex);
+                local_stats.replaced_f16_bytes += ggml_nbytes(real);
+                ++local_stats.replaced_f16_tensors;
+            }
+            *dst_tensor = real;
+            return true;
+        }
         if (tensor_storage.layout == TensorDataLayout::HTP_PERMUTED_W16A32) {
             real->flags |= SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32;
         }

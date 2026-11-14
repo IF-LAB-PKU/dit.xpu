@@ -18,6 +18,8 @@ struct TensorSubsetLoadStats {
     size_t deferred_packed_bytes = 0;
     size_t host_loaded_tensors = 0;
     size_t deferred_packed_tensors = 0;
+    size_t replaced_f16_bytes = 0;
+    size_t replaced_f16_tensors = 0;
 };
 
 enum SDVersion {

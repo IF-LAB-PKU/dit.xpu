@@ -25,6 +25,7 @@ static const char * HTP_OPS_DL_PATH = "libhtp_ops.so";
 #ifdef GGML_HTP_OPENCL_SIDECAR
 struct ggml_opencl_htp_sidecar;
 struct ggml_opencl_htp_graph;
+struct ggml_opencl_htp_w8a8;
 #endif
 
 struct ggml_backend_htp_context {
@@ -70,6 +71,7 @@ struct ggml_backend_htp_context {
     bool skip_htp_ops = false;
     bool runtime_available = false;
     std::atomic<int64_t> last_attention_elapsed_us{-1};
+    std::atomic<int64_t> last_linear_elapsed_us{-1};
     // Host instant of the DSP doorbell of the last dispatched node: everything
     // the host spends before the store is the submit, everything after it is the
     // wait for the DSP.  -1 until a node has been dispatched since the last
@@ -96,6 +98,7 @@ struct ggml_backend_htp_context {
         ggml_opencl_htp_graph * graph = nullptr;
     };
     ggml_opencl_htp_sidecar * sparse_opencl_sidecar = nullptr;
+    ggml_opencl_htp_w8a8 * w8a8_gpu_epilogue = nullptr;
     ggml_opencl_htp_graph * sparse_opencl_graph = nullptr;
     std::vector<deferred_opencl_graph> deferred_opencl_graphs;
     uint64_t active_compute_arena_generation = 0;
