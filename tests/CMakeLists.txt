@@ -4,6 +4,26 @@ target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
 target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../src)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
+set(TEST_TARGET test-text-offline-pack)
+add_executable(${TEST_TARGET} test-text-offline-pack.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../src)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+set(TEST_TARGET test-graph-cut-views)
+add_executable(${TEST_TARGET} test-graph-cut-views.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/.. ${CMAKE_CURRENT_LIST_DIR}/../src)
+target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+# Explicit real-model/device benchmark, not part of ordinary CTest runs.
+set(TEST_TARGET test-text-encoder)
+add_executable(${TEST_TARGET} test-text-encoder.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/.. ${CMAKE_CURRENT_LIST_DIR}/../src)
+target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
+
 set(TEST_TARGET test-htp-message-layout)
 add_executable(${TEST_TARGET} ../ggml/src/ggml-htp/message_layout_test.cc)
 target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-htp)

@@ -43,6 +43,7 @@ struct SDCliParams {
     bool convert_name     = false;
     bool htp_pack_dit     = false;
     bool htp_pack_vae     = false;
+    std::string htp_pack_text;
     bool force_f16        = false;
 
     preview_t preview_method = PREVIEW_NONE;
@@ -62,6 +63,7 @@ struct SDCliParams {
         ArgOptions options;
 
         options.string_options = {
+            {"", "--htp-pack-text", "offline pack a standalone text encoder: clip_l, clip_g or t5xxl (convert mode)", &htp_pack_text},
             {"-o",
              "--output",
              "path to write result image to. you can use printf-style %d format specifiers for image sequences (default: ./output.png) (eg. output_%03d.png). Single-file video outputs support .avi, .webm, and animated .webp",
@@ -616,11 +618,18 @@ int main(int argc, const char* argv[]) {
     LOG_DEBUG("%s", gen_params.to_string().c_str());
 
     if (cli_params.mode == CONVERT) {
+        if (!cli_params.htp_pack_text.empty() && (cli_params.htp_pack_dit || cli_params.htp_pack_vae ||
+                !ctx_params.vae_path.empty() || cli_params.force_f16)) {
+            LOG_ERROR("--htp-pack-text takes a standalone -m encoder; do not combine packing modes, --vae or --force-f16");
+            return 1;
+        }
         if (cli_params.htp_pack_vae && (cli_params.htp_pack_dit || !ctx_params.vae_path.empty() || cli_params.force_f16)) {
             LOG_ERROR("--htp-pack-vae takes a standalone -m VAE and cannot be combined with --htp-pack-dit, --vae or --force-f16");
             return 1;
         }
-        bool success = cli_params.htp_pack_vae
+        bool success = !cli_params.htp_pack_text.empty()
+            ? convert_text_encoder_htp(ctx_params.model_path.c_str(), cli_params.output_path.c_str(), cli_params.htp_pack_text.c_str())
+            : cli_params.htp_pack_vae
             ? convert_vae_htp(ctx_params.model_path.c_str(), cli_params.output_path.c_str())
             : convert(ctx_params.model_path.c_str(),
                                ctx_params.vae_path.c_str(),

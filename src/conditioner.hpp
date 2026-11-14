@@ -118,6 +118,7 @@ public:
     virtual void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors)           = 0;
     virtual size_t get_params_buffer_size()                                                = 0;
     virtual void set_max_graph_vram_bytes(size_t max_vram_bytes) {}
+    virtual bool configure_htp_text_encoder(ggml_backend_t backend, ModelLoader* loader) { return false; }
     virtual void set_flash_attention_enabled(bool enabled) = 0;
 };
 
@@ -182,6 +183,14 @@ struct SD3CLIPEmbedder : public Conditioner {
     std::shared_ptr<CLIPTextModelRunner> clip_l;
     std::shared_ptr<CLIPTextModelRunner> clip_g;
     std::shared_ptr<T5Runner> t5;
+
+    bool configure_htp_text_encoder(ggml_backend_t backend, ModelLoader* loader) override {
+        for (auto* runner : {static_cast<GGMLRunner*>(clip_l.get()), static_cast<GGMLRunner*>(clip_g.get()),
+                             static_cast<GGMLRunner*>(t5.get())}) {
+            if (runner) runner->configure_htp_text_encoder(backend, loader);
+        }
+        return true;
+    }
 
     SD3CLIPEmbedder(ggml_backend_t backend,
                     ggml_backend_t params_backend,

@@ -252,7 +252,10 @@ protected:
     void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
         if (version == OPEN_CLIP_VIT_BIGG_14) {
             enum ggml_type wtype      = GGML_TYPE_F32;
+            const bool packed = get_data_layout(prefix + "text_projection", tensor_storage_map) == TensorDataLayout::HTP_PERMUTED_W16A32;
+            if (packed) wtype = GGML_TYPE_F16;
             params["text_projection"] = ggml_new_tensor_2d(ctx, wtype, projection_dim, hidden_size);
+            if (packed) params["text_projection"]->flags |= SD_GGML_TENSOR_FLAG_HTP_MUL_MAT_WEIGHT | SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32;
         }
     }
 

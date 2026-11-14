@@ -175,6 +175,10 @@ To try VAE convolution on HTP as well, add `SD_HTP_VAE=1`. See
 [HTP VAE experiments](docs/htp_vae.md) for the hybrid execution path, memory costs
 and isolated decoder benchmarks.
 
+For SD3 text encoders, use `--htp-pack-text clip_l|clip_g|t5xxl` during conversion
+and `SD_HTP_TEXT=1` during inference. See [HTP text encoders](docs/htp_text_encoders.md)
+for conversion commands, segment staging and device validation.
+
 <a id="issues"></a>
 
 ## 🐛 Issues

@@ -417,6 +417,9 @@ SD_API bool convert(const char* input_path,
 // Export standalone SD3 AutoEncoderKL convolution weights in HTP-only GGUF layout.
 SD_API bool convert_vae_htp(const char* input_path, const char* output_path);
 
+// kind: clip_l, clip_g or t5xxl. Embeddings and norms remain row-major.
+SD_API bool convert_text_encoder_htp(const char* input_path, const char* output_path, const char* kind);
+
 SD_API bool preprocess_canny(sd_image_t image,
                              float high_threshold,
                              float low_threshold,

@@ -16,6 +16,7 @@
 #include "model.h"
 #include "htp_tensor_flags.h"
 #include "model_io/gguf_io.h"
+#include "htp_text_encoder.h"
 #include "model_io/safetensors_io.h"
 #include "model_io/torch_legacy_io.h"
 #include "model_io/torch_zip_io.h"
@@ -394,8 +395,13 @@ bool ModelLoader::init_from_gguf_file(const std::string& file_path, const std::s
 
     std::vector<TensorStorage> tensor_storages;
     std::string error;
-    if (!read_gguf_file(file_path, tensor_storages, &error)) {
+    GGUFHTPMetadata metadata;
+    if (!read_gguf_file(file_path, tensor_storages, &error, &metadata)) {
         LOG_ERROR("%s", error.c_str());
+        return false;
+    }
+    if (metadata.htp_packed_text && !prefix.empty() && prefix != sd_htp_text_prefix(metadata.htp_text_encoder)) {
+        LOG_ERROR("packed %s encoder cannot be loaded into namespace %s", metadata.htp_text_encoder.c_str(), prefix.c_str());
         return false;
     }
 

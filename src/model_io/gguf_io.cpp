@@ -12,12 +12,15 @@
 #include "gguf.h"
 #include "gguf_reader_ext.h"
 #include "util.h"
+#include "htp_text_encoder.h"
 
 // HTP packed DIT GGUF 通过这些私有元数据声明：文件里的部分权重已经不是普通 row-major，
 // 而是只能给 HTP permuted W16A32 matmul 使用的离线重排布局。
 static constexpr const char* SD_GGUF_HTP_PACKED_DIT_KEY     = "sd.cpp.htp.packed_dit";
 static constexpr const char* SD_GGUF_HTP_LAYOUT_KEY         = "sd.cpp.htp.layout";
 static constexpr const char* SD_GGUF_HTP_PACKED_TENSORS_KEY = "sd.cpp.htp.packed_tensors";
+static constexpr const char* SD_GGUF_HTP_PACKED_TEXT_KEY = "sd.cpp.htp.packed_text";
+static constexpr const char* SD_GGUF_HTP_TEXT_ENCODER_KEY = "sd.cpp.htp.text_encoder";
 
 static constexpr const char* SD_GGUF_HTP_PACKED_VAE_KEY = "sd.cpp.htp.packed_vae";
 static constexpr const char* SD_GGUF_HTP_VAE_TENSORS_KEY = "sd.cpp.htp.vae_conv_tensors";
@@ -60,6 +63,15 @@ static void read_htp_metadata_from_gguf(const gguf_context* ctx, GGUFHTPMetadata
         metadata->htp_layout = layout != nullptr ? layout : "";
     }
 
+    const auto text_key = gguf_find_key(ctx, SD_GGUF_HTP_PACKED_TEXT_KEY);
+    if (text_key >= 0 && gguf_get_kv_type(ctx, text_key) == GGUF_TYPE_BOOL) {
+        metadata->htp_packed_text = gguf_get_val_bool(ctx, text_key);
+    }
+    const auto encoder_key = gguf_find_key(ctx, SD_GGUF_HTP_TEXT_ENCODER_KEY);
+    if (encoder_key >= 0 && gguf_get_kv_type(ctx, encoder_key) == GGUF_TYPE_STRING) {
+        metadata->htp_text_encoder = gguf_get_val_str(ctx, encoder_key);
+    }
+
     const int64_t vae_key = gguf_find_key(ctx, SD_GGUF_HTP_PACKED_VAE_KEY);
     if (vae_key >= 0 && gguf_get_kv_type(ctx, vae_key) == GGUF_TYPE_BOOL) {
         metadata->htp_packed_vae = gguf_get_val_bool(ctx, vae_key);
@@ -96,6 +108,34 @@ static void read_htp_metadata_from_gguf(const gguf_context* ctx, GGUFHTPMetadata
     } else if (kv_type == GGUF_TYPE_STRING) {
         read_newline_delimited_strings(gguf_get_val_str(ctx, packed_tensors_key), metadata->htp_packed_tensors);
     }
+}
+
+static bool apply_text_metadata(const GGUFHTPMetadata& metadata, std::vector<TensorStorage>& tensors, std::string* error) {
+    if (!metadata.htp_packed_text) return true;
+    if (metadata.htp_packed_dit || metadata.htp_packed_vae ||
+        sd_htp_text_prefix(metadata.htp_text_encoder).empty() ||
+        metadata.htp_layout != "permuted_w16a32" || metadata.htp_packed_tensors.empty()) {
+        set_error(error, "invalid HTP text encoder metadata");
+        return false;
+    }
+    std::map<std::string, TensorStorage*> by_name;
+    for (auto& t : tensors) by_name.emplace(t.name, &t);
+    std::unordered_set<std::string> seen;
+    for (const auto& name : metadata.htp_packed_tensors) {
+        const auto found = by_name.find(name);
+        if (found == by_name.end() || !seen.insert(name).second ||
+            !sd_htp_text_linear_name(name, metadata.htp_text_encoder)) {
+            set_error(error, "invalid/missing/duplicate packed text Linear: " + name);
+            return false;
+        }
+        auto& t = *found->second;
+        if (t.type != GGML_TYPE_F16 || t.n_dims != 2 || t.ne[0] % 32 || t.ne[1] % 32) {
+            set_error(error, "invalid packed text Linear shape/type: " + name);
+            return false;
+        }
+        t.layout = TensorDataLayout::HTP_PERMUTED_W16A32;
+    }
+    return true;
 }
 
 static void apply_htp_metadata_to_tensors(const GGUFHTPMetadata& metadata, std::vector<TensorStorage>& tensor_storages) {
@@ -219,6 +259,15 @@ bool read_gguf_file(const std::string& file_path,
 
     GGUFHTPMetadata metadata;
     read_htp_metadata_from_gguf(ctx_gguf_, &metadata);
+    const auto text_key = gguf_find_key(ctx_gguf_, SD_GGUF_HTP_PACKED_TEXT_KEY);
+    const auto encoder_key = gguf_find_key(ctx_gguf_, SD_GGUF_HTP_TEXT_ENCODER_KEY);
+    if ((text_key >= 0 && gguf_get_kv_type(ctx_gguf_, text_key) != GGUF_TYPE_BOOL) ||
+        (encoder_key >= 0 && !metadata.htp_packed_text)) {
+        set_error(error, "invalid HTP text encoder flag");
+        gguf_free(ctx_gguf_);
+        ggml_free(ctx_meta_);
+        return false;
+    }
     const int64_t vae_key = gguf_find_key(ctx_gguf_, SD_GGUF_HTP_PACKED_VAE_KEY);
     const int64_t vae_names = gguf_find_key(ctx_gguf_, SD_GGUF_HTP_VAE_TENSORS_KEY);
     const int64_t vae_shapes = gguf_find_key(ctx_gguf_, SD_GGUF_HTP_VAE_SHAPES_KEY);
@@ -251,7 +300,8 @@ bool read_gguf_file(const std::string& file_path,
     }
 
     apply_htp_metadata_to_tensors(metadata, tensor_storages);
-    if (!apply_vae_metadata(metadata, tensor_storages, error)) {
+    if (!apply_text_metadata(metadata, tensor_storages, error) ||
+        !apply_vae_metadata(metadata, tensor_storages, error)) {
         gguf_free(ctx_gguf_);
         ggml_free(ctx_meta_);
         return false;
@@ -286,9 +336,14 @@ bool write_gguf_file(const std::string& file_path,
         gguf_add_tensor(gguf_ctx, tensor);
     }
 
-    if (options != nullptr && options->htp.htp_packed_dit) {
+    if (options != nullptr && (options->htp.htp_packed_dit || options->htp.htp_packed_text)) {
         // 写出离线重排 tensor 名单，加载端依赖这个名单禁止 packed 权重走 CPU fallback。
-        gguf_set_val_bool(gguf_ctx, SD_GGUF_HTP_PACKED_DIT_KEY, true);
+        if (options->htp.htp_packed_text) {
+            gguf_set_val_bool(gguf_ctx, SD_GGUF_HTP_PACKED_TEXT_KEY, true);
+            gguf_set_val_str(gguf_ctx, SD_GGUF_HTP_TEXT_ENCODER_KEY, options->htp.htp_text_encoder.c_str());
+        } else {
+            gguf_set_val_bool(gguf_ctx, SD_GGUF_HTP_PACKED_DIT_KEY, true);
+        }
         gguf_set_val_str(gguf_ctx, SD_GGUF_HTP_LAYOUT_KEY, options->htp.htp_layout.c_str());
 
         std::vector<const char*> names;

@@ -9,6 +9,8 @@
 
 struct GGUFHTPMetadata {
     bool htp_packed_dit = false;
+    bool htp_packed_text = false;
+    std::string htp_text_encoder;
     std::string htp_layout;
     std::vector<std::string> htp_packed_tensors;
     bool htp_packed_vae = false;

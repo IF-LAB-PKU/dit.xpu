@@ -260,6 +260,10 @@ public:
             auto ret  = block->forward(ctx, x, past_bias, attention_mask, relative_position_bucket);
             x         = ret.first;
             past_bias = ret.second;
+            // The first relative bias is shared across SD3 T5 layers.
+            if (i == 0 && past_bias != nullptr && !graph_cut_prefix.empty()) {
+                sd::ggml_graph_cut::mark_graph_cut(past_bias, graph_cut_prefix + ".relative_bias", "bias");
+            }
             if (!graph_cut_prefix.empty()) {
                 sd::ggml_graph_cut::mark_graph_cut(x, graph_cut_prefix + ".block." + std::to_string(i), "x");
             }

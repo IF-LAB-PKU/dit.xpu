@@ -2052,10 +2052,12 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
 #else
         GGML_ABORT("native W8A8 requires an HTP build");
 #endif
-    } else if (x->ne[2] * x->ne[3] > 1024) {
+    } else if (x->ne[2] * x->ne[3] > 1024 ||
+               (w->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) != 0) {
         // workaround: avoid ggml cuda error
         int64_t ne2 = x->ne[2];
         int64_t ne3 = x->ne[3];
+        if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
         x           = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1] * x->ne[2] * x->ne[3]);
         x           = ggml_mul_mat(ctx, w, x);
         if (force_prec_f32) {
@@ -6244,6 +6246,7 @@ protected:
     HtpDenseMaskCache htp_dense_mask_cache_;
     HtpVaeConvWeights htp_vae_conv_weights_;
     bool htp_vae_conv_enabled_ = false;
+    bool htp_text_encoder_enabled_ = false;
     std::unique_ptr<HtpPackedStagingPool> htp_packed_staging_pool_;
     HtpPackedStagingPool::TypedLoadFn htp_packed_staging_loader_;
     std::vector<HtpPackedStagingPool::Handle> htp_packed_staging_handles_;
@@ -7433,13 +7436,13 @@ protected:
         for (ggml_tensor* tensor = ggml_get_first_tensor(params_ctx); tensor != nullptr;
              tensor = ggml_get_next_tensor(params_ctx, tensor)) {
             if (ggml_backend_htp_w8a8_selected(tensor) &&
-                (!htp_op_routing_enabled() || sd_env_flag_enabled("SD_HTP_PACKED_STAGING"))) {
+                (!htp_op_routing_enabled() || htp_packed_staging_requested())) {
                 GGML_ABORT("selected W8A8 weights require HTP routing and direct shared RPCMEM placement");
             }
         }
 #endif
         if (!htp_op_routing_enabled() || htp_param_placement_buffer_ != nullptr ||
-            (sd_env_flag_enabled("SD_HTP_PACKED_STAGING") && !htp_vae_conv_enabled_)) {
+            (htp_packed_staging_requested() && !htp_vae_conv_enabled_)) {
             return true;
         }
 
@@ -7466,7 +7469,7 @@ protected:
         ggml_backend_buffer_type_t htp_buft = ggml_backend_get_default_buffer_type(htp_backend);
         const int session_count = ggml_backend_htp_session_count(htp_backend);
         const bool owner_aware = sd_env_flag_enabled("SD_HTP_MULTI_SESSION") &&
-            session_count > 1 && !sd_env_flag_enabled("SD_HTP_PACKED_STAGING");
+            session_count > 1 && !htp_packed_staging_requested();
 
         // Duplicate metadata once, then bind each duplicate into an owner-
         // specific RPCMEM chunk.  The ordinary path below remains unchanged
@@ -8810,7 +8813,7 @@ protected:
     bool should_use_graph_cut_segmented_compute(const GraphCutPlan& plan) {
         // Packed staging and graph-cut execution are one opt-in experiment.
         // With the flag unset, preserve the original full-graph path.
-        return sd_env_flag_enabled("SD_HTP_PACKED_STAGING") &&
+        return htp_packed_staging_requested() &&
                plan.has_cuts &&
                plan.valid &&
                max_graph_vram_bytes > 0 &&
@@ -8818,7 +8821,7 @@ protected:
     }
 
     bool can_attempt_graph_cut_segmented_compute() const {
-        return sd_env_flag_enabled("SD_HTP_PACKED_STAGING") &&
+        return htp_packed_staging_requested() &&
                max_graph_vram_bytes > 0;
     }
 
@@ -8834,7 +8837,7 @@ protected:
                 planner_session_count = actual_session_count;
             }
         }
-        const bool shared_param_backing = sd_env_flag_enabled("SD_HTP_PACKED_STAGING");
+        const bool shared_param_backing = htp_packed_staging_requested();
         *plan_out = sd::ggml_graph_cut::resolve_plan(runtime_backend,
                                                      gf,
                                                      &graph_cut_plan_cache_,
@@ -8931,8 +8934,12 @@ protected:
         return true;
     }
 
+    bool htp_packed_staging_requested() const {
+        return htp_text_encoder_enabled_ || sd_env_flag_enabled("SD_HTP_PACKED_STAGING");
+    }
+
     bool htp_packed_staging_enabled() const {
-        return sd_env_flag_enabled("SD_HTP_PACKED_STAGING") &&
+        return htp_packed_staging_requested() &&
                htp_backend != nullptr && static_cast<bool>(htp_packed_staging_loader_);
     }
 
@@ -9608,7 +9615,11 @@ protected:
                         (is_residual_output ||
                          (sd::ggml_graph_cut::is_graph_cut_tensor(output_tensor) &&
                           future_cut_names.find(output_tensor->name) != future_cut_names.end()))) {
-                        cache(output_tensor->name, output_tensor);
+                        // The segment graph is already closed. cache() would
+                        // append an unexecuted CONT for a view, then the cache
+                        // copier would skip that node as outside this graph.
+                        // Copy the existing view/backing after execution.
+                        cache_tensor_map[output_tensor->name] = output_tensor;
                     }
                 }
             }
@@ -9722,6 +9733,13 @@ public:
                 return false;
             }
         }
+        for (auto* t = ggml_get_first_tensor(params_ctx); t; t = ggml_get_next_tensor(params_ctx, t)) {
+            if ((t->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) != 0 &&
+                (!htp_op_routing_enabled() || !sd_env_flag_enabled("SD_HTP_COMPUTE"))) {
+                LOG_ERROR("packed HTP parameters require HTP routing and SD_HTP_COMPUTE=1");
+                return false;
+            }
+        }
         params_buffer_tensors_.clear();
         size_t num_tensors = ggml_tensor_num(params_ctx);
         if (num_tensors > 0) {
@@ -9741,7 +9759,7 @@ public:
                     ++deferred_tensor_count;
                 } else if (htp_should_defer_packed_param(
                         htp_op_routing_enabled(),
-                        sd_env_flag_enabled("SD_HTP_PACKED_STAGING"),
+                        htp_packed_staging_requested(),
                         max_graph_vram_bytes,
                         tensor)) {
                     tensor->flags |= SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM;
@@ -9813,6 +9831,11 @@ public:
     void free_params_buffer() {
         htp_vae_conv_weights_.clear();
         htp_dense_mask_cache_.clear();
+        if (htp_text_encoder_enabled_) {
+            release_htp_packed_staging();
+            htp_packed_staging_pool_.reset();
+            htp_packed_staging_pool_owner_count_ = 0;
+        }
         free_htp_param_placement();
         non_deferred_params_allocation_.clear();
         if (params_buffer != nullptr) {
@@ -9841,6 +9864,7 @@ public:
             }
         }
         size += htp_vae_conv_weights_.bytes();
+        if (htp_packed_staging_pool_) size += htp_packed_staging_pool_->allocated_bytes();
         size += non_deferred_params_allocation_.buffer_size();
         return size;
     }
@@ -9969,7 +9993,7 @@ public:
         // allow graph-cut when cross-step cache tensors are present. Multi-
         // session only changes segment ownership and transfer routing.
         const bool allow_packed_staging_graph_cut =
-            sd_env_flag_enabled("SD_HTP_PACKED_STAGING");
+            htp_packed_staging_requested();
         if ((!uses_cross_step_cache || allow_packed_staging_graph_cut) &&
             can_attempt_graph_cut_segmented_compute()) {
             if (allow_packed_staging_graph_cut && uses_cross_step_cache) {
@@ -10044,6 +10068,17 @@ public:
             htp_vae_conv_weights_.clear();
         }
         htp_backend = backend;
+    }
+
+    // Text encoders use segment-sized packed RPCMEM staging by default: T5's
+    // FP16 linears alone exceed 8 GiB and cannot share one FastRPC map window.
+    void configure_htp_text_encoder(ggml_backend_t backend, ModelLoader* loader) {
+        GGML_ASSERT(backend && loader);
+        set_htp_backend(backend);
+        set_htp_packed_staging_loader(loader);
+        htp_text_encoder_enabled_ = true;
+        const size_t staging_budget = size_t(std::max(1, sd_env_int_value("SD_HTP_PACKED_STAGING_BUDGET_MB", 512))) * 1024 * 1024;
+        max_graph_vram_bytes = max_graph_vram_bytes == 0 ? staging_budget : std::min(max_graph_vram_bytes, staging_budget);
     }
 
     void set_htp_vae_conv_enabled(bool enabled) {
@@ -10284,8 +10319,8 @@ public:
             b = params["bias"];
         }
         if (ctx->weight_adapter) {
-            if ((w->flags & SD_GGML_TENSOR_FLAG_HTP_W8A8_REPLACED) != 0)
-                GGML_ABORT("weight adapters cannot read a replaced FP16 weight");
+            if ((w->flags & (SD_GGML_TENSOR_FLAG_HTP_W8A8_REPLACED | SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32)) != 0)
+                GGML_ABORT("weight adapters cannot read a replaced or offline packed FP16 weight");
             WeightAdapter::ForwardParams forward_params;
             forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;
             forward_params.linear.force_prec_f32 = force_prec_f32;

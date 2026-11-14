@@ -10,6 +10,7 @@
 #include "util.h"
 
 #include "ggml-cpu.h"
+#include "htp_text_encoder.h"
 
 static constexpr const char* SD_GGUF_HTP_LAYOUT_W16A32 = "permuted_w16a32";
 
@@ -45,17 +46,20 @@ static bool load_tensors_for_export(ModelLoader& model_loader,
                                     const TensorTypeRules& tensor_type_rules,
                                     bool force_f16,
                                     std::vector<TensorWriteInfo>& tensors,
-                                    bool htp_pack_vae = false) {
+                                    bool htp_pack_vae = false, const std::string& text_kind = "") {
     std::mutex tensor_mutex;
     auto on_new_tensor_cb = [&](const TensorStorage& tensor_storage, ggml_tensor** dst_tensor) -> bool {
         const std::string& name = tensor_storage.name;
-        ggml_type tensor_type   = htp_pack_vae ? tensor_storage.type
+        ggml_type tensor_type   = (htp_pack_vae || !text_kind.empty()) ? tensor_storage.type
             : get_export_tensor_type(model_loader, tensor_storage, type, tensor_type_rules, force_f16);
         if (htp_pack_vae && starts_with(name, "first_stage_model.") &&
             ends_with(name, ".weight") && tensor_storage.n_dims == 4) {
             tensor_type = GGML_TYPE_F16;
         }
-        if (htp_pack_vae && tensor_storage.layout != TensorDataLayout::REFERENCE) {
+        if (!text_kind.empty() && sd_htp_text_linear_name(name, text_kind)) {
+            tensor_type = GGML_TYPE_F16;
+        }
+        if (tensor_storage.layout != TensorDataLayout::REFERENCE) {
             LOG_ERROR("re-exporting packed input is unsupported; use the original model: %s", name.c_str());
             return false;
         }
@@ -124,16 +128,16 @@ static void pack_htp_f16_weight_w16a32(ggml_fp16_t* dst, const ggml_fp16_t* src,
     GGML_ASSERT(k % 32 == 0);
     GGML_ASSERT(n % 32 == 0);
 
-    for (int64_t i = 0; i < k; ++i) {
-        for (int64_t j = 0; j < n; ++j) {
-            const int64_t i0 = i / 32;
-            const int64_t i1 = i % 32;
-            const int64_t j0 = j / 32;
-            const int64_t j1 = j % 32;
-
-            const int64_t tile_idx = j0 * (k / 32) + i0;
-            ggml_fp16_t* tile = dst + tile_idx * 32 * 32;
-            tile[(i1 & ~int64_t{1}) * 32 + j1 * 2 + (i1 & int64_t{1})] = src[j * k + i];
+    // Tile-sized source working set also keeps large T5 exports cache-friendly.
+    for (int64_t j0 = 0; j0 < n; j0 += 32) {
+        for (int64_t i0 = 0; i0 < k; i0 += 32) {
+            auto* tile = dst + ((j0 / 32) * (k / 32) + i0 / 32) * 1024;
+            for (int64_t i1 = 0; i1 < 32; i1 += 2) {
+                for (int64_t j1 = 0; j1 < 32; ++j1) {
+                    tile[i1 * 32 + j1 * 2] = src[(j0 + j1) * k + i0 + i1];
+                    tile[i1 * 32 + j1 * 2 + 1] = src[(j0 + j1) * k + i0 + i1 + 1];
+                }
+            }
         }
     }
 }
@@ -208,6 +212,30 @@ static bool pack_htp_vae_weights_for_export(ggml_context* packed_ctx,
     return !metadata.htp_vae_conv_tensors.empty();
 }
 
+static bool pack_htp_text_weights_for_export(std::vector<TensorWriteInfo>& tensors,
+                                               const std::string& kind, GGUFHTPMetadata& metadata) {
+    metadata.htp_packed_text = true;
+    metadata.htp_text_encoder = kind;
+    metadata.htp_layout = SD_GGUF_HTP_LAYOUT_W16A32;
+    size_t bytes = 0;
+    for (auto& info : tensors) {
+        auto* t = info.tensor;
+        if (!sd_htp_text_linear_name(t->name, kind)) continue;
+        if (t->type != GGML_TYPE_F16 || info.n_dims != 2 || t->ne[0] % 32 || t->ne[1] % 32) {
+            LOG_ERROR("unsupported HTP text Linear shape/type: %s", t->name);
+            return false;
+        }
+        std::vector<ggml_fp16_t> packed(ggml_nelements(t));
+        pack_htp_f16_weight_w16a32(packed.data(), static_cast<const ggml_fp16_t*>(t->data), t->ne[0], t->ne[1]);
+        std::memcpy(t->data, packed.data(), ggml_nbytes(t));
+        metadata.htp_packed_tensors.emplace_back(t->name);
+        bytes += ggml_nbytes(t);
+    }
+    LOG_INFO("HTP packed %s: %zu Linear weights, %.2f MiB; embeddings/norms preserve source precision",
+             kind.c_str(), metadata.htp_packed_tensors.size(), bytes / 1024.f / 1024.f);
+    return !metadata.htp_packed_tensors.empty();
+}
+
 static bool convert_impl(const char* input_path,
              const char* vae_path,
              const char* output_path,
@@ -216,9 +244,9 @@ static bool convert_impl(const char* input_path,
              bool convert_name,
              bool htp_pack_dit,
              bool force_f16,
-             bool htp_pack_vae) {
+             bool htp_pack_vae, const std::string& text_kind = "") {
     const bool output_is_safetensors = ends_with(output_path, ".safetensors");
-    if ((htp_pack_dit || htp_pack_vae) && output_is_safetensors) {
+    if ((htp_pack_dit || htp_pack_vae || !text_kind.empty()) && output_is_safetensors) {
         LOG_ERROR("HTP offline packing only supports GGUF output");
         return false;
     }
@@ -230,7 +258,9 @@ static bool convert_impl(const char* input_path,
 
     // HTP packing accepts standalone DiT files whose tensor names omit the runtime namespace.
     const std::string input_prefix = htp_pack_dit ? "model.diffusion_model." : "";
-    const bool initialized = htp_pack_vae
+    const bool initialized = !text_kind.empty()
+        ? model_loader.init_from_file_and_convert_name(input_path, sd_htp_text_prefix(text_kind), VERSION_SD3)
+        : htp_pack_vae
         ? model_loader.init_from_file_and_convert_name(input_path, "vae.", VERSION_SD3)
         : model_loader.init_from_file(input_path, input_prefix);
     if (!initialized) {
@@ -244,7 +274,7 @@ static bool convert_impl(const char* input_path,
             return false;
         }
     }
-    if (convert_name && !htp_pack_vae) {
+    if (convert_name && !htp_pack_vae && text_kind.empty()) {
         model_loader.convert_tensors_name();
     }
 
@@ -254,7 +284,15 @@ static bool convert_impl(const char* input_path,
     auto backend    = ggml_backend_cpu_init();
     size_t mem_size = 1 * 1024 * 1024;  // for padding
     mem_size += model_loader.get_tensor_storage_map().size() * ggml_tensor_overhead();
-    mem_size += model_loader.get_params_mem_size(backend, htp_pack_vae ? GGML_TYPE_F32 : type);
+    if (!text_kind.empty()) {
+        for (const auto& item : model_loader.get_tensor_storage_map()) {
+            auto storage = item.second;
+            if (sd_htp_text_linear_name(storage.name, text_kind)) storage.type = GGML_TYPE_F16;
+            mem_size += storage.nbytes() + 128;
+        }
+    } else {
+        mem_size += model_loader.get_params_mem_size(backend, htp_pack_vae ? GGML_TYPE_F32 : type);
+    }
     LOG_INFO("model tensors mem size: %.2fMB", mem_size / 1024.f / 1024.f);
     ggml_context* ggml_ctx = ggml_init({mem_size, nullptr, false});
 
@@ -265,7 +303,7 @@ static bool convert_impl(const char* input_path,
     }
 
     std::vector<TensorWriteInfo> tensors;
-    bool success = load_tensors_for_export(model_loader, ggml_ctx, type, type_rules, force_f16, tensors, htp_pack_vae);
+    bool success = load_tensors_for_export(model_loader, ggml_ctx, type, type_rules, force_f16, tensors, htp_pack_vae, text_kind);
     std::vector<std::string> packed_tensor_names;
     if (success && htp_pack_dit) {
         // --htp-pack-dit 只在导出 GGUF 时执行一次重排；推理阶段只消费这个 packed GGUF。
@@ -277,6 +315,9 @@ static bool convert_impl(const char* input_path,
     if (success && htp_pack_vae) {
         packed_ctx = ggml_init({(tensors.size() + 1) * ggml_tensor_overhead() + 1024, nullptr, true});
         success = packed_ctx != nullptr && pack_htp_vae_weights_for_export(packed_ctx, tensors, packed_storage, options.htp);
+    }
+    if (success && !text_kind.empty()) {
+        success = pack_htp_text_weights_for_export(tensors, text_kind, options.htp);
     }
     ggml_backend_free(backend);
 
@@ -291,7 +332,7 @@ static bool convert_impl(const char* input_path,
                 options.htp.htp_layout         = SD_GGUF_HTP_LAYOUT_W16A32;
                 options.htp.htp_packed_tensors = packed_tensor_names;
             }
-            success = write_gguf_file(output_path, tensors, &error, (htp_pack_dit || htp_pack_vae) ? &options : nullptr);
+            success = write_gguf_file(output_path, tensors, &error, (htp_pack_dit || htp_pack_vae || !text_kind.empty()) ? &options : nullptr);
         }
     }
 
@@ -312,4 +353,13 @@ bool convert(const char* input_path, const char* vae_path, const char* output_pa
 
 bool convert_vae_htp(const char* input_path, const char* output_path) {
     return convert_impl(input_path, "", output_path, SD_TYPE_F16, "", true, false, false, true);
+}
+
+bool convert_text_encoder_htp(const char* input_path, const char* output_path, const char* kind) {
+    const std::string encoder = kind ? kind : "";
+    if (sd_htp_text_prefix(encoder).empty()) {
+        LOG_ERROR("HTP text encoder kind must be clip_l, clip_g or t5xxl");
+        return false;
+    }
+    return convert_impl(input_path, "", output_path, SD_TYPE_F16, "", true, false, false, false, encoder);
 }

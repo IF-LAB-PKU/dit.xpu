@@ -1156,6 +1156,28 @@ public:
             }
         }
 
+        bool packed_text = false;
+        for (const auto& entry : conditioner_tensors) {
+            packed_text |= (entry.second->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) != 0;
+        }
+        if (packed_text && !sd_env_flag_enabled("SD_HTP_TEXT")) {
+            LOG_ERROR("offline packed text encoders require SD_HTP_TEXT=1");
+            ggml_free(ctx);
+            return false;
+        }
+        if (sd_env_flag_enabled("SD_HTP_TEXT")) {
+            auto* htp = backend_manager.cached_backend("htp");
+            if (!packed_text || !htp || !sd_env_flag_enabled("SD_HTP_COMPUTE") ||
+                !backend_manager.runtime_backend_is_cpu(SDBackendModule::TE) ||
+                !backend_manager.params_backend_is_cpu(SDBackendModule::TE) ||
+                !cond_stage_model || !cond_stage_model->configure_htp_text_encoder(htp, retained_model_loader.get())) {
+                LOG_ERROR("SD_HTP_TEXT requires SD3 packed text encoders, preloaded HTP, SD_HTP_COMPUTE=1 and CPU conditioner runtime/params");
+                ggml_free(ctx);
+                return false;
+            }
+            LOG_INFO("enabled HTP text Linear routing with offline packed, segment-staged weights");
+        }
+
         if (!sd_env_flag_enabled("SD_HTP_VAE") && first_stage_model && first_stage_model->get_htp_vae_offline_count() != 0) {
             LOG_ERROR("this VAE GGUF contains HTP-only convolution weights; enable SD_HTP_VAE=1");
             ggml_free(ctx);
