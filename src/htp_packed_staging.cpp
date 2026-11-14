@@ -337,6 +337,31 @@ bool HtpPackedStagingPool::acquire_for_session(size_t required_bytes,
     return true;
 }
 
+bool HtpPackedStagingPool::reserve_unbound(Handle handle, size_t bytes, Reservation* reservation) {
+    Slot* slot = get_slot(handle);
+    if (slot == nullptr || reservation == nullptr || bytes == 0) return false;
+    const size_t offset = reserve(*slot, bytes);
+    if (offset == static_cast<size_t>(-1)) return false;
+    *reservation = {handle, offset, bytes, static_cast<uint8_t*>(slot->allocation.data) + offset};
+    return true;
+}
+
+bool HtpPackedStagingPool::bind_reserved(const Reservation& r, ggml_tensor* tensor) {
+    Slot* slot = get_slot(r.handle);
+    if (slot == nullptr || tensor == nullptr || ggml_nbytes(tensor) != r.bytes ||
+        r.offset > slot->used_bytes || r.bytes > slot->used_bytes - r.offset) return false;
+    for (const auto& binding : slot->bindings) {
+        if (binding.tensor == tensor) return false;
+    }
+    void* data = static_cast<uint8_t*>(slot->allocation.data) + r.offset;
+    slot->bindings.push_back({tensor, tensor->buffer, tensor->data, tensor->extra, slot->allocation.buffer, data});
+    tensor->buffer = slot->allocation.buffer;
+    tensor->data = data;
+    tensor->extra = nullptr;
+    emit(DiagnosticKind::TensorPlaced, r.bytes, r.handle.slot, slot, false, tensor->name);
+    return true;
+}
+
 bool HtpPackedStagingPool::place_tensor(const LoadFn& load,
                                         Handle handle,
                                         const std::string& name,

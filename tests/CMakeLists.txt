@@ -341,6 +341,10 @@ add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
 if(GGML_HTP)
     # Explicit device correctness test; needs a matched host/DSP runtime.
+    add_executable(test-htp-threadpool test-htp-threadpool.cpp)
+    target_link_libraries(test-htp-threadpool PRIVATE ggml ggml-htp)
+    target_include_directories(test-htp-threadpool PRIVATE ../ggml/src/ggml-htp)
+    target_compile_options(test-htp-threadpool PRIVATE -UNDEBUG)
     add_executable(test-htp-native test-htp-native.cpp)
     target_link_libraries(test-htp-native PRIVATE ggml)
     target_compile_options(test-htp-native PRIVATE -UNDEBUG)

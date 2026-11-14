@@ -39,8 +39,10 @@
 
 #include "htp_tensor_flags.h"
 #include "htp_packed_staging.h"
+#include "htp_weight_prefetch.hpp"
 #include "htp_dense_mask.h"
 #include "htp_vae_conv.hpp"
+#include "runner_profile.hpp"
 #include "ggml/src/ggml-htp/htp_param_placement.h"
 #include "ggml/src/ggml-htp/session_placement.h"
 #include "ggml/src/ggml-htp/session_ownership.h"
@@ -6286,6 +6288,9 @@ protected:
     HtpPackedStagingPool::TypedLoadFn htp_packed_staging_loader_;
     std::vector<HtpPackedStagingPool::Handle> htp_packed_staging_handles_;
     std::vector<ggml_tensor*> htp_packed_staging_tensors_;
+    std::function<void()> htp_prepare_staging_loader_;
+    std::function<bool(ggml_cgraph*)> htp_consume_prefetch_;
+    std::function<void()> htp_start_prefetch_;
     bool preserve_htp_packed_staging_ = false;
     int htp_packed_staging_owner_count_ = 1;
     int htp_packed_staging_pool_owner_count_ = 0;
@@ -6366,6 +6371,7 @@ protected:
 
     ggml_context* compute_ctx    = nullptr;
     ggml_gallocr* compute_allocr = nullptr;
+    RunnerProfile execution_profile_;
     struct RetiredComputeArenaGeneration {
         uint64_t generation = 0;
         ggml_gallocr* allocator = nullptr;
@@ -7038,6 +7044,7 @@ protected:
         }
 
         bool reserve_ok = false;
+        auto reserve_profile = execution_profile_.timer(RunnerProfile::Reserve);
         if (!compute_node_buffer_ids_.empty() || !compute_leaf_buffer_ids_.empty()) {
             reserve_ok = ggml_gallocr_reserve_n(compute_allocr,
                                                 gf,
@@ -7047,6 +7054,7 @@ protected:
             reserve_ok = ggml_gallocr_reserve(compute_allocr, gf);
         }
 
+        reserve_profile.finish();
         if (!reserve_ok) {
             // failed to allocate the compute buffer
             LOG_ERROR("%s: failed to allocate the compute buffer\n", get_desc().c_str());
@@ -8533,12 +8541,17 @@ protected:
         }
         if (!compute_node_buffer_ids_.empty() ||
             !compute_leaf_buffer_ids_.empty()) {
-            return ggml_gallocr_reserve_n(
-                       compute_allocr, gf, compute_node_buffer_ids_.data(),
-                       compute_leaf_buffer_ids_.data()) &&
-                   ggml_gallocr_alloc_graph(compute_allocr, gf);
+            if (!execution_profile_.measure(RunnerProfile::Reserve, [&] {
+                    return ggml_gallocr_reserve_n(
+                        compute_allocr, gf, compute_node_buffer_ids_.data(),
+                        compute_leaf_buffer_ids_.data());
+                })) {
+                return false;
+            }
         }
-        return ggml_gallocr_alloc_graph(compute_allocr, gf);
+        return execution_profile_.measure(RunnerProfile::Allocate, [&] {
+            return ggml_gallocr_alloc_graph(compute_allocr, gf);
+        });
     }
 
     void rollback_async_residual_cache_outputs(
@@ -9010,6 +9023,14 @@ protected:
             htp_packed_staging_pool_.reset();
             htp_packed_staging_pool_owner_count_ = 0;
         }
+        htp_packed_staging_pool_ = create_htp_packed_staging_bank();
+        if (!htp_packed_staging_pool_) return false;
+        htp_packed_staging_pool_owner_count_ = htp_packed_staging_owner_count_;
+        return true;
+    }
+
+    std::unique_ptr<HtpPackedStagingPool> create_htp_packed_staging_bank() {
+        std::unique_ptr<HtpPackedStagingPool> pool;
         const size_t budget_mb = static_cast<size_t>(std::max(1, sd_env_int_value("SD_HTP_PACKED_STAGING_BUDGET_MB", 512)));
         const size_t slot_mb = static_cast<size_t>(std::max(1, sd_env_int_value("SD_HTP_PACKED_STAGING_SLOT_MB", 256)));
         const size_t budget_bytes = budget_mb * 1024ull * 1024ull;
@@ -9017,7 +9038,7 @@ protected:
         if (slot_bytes > budget_bytes) {
             LOG_ERROR("%s packed staging slot (%zu MiB) exceeds budget (%zu MiB)",
                       get_desc().c_str(), slot_mb, budget_mb);
-            return false;
+            return nullptr;
         }
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(htp_backend);
         HtpPackedStagingPool::DiagnosticFn diagnostic;
@@ -9049,13 +9070,13 @@ protected:
                 ggml_backend_buffer_free(allocation.buffer);
             }
         };
-        // Keep one persistent arena, but allocate chunks with a stable
-        // session/domain affinity.  This target rejects a live 256 MiB fd
+        // Each bank allocates chunks with a stable session/domain affinity.
+        // This target rejects a live 256 MiB fd
         // being mapped in two FastRPC PDs, so a chunk must never contain
         // weights consumed by another session.  The arena remains shared at
         // runner level and chunks are retained until backend teardown.
         if (htp_packed_staging_owner_count_ > 1) {
-            htp_packed_staging_pool_ = std::make_unique<HtpPackedStagingPool>(
+            pool = std::make_unique<HtpPackedStagingPool>(
                 budget_bytes,
                 slot_bytes,
                 htp_packed_staging_owner_count_,
@@ -9075,7 +9096,7 @@ protected:
                 free_allocation,
                 std::move(diagnostic));
         } else {
-            htp_packed_staging_pool_ = std::make_unique<HtpPackedStagingPool>(
+            pool = std::make_unique<HtpPackedStagingPool>(
                 budget_bytes,
                 slot_bytes,
                 [buft, backend = htp_backend](size_t bytes) {
@@ -9092,45 +9113,14 @@ protected:
                 free_allocation,
                 std::move(diagnostic));
         }
-        htp_packed_staging_pool_owner_count_ = htp_packed_staging_owner_count_;
         LOG_INFO("%s HTP packed staging enabled: budget=%zu MiB slot=%zu MiB owners=%d",
                  get_desc().c_str(), budget_mb, slot_mb,
-                 htp_packed_staging_pool_owner_count_);
-        return true;
+                 htp_packed_staging_owner_count_);
+        return pool;
     }
 
-    bool stage_htp_packed_weights(ggml_cgraph* gf) {
-        if (!htp_packed_staging_enabled()) {
-            return true;
-        }
-        if (!ensure_htp_packed_staging_pool() || gf == nullptr) {
-            return false;
-        }
-        std::vector<ggml_tensor*> tensors = collect_htp_packable_f16_weights(gf);
-        const auto validate_deferred_qkv_staging = [&]() {
-            for (int node_index = 0; node_index < ggml_graph_n_nodes(gf); ++node_index) {
-                ggml_tensor* node = ggml_graph_node(gf, node_index);
-                if (!is_htp_supported_packed_qkv(node)) {
-                    continue;
-                }
-                for (int src_index : htp_packed_qkv_staging_src_indices(node->name)) {
-                    ggml_tensor* param = get_htp_tensor_backing_root(node->src[src_index]);
-                    if (param != nullptr &&
-                        (((param->flags & SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM) != 0) ||
-                         should_place_param_in_htp_rpcmem(param)) &&
-                        !htp_packed_staging_contains(htp_packed_staging_tensors_, param)) {
-                        LOG_ERROR("%s HTP QKV parameter is not staged: node=%s src[%d] tensor=%s bytes=%zu",
-                                  get_desc().c_str(), node->name, src_index,
-                                  param->name, ggml_nbytes(param));
-                        return false;
-                    }
-                }
-            }
-            return true;
-        };
-        if (tensors.empty()) {
-            return validate_deferred_qkv_staging();
-        }
+    std::unordered_map<ggml_tensor*, int> plan_htp_staging_owners(
+            ggml_cgraph* gf, const std::vector<ggml_tensor*>& tensors) {
         std::unordered_set<ggml_tensor*> staged_lookup(tensors.begin(), tensors.end());
         std::unordered_map<ggml_tensor*, int> tensor_sessions;
         const int owner_count = std::max(1, htp_packed_staging_owner_count_);
@@ -9174,6 +9164,43 @@ protected:
                 }
             }
         }
+        return tensor_sessions;
+    }
+
+    bool stage_htp_packed_weights(ggml_cgraph* gf) {
+        if (!htp_packed_staging_enabled()) {
+            return true;
+        }
+        if (!ensure_htp_packed_staging_pool() || gf == nullptr) {
+            return false;
+        }
+        if (htp_consume_prefetch_ && !htp_consume_prefetch_(gf)) return false;
+        std::vector<ggml_tensor*> tensors = collect_htp_packable_f16_weights(gf);
+        const auto validate_deferred_qkv_staging = [&]() {
+            for (int node_index = 0; node_index < ggml_graph_n_nodes(gf); ++node_index) {
+                ggml_tensor* node = ggml_graph_node(gf, node_index);
+                if (!is_htp_supported_packed_qkv(node)) {
+                    continue;
+                }
+                for (int src_index : htp_packed_qkv_staging_src_indices(node->name)) {
+                    ggml_tensor* param = get_htp_tensor_backing_root(node->src[src_index]);
+                    if (param != nullptr &&
+                        (((param->flags & SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM) != 0) ||
+                         should_place_param_in_htp_rpcmem(param)) &&
+                        !htp_packed_staging_contains(htp_packed_staging_tensors_, param)) {
+                        LOG_ERROR("%s HTP QKV parameter is not staged: node=%s src[%d] tensor=%s bytes=%zu",
+                                  get_desc().c_str(), node->name, src_index,
+                                  param->name, ggml_nbytes(param));
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+        if (tensors.empty()) {
+            return validate_deferred_qkv_staging();
+        }
+        const auto tensor_sessions = plan_htp_staging_owners(gf, tensors);
         if (!htp_packed_staging_handles_.empty()) {
             // The graph-cut executor may already own the canonical staged
             // slots from the complete graph. Rebind the tensors after a
@@ -9313,6 +9340,7 @@ protected:
         // htp_packed_staging_tensors_ to exclude these tensors; doing this in
         // the opposite order duplicates the complete packed model in HTP
         // before the segment-sized staging allocation is attempted.
+        auto staging_profile = execution_profile_.timer(RunnerProfile::Staging);
         if (use_packed_staging) {
             preserve_htp_packed_staging_ = true;
             if (!stage_htp_packed_weights(gf)) {
@@ -9320,6 +9348,11 @@ protected:
             }
         }
 
+        // The current bank is now bound. Only the private next bank may be
+        // written by the worker while this graph executes.
+        if (use_packed_staging && htp_start_prefetch_) htp_start_prefetch_();
+        staging_profile.finish();
+        auto offload_profile = execution_profile_.timer(RunnerProfile::Offload);
         int64_t t_offload_begin              = ggml_time_ms();
         if (use_partial_param_offload) {
             if (!offload_partial_params(runtime_param_tensors)) {
@@ -9333,7 +9366,9 @@ protected:
             }
         }
         int64_t t_offload_end = ggml_time_ms();
+        offload_profile.finish();
 
+        auto packed_profile = execution_profile_.timer(RunnerProfile::PackedPrepare);
         if (use_htp_compute && !prepare_htp_packed_f16_weights(gf)) {
             LOG_ERROR("%s prepare HTP packed F16 weights failed", get_desc().c_str());
             if (use_partial_param_offload) {
@@ -9348,6 +9383,7 @@ protected:
             return std::nullopt;
         }
 
+        packed_profile.finish();
         AsyncResidualCacheOutputTransaction cache_output_transaction;
         auto cache_output_rollback = std::unique_ptr<
             AsyncResidualCacheOutputTransaction,
@@ -9392,6 +9428,7 @@ protected:
         int64_t t_alloc_end = ggml_time_ms();
 
         int64_t t_copy_begin = ggml_time_ms();
+        auto copy_profile = execution_profile_.timer(RunnerProfile::CopyIn);
         if (!bind_cache_outputs_before_reserve &&
             !prepare_async_residual_cache_outputs(
                 &cache_output_transaction, gf)) {
@@ -9406,6 +9443,7 @@ protected:
         copy_data_to_backend_tensor(gf, !preserve_backend_tensor_data_map);
         trace_residual_pair_allocation("pre_htp_compute", gf);
         int64_t t_copy_end = ggml_time_ms();
+        copy_profile.finish();
         if (ggml_backend_is_cpu(runtime_backend)) {
             ggml_backend_cpu_set_n_threads(runtime_backend, n_threads);
         }
@@ -9424,7 +9462,9 @@ protected:
             sd_backend_htp_opencl_set_compute_arena_generation(
                 htp_backend, arena_generation);
         }
-        ggml_status status      = ggml_backend_graph_compute(use_htp_compute ? htp_backend : runtime_backend, gf);
+        ggml_status status = execution_profile_.measure(RunnerProfile::Compute, [&] {
+            return ggml_backend_graph_compute(use_htp_compute ? htp_backend : runtime_backend, gf);
+        });
         finalize_cache_input_bindings(&cache_input_transaction, status);
         if (status == GGML_STATUS_SUCCESS) {
             cache_input_rollback.release();
@@ -9530,6 +9570,7 @@ protected:
                          (long long) ggml_time_us());
         }
         int64_t t_cache_begin = ggml_time_ms();
+        auto cache_profile = execution_profile_.timer(RunnerProfile::Cache);
         if (!copy_cache_tensors_to_cache_buffer(cache_keep_names, gf)) {
             if (free_compute_buffer_immediately) {
                 free_compute_buffer();
@@ -9544,6 +9585,8 @@ protected:
                          (long long) ggml_time_us());
         }
         int64_t t_cache_end = ggml_time_ms();
+        cache_profile.finish();
+        auto readback_profile = execution_profile_.timer(RunnerProfile::Readback);
         auto result         = ggml_get_tensor(compute_ctx, final_result_name.c_str());
         std::optional<sd::Tensor<T>> output;
         if (!no_return) {
@@ -9560,11 +9603,14 @@ protected:
             output = sd::Tensor<T>();
         }
 
-        if (free_compute_buffer_immediately) {
-            free_compute_buffer();
-        } else if (use_partial_param_offload) {
-            restore_partial_params();
-        }
+        readback_profile.finish();
+        execution_profile_.measure(RunnerProfile::Release, [&] {
+            if (free_compute_buffer_immediately) {
+                free_compute_buffer();
+            } else if (use_partial_param_offload) {
+                restore_partial_params();
+            }
+        });
         if (use_partial_param_offload) {
             LOG_DEBUG("%s execute_graph timing: offload=%lld ms alloc=%lld ms copy_in=%lld ms compute=%lld ms cache=%lld ms total=%lld ms",
                       get_desc().c_str(),
@@ -9627,7 +9673,99 @@ protected:
         // segment, so session switches do not reload the same weight.
         preserve_htp_packed_staging_ = false;
         release_htp_packed_staging();
+
+        // A request owns one active bank and at most one private next bank.
+        // No tensor or backend state is accessed by the loading worker.
+        HtpWeightPrefetch prefetch;
+        std::unique_ptr<HtpPackedStagingPool> spare_bank;
+        std::vector<std::vector<HtpWeightPrefetch::Weight>> prefetch_plan;
+        size_t current_segment = 0, prepared_segment = SIZE_MAX;
+        size_t prefetch_skipped = 0, prefetch_peak_bytes = 0;
+        auto prefetch_cleanup = [&](int*) {
+            htp_consume_prefetch_ = {};
+            htp_start_prefetch_ = {};
+            prefetch.cancel(); // join before either bank can be freed
+            spare_bank.reset();
+            if (!prefetch_plan.empty()) {
+                LOG_INFO("%s htp_prefetch_profile started=%zu skipped=%zu wait_us=%lld load_us=%lld peak_bank_bytes=%zu",
+                         get_desc().c_str(), prefetch.started, prefetch_skipped,
+                         (long long)prefetch.wait_us, (long long)prefetch.load_us, prefetch_peak_bytes);
+            }
+        };
+        int prefetch_token = 0;
+        std::unique_ptr<int, decltype(prefetch_cleanup)> prefetch_guard(&prefetch_token, prefetch_cleanup);
+        if (get_desc() == "t5" && htp_packed_staging_enabled() &&
+            sd_env_flag_enabled("SD_HTP_PACKED_PREFETCH") && plan.segments.size() > 1 &&
+            !sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL")) {
+            auto profile = execution_profile_.timer(RunnerProfile::Build);
+            bool eligible = true;
+            prefetch_plan.resize(plan.segments.size());
+            for (size_t i = 0; i < plan.segments.size(); ++i) {
+                ggml_context* view_ctx = nullptr;
+                ggml_cgraph* view = sd::ggml_graph_cut::build_segment_graph(gf, plan.segments[i], &view_ctx);
+                const auto weights = collect_htp_packable_f16_weights(view);
+                const auto owners = plan_htp_staging_owners(view, weights);
+                for (auto* weight : weights) {
+                    if (weight->type != GGML_TYPE_F16 ||
+                        !(weight->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) ||
+                        !(weight->flags & SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM)) {
+                        eligible = false;
+                        break;
+                    }
+                    auto owner = owners.find(weight);
+                    prefetch_plan[i].push_back({weight, weight->name, ggml_nbytes(weight),
+                                               weight->type, owner == owners.end() ? 0 : owner->second});
+                }
+                ggml_free(view_ctx);
+                if (!eligible) break;
+            }
+            if (!eligible) {
+                prefetch_plan.clear();
+            } else {
+                // Freeze ModelLoader metadata before the first concurrent read.
+                if (htp_prepare_staging_loader_) htp_prepare_staging_loader_();
+                htp_consume_prefetch_ = [&](ggml_cgraph* view) {
+                    if (!prefetch.pending()) return true;
+                    auto batch = prefetch.take();
+                    if (!batch || prepared_segment != current_segment ||
+                        !htp_packed_staging_handles_.empty()) {
+                        LOG_ERROR("%s packed prefetch failed or segment mismatch", get_desc().c_str());
+                        return false;
+                    }
+                    const auto actual = collect_htp_packable_f16_weights(view);
+                    if (actual.size() != batch->weights.size()) return false;
+                    for (const auto& weight : batch->weights) {
+                        if (std::find(actual.begin(), actual.end(), weight.tensor) == actual.end() ||
+                            ggml_nbytes(weight.tensor) != weight.bytes || weight.tensor->type != weight.type) return false;
+                    }
+                    if (!batch->bind()) return false;
+                    GGML_ASSERT(!spare_bank);
+                    spare_bank = std::move(htp_packed_staging_pool_);
+                    htp_packed_staging_pool_ = std::move(batch->pool);
+                    htp_packed_staging_handles_ = std::move(batch->handles);
+                    for (const auto& weight : batch->weights) htp_packed_staging_tensors_.push_back(weight.tensor);
+                    return true;
+                };
+                htp_start_prefetch_ = [&] {
+                    const size_t next = current_segment + 1;
+                    if (next >= prefetch_plan.size() || prefetch_plan[next].empty()) return;
+                    GGML_ASSERT(!prefetch.pending());
+                    if (!spare_bank) spare_bank = create_htp_packed_staging_bank();
+                    if (prefetch.start(std::move(spare_bank), prefetch_plan[next], htp_packed_staging_loader_)) {
+                        prepared_segment = next;
+                        prefetch_peak_bytes = std::max(prefetch_peak_bytes,
+                            htp_packed_staging_pool_->allocated_bytes() + prefetch.allocated_bytes());
+                    } else {
+                        // Reservation/launch failure is safe to retry synchronously.
+                        // I/O failure after launch is fatal at take(), never a fallback.
+                        ++prefetch_skipped;
+                    }
+                };
+            }
+        }
         for (size_t seg_idx = 0; seg_idx < plan.segments.size(); ++seg_idx) {
+            current_segment = seg_idx;
+            auto segment_build_profile = execution_profile_.timer(RunnerProfile::Build);
             int64_t t_segment_begin = ggml_time_ms();
             const auto& segment     = plan.segments[seg_idx];
             auto future_cut_names   = sd::ggml_graph_cut::collect_future_input_names(
@@ -9677,6 +9815,7 @@ protected:
 
             ggml_context* segment_graph_ctx = nullptr;
             ggml_cgraph* segment_graph      = sd::ggml_graph_cut::build_segment_graph(gf, segment, &segment_graph_ctx);
+            segment_build_profile.finish();
             auto segment_output             = execute_graph<T>(segment_graph,
                                                    n_threads,
                                                    true,
@@ -10024,12 +10163,17 @@ public:
                                          int n_threads,
                                          bool free_compute_buffer_immediately,
                                          bool no_return = false) {
+        RunnerProfile::Request profile_request(execution_profile_,
+            sd_env_flag_enabled("SD_RUNNER_PROFILE"), get_desc());
         ggml_cgraph* gf = nullptr;
-        if (!prepare_compute_graph(get_graph, &gf)) {
+        if (!execution_profile_.measure(RunnerProfile::Build, [&] {
+                return prepare_compute_graph(get_graph, &gf);
+            })) {
             return std::nullopt;
         }
         GGML_ASSERT(gf != nullptr);
 
+        auto packed_profile = execution_profile_.timer(RunnerProfile::PackedPrepare);
         const bool use_htp_compute = htp_op_routing_enabled() &&
                                      sd_env_flag_enabled("SD_HTP_COMPUTE");
         if (use_htp_compute && !prepare_htp_packed_f16_weights(gf)) {
@@ -10042,6 +10186,7 @@ public:
             return std::nullopt;
         }
 
+        packed_profile.finish();
         const bool uses_cross_step_cache =
             !cache_tensor_map.empty() || !cache_backed_tensor_name_map.empty();
         // Packed staging is segment-scoped, so its unified opt-in must also
@@ -10057,7 +10202,9 @@ public:
                          cache_backed_tensor_name_map.size());
             }
             GraphCutPlan plan;
-            if (!resolve_graph_cut_plan(gf, &plan)) {
+            if (!execution_profile_.measure(RunnerProfile::Plan, [&] {
+                    return resolve_graph_cut_plan(gf, &plan);
+                })) {
                 free_compute_ctx();
                 return std::nullopt;
             }
@@ -10067,19 +10214,23 @@ public:
                          plan.segments.size(), max_graph_vram_bytes);
             }
             if (should_use_graph_cut_segmented_compute(plan)) {
-                return compute_with_graph_cuts<T>(gf,
+                auto output = compute_with_graph_cuts<T>(gf,
                                                   plan,
                                                   n_threads,
                                                   free_compute_buffer_immediately,
                                                   no_return);
+                profile_request.success = output.has_value();
+                return output;
             }
         }
-        return execute_graph<T>(gf,
+        auto output = execute_graph<T>(gf,
                                 n_threads,
                                 free_compute_buffer_immediately,
                                 {},
                                 false,
                                 no_return);
+        profile_request.success = output.has_value();
+        return output;
     }
 
     void set_flash_attention_enabled(bool enabled) {
@@ -10155,8 +10306,10 @@ public:
     void set_htp_packed_staging_loader(ModelLoader* loader) {
         if (loader == nullptr) {
             htp_packed_staging_loader_ = {};
+            htp_prepare_staging_loader_ = {};
             return;
         }
+        htp_prepare_staging_loader_ = [loader] { loader->process_model_files(false, false); };
         htp_packed_staging_loader_ = [loader](const std::string& name,
                                               void* dst,
                                               size_t bytes,

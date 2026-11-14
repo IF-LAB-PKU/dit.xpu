@@ -386,6 +386,7 @@ struct SD3CLIPEmbedder : public Conditioner {
             clip_skip = 2;
         }
 
+        const bool shared_clip_pass = sd_env_flag_enabled_default("SD_CLIP_SHARED_PASS", true);
         size_t chunk_len = 77;
         int64_t t0       = ggml_time_ms();
         sd::Tensor<float> hidden_states;
@@ -406,17 +407,26 @@ struct SD3CLIPEmbedder : public Conditioner {
                 sd::Tensor<int32_t> input_ids({static_cast<int64_t>(chunk_tokens.size())}, chunk_tokens);
                 size_t max_token_idx = 0;
 
-                chunk_hidden_states_l = clip_l->compute(n_threads,
-                                                        input_ids,
-                                                        0,
-                                                        nullptr,
-                                                        max_token_idx,
-                                                        false,
-                                                        clip_skip);
+                if (chunk_idx == 0 && shared_clip_pass) {
+                    const auto eos = std::find(chunk_tokens.begin(), chunk_tokens.end(), clip_l_tokenizer.EOS_TOKEN_ID);
+                    max_token_idx = std::min<size_t>(eos - chunk_tokens.begin(), chunk_tokens.size() - 1);
+                    auto both = clip_l->compute_hidden_and_pooled(n_threads, input_ids, max_token_idx, clip_skip);
+                    chunk_hidden_states_l = std::move(both.first);
+                    pooled_l = std::move(both.second);
+                    GGML_ASSERT(!pooled_l.empty());
+                } else {
+                    chunk_hidden_states_l = clip_l->compute(n_threads,
+                                                            input_ids,
+                                                            0,
+                                                            nullptr,
+                                                            max_token_idx,
+                                                            false,
+                                                            clip_skip);
+                }
                 GGML_ASSERT(!chunk_hidden_states_l.empty());
                 chunk_hidden_states_l = ::apply_token_weights(std::move(chunk_hidden_states_l), chunk_weights);
 
-                if (chunk_idx == 0) {
+                if (chunk_idx == 0 && !shared_clip_pass) {
                     auto it       = std::find(chunk_tokens.begin(), chunk_tokens.end(), clip_l_tokenizer.EOS_TOKEN_ID);
                     max_token_idx = std::min<size_t>(std::distance(chunk_tokens.begin(), it), chunk_tokens.size() - 1);
                     pooled_l      = clip_l->compute(n_threads,
@@ -447,17 +457,26 @@ struct SD3CLIPEmbedder : public Conditioner {
                 sd::Tensor<int32_t> input_ids({static_cast<int64_t>(chunk_tokens.size())}, chunk_tokens);
                 size_t max_token_idx = 0;
 
-                chunk_hidden_states_g = clip_g->compute(n_threads,
-                                                        input_ids,
-                                                        0,
-                                                        nullptr,
-                                                        max_token_idx,
-                                                        false,
-                                                        clip_skip);
+                if (chunk_idx == 0 && shared_clip_pass) {
+                    const auto eos = std::find(chunk_tokens.begin(), chunk_tokens.end(), clip_g_tokenizer.EOS_TOKEN_ID);
+                    max_token_idx = std::min<size_t>(eos - chunk_tokens.begin(), chunk_tokens.size() - 1);
+                    auto both = clip_g->compute_hidden_and_pooled(n_threads, input_ids, max_token_idx, clip_skip);
+                    chunk_hidden_states_g = std::move(both.first);
+                    pooled_g = std::move(both.second);
+                    GGML_ASSERT(!pooled_g.empty());
+                } else {
+                    chunk_hidden_states_g = clip_g->compute(n_threads,
+                                                            input_ids,
+                                                            0,
+                                                            nullptr,
+                                                            max_token_idx,
+                                                            false,
+                                                            clip_skip);
+                }
                 GGML_ASSERT(!chunk_hidden_states_g.empty());
                 chunk_hidden_states_g = ::apply_token_weights(std::move(chunk_hidden_states_g), chunk_weights);
 
-                if (chunk_idx == 0) {
+                if (chunk_idx == 0 && !shared_clip_pass) {
                     auto it       = std::find(chunk_tokens.begin(), chunk_tokens.end(), clip_g_tokenizer.EOS_TOKEN_ID);
                     max_token_idx = std::min<size_t>(std::distance(chunk_tokens.begin(), it), chunk_tokens.size() - 1);
                     pooled_g      = clip_g->compute(n_threads,

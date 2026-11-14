@@ -11,6 +11,7 @@
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
 #include "htp-ops.h"
+#include "htp-hybrid.h"
 
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
@@ -3052,7 +3053,7 @@ static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask
     }
 }
 
-void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
+void ggml_htp_threadpool_free(struct ggml_threadpool* threadpool) {
     if (!threadpool) return;
 
     const int n_threads = threadpool->n_threads;
@@ -3098,7 +3099,7 @@ static void ggml_threadpool_resume_locked(struct ggml_threadpool * threadpool) {
 }
 #endif
 
-void ggml_threadpool_pause(struct ggml_threadpool * threadpool) {
+static void ggml_htp_threadpool_pause(struct ggml_threadpool * threadpool) {
 #ifndef GGML_USE_OPENMP
     ggml_mutex_lock(&threadpool->mutex);
     if (!threadpool->pause) {
@@ -3110,7 +3111,7 @@ void ggml_threadpool_pause(struct ggml_threadpool * threadpool) {
 #endif
 }
 
-void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
+static void ggml_htp_threadpool_resume(struct ggml_threadpool * threadpool) {
 #ifndef GGML_USE_OPENMP
     ggml_mutex_lock(&threadpool->mutex);
     if (threadpool->pause) {
@@ -3122,7 +3123,7 @@ void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
 #endif
 }
 
-struct ggml_cplan ggml_graph_plan(
+struct ggml_cplan ggml_htp_graph_plan(
           const struct ggml_cgraph * cgraph,
                                int   n_threads,
             struct ggml_threadpool * threadpool) {
@@ -3675,6 +3676,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             }
         }
 
+        // All workers must pass the admission status checks before worker zero
+        // can publish cancellation. Otherwise a late worker can mistake this
+        // node's cancellation for admission failure and skip a node barrier.
+        if (cplan->abort_callback) {
+            ggml_barrier(state->threadpool);
+        }
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
             atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
@@ -3975,7 +3982,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     return threadpool;
 }
 
-static struct ggml_threadpool * ggml_htp_threadpool_new(struct ggml_threadpool_params * tpp) {
+struct ggml_threadpool * ggml_htp_threadpool_new(struct ggml_threadpool_params * tpp) {
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
 
@@ -4050,14 +4057,18 @@ enum ggml_status ggml_graph_compute_htp_hybrid(struct ggml_cgraph * cgraph, stru
     enum ggml_status ret = threadpool->ec;
 
     if (disposable_threadpool) {
-        ggml_threadpool_free(threadpool);
+        ggml_htp_threadpool_free(threadpool);
+    } else {
+        // Graph cuts can spend a long time loading weights or running another
+        // backend. Keep persistent workers asleep rather than polling then.
+        ggml_htp_threadpool_pause(threadpool);
     }
 
     return ret;
 }
 
 static enum ggml_status ggml_graph_compute_htp_hybrid_with_ctx(struct ggml_context * ctx, struct ggml_cgraph * cgraph, int n_threads) {
-    struct ggml_cplan cplan = ggml_graph_plan(cgraph, n_threads, NULL);
+    struct ggml_cplan cplan = ggml_htp_graph_plan(cgraph, n_threads, NULL);
 
     cplan.work_data = (uint8_t *)ggml_new_buffer(ctx, cplan.work_size);
 

@@ -2326,6 +2326,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     }
 
     auto * ctx           = ggml_backend_htp_context::instance();
+    const int64_t profile_start_us = ctx->dispatch_profile_enabled ? ggml_time_us() : 0;
     void * ops_dl_handle = ctx->ops_dl_handle;
     GGML_ASSERT(ops_dl_handle != nullptr);
 
@@ -3457,6 +3458,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
         }
         if (!consume_cpu_batches()) usleep(100);
     }
+    const int64_t profile_done_us = ctx->dispatch_profile_enabled ? ggml_time_us() : 0;
     consume_cpu_batches();
 #ifdef GGML_HTP_OPENCL_SIDECAR
     if (gpu_dequant) {
@@ -3525,6 +3527,23 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     else if (ret == 0 && op_index == HTP_OPS_MAT_MUL_PERMUTED_W16A32 && args_size == sizeof(MatMulProfileParams))
         linear_elapsed_us = reinterpret_cast<const MatMulProfileParams *>(compute_request->payload)->elapsed_us;
     ctx->last_linear_elapsed_us.store(linear_elapsed_us,std::memory_order_release);
+    if (ctx->dispatch_profile_enabled) {
+        auto & p = ctx->dispatch_profile;
+        ++p.calls;
+        p.submit_us += ctx->last_dispatch_doorbell_us.load(std::memory_order_acquire) - profile_start_us;
+        p.wait_us += profile_done_us - wait_begin_us;
+        int64_t dsp_us = linear_elapsed_us;
+        if (ret == 0 && op_index == HTP_OPS_CONV2D_NCHW_F16)
+            dsp_us = reinterpret_cast<const NativeConvParams *>(compute_request->payload)->elapsed_us;
+        else if (ret == 0 && op_index == HTP_OPS_ATTENTION_F32)
+            dsp_us = reinterpret_cast<const NativeAttentionParams *>(compute_request->payload)->elapsed_us;
+        else if (ret == 0 && op_index == HTP_OPS_MODEL_AUX_F32)
+            dsp_us = reinterpret_cast<const NativeAuxParams *>(compute_request->payload)->elapsed_us;
+        if (dsp_us >= 0) {
+            p.dsp_us += dsp_us;
+            ++p.dsp_reported_calls;
+        }
+    }
     if (ret == 0 && op_index == HTP_OPS_MAT_MUL_NATIVE_W8A8 && args_size == sizeof(NativeW8A8ProfileParams)) {
         NativeW8A8Profile profile;
         std::memcpy(&profile, compute_request->payload+sizeof(NativeW8A8Params), sizeof(profile));

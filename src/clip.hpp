@@ -97,7 +97,9 @@ public:
                          ggml_tensor* x,
                          ggml_tensor* mask                   = nullptr,
                          int clip_skip                       = -1,
-                         const std::string& graph_cut_prefix = "") {
+                         const std::string& graph_cut_prefix = "",
+                         ggml_tensor** captured_hidden       = nullptr,
+                         int capture_layer                   = -1) {
         // x: [N, n_token, d_model]
         int layer_idx = n_layer - 1;
         // LOG_DEBUG("clip_skip %d", clip_skip);
@@ -115,6 +117,9 @@ public:
             x                = layer->forward(ctx, x, mask);  // [N, n_token, d_model]
             if (!graph_cut_prefix.empty()) {
                 sd::ggml_graph_cut::mark_graph_cut(x, graph_cut_prefix + ".layers." + std::to_string(i), "x");
+            }
+            if (captured_hidden != nullptr && i == capture_layer) {
+                *captured_hidden = x;
             }
             // LOG_DEBUG("layer %d", i);
         }
@@ -304,7 +309,8 @@ public:
                          ggml_tensor* mask    = nullptr,
                          size_t max_token_idx = 0,
                          bool return_pooled   = false,
-                         int clip_skip        = -1) {
+                         int clip_skip        = -1,
+                         ggml_tensor** captured_hidden = nullptr) {
         // input_ids: [N, n_token]
         auto embeddings       = std::dynamic_pointer_cast<CLIPEmbeddings>(blocks["embeddings"]);
         auto encoder          = std::dynamic_pointer_cast<CLIPEncoder>(blocks["encoder"]);
@@ -312,7 +318,11 @@ public:
 
         auto x = embeddings->forward(ctx, input_ids, tkn_embeddings);  // [N, n_token, hidden_size]
         sd::ggml_graph_cut::mark_graph_cut(x, "clip_text.prelude", "x");
-        x = encoder->forward(ctx, x, mask, return_pooled ? -1 : clip_skip, "clip_text");
+        x = encoder->forward(ctx, x, mask, return_pooled ? -1 : clip_skip, "clip_text",
+                             captured_hidden, clip_skip > 0 ? n_layer - clip_skip : n_layer - 1);
+        if (captured_hidden != nullptr && with_final_ln) {
+            *captured_hidden = final_layer_norm->forward(ctx, *captured_hidden);
+        }
         if (return_pooled || with_final_ln) {
             x = final_layer_norm->forward(ctx, x);
         }
@@ -507,7 +517,8 @@ struct CLIPTextModelRunner : public GGMLRunner {
                          ggml_tensor* mask,
                          size_t max_token_idx = 0,
                          bool return_pooled   = false,
-                         int clip_skip        = -1) {
+                         int clip_skip        = -1,
+                         ggml_tensor** captured_hidden = nullptr) {
         size_t N       = input_ids->ne[1];
         size_t n_token = input_ids->ne[0];
         if (input_ids->ne[0] > model.n_token) {
@@ -515,7 +526,7 @@ struct CLIPTextModelRunner : public GGMLRunner {
             input_ids = ggml_reshape_2d(ctx->ggml_ctx, input_ids, model.n_token, input_ids->ne[0] / model.n_token);
         }
 
-        return model.forward(ctx, input_ids, embeddings, mask, max_token_idx, return_pooled, clip_skip);
+        return model.forward(ctx, input_ids, embeddings, mask, max_token_idx, return_pooled, clip_skip, captured_hidden);
     }
 
     ggml_cgraph* build_graph(const sd::Tensor<int32_t>& input_ids_tensor,
@@ -523,7 +534,8 @@ struct CLIPTextModelRunner : public GGMLRunner {
                              void* custom_embeddings_data = nullptr,
                              size_t max_token_idx         = 0,
                              bool return_pooled           = false,
-                             int clip_skip                = -1) {
+                             int clip_skip                = -1,
+                             bool return_both             = false) {
         ggml_cgraph* gf        = new_graph_custom(2048);
         ggml_tensor* input_ids = make_input(input_ids_tensor);
 
@@ -557,11 +569,48 @@ struct CLIPTextModelRunner : public GGMLRunner {
 
         auto runner_ctx = get_context();
 
-        ggml_tensor* hidden_states = forward(&runner_ctx, input_ids, embeddings, attention_mask, max_token_idx, return_pooled, clip_skip);
+        ggml_tensor* captured_hidden = nullptr;
+        ggml_tensor* hidden_states = forward(&runner_ctx, input_ids, embeddings, attention_mask, max_token_idx,
+                                            return_pooled, clip_skip, return_both ? &captured_hidden : nullptr);
+
+        if (return_both) {
+            GGML_ASSERT(return_pooled && captured_hidden != nullptr);
+            // Expand the full encoder first. The intermediate is already a
+            // named graph cut, so segmented execution retains it until this
+            // final consumer. No tensor pointers survive a runner request.
+            ggml_build_forward_expand(gf, hidden_states);
+            hidden_states = ggml_concat(compute_ctx,
+                ggml_reshape_1d(compute_ctx, ggml_cont(compute_ctx, captured_hidden), ggml_nelements(captured_hidden)),
+                ggml_reshape_1d(compute_ctx, ggml_cont(compute_ctx, hidden_states), ggml_nelements(hidden_states)), 0);
+        }
 
         ggml_build_forward_expand(gf, hidden_states);
 
         return gf;
+    }
+
+    // SD3 needs intermediate token features and final-layer pooled features.
+    // Produce both from one encoder traversal and one weight stream.
+    std::pair<sd::Tensor<float>, sd::Tensor<float>> compute_hidden_and_pooled(
+            int n_threads, const sd::Tensor<int32_t>& input_ids,
+            size_t max_token_idx, int clip_skip) {
+        if (input_ids.numel() > model.n_token || clip_skip > model.n_layer ||
+            clip_skip < -1 || max_token_idx >= size_t(input_ids.numel())) {
+            return {compute(n_threads, input_ids, 0, nullptr, max_token_idx, false, clip_skip),
+                    compute(n_threads, input_ids, 0, nullptr, max_token_idx, true, clip_skip)};
+        }
+        auto get_graph = [&]() {
+            return build_graph(input_ids, 0, nullptr, max_token_idx, true, clip_skip, true);
+        };
+        auto combined = GGMLRunner::compute<float>(get_graph, n_threads, true);
+        if (!combined.has_value()) return {};
+        const int64_t hidden_count = model.hidden_size * input_ids.numel();
+        GGML_ASSERT(combined->numel() > hidden_count);
+        sd::Tensor<float> hidden({model.hidden_size, input_ids.numel(), 1});
+        sd::Tensor<float> pooled({combined->numel() - hidden_count});
+        std::copy_n(combined->data(), hidden_count, hidden.data());
+        std::copy_n(combined->data() + hidden_count, pooled.numel(), pooled.data());
+        return {std::move(hidden), std::move(pooled)};
     }
 
     sd::Tensor<float> compute(const int n_threads,

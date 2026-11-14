@@ -4,6 +4,7 @@ set(GGML_SOURCES_HTP
     ggml-htp-impl.h
     ggml-htp.cc
     htp-cpu-impl.c
+    htp-hybrid.h
     htp-ops.cc
     htp-w8a8.cc
     htp-w8a8.h

@@ -57,6 +57,8 @@ static void self_test(ggml_backend_t cpu, ggml_backend_t htp) {
         {65, 9, 3, 5, 3, 1, 1, 1}, {64, 64, 512, 32, 3, 1, 1, 1},
         {11, 9, 3, 5, 3, 1, 1, 1}, {9, 7, 16, 32, 1, 1, 0, 1},
         {13, 11, 32, 3, 3, 2, 1, 1}, {11, 9, 32, 64, 3, 1, 2, 2},
+        // Full 32-lane rows, cross-row/tail tiles, and simultaneous K/N tails.
+        {32, 2, 7, 37, 1, 1, 0, 1}, {97, 3, 7, 37, 3, 1, 1, 1},
     };
     for (const auto& c : cases) for(bool upscale:{false,true}) {
         if(c[2]>=512 && upscale) continue;

@@ -45,7 +45,10 @@ int main(int argc, char** argv) {
         }
         std::printf("encoder=%s mode=%s load_seconds=%.6f packed=%zu deferred=%zu params_bytes=%zu\n",
                     kind.c_str(), argv[3], seconds() - t0, packed, deferred, encoder.get_params_buffer_size());
+        std::vector<float> shared_reference_cross, shared_reference_vector;
         for (int r = 0; r < repeats; ++r) {
+            const bool prefetch_ab = encoder.t5 && std::getenv("SD_HTP_PREFETCH_AB");
+            if (prefetch_ab) setenv("SD_HTP_PACKED_PREFETCH", r % 4 == 1 || r % 4 == 2 ? "1" : "0", 1);
             if (std::getenv("SD_HTP_FUSION_AB")) setenv("SD_HTP_TEXT_FUSION",r%2 ? "1" : "0",1);
             ConditionerParams p;
             p.text = argc > 6 ? argv[6] : "a cat sitting on a wooden table";
@@ -61,14 +64,48 @@ int main(int argc, char** argv) {
                 auto model = encoder.clip_l ? encoder.clip_l : encoder.clip_g;
                 const auto eos = std::find(tokens[index].first.begin(), tokens[index].first.end(), 49407);
                 const auto eos_index = std::min<size_t>(eos - tokens[index].first.begin(), tokens[index].first.size() - 1);
-                condition.c_crossattn = model->compute(4, ids, 0, nullptr, eos_index, false, 2);
-                condition.c_vector = model->compute(4, ids, 0, nullptr, eos_index, true, 2);
+                int clip_skip = sd_env_int_value("SD_TEST_CLIP_SKIP", 2);
+                const bool skip_cycle = std::getenv("SD_TEST_CLIP_SKIP_CYCLE") != nullptr;
+                if (skip_cycle) {
+                    const int skips[] = {2, 1, model->model.n_layer};
+                    clip_skip = skips[(r / 2) % 3];
+                }
+                const bool shared = skip_cycle ? r % 2 != 0 : std::getenv("SD_CLIP_SHARED_PASS_AB")
+                    ? (r % 4 == 1 || r % 4 == 2)
+                    : sd_env_flag_enabled_default("SD_CLIP_SHARED_PASS", true);
+                if (shared) {
+                    auto both = model->compute_hidden_and_pooled(4, ids, eos_index, clip_skip);
+                    condition.c_crossattn = std::move(both.first);
+                    condition.c_vector = std::move(both.second);
+                } else {
+                    condition.c_crossattn = model->compute(4, ids, 0, nullptr, eos_index, false, clip_skip);
+                    condition.c_vector = model->compute(4, ids, 0, nullptr, eos_index, true, clip_skip);
+                }
+                std::printf("shared_pass=%d clip_skip=%d ", shared ? 1 : 0, clip_skip);
             }
             const double elapsed = seconds() - start;
+            if ((prefetch_ab || (std::getenv("SD_CLIP_SHARED_PASS_AB") && !encoder.t5)) &&
+                !std::getenv("SD_HTP_FUSION_AB")) {
+                if (r == 0 || (std::getenv("SD_TEST_CLIP_SKIP_CYCLE") && r % 2 == 0)) {
+                    shared_reference_cross.assign(condition.c_crossattn.data(),
+                        condition.c_crossattn.data() + condition.c_crossattn.numel());
+                    shared_reference_vector.assign(condition.c_vector.data(),
+                        condition.c_vector.data() + condition.c_vector.numel());
+                } else {
+                    GGML_ASSERT(size_t(condition.c_crossattn.numel()) == shared_reference_cross.size());
+                    GGML_ASSERT(size_t(condition.c_vector.numel()) == shared_reference_vector.size());
+                    GGML_ASSERT(std::memcmp(condition.c_crossattn.data(), shared_reference_cross.data(),
+                        shared_reference_cross.size() * sizeof(float)) == 0);
+                    GGML_ASSERT(std::memcmp(condition.c_vector.data(), shared_reference_vector.data(),
+                        shared_reference_vector.size() * sizeof(float)) == 0);
+                    std::printf("output_check=exact ");
+                }
+            }
             const std::string prefix = std::string(argv[5]) + "." + std::to_string(r);
             save(prefix + ".cross.f32", condition.c_crossattn);
             save(prefix + ".vector.f32", condition.c_vector);
             std::printf("fusion=%d ",sd_env_flag_enabled("SD_HTP_TEXT_FUSION") ? 1 : 0);
+            if (prefetch_ab) std::printf("prefetch=%d ", sd_env_flag_enabled("SD_HTP_PACKED_PREFETCH") ? 1 : 0);
             std::printf("encoder=%s mode=%s repeat=%d seconds=%.6f params_and_staging_bytes=%zu cross_elements=%lld vector_elements=%lld\n",
                         kind.c_str(), argv[3], r, elapsed, encoder.get_params_buffer_size(),
                         (long long)condition.c_crossattn.numel(), (long long)condition.c_vector.numel());

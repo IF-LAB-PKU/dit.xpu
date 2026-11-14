@@ -36,6 +36,19 @@ struct ggml_backend_htp_context {
 
     int n_threads = 0;
     struct ggml_threadpool * threadpool = nullptr;
+    int threadpool_n_threads = 0;
+    uint64_t hybrid_graphs = 0;
+    uint64_t threadpool_creations = 0;
+    int64_t threadpool_create_us = 0;
+    // Serial dispatcher counters, protected by compute_mutex during graphs.
+    bool dispatch_profile_enabled = false;
+    struct {
+        uint64_t calls = 0;
+        int64_t submit_us = 0;
+        int64_t wait_us = 0;
+        int64_t dsp_us = 0;
+        uint64_t dsp_reported_calls = 0;
+    } dispatch_profile;
 
     RpcMemMapper mapper;
     std::unique_ptr<RpcMemMapper> reserved_mapper;

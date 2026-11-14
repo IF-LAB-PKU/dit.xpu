@@ -24,6 +24,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-htp-impl.h"
 #include "htp-ops.h"
+#include "htp-hybrid.h"
 #include "htp-w8a8.h"
 #include "rpcmem_session_route.h"
 #include "session_placement.h"
@@ -31,12 +32,6 @@
 #ifdef GGML_HTP_OPENCL_SIDECAR
 #include "ggml-opencl-htp.h"
 #endif
-
-extern "C" {
-struct ggml_threadpool;
-enum ggml_status ggml_graph_compute_htp_hybrid(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
-struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threads, struct ggml_threadpool * threadpool);
-}
 
 struct ggml_backend_htp_buffer_context {
     void * data;
@@ -898,6 +893,15 @@ ggml_backend_htp_context::~ggml_backend_htp_context() {
     sparse_opencl_sidecar = nullptr;
 #endif
 
+    ggml_htp_threadpool_free(threadpool);
+    threadpool = nullptr;
+    if (ggml_backend_htp_env_enabled("SD_HTP_THREADPOOL_STATS")) {
+        std::fprintf(stderr,
+                     "htp_threadpool graphs=%llu persistent_creations=%llu create_us=%lld\n",
+                     (unsigned long long) hybrid_graphs,
+                     (unsigned long long) threadpool_creations,
+                     (long long) threadpool_create_us);
+    }
     ggml_backend_htp_aligned_free(work_data);
 
     // 退出时打印映射统计，用来判断活跃映射集有没有被回收过。
@@ -2096,8 +2100,44 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
         return GGML_STATUS_SUCCESS;
     }
 
+    ctx->dispatch_profile = {};
+    ctx->dispatch_profile_enabled = ggml_backend_htp_env_enabled("SD_RUNNER_PROFILE");
+    int profile_token = 0;
+    auto finish_profile = [ctx](int *) {
+        if (ctx->dispatch_profile_enabled) {
+            const auto & p = ctx->dispatch_profile;
+            std::fprintf(stderr,
+                "htp_dispatch_profile calls=%llu submit_us=%lld wait_us=%lld "
+                "dsp_reported_us=%lld dsp_reported_calls=%llu\n",
+                (unsigned long long) p.calls, (long long) p.submit_us,
+                (long long) p.wait_us, (long long) p.dsp_us,
+                (unsigned long long) p.dsp_reported_calls);
+        }
+        ctx->dispatch_profile_enabled = false;
+    };
+    std::unique_ptr<int, decltype(finish_profile)> profile_guard(&profile_token, finish_profile);
+
     if (ggml_backend_htp_use_hybrid_graph_compute()) {
-        struct ggml_cplan cplan = ggml_graph_plan(cgraph, ctx->n_threads > 0 ? ctx->n_threads : 1, nullptr);
+        const int n_threads = ctx->n_threads > 0 ? ctx->n_threads : 1;
+        const char * persistent = std::getenv("SD_HTP_PERSISTENT_THREADPOOL");
+        const bool reuse_pool = persistent == nullptr || std::strcmp(persistent, "0") != 0;
+        if (ctx->threadpool != nullptr &&
+            (!reuse_pool || ctx->threadpool_n_threads != n_threads)) {
+            ggml_htp_threadpool_free(ctx->threadpool);
+            ctx->threadpool = nullptr;
+            ctx->threadpool_n_threads = 0;
+        }
+        if (reuse_pool && ctx->threadpool == nullptr) {
+            auto params = ggml_threadpool_params_default(n_threads);
+            params.paused = true;
+            const int64_t begin_us = ggml_time_us();
+            ctx->threadpool = ggml_htp_threadpool_new(&params);
+            ctx->threadpool_create_us += ggml_time_us() - begin_us;
+            ctx->threadpool_n_threads = n_threads;
+            ++ctx->threadpool_creations;
+        }
+        ++ctx->hybrid_graphs;
+        struct ggml_cplan cplan = ggml_htp_graph_plan(cgraph, n_threads, ctx->threadpool);
         if (!ggml_backend_htp_ensure_work_data(ctx, cplan.work_size)) {
             std::fprintf(stderr, "ggml-htp: failed to allocate hybrid work buffer (%zu bytes)\n", cplan.work_size);
             return GGML_STATUS_FAILED;
@@ -2835,6 +2875,7 @@ void ggml_backend_htp_set_n_threads(ggml_backend_t backend, int n_threads) {
 
     auto * ctx = static_cast<ggml_backend_htp_context *>(backend->context);
     if (ctx != nullptr) {
+        std::lock_guard<std::mutex> lock(ctx->compute_mutex);
         ctx->n_threads = n_threads > 0 ? n_threads : 1;
     }
 }

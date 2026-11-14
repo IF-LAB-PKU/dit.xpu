@@ -94,6 +94,13 @@ public:
         bool valid() const { return slot != static_cast<size_t>(-1); }
     };
 
+    struct Reservation {
+        Handle handle;
+        size_t offset = 0;
+        size_t bytes = 0;
+        void* data = nullptr;
+    };
+
     HtpPackedStagingPool(size_t budget_bytes,
                          size_t slot_capacity,
                          AllocateFn allocate,
@@ -116,6 +123,10 @@ public:
     bool acquire_for_session(size_t required_bytes,
                              int logical_session_index,
                              Handle* handle);
+    // Main-thread allocation/binding only. The lease must remain held until
+    // any background writer completes. Reserving never changes a tensor.
+    bool reserve_unbound(Handle handle, size_t bytes, Reservation* reservation);
+    bool bind_reserved(const Reservation& reservation, ggml_tensor* tensor);
     bool place_tensor(const LoadFn& load,
                       Handle handle,
                       const std::string& name,

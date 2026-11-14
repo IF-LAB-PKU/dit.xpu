@@ -1,4 +1,5 @@
 #include "htp_packed_staging.h"
+#include "htp_weight_prefetch.hpp"
 
 #include "htp_tensor_flags.h"
 #include "flux.hpp"
@@ -16,6 +17,7 @@
 #include <filesystem>
 #include <map>
 #include <vector>
+#include <stdexcept>
 
 #define CHECK(condition)                                                                 \
     do {                                                                                 \
@@ -33,6 +35,134 @@ extern "C" bool ggml_backend_htp_opencl_release_qkv_generation(ggml_backend_t, u
 }
 #endif
 
+static void test_prefetch() {
+    auto* ctx = ggml_init({1024 * 1024, nullptr, true});
+    auto* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 64);
+    auto* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 64);
+    int allocations = 0;
+    std::atomic<int> writers{0};
+    auto bank = [&](size_t budget = 256) {
+        return std::make_unique<HtpPackedStagingPool>(budget, 128, 2,
+            [&](size_t bytes, int owner) {
+                ++allocations;
+                return HtpPackedStagingPool::Allocation{std::malloc(bytes), nullptr, owner, owner + 10};
+            }, [&](const HtpPackedStagingPool::Allocation& allocation) {
+                CHECK(writers.load() == 0);
+                --allocations;
+                std::free(allocation.data);
+            });
+    };
+    const std::vector<HtpWeightPrefetch::Weight> weights{
+        {a, "a", 128, GGML_TYPE_F16, 0}, {b, "b", 128, GGML_TYPE_F16, 1}};
+    // A released generation can never bind a stale raw reservation.
+    {
+        auto pool = bank();
+        HtpPackedStagingPool::Handle handle;
+        HtpPackedStagingPool::Reservation stale;
+        CHECK(pool->acquire_for_session(128, 0, &handle));
+        CHECK(pool->reserve_unbound(handle, 128, &stale));
+        CHECK(a->data == nullptr);
+        CHECK(pool->release(&handle));
+        CHECK(pool->acquire_for_session(128, 0, &handle));
+        CHECK(!pool->bind_reserved(stale, a));
+        CHECK(pool->release(&handle));
+    }
+    {
+        // The active bank stays usable while the next bank's reader is gated.
+        auto active = bank();
+        HtpPackedStagingPool::Handle handle;
+        CHECK(active->acquire_for_session(128, 0, &handle));
+        CHECK(active->place_tensor([](const std::string&, void* p, size_t n) {
+            std::memset(p, 7, n); return true;
+        }, handle, "a", a));
+        void* original = a->data;
+        std::promise<void> entered, proceed;
+        auto gate = proceed.get_future().share();
+        HtpWeightPrefetch pipeline;
+        CHECK(pipeline.start(bank(), weights, [&](const std::string& name, void* p, size_t n, ggml_type type) {
+            CHECK(type == GGML_TYPE_F16);
+            if (name == "a") { entered.set_value(); gate.wait(); }
+            std::memset(p, name == "a" ? 21 : 22, n);
+            return true;
+        }));
+        entered.get_future().wait();
+        CHECK(pipeline.pending());
+        CHECK(a->data == original && b->data == nullptr);
+        CHECK(static_cast<unsigned char*>(a->data)[127] == 7);
+        proceed.set_value();
+        auto ready = pipeline.take();
+        CHECK(ready && !pipeline.pending() && ready->load_us >= 0);
+        CHECK(a->data == original); // take joins but does not bind
+        CHECK(active->unbind_tensor(handle, a));
+        CHECK(active->release(&handle));
+        CHECK(ready->bind());
+        CHECK(ready->pool->session_for_handle(ready->handles[0]) == 0);
+        CHECK(ready->pool->session_for_handle(ready->handles[1]) == 1);
+        CHECK(static_cast<unsigned char*>(a->data)[127] == 21);
+        CHECK(static_cast<unsigned char*>(b->data)[127] == 22);
+    }
+    CHECK(a->data == nullptr && b->data == nullptr && allocations == 0);
+    for (int failure = 0; failure < 3; ++failure) {
+        HtpWeightPrefetch pipeline;
+        auto load = [=](const std::string& name, void* p, size_t n, ggml_type) {
+            std::memset(p, 33, n);
+            if (name == "b") {
+                if (failure == 1) throw std::runtime_error("injected read exception");
+                return false;
+            }
+            return true;
+        };
+        if (failure == 2) CHECK(!pipeline.start(bank(128), weights, load));
+        else { CHECK(pipeline.start(bank(), weights, load)); CHECK(!pipeline.take()); }
+        CHECK(a->data == nullptr && b->data == nullptr && allocations == 0);
+    }
+    {
+        // Partial binding must roll back when a later reservation is invalid.
+        HtpWeightPrefetch pipeline;
+        CHECK(pipeline.start(bank(), weights, [](const std::string&, void*, size_t, ggml_type) { return true; }));
+        auto ready = pipeline.take();
+        CHECK(ready);
+        ready->reservations[1].bytes = 1;
+        CHECK(!ready->bind());
+        CHECK(a->data != nullptr && b->data == nullptr);
+    }
+    CHECK(a->data == nullptr && b->data == nullptr && allocations == 0);
+    {
+        // Destruction drains an in-flight reader before freeing reservations.
+        std::promise<void> entered, begin_destroy;
+        auto destruction = begin_destroy.get_future();
+        auto pipeline = std::make_unique<HtpWeightPrefetch>();
+        CHECK(pipeline->start(bank(), weights, [&](const std::string& name, void* p, size_t n, ggml_type) {
+            ++writers;
+            if (name == "a") { entered.set_value(); destruction.wait(); }
+            std::memset(p, 44, n);
+            --writers;
+            return true;
+        }));
+        entered.get_future().wait();
+        begin_destroy.set_value();
+        pipeline.reset();
+    }
+    CHECK(a->data == nullptr && b->data == nullptr && allocations == 0);
+    {
+        HtpWeightPrefetch pipeline;
+        auto load = [](const std::string&, void* p, size_t n, ggml_type) {
+            std::memset(p, 55, n); return true;
+        };
+        CHECK(pipeline.start(bank(), weights, load));
+        pipeline.cancel();
+        pipeline.cancel();
+        CHECK(!pipeline.pending() && allocations == 0);
+        CHECK(pipeline.start(bank(), weights, load));
+        auto ready = pipeline.take();
+        CHECK(ready && ready->bind());
+        CHECK(static_cast<unsigned char*>(b->data)[127] == 55);
+    }
+    CHECK(a->data == nullptr && b->data == nullptr && allocations == 0);
+    ggml_free(ctx);
+    std::puts("prefetch lifecycle checks passed");
+}
+
 static TensorWriteInfo info_for(ggml_tensor* tensor) {
     TensorWriteInfo info;
     info.n_dims = ggml_n_dims(tensor);
@@ -42,6 +172,7 @@ static TensorWriteInfo info_for(ggml_tensor* tensor) {
 }
 
 int main() {
+    test_prefetch();
     // Packed Flux2 Q/K/V must remain graph views so gallocr can release the
     // shared storage after the attention node consumes the last view.
     ggml_context* packed_ctx = ggml_init({64 * 1024 * 1024, nullptr, false});
