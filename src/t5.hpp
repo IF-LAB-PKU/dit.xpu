@@ -32,6 +32,7 @@ public:
 
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
         ggml_tensor* w = params["weight"];
+        if(ctx->htp_text_native_aux) return ggml_htp_native_aux(ctx->ggml_ctx,x,w,nullptr,1,1,eps);
         x              = ggml_rms_norm(ctx->ggml_ctx, x, eps);
         x              = ggml_mul(ctx->ggml_ctx, x, w);
         return x;
@@ -75,7 +76,7 @@ public:
 
         auto hidden_gelu   = ggml_ext_gelu(ctx->ggml_ctx, wi_0->forward(ctx, x), true);
         auto hidden_linear = wi_1->forward(ctx, x);
-        x                  = ggml_mul_inplace(ctx->ggml_ctx, hidden_gelu, hidden_linear);
+        x                  = sd_htp_model_mul(ctx, hidden_gelu, hidden_linear);
         x                  = wo->forward(ctx, x);
         return x;
     }
@@ -95,7 +96,7 @@ public:
 
         auto forwarded_states = layer_norm->forward(ctx, x);
         forwarded_states      = DenseReluDense->forward(ctx, forwarded_states);
-        x                     = ggml_add_inplace(ctx->ggml_ctx, forwarded_states, x);
+        x                     = sd_htp_model_add(ctx, forwarded_states, x);
         return x;
     }
 };
@@ -166,9 +167,12 @@ public:
             }
         }
 
-        k = ggml_ext_scale(ctx->ggml_ctx, k, ::sqrtf(static_cast<float>(d_head)), true);
-
-        x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, num_heads, mask);  // [N, n_token, d_head * n_head]
+        if (ctx->htp_text_native) {
+            x=ggml_htp_native_attention(ctx->ggml_ctx,q,k,v,mask,num_heads,1.f);
+        } else {
+            k = ggml_ext_scale(ctx->ggml_ctx, k, ::sqrtf(static_cast<float>(d_head)), true);
+            x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, num_heads, mask);
+        }  // [N, n_token, d_head * n_head]
 
         x = out_proj->forward(ctx, x);  // [N, n_token, model_dim]
         return {x, past_bias};
@@ -200,7 +204,7 @@ public:
         auto output              = ret.first;
         past_bias                = ret.second;
 
-        x = ggml_add_inplace(ctx->ggml_ctx, output, x);
+        x = sd_htp_model_add(ctx, output, x);
         return {x, past_bias};
     }
 };

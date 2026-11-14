@@ -1,5 +1,7 @@
 # Experimental HTP VAE convolution
 
+This page describes the base hybrid convolution path. [Native HTP models](htp_native_models.md) adds DSP convolution sampling, attention, GroupNorm/SiLU and residual operations, eliminating full CPU im2col.
+
 `SD_HTP_VAE=1` enables a hybrid VAE path, initially validated with SD3.5 Medium.
 Standard `Conv2d` layers run as CPU F32 im2col plus the existing HTP FP16-weight
 GEMM. GroupNorm, activations, attention and output layout conversion retain their
@@ -187,3 +189,5 @@ existing DiT FastRPC mapping path. The documented two-session option completed
 the A/B pair. Enabling staging with `--max-vram 1` separately hit an existing
 T5 graph-cut cache error, so staging was disabled for the successful runs. Neither
 workaround changes the VAE implementation; no DSP-library changes were required.
+
+Optional native DSP epilogue fusion is described in [htp_fusion.md](htp_fusion.md).

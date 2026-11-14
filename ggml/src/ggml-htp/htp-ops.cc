@@ -1128,6 +1128,49 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                        max_bias == 0 && logit_softcap == 0;
             }
         case GGML_OP_CUSTOM:
+            if (ggml_htp_native_kind(dst)) {
+                if (!dlsym(ops_dl_handle,"htp_ops_native_model_version")) return false;
+                const auto *p=ggml_htp_native_meta(dst); if(!p || dst->type!=GGML_TYPE_F32 || !ggml_is_contiguous(dst)) return false;
+                if(ggml_htp_native_kind(dst)==3) {
+                    auto *x=dst->src[0],*w=dst->src[1],*b=dst->src[2];int mode=p->v[0];
+                    if(!x || x->type!=GGML_TYPE_F32 || !ggml_is_contiguous(x) || ggml_nelements(x)>INT32_MAX || mode<0 || mode>8) return false;
+                    for(auto *t:{w,b}) if(t && (t->type!=GGML_TYPE_F32 || !ggml_is_contiguous(t))) return false;
+                    if(mode==8) return !w && !b && p->v[3]>0 && p->v[4]>0 && p->v[5]>0 && ggml_nelements(x)==(int64_t)p->v[3]*p->v[4]*p->v[5];
+                    if(mode<=2) {int64_t n=mode==2?x->ne[2]:x->ne[0];
+                        return (!w || ggml_nelements(w)==n) && (!b || ggml_nelements(b)==n) && (mode!=2 || (p->v[1]>0 && n%p->v[1]==0));}
+                    return !b && ((mode==3 || mode==4) ? (w && ggml_nelements(x)%ggml_nelements(w)==0) : !w);
+                }
+                if(ggml_htp_native_kind(dst)==1) {
+                    auto *w=dst->src[0],*a=dst->src[1],*b=dst->src[2];
+                    return w && a && w->type==GGML_TYPE_F16 && a->type==GGML_TYPE_F32 &&
+                        ggml_is_contiguous(w) && ggml_is_contiguous(a) && w->ne[0]%32==0 && w->ne[1]%32==0 &&
+                        p->v[0]>0 && p->v[1]>0 && p->v[2]>0 && p->v[2]<=w->ne[1] &&
+                        w->ne[0]==GGML_PAD(p->v[0]*p->v[1]*a->ne[2],32) &&
+                        (!b || (b->type==GGML_TYPE_F32 && ggml_is_contiguous(b) && ggml_nelements(b)==p->v[2]));
+                }
+                auto *q=dst->src[0],*k=dst->src[1],*v=dst->src[2],*mask=dst->src[3];
+                return q && k && v && p->v[0]>0 && q->ne[0]%p->v[0]==0 && (q->ne[0]/p->v[0])%64==0 &&
+                    q->type==GGML_TYPE_F32 && k->type==GGML_TYPE_F32 && v->type==GGML_TYPE_F32 &&
+                    ggml_is_contiguous(q) && ggml_is_contiguous(k) && ggml_is_contiguous(v) &&
+                    q->ne[0]==k->ne[0] && ggml_are_same_shape(k,v) && q->ne[2]==k->ne[2] && q->ne[3]==1 &&
+                    (!mask || (mask->type==GGML_TYPE_F32 && ggml_is_contiguous(mask) && mask->ne[0]==k->ne[1] &&
+                    mask->ne[1]>=q->ne[1] && (mask->ne[2]==1 || mask->ne[2]==p->v[0]) && (mask->ne[3]==1 || mask->ne[3]==q->ne[2])));
+            }
+            if (ggml_htp_f16_epilogue_mode(dst)>=0) {
+                const auto *w=dst->src[0], *a=dst->src[1], *b=dst->src[2];
+                if (!w || !a || dst->src[3] ||
+                    !dlsym(ops_dl_handle,"htp_ops_f16_epilogue_version")) return false;
+                int mode=ggml_htp_f16_epilogue_mode(dst);
+                int64_t channels=mode==3 ? dst->ne[1] : dst->ne[0];
+                return dst->type==GGML_TYPE_F32 && w->type==GGML_TYPE_F16 &&
+                    a->type==GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_is_contiguous(a) &&
+                    ggml_is_contiguous(dst) && ggml_n_dims(w)==2 && ggml_n_dims(a)<=2 &&
+                    w->ne[0]==a->ne[0] && w->ne[0]>0 && w->ne[0]%32==0 && w->ne[1]%32==0 &&
+                    a->ne[1]>0 && a->ne[1]<=INT32_MAX && w->ne[0]<=INT32_MAX && w->ne[1]<=INT32_MAX &&
+                    channels>0 && channels<=w->ne[1] && (mode==3 || channels==w->ne[1]) &&
+                    ggml_nelements(dst)==channels*a->ne[1] &&
+                    (!b || (b->type==GGML_TYPE_F32 && ggml_is_contiguous(b) && ggml_nelements(b)==channels));
+            }
             if (htp_w8a8_is_node(dst)) return true;
             if (is_fused_anchor_attention_custom(dst)) {
                 return true;
@@ -1196,6 +1239,16 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
     }
 }
 
+// Print the precise placement condition before a native custom op reaches its
+// CPU-abort callback. Enabled only for model coverage diagnostics.
+static bool htp_native_runtime_diagnostic(const ggml_tensor *dst) {
+    if((ggml_htp_native_kind(dst)||ggml_htp_f16_epilogue_mode(dst)>=0) && getenv("SD_HTP_MODEL_COVERAGE")) {
+        fprintf(stderr,"htp_native_runtime_rejected node=%s tag=%d static=%d dst_ready=%d\n",dst->name,ggml_htp_custom_tag(dst),htp_ops_support_op(dst),tensor_ready_for_htp_dispatch(dst));
+        for(int i=0;i<GGML_MAX_SRC;++i) if(dst->src[i]) fprintf(stderr,"  src%d name=%s ready=%d cont=%d shape=[%lld,%lld,%lld,%lld]\n",i,dst->src[i]->name,tensor_ready_for_htp_dispatch(dst->src[i]),ggml_is_contiguous(dst->src[i]),(long long)dst->src[i]->ne[0],(long long)dst->src[i]->ne[1],(long long)dst->src[i]->ne[2],(long long)dst->src[i]->ne[3]);
+    }
+    return false;
+}
+
 bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
     const bool fused_anchor_named = dst != nullptr && dst->op == GGML_OP_CUSTOM &&
         std::strcmp(dst->name, "htp_fused_anchor_attention") == 0;
@@ -1206,7 +1259,7 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
         if (trace_fused_anchor) {
             std::fprintf(stderr, "fused_anchor_runtime_support rejected stage=static_support\n");
         }
-        return false;
+        return htp_native_runtime_diagnostic(dst);
     }
     const bool view_backed_custom = dst != nullptr && dst->op == GGML_OP_CUSTOM &&
         (is_qkv_mul_rms_packed_custom(dst) ||
@@ -1218,7 +1271,7 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
             std::fprintf(stderr, "fused_anchor_runtime_support rejected stage=dst_rpcmem\n");
             dump_tensor_rpcmem_state("fused_dst", dst);
         }
-        return false;
+        return htp_native_runtime_diagnostic(dst);
     }
 
     if (is_fused_anchor_attention_custom(dst)) {
@@ -1230,7 +1283,7 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
             if (trace_fused_anchor) {
                 std::fprintf(stderr, "fused_anchor_runtime_support rejected stage=expected_sizes\n");
             }
-            return false;
+            return htp_native_runtime_diagnostic(dst);
         }
         for (int i = 0; i < 5; ++i) {
             if (!tensor_ready_for_htp_dispatch_view_backed(dst->src[i])) {
@@ -1239,7 +1292,7 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
                                  "fused_anchor_runtime_support rejected stage=src_rpcmem src=%d\n", i);
                     dump_tensor_rpcmem_state("fused_src", dst->src[i]);
                 }
-                return false;
+                return htp_native_runtime_diagnostic(dst);
             }
         }
         htp_tensor_range ranges[6] = {};
@@ -1254,7 +1307,7 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
                                  i, sizes[i]);
                     dump_tensor_rpcmem_state("fused_range", tensors[i]);
                 }
-                return false;
+                return htp_native_runtime_diagnostic(dst);
             }
         }
         for (int i = 1; i < 6; ++i) {
@@ -1266,7 +1319,7 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
                                  i, ranges[0].offset, ranges[0].size,
                                  ranges[i].offset, ranges[i].size);
                 }
-                return false;
+                return htp_native_runtime_diagnostic(dst);
             }
         }
         return true;
@@ -1274,14 +1327,14 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
 
     if (is_qkv_mul_rms_packed_custom(dst)) {
         for (int i = 0; i < 5; ++i) {
-            if (!tensor_ready_for_htp_dispatch_view_backed(dst->src[i])) return false;
+            if (!tensor_ready_for_htp_dispatch_view_backed(dst->src[i])) return htp_native_runtime_diagnostic(dst);
         }
         return tensor_ready_for_htp_dispatch_view_backed(dst);
     }
 
     if (is_qkv_mul_rms_packed_rope_custom(dst)) {
         for (int i = 0; i <= 5; ++i) {
-            if (dst->src[i] != nullptr && !tensor_ready_for_htp_dispatch_view_backed(dst->src[i])) return false;
+            if (dst->src[i] != nullptr && !tensor_ready_for_htp_dispatch_view_backed(dst->src[i])) return htp_native_runtime_diagnostic(dst);
         }
         return tensor_ready_for_htp_dispatch_view_backed(dst);
     }
@@ -1290,18 +1343,18 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
         for (int i = 0; i < 10; ++i) {
             if (dst->src[i] == nullptr) continue;
             if (!tensor_ready_for_htp_dispatch_view_backed(dst->src[i])) {
-                return false;
+                return htp_native_runtime_diagnostic(dst);
             }
         }
         if (!tensor_ready_for_htp_dispatch_view_backed(dst)) {
-            return false;
+            return htp_native_runtime_diagnostic(dst);
         }
         return true;
     }
 
     if (is_qkv_mul_rms_packed_dual_rope_custom(dst)) {
         for (int i = 0; i <= 10; ++i) {
-            if (dst->src[i] != nullptr && !tensor_ready_for_htp_dispatch_view_backed(dst->src[i])) return false;
+            if (dst->src[i] != nullptr && !tensor_ready_for_htp_dispatch_view_backed(dst->src[i])) return htp_native_runtime_diagnostic(dst);
         }
         return tensor_ready_for_htp_dispatch_view_backed(dst);
     }
@@ -1317,14 +1370,14 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
                     continue;
                 }
                 if (!tensor_ready_for_htp_dispatch_view_backed(src)) {
-                    return false;
+                    return htp_native_runtime_diagnostic(dst);
                 }
             }
             return true;
         }
     }
 
-    if (dst->op == GGML_OP_MUL_MAT) {
+    if (dst->op == GGML_OP_MUL_MAT || ggml_htp_f16_epilogue_mode(dst)>=0 || ggml_htp_native_kind(dst)==1) {
         const ggml_tensor * weight     = dst->src[0];
         const ggml_tensor * activation = dst->src[1];
         if (weight != nullptr && activation != nullptr &&
@@ -1333,7 +1386,8 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
             activation->type == GGML_TYPE_F32) {
             ggml_tensor * packed_weight = ggml_backend_htp_get_packed_f16_weight(weight);
             return tensor_ready_for_htp_dispatch(activation) &&
-                   tensor_ready_for_htp_dispatch(packed_weight);
+                   tensor_ready_for_htp_dispatch(packed_weight) &&
+                   (!dst->src[2] || tensor_ready_for_htp_dispatch_view_backed(dst->src[2]));
         }
     }
 
@@ -1343,7 +1397,7 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
             continue;
         }
         if (!tensor_ready_for_htp_dispatch(src)) {
-            return false;
+            return htp_native_runtime_diagnostic(dst);
         }
     }
 
@@ -2650,6 +2704,57 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
 
         case GGML_OP_CUSTOM:
             {
+                if (ggml_htp_native_kind(dst)) {
+                    const auto *meta=ggml_htp_native_meta(dst);
+                    auto *packed=ggml_htp_native_kind(dst)==1 ? ggml_backend_htp_get_packed_f16_weight(dst->src[0]) : nullptr;
+                    if(prepare_tensor_rpcmem_mapping_with_extra(dst,packed)!=0) return -EINVAL;
+                    auto &mapper=ctx->dispatch_mapper();
+                    auto addr=[&](ggml_tensor *t)->RpcmemBufAddr {if(!t) return {-1,0};auto m=mapper.get_tensor_mapping(t);return {m.first,(int32_t)m.second};};
+                    if(ggml_htp_native_kind(dst)==3) {
+                        NativeAuxParams p{};auto *x=dst->src[0],*w=dst->src[1];
+                        p.output=addr(dst);p.input=addr(x);p.weight=addr(w);p.bias=addr(dst->src[2]);
+                        p.mode=meta->v[0];p.groups=meta->v[1];p.activation=meta->v[2];p.eps=meta->scale;
+                        p.count=ggml_nelements(x);p.width=x->ne[0];p.channels=x->ne[2];p.spatial=x->ne[0]*x->ne[1];p.batch=x->ne[3];p.other_count=w?ggml_nelements(w):0;
+                        if(p.mode==8) {p.width=meta->v[3];p.spatial=meta->v[4];p.batch=meta->v[5];}
+                        memcpy(param_buf,&p,sizeof(p));op_index=HTP_OPS_MODEL_AUX_F32;args_size=sizeof(p);dispatch_m=p.count;dispatch_k=p.mode;dispatch_n=1;
+                    } else if(ggml_htp_native_kind(dst)==1) {
+                        auto *a=dst->src[1]; NativeConvParams p{};
+                        p.output=addr(dst);p.activation=addr(a);p.weight=addr(packed);p.bias=addr(dst->src[2]);
+                        p.iw=a->ne[0];p.ih=a->ne[1];p.ic=a->ne[2];p.batch=a->ne[3];p.ow=dst->ne[0];p.oh=dst->ne[1];
+                        p.kw=meta->v[0];p.kh=meta->v[1];p.oc=meta->v[2];p.sx=meta->v[3];p.sy=meta->v[4];
+                        p.px=meta->v[5];p.py=meta->v[6];p.dx=meta->v[7];p.dy=meta->v[8];p.kp=packed->ne[0];p.np=packed->ne[1];p.upscale=meta->v[9];
+                        memcpy(param_buf,&p,sizeof(p));op_index=HTP_OPS_CONV2D_NCHW_F16;args_size=sizeof(p);
+                        dispatch_m=p.ow*p.oh;dispatch_k=p.kp;dispatch_n=p.oc;
+                    } else {
+                        NativeAttentionParams p{};auto *q=dst->src[0],*k=dst->src[1],*mask=dst->src[3];
+                        p.output=addr(dst);p.q=addr(q);p.k=addr(k);p.v=addr(dst->src[2]);p.mask=addr(mask);
+                        p.queries=q->ne[1];p.keys=k->ne[1];p.heads=meta->v[0];p.dim=q->ne[0]/p.heads;p.batch=q->ne[2];
+                        p.mask_heads=mask?mask->ne[2]:0;p.mask_batch=mask?mask->ne[3]:0;p.mask_queries=mask?mask->ne[1]:0;p.scale=meta->scale;
+                        memcpy(param_buf,&p,sizeof(p));op_index=HTP_OPS_ATTENTION_F32;args_size=sizeof(p);
+                        dispatch_m=p.queries;dispatch_k=p.keys;dispatch_n=p.heads;
+                    }
+                    break;
+                }
+                if (ggml_htp_f16_epilogue_mode(dst)>=0) {
+                    auto *packed=ggml_backend_htp_get_packed_f16_weight(dst->src[0]);
+                    if (!packed || prepare_tensor_rpcmem_mapping_with_extra(dst,packed)!=0) return -EINVAL;
+                    auto &mapper=ctx->dispatch_mapper();
+                    auto out=mapper.get_tensor_mapping(dst), a=mapper.get_tensor_mapping(dst->src[1]);
+                    auto w=mapper.get_tensor_mapping(packed);
+                    F16EpilogueParams p{};
+                    p.output={out.first,(int32_t)out.second};
+                    p.activation={a.first,(int32_t)a.second};
+                    p.weight={w.first,(int32_t)w.second};
+                    p.bias={-1,0};
+                    if (dst->src[2]) { auto b=mapper.get_tensor_mapping(dst->src[2]); p.bias={b.first,(int32_t)b.second}; }
+                    p.m=(int32_t)dst->src[1]->ne[1]; p.k=(int32_t)packed->ne[0]; p.n=(int32_t)packed->ne[1];
+                    p.mode=ggml_htp_f16_epilogue_mode(dst); p.channels=(int32_t)(p.mode==3 ? dst->ne[1] : dst->ne[0]);
+                    p.elapsed_us=-1;
+                    std::memcpy(param_buf,&p,sizeof(p));
+                    op_index=HTP_OPS_MAT_MUL_F16_EPILOGUE; args_size=sizeof(p);
+                    dispatch_m=p.m; dispatch_k=p.k; dispatch_n=p.n;
+                    break;
+                }
                 if (htp_w8a8_is_node(dst)) {
                     if (prepare_tensor_rpcmem_mapping(dst) != 0) return -EINVAL;
                     auto &mapper = ctx->dispatch_mapper();
@@ -3401,7 +3506,21 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     int ret = completed_request->state;
     auto * compute_request = reinterpret_cast<OpComputeRequest *>(completed_request->data);
     int64_t linear_elapsed_us = -1;
-    if (ret == 0 && op_index == HTP_OPS_MAT_MUL_NATIVE_W8A8)
+    if (ret==0 && getenv("SD_HTP_MODEL_PROFILE")) {
+        if(op_index==HTP_OPS_CONV2D_NCHW_F16) {
+            const auto *p=reinterpret_cast<const NativeConvParams *>(compute_request->payload);
+            fprintf(stderr,"htp_native_conv m=%d k=%d n=%d elapsed_us=%d gather_us=%d weight_us=%d hmx_us=%d store_us=%d\n",dispatch_m,dispatch_k,dispatch_n,p->elapsed_us,p->gather_us,p->weight_us,p->hmx_us,p->store_us);
+        } else if(op_index==HTP_OPS_ATTENTION_F32) {
+            const auto *p=reinterpret_cast<const NativeAttentionParams *>(compute_request->payload);
+            fprintf(stderr,"htp_native_attention queries=%d keys=%d heads=%d dim=%d elapsed_us=%d\n",p->queries,p->keys,p->heads,p->dim,p->elapsed_us);
+        } else if(op_index==HTP_OPS_MODEL_AUX_F32) {
+            const auto *p=reinterpret_cast<const NativeAuxParams *>(compute_request->payload);
+            fprintf(stderr,"htp_native_aux mode=%d count=%d elapsed_us=%d\n",p->mode,p->count,p->elapsed_us);
+        }
+    }
+    if (ret == 0 && op_index == HTP_OPS_MAT_MUL_F16_EPILOGUE)
+        linear_elapsed_us = reinterpret_cast<const F16EpilogueParams *>(compute_request->payload)->elapsed_us;
+    else if (ret == 0 && op_index == HTP_OPS_MAT_MUL_NATIVE_W8A8)
         linear_elapsed_us = reinterpret_cast<const NativeW8A8Params *>(compute_request->payload)->elapsed_us;
     else if (ret == 0 && op_index == HTP_OPS_MAT_MUL_PERMUTED_W16A32 && args_size == sizeof(MatMulProfileParams))
         linear_elapsed_us = reinterpret_cast<const MatMulProfileParams *>(compute_request->payload)->elapsed_us;

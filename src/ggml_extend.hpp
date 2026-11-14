@@ -2012,6 +2012,13 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_scale(ggml_context* ctx,
 __STATIC_INLINE__ ggml_tensor* ggml_ext_gelu(ggml_context* ctx,
                                              ggml_tensor* x,
                                              bool inplace = false) {
+    if (inplace && sd_env_flag_enabled_default("SD_HTP_TEXT_FUSION",sd_env_flag_enabled("SD_HTP_TEXT_NATIVE"))) {
+        auto *linear=x->op==GGML_OP_RESHAPE ? x->src[0] : x;
+        if (ggml_htp_f16_epilogue_mode(linear)==0) {
+            auto *out=ggml_htp_f16_epilogue(ctx,linear->src[0],linear->src[1],linear->src[2],1,linear->ne[0]);
+            return ggml_reshape_4d(ctx,out,x->ne[0],x->ne[1],x->ne[2],x->ne[3]);
+        }
+    }
     if (!ggml_is_contiguous(x)) {
         x = ggml_cont(ctx, x);
     }
@@ -2026,6 +2033,13 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_gelu(ggml_context* ctx,
 __STATIC_INLINE__ ggml_tensor* ggml_ext_gelu_quick(ggml_context* ctx,
                                                    ggml_tensor* x,
                                                    bool inplace = false) {
+    if (inplace && sd_env_flag_enabled_default("SD_HTP_TEXT_FUSION",sd_env_flag_enabled("SD_HTP_TEXT_NATIVE"))) {
+        auto *linear=x->op==GGML_OP_RESHAPE ? x->src[0] : x;
+        if (ggml_htp_f16_epilogue_mode(linear)==0) {
+            auto *out=ggml_htp_f16_epilogue(ctx,linear->src[0],linear->src[1],linear->src[2],2,linear->ne[0]);
+            return ggml_reshape_4d(ctx,out,x->ne[0],x->ne[1],x->ne[2],x->ne[3]);
+        }
+    }
     if (!ggml_is_contiguous(x)) {
         x = ggml_cont(ctx, x);
     }
@@ -2043,6 +2057,21 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
                                                ggml_tensor* b,
                                                bool force_prec_f32 = false,
                                                float scale         = 1.f) {
+    // Fusion-only mode targets MLP inputs with an activation to absorb.
+    // Native text mode also keeps bias-only projections on the DSP; its
+    // wider routing can trade latency for fewer CPU compute operations.
+    const bool htp_mlp_input = std::strstr(w->name, ".mlp.fc1.weight") != nullptr ||
+                               std::strstr(w->name, ".DenseReluDense.wi_0.weight") != nullptr ||
+                               std::strstr(w->name, ".DenseReluDense.wi.weight") != nullptr;
+    if ((htp_mlp_input || sd_env_flag_enabled("SD_HTP_TEXT_NATIVE")) && std::strncmp(w->name,"text_encoders.",14)==0 && scale==1.f &&
+        sd_env_flag_enabled("SD_HTP_TEXT") && sd_env_flag_enabled_default("SD_HTP_TEXT_FUSION",sd_env_flag_enabled("SD_HTP_TEXT_NATIVE")) &&
+        (w->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32)!=0) {
+        const int64_t n1=x->ne[1],n2=x->ne[2],n3=x->ne[3];
+        if (!ggml_is_contiguous(x)) x=ggml_cont(ctx,x);
+        x=ggml_reshape_2d(ctx,x,x->ne[0],n1*n2*n3);
+        x=ggml_htp_f16_epilogue(ctx,w,x,b,0,w->ne[1]);
+        return ggml_reshape_4d(ctx,x,x->ne[0],n1,n2,n3);
+    }
     if (scale != 1.f) {
         x = ggml_ext_scale(ctx, x, scale);
     }
@@ -2154,7 +2183,10 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
     }
 
     if (htp_packed != nullptr) {
-        x = ggml_htp_vae_conv_2d(ctx, x, w, htp_packed, s0, s1, p0, p1, d0, d1);
+        const bool fused=scale==1.f && (sd_env_flag_enabled("SD_HTP_VAE_FUSION") || sd_env_flag_enabled_default("SD_HTP_VAE_NATIVE_CONV",sd_env_flag_enabled("SD_HTP_VAE_NATIVE")));
+        x = ggml_htp_vae_conv_2d(ctx, x, w, htp_packed, s0, s1, p0, p1, d0, d1,
+                                128 * 1024 * 1024, fused ? b : nullptr, fused);
+        if (fused) b=nullptr;
     } else if (direct) {
         x = ggml_conv_2d_direct(ctx, w, x, s0, s1, p0, p1, d0, d1);
     } else {
@@ -6122,6 +6154,9 @@ struct GGMLRunnerContext {
     bool flash_attn_enabled                                          = false;
     bool block_sparse_attn_enabled                                   = false;
     bool htp_attention_enabled                                       = false;
+    bool htp_text_native = false;
+    bool htp_text_native_aux = false;
+    bool htp_vae_native = false;
     bool conv2d_direct_enabled                                       = false;
     bool circular_x_enabled                                          = false;
     bool circular_y_enabled                                          = false;
@@ -7117,7 +7152,7 @@ protected:
 
     // 统一收敛 diffusion 里 HTP F16 matmul 的基础 type/shape 判断；weight layout 资格由离线 packed flag 单独决定。
     bool is_htp_supported_f16_mul_mat(ggml_tensor* node) const {
-        if (!htp_op_routing_enabled() || node == nullptr || node->op != GGML_OP_MUL_MAT) {
+        if (!htp_op_routing_enabled() || node == nullptr || (node->op != GGML_OP_MUL_MAT && (ggml_htp_f16_epilogue_mode(node)<0 && ggml_htp_native_kind(node)!=1))) {
             return false;
         }
         if (!ggml_backend_supports_op(htp_backend, node)) {
@@ -7137,7 +7172,7 @@ protected:
         return node->type == GGML_TYPE_F32 &&
                weight->type == GGML_TYPE_F16 &&
                activation->type == GGML_TYPE_F32 &&
-               row_major_2d_layout_ok &&
+               (row_major_2d_layout_ok || ggml_htp_native_kind(node)==1) &&
                ggml_is_contiguous(weight) &&
                ggml_is_contiguous(activation) &&
                ggml_is_contiguous(node);
@@ -7187,6 +7222,7 @@ protected:
         if (node->op == GGML_OP_CUSTOM && std::strcmp(node->name,"htp_w8a8_linear") == 0) {
             return ggml_backend_supports_op(htp_backend,node);
         }
+        if (ggml_htp_native_kind(node)>=2) return ggml_backend_supports_op(htp_backend,node);
         if (is_htp_supported_packed_qkv(node)) {
             return true;
         }
@@ -7711,7 +7747,7 @@ protected:
             if (tensor == node) {
                 return true;
             }
-            if (node->op == GGML_OP_MUL_MAT &&
+            if ((node->op == GGML_OP_MUL_MAT || (ggml_htp_f16_epilogue_mode(node)>=0 || ggml_htp_native_kind(node)==1)) &&
                 node->src[0] != nullptr &&
                 tensor == node->src[0] &&
                 htp_packed_f16_weight_is_prepared(node->src[0])) {
@@ -7722,7 +7758,7 @@ protected:
                 if (tensor == src) {
                     return true;
                 }
-                if (j == 0 && node->op == GGML_OP_MUL_MAT) {
+                if (j == 0 && (node->op == GGML_OP_MUL_MAT || (ggml_htp_f16_epilogue_mode(node)>=0 || ggml_htp_native_kind(node)==1))) {
                     continue;
                 }
                 // HTP attention inputs are commonly PERMUTE/RESHAPE views. The
@@ -7761,6 +7797,16 @@ protected:
             selected_nodes.push_back(node);
         }
 
+        if(sd_env_flag_enabled("SD_HTP_MODEL_COVERAGE")) {
+            std::map<std::string,int> counts;
+            for(int i=0;i<ggml_graph_n_nodes(gf);++i) {auto *n=ggml_graph_node(gf,i);
+                bool offload=std::find(selected_nodes.begin(),selected_nodes.end(),n)!=selected_nodes.end();
+                std::string key=offload?"HTP:":"CPU:";
+                key+=ggml_htp_native_kind(n)==1?"CONV":ggml_htp_native_kind(n)==2?"ATTENTION":ggml_htp_native_kind(n)==3?"NORM_OR_ELEMENTWISE":ggml_op_name(n->op);
+                ++counts[key];
+            }
+            for(auto &c:counts) LOG_INFO("htp_model_coverage %s count=%d",c.first.c_str(),c.second);
+        }
         return selected_nodes;
     }
 
@@ -7791,10 +7837,10 @@ protected:
                 }
 
                 const bool routed_to_htp_matmul = j == 0 &&
-                                                   node->op == GGML_OP_MUL_MAT &&
+                                                   (node->op == GGML_OP_MUL_MAT || (ggml_htp_f16_epilogue_mode(node)>=0 || ggml_htp_native_kind(node)==1)) &&
                                                    src == node->src[0] &&
                                                    is_htp_target_op(node);
-                if (j == 0 && node->op == GGML_OP_MUL_MAT && !routed_to_htp_matmul &&
+                if (j == 0 && (node->op == GGML_OP_MUL_MAT || (ggml_htp_f16_epilogue_mode(node)>=0 || ggml_htp_native_kind(node)==1)) && !routed_to_htp_matmul &&
                     sd_env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE")) {
                     LOG_INFO("flux2_packed_matmul_skip weight_contig=%d activation_contig=%d output_contig=%d backend_support=%d prepared=%d weight=[%lld,%lld] activation=[%lld,%lld,%lld,%lld]",
                              ggml_is_contiguous(node->src[0]) ? 1 : 0,
@@ -8037,7 +8083,12 @@ protected:
             segment.names.insert(kv.first);
         }
         const size_t num_tensors = ggml_tensor_num(segment.ctx);
-        segment.buffer = ggml_backend_alloc_ctx_tensors(segment.ctx, runtime_backend);
+        // Native norm/residual/attention may consume a cut's cached output
+        // directly. Cached leaves cannot be relocated by the graph allocator.
+        const bool native_cache=htp_op_routing_enabled() &&
+            ((htp_text_encoder_enabled_ && sd_env_flag_enabled("SD_HTP_TEXT_NATIVE")) ||
+             (htp_vae_conv_enabled_ && sd_env_flag_enabled("SD_HTP_VAE_NATIVE")));
+        segment.buffer = ggml_backend_alloc_ctx_tensors(segment.ctx, native_cache ? htp_backend : runtime_backend);
         if (segment.buffer == nullptr) {
             LOG_ERROR("%s alloc cache backend buffer failed, num_tensors=%zu",
                       get_desc().c_str(), num_tensors);
@@ -9675,6 +9726,10 @@ public:
         GGMLRunnerContext runner_ctx;
         runner_ctx.ggml_ctx              = compute_ctx;
         runner_ctx.backend               = runtime_backend;
+        runner_ctx.htp_text_native = htp_text_encoder_enabled_ && htp_op_routing_enabled() && sd_env_flag_enabled("SD_HTP_TEXT_NATIVE");
+        runner_ctx.htp_text_native_aux = runner_ctx.htp_text_native &&
+            (!std::getenv("SD_HTP_TEXT_NATIVE_AUX") || sd_env_flag_enabled("SD_HTP_TEXT_NATIVE_AUX"));
+        runner_ctx.htp_vae_native = htp_vae_conv_enabled_ && htp_op_routing_enabled() && sd_env_flag_enabled("SD_HTP_VAE_NATIVE");
         runner_ctx.flash_attn_enabled    = flash_attn_enabled;
         runner_ctx.block_sparse_attn_enabled = block_sparse_attn_enabled;
         runner_ctx.htp_attention_enabled  = htp_attention_enabled;
@@ -10712,6 +10767,19 @@ public:
     }
 };
 
+static inline ggml_tensor *sd_htp_model_add(GGMLRunnerContext *ctx,ggml_tensor *x,ggml_tensor *y) {
+ return (ctx->htp_text_native_aux||ctx->htp_vae_native) && ggml_are_same_shape(x,y) ? ggml_htp_native_aux(ctx->ggml_ctx,x,y,nullptr,3,0,0) : ggml_add(ctx->ggml_ctx,x,y);
+}
+static inline ggml_tensor *sd_htp_model_mul(GGMLRunnerContext *ctx,ggml_tensor *x,ggml_tensor *y) {
+ return (ctx->htp_text_native_aux||ctx->htp_vae_native) && ggml_are_same_shape(x,y) ? ggml_htp_native_aux(ctx->ggml_ctx,x,y,nullptr,4,0,0) : ggml_mul(ctx->ggml_ctx,x,y);
+}
+static inline ggml_tensor *sd_htp_model_silu(GGMLRunnerContext *ctx,ggml_tensor *x) {
+ if(ctx->htp_vae_native && ggml_htp_native_kind(x)==3 && ggml_htp_native_meta(x)->v[0]==2) {
+  auto *y=ggml_htp_native_aux(ctx->ggml_ctx,x->src[0],x->src[1],x->src[2],2,ggml_htp_native_meta(x)->v[1],ggml_htp_native_meta(x)->scale);
+  ((ggml_htp_native_metadata *)ggml_htp_native_meta(y))->v[2]=1;return y;
+ }
+ return ctx->htp_vae_native ? ggml_htp_native_aux(ctx->ggml_ctx,x,nullptr,nullptr,5,0,0) : ggml_silu_inplace(ctx->ggml_ctx,x);
+}
 class LayerNorm : public UnaryBlock {
 protected:
     int64_t normalized_shape;
@@ -10758,6 +10826,7 @@ public:
                 }
             }
         }
+        if(ctx->htp_text_native_aux) return ggml_htp_native_aux(ctx->ggml_ctx,x,w,b,0,1,eps);
         return ggml_ext_layer_norm(ctx->ggml_ctx, x, w, b, eps);
     }
 };
@@ -10801,6 +10870,7 @@ public:
                 b = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, b, prefix + "bias");
             }
         }
+        if(ctx->htp_vae_native) return ggml_htp_native_aux(ctx->ggml_ctx,x,w,b,2,num_groups,1e-6f);
         return ggml_ext_group_norm(ctx->ggml_ctx, x, w, b, num_groups);
     }
 };
@@ -10906,7 +10976,8 @@ public:
             v = v_proj->forward(ctx, x);
         }
 
-        x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, n_head, mask, false);  // [N, n_token, embed_dim]
+        x = ctx->htp_text_native ? ggml_htp_native_attention(ctx->ggml_ctx,q,k,v,mask,n_head,1.f/sqrtf(embed_dim/n_head))
+                                : ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, n_head, mask, false);  // [N, n_token, embed_dim]
 
         x = out_proj->forward(ctx, x);  // [N, n_token, embed_dim]
         return x;

@@ -259,6 +259,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml.h
     include/ggml-cpu.h
     include/ggml-htp.h
+    include/ggml-htp-fusion.h
     include/ggml-alloc.h
     include/ggml-backend.h
     include/ggml-cpp.h

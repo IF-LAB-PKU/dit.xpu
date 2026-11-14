@@ -39,12 +39,12 @@ public:
 
         auto h = x;
         h      = norm1->forward(ctx, h);
-        h      = ggml_silu_inplace(ctx->ggml_ctx, h);  // swish
+        h      = sd_htp_model_silu(ctx, h);  // swish
         h      = conv1->forward(ctx, h);
         // return h;
 
         h = norm2->forward(ctx, h);
-        h = ggml_silu_inplace(ctx->ggml_ctx, h);  // swish
+        h = sd_htp_model_silu(ctx, h);  // swish
         // dropout, skip for inference
         h = conv2->forward(ctx, h);
 
@@ -55,7 +55,7 @@ public:
             x = nin_shortcut->forward(ctx, x);  // [N, out_channels, h, w]
         }
 
-        h = ggml_add(ctx->ggml_ctx, h, x);
+        h = sd_htp_model_add(ctx, h, x);
         return h;  // [N, out_channels, h, w]
     }
 };
@@ -68,13 +68,13 @@ protected:
     void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") {
         auto iter = tensor_storage_map.find(prefix + "proj_out.weight");
         if (iter != tensor_storage_map.end()) {
-            if (iter->second.n_dims == 4 && use_linear) {
+            if ((iter->second.n_dims == 4 || iter->second.layout==TensorDataLayout::HTP_CONV2D_W16A32) && use_linear) {
                 use_linear         = false;
                 blocks["q"]        = std::make_shared<Conv2d>(in_channels, in_channels, std::pair{1, 1});
                 blocks["k"]        = std::make_shared<Conv2d>(in_channels, in_channels, std::pair{1, 1});
                 blocks["v"]        = std::make_shared<Conv2d>(in_channels, in_channels, std::pair{1, 1});
                 blocks["proj_out"] = std::make_shared<Conv2d>(in_channels, in_channels, std::pair{1, 1});
-            } else if (iter->second.n_dims == 2 && !use_linear) {
+            } else if (iter->second.n_dims == 2 && iter->second.layout!=TensorDataLayout::HTP_CONV2D_W16A32 && !use_linear) {
                 use_linear         = true;
                 blocks["q"]        = std::make_shared<Linear>(in_channels, in_channels);
                 blocks["k"]        = std::make_shared<Linear>(in_channels, in_channels);
@@ -120,7 +120,7 @@ public:
         ggml_tensor* k;
         ggml_tensor* v;
         if (use_linear) {
-            h_ = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, h_, 1, 2, 0, 3));  // [N, h, w, in_channels]
+            h_ = (ctx->htp_vae_native ? ggml_htp_native_transpose(ctx->ggml_ctx,h_,c,h*w,n,c,h*w,n,1) : ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, h_, 1, 2, 0, 3)));  // [N, h, w, in_channels]
             h_ = ggml_reshape_3d(ctx->ggml_ctx, h_, c, h * w, n);                        // [N, h * w, in_channels]
 
             q = q_proj->forward(ctx, h_);  // [N, h * w, in_channels]
@@ -128,33 +128,34 @@ public:
             v = v_proj->forward(ctx, h_);  // [N, h * w, in_channels]
         } else {
             q = q_proj->forward(ctx, h_);                                              // [N, in_channels, h, w]
-            q = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, q, 1, 2, 0, 3));  // [N, h, w, in_channels]
+            q = (ctx->htp_vae_native ? ggml_htp_native_transpose(ctx->ggml_ctx,q,c,h*w,n,c,h*w,n,1) : ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, q, 1, 2, 0, 3)));  // [N, h, w, in_channels]
             q = ggml_reshape_3d(ctx->ggml_ctx, q, c, h * w, n);                        // [N, h * w, in_channels]
 
             k = k_proj->forward(ctx, h_);                                              // [N, in_channels, h, w]
-            k = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, k, 1, 2, 0, 3));  // [N, h, w, in_channels]
+            k = (ctx->htp_vae_native ? ggml_htp_native_transpose(ctx->ggml_ctx,k,c,h*w,n,c,h*w,n,1) : ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, k, 1, 2, 0, 3)));  // [N, h, w, in_channels]
             k = ggml_reshape_3d(ctx->ggml_ctx, k, c, h * w, n);                        // [N, h * w, in_channels]
 
             v = v_proj->forward(ctx, h_);                                              // [N, in_channels, h, w]
-            v = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, v, 1, 2, 0, 3));  // [N, h, w, in_channels]
+            v = (ctx->htp_vae_native ? ggml_htp_native_transpose(ctx->ggml_ctx,v,c,h*w,n,c,h*w,n,1) : ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, v, 1, 2, 0, 3)));  // [N, h, w, in_channels]
             v = ggml_reshape_3d(ctx->ggml_ctx, v, c, h * w, n);                        // [N, h * w, in_channels]
         }
 
-        h_ = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, 1, nullptr, false, ctx->flash_attn_enabled);
+        h_ = ctx->htp_vae_native ? ggml_htp_native_attention(ctx->ggml_ctx,q,k,v,nullptr,1,1.f/sqrtf(c))
+                                : ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, 1, nullptr, false, ctx->flash_attn_enabled);
 
         if (use_linear) {
             h_ = proj_out->forward(ctx, h_);  // [N, h * w, in_channels]
 
-            h_ = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, h_, 1, 0, 2, 3));  // [N, in_channels, h * w]
+            h_ = (ctx->htp_vae_native ? ggml_htp_native_transpose(ctx->ggml_ctx,h_,h*w,c,n,w,h,c,n) : ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, h_, 1, 0, 2, 3)));  // [N, in_channels, h * w]
             h_ = ggml_reshape_4d(ctx->ggml_ctx, h_, w, h, c, n);                         // [N, in_channels, h, w]
         } else {
-            h_ = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, h_, 1, 0, 2, 3));  // [N, in_channels, h * w]
+            h_ = (ctx->htp_vae_native ? ggml_htp_native_transpose(ctx->ggml_ctx,h_,h*w,c,n,w,h,c,n) : ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, h_, 1, 0, 2, 3)));  // [N, in_channels, h * w]
             h_ = ggml_reshape_4d(ctx->ggml_ctx, h_, w, h, c, n);                         // [N, in_channels, h, w]
 
             h_ = proj_out->forward(ctx, h_);  // [N, in_channels, h, w]
         }
 
-        h_ = ggml_add(ctx->ggml_ctx, h_, x);
+        h_ = sd_htp_model_add(ctx, h_, x);
         return h_;
     }
 };
@@ -254,7 +255,7 @@ public:
 
         // end
         h = norm_out->forward(ctx, h);
-        h = ggml_silu_inplace(ctx->ggml_ctx, h);  // nonlinearity/swish
+        h = sd_htp_model_silu(ctx, h);  // nonlinearity/swish
         h = conv_out->forward(ctx, h);            // [N, z_channels*2, h, w]
         return h;
     }
@@ -363,7 +364,7 @@ public:
         }
 
         h = norm_out->forward(ctx, h);
-        h = ggml_silu_inplace(ctx->ggml_ctx, h);  // nonlinearity/swish
+        h = sd_htp_model_silu(ctx, h);  // nonlinearity/swish
         h = conv_out->forward(ctx, h);            // [N, out_ch, h*8, w*8]
         return h;
     }

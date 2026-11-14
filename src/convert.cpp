@@ -40,6 +40,11 @@ static ggml_type get_export_tensor_type(ModelLoader& model_loader,
     return tensor_type;
 }
 
+static bool htp_vae_attention_projection(const std::string& name,int dims) {
+    if(dims!=2 || !starts_with(name,"first_stage_model.") || name.find(".attn_1.")==std::string::npos) return false;
+    return ends_with(name,".q.weight") || ends_with(name,".k.weight") || ends_with(name,".v.weight") || ends_with(name,".proj_out.weight");
+}
+
 static bool load_tensors_for_export(ModelLoader& model_loader,
                                     ggml_context* ggml_ctx,
                                     ggml_type type,
@@ -53,7 +58,7 @@ static bool load_tensors_for_export(ModelLoader& model_loader,
         ggml_type tensor_type   = (htp_pack_vae || !text_kind.empty()) ? tensor_storage.type
             : get_export_tensor_type(model_loader, tensor_storage, type, tensor_type_rules, force_f16);
         if (htp_pack_vae && starts_with(name, "first_stage_model.") &&
-            ends_with(name, ".weight") && tensor_storage.n_dims == 4) {
+            ends_with(name, ".weight") && (tensor_storage.n_dims == 4 || htp_vae_attention_projection(name,tensor_storage.n_dims))) {
             tensor_type = GGML_TYPE_F16;
         }
         if (!text_kind.empty() && sd_htp_text_linear_name(name, text_kind)) {
@@ -186,9 +191,13 @@ static bool pack_htp_vae_weights_for_export(ggml_context* packed_ctx,
     for (auto& info : tensors) {
         auto* source = info.tensor;
         const std::string name = source->name;
-        if (!starts_with(name, "first_stage_model.") || !ends_with(name, ".weight") || info.n_dims != 4) continue;
+        const bool projection=htp_vae_attention_projection(name,info.n_dims);
+        if (!starts_with(name, "first_stage_model.") || !ends_with(name, ".weight") || (info.n_dims != 4 && !projection)) continue;
         if (source->type != GGML_TYPE_F16) return false;
-        const int64_t k = source->ne[0] * source->ne[1] * source->ne[2], n = source->ne[3];
+        // A token-wise attention Linear is exactly a 1x1 NCHW convolution.
+        const std::array<int64_t,4> shape=projection ? std::array<int64_t,4>{1,1,source->ne[0],source->ne[1]} :
+            std::array<int64_t,4>{source->ne[0],source->ne[1],source->ne[2],source->ne[3]};
+        const int64_t k = shape[0]*shape[1]*shape[2], n=shape[3];
         const int64_t kp = GGML_PAD(k, 32), np = GGML_PAD(n, 32);
         std::vector<ggml_fp16_t> padded(size_t(kp * np), 0);
         const auto* data = static_cast<const ggml_fp16_t*>(source->data);
@@ -199,7 +208,7 @@ static bool pack_htp_vae_weights_for_export(ggml_context* packed_ctx,
         ggml_set_name(packed, name.c_str());
         packed->data = storage.back().data();
         metadata.htp_vae_conv_tensors.push_back(name);
-        metadata.htp_vae_conv_shapes.insert(metadata.htp_vae_conv_shapes.end(), source->ne, source->ne + 4);
+        metadata.htp_vae_conv_shapes.insert(metadata.htp_vae_conv_shapes.end(), shape.begin(), shape.end());
         info = TensorWriteInfo{};
         info.tensor = packed;
         info.n_dims = 2;

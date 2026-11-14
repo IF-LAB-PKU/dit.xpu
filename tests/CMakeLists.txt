@@ -338,3 +338,13 @@ add_executable(${TEST_TARGET} test-vae-offline-pack.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
 target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/.. ${CMAKE_CURRENT_LIST_DIR}/../src)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+if(GGML_HTP)
+    # Explicit device correctness test; needs a matched host/DSP runtime.
+    add_executable(test-htp-native test-htp-native.cpp)
+    target_link_libraries(test-htp-native PRIVATE ggml)
+    target_compile_options(test-htp-native PRIVATE -UNDEBUG)
+    add_executable(test-htp-f16-fusion test-htp-f16-fusion.cpp)
+    target_link_libraries(test-htp-f16-fusion PRIVATE ggml)
+    target_compile_options(test-htp-f16-fusion PRIVATE -UNDEBUG)
+endif()

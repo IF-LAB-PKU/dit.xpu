@@ -46,6 +46,7 @@ int main(int argc, char** argv) {
         std::printf("encoder=%s mode=%s load_seconds=%.6f packed=%zu deferred=%zu params_bytes=%zu\n",
                     kind.c_str(), argv[3], seconds() - t0, packed, deferred, encoder.get_params_buffer_size());
         for (int r = 0; r < repeats; ++r) {
+            if (std::getenv("SD_HTP_FUSION_AB")) setenv("SD_HTP_TEXT_FUSION",r%2 ? "1" : "0",1);
             ConditionerParams p;
             p.text = argc > 6 ? argv[6] : "a cat sitting on a wooden table";
             const double start = seconds();
@@ -67,6 +68,7 @@ int main(int argc, char** argv) {
             const std::string prefix = std::string(argv[5]) + "." + std::to_string(r);
             save(prefix + ".cross.f32", condition.c_crossattn);
             save(prefix + ".vector.f32", condition.c_vector);
+            std::printf("fusion=%d ",sd_env_flag_enabled("SD_HTP_TEXT_FUSION") ? 1 : 0);
             std::printf("encoder=%s mode=%s repeat=%d seconds=%.6f params_and_staging_bytes=%zu cross_elements=%lld vector_elements=%lld\n",
                         kind.c_str(), argv[3], r, elapsed, encoder.get_params_buffer_size(),
                         (long long)condition.c_crossattn.numel(), (long long)condition.c_vector.numel());

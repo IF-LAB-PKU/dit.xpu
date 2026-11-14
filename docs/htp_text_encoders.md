@@ -1,5 +1,7 @@
 # SD3 text encoders with offline HTP weights
 
+This page describes the base Linear-only path. [Native HTP models](htp_native_models.md) adds attention, normalization, residual/gating and expanded epilogues, with device correctness and performance results.
+
 `SD_HTP_TEXT=1` routes SD3 CLIP-L, CLIP-G and T5-XXL Linear layers to the existing
 HTP FP16-weight/F32-activation GEMM. Embedding lookups, normalization, activation,
 attention and tokenization retain their CPU implementations. No new DSP kernels
@@ -155,3 +157,5 @@ The tested packed models are stored on the device under
 `/data/local/tmp/sd-text-htp-20261114/`. Host logs, F32 comparisons, the generation
 script and PNG are in the sibling workspace directory
 `text-htp-results-20261114/`.
+
+Optional native DSP epilogue fusion is described in [htp_fusion.md](htp_fusion.md).

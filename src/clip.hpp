@@ -70,8 +70,8 @@ public:
         auto layer_norm2 = std::dynamic_pointer_cast<LayerNorm>(blocks["layer_norm2"]);
         auto mlp         = std::dynamic_pointer_cast<CLIPMLP>(blocks["mlp"]);
 
-        x = ggml_add(ctx->ggml_ctx, x, self_attn->forward(ctx, layer_norm1->forward(ctx, x), mask));
-        x = ggml_add(ctx->ggml_ctx, x, mlp->forward(ctx, layer_norm2->forward(ctx, x)));
+        x = sd_htp_model_add(ctx, x, self_attn->forward(ctx, layer_norm1->forward(ctx, x), mask));
+        x = sd_htp_model_add(ctx, x, mlp->forward(ctx, layer_norm2->forward(ctx, x)));
         return x;
     }
 };

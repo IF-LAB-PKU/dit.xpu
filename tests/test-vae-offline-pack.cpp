@@ -32,6 +32,9 @@ int main() {
     ggml_set_name(probe, "decoder.probe.weight");
     for (int i = 0; i < 12; ++i) static_cast<float*>(probe->data)[i] = 1e-9f * (i + 1);
 
+    auto *projection=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,32,32);
+    ggml_set_name(projection,"decoder.mid.attn_1.q.weight");
+    for(int i=0;i<1024;++i) static_cast<float *>(projection->data)[i]=sinf(i*.05f);
     const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto root = std::filesystem::temp_directory_path() / ("sd-vae-offline-" + std::to_string(nonce));
     std::filesystem::create_directory(root);
@@ -39,7 +42,7 @@ int main() {
     const auto output = (root / "packed.gguf").string();
     const auto bad = (root / "bad.gguf").string();
     std::string error;
-    CHECK(write_safetensors_file(input, {info(source), info(norm), info(probe)}, &error));
+    CHECK(write_safetensors_file(input, {info(source), info(norm), info(probe),info(projection)}, &error));
     CHECK(convert_vae_htp(input.c_str(), output.c_str()));
     CHECK(!convert_vae_htp(input.c_str(), (root / "packed.safetensors").string().c_str()));
 
@@ -48,8 +51,8 @@ int main() {
     CHECK(read_gguf_file(output, tensors, &error, &metadata));
     CHECK(metadata.htp_packed_vae && !metadata.htp_packed_dit);
     CHECK(metadata.htp_layout == "permuted_w16a32");
-    CHECK(metadata.htp_vae_conv_tensors.size() == 1);
-    CHECK(metadata.htp_vae_conv_shapes == std::vector<int64_t>({3, 3, 16, 5}));
+    CHECK(metadata.htp_vae_conv_tensors.size() == 2);
+    CHECK(metadata.htp_vae_conv_shapes == std::vector<int64_t>({3, 3, 16, 5,1,1,32,32}));
     ModelLoader loader;
     // Canonical names must survive the same vae. prefix used by inference.
     CHECK(loader.init_from_file_and_convert_name(output, "vae.", VERSION_SD3));
@@ -61,6 +64,9 @@ int main() {
     CHECK((packed.htp_conv_shape == std::array<int64_t, 4>{3, 3, 16, 5}));
     CHECK(stored.at("first_stage_model.decoder.norm_out.weight").type == GGML_TYPE_BF16);
     CHECK(stored.at("first_stage_model.decoder.probe.weight").type == GGML_TYPE_F32);
+    const auto &projected=stored.at("first_stage_model.decoder.mid.attn_1.q.weight");
+    CHECK(projected.layout==TensorDataLayout::HTP_CONV2D_W16A32 && projected.type==GGML_TYPE_F16);
+    CHECK((projected.htp_conv_shape==std::array<int64_t,4>{1,1,32,32}));
     Conv2d conv(16, 5, {3, 3});
     conv.init(ctx, stored, "first_stage_model.decoder.conv_in");
     auto* weight = conv.get_param("weight");

@@ -88,8 +88,13 @@ public:
 inline ggml_tensor* ggml_htp_vae_conv_2d(ggml_context* ctx, ggml_tensor* x,
                                         ggml_tensor* weight, ggml_tensor* packed,
                                         int s0, int s1, int p0, int p1, int d0, int d1,
-                                        size_t chunk_bytes = 128 * 1024 * 1024) {
+                                        size_t chunk_bytes = 128 * 1024 * 1024,
+                                        ggml_tensor* bias = nullptr, bool fused = false) {
     GGML_ASSERT(x->type == GGML_TYPE_F32 && packed != nullptr);
+    const char *native=getenv("SD_HTP_VAE_NATIVE_CONV");
+    if (!native) native=getenv("SD_HTP_VAE_NATIVE");
+    if (native && strcmp(native,"0")!=0) return ggml_htp_native_conv(ctx,packed,x,bias,
+        weight->ne[0],weight->ne[1],weight->ne[3],s0,s1,p0,p1,d0,d1);
     auto* cols = ggml_im2col(ctx, weight, x, s0, s1, p0, p1, d0, d1, true, GGML_TYPE_F32);
     const int64_t ow = cols->ne[1], oh = cols->ne[2], batch = cols->ne[3];
     cols = ggml_reshape_2d(ctx, cols, cols->ne[0], ow * oh * batch);
@@ -109,9 +114,15 @@ inline ggml_tensor* ggml_htp_vae_conv_2d(ggml_context* ctx, ggml_tensor* x,
             activation = ggml_cont(ctx, ggml_view_2d(ctx, cols, cols->ne[0], count,
                                                      cols->nb[1], first * cols->nb[1]));
         }
-        auto* tile = ggml_mul_mat(ctx, packed, activation);
-        ggml_format_name(tile, "htp_vae_conv_%s_%lld", weight->name, (long long) first);
-        result = result ? ggml_concat(ctx, result, tile, 1) : tile;
+        auto* tile = fused ? ggml_htp_f16_epilogue(ctx,packed,activation,bias,3,weight->ne[3])
+                           : ggml_mul_mat(ctx, packed, activation);
+        if (!fused) ggml_format_name(tile, "htp_vae_conv_%s_%lld", weight->name, (long long) first);
+        result = result ? ggml_concat(ctx, result, tile, fused ? 0 : 1) : tile;
+    }
+    if (fused) {
+        result=ggml_reshape_4d(ctx,result,ow,oh,batch,weight->ne[3]);
+        result=ggml_permute(ctx,result,0,1,3,2);
+        return ggml_is_contiguous(result) ? result : ggml_cont(ctx,result);
     }
     result = ggml_reshape_4d(ctx, result, packed->ne[1], ow, oh, batch);
     if (weight->ne[3] != packed->ne[1]) {

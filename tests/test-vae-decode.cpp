@@ -9,29 +9,36 @@ static double seconds() {
 
 struct ConvRunner : GGMLRunner {
     ggml_tensor* weight;
+    ggml_tensor* bias;
     int stride, pad, dilation;
     ConvRunner(ggml_backend_t cpu, ggml_backend_t htp, int ic, int oc, int kernel,
                int stride, int pad, int dilation)
         : GGMLRunner(cpu, cpu), stride(stride), pad(pad), dilation(dilation) {
         weight = ggml_new_tensor_4d(params_ctx, GGML_TYPE_F16, kernel, kernel, ic, oc);
         ggml_set_name(weight, "conv_test.weight");
+        bias=ggml_new_tensor_1d(params_ctx,GGML_TYPE_F32,oc);
         GGML_ASSERT(alloc_params_buffer());
         std::vector<ggml_fp16_t> w(ggml_nelements(weight));
         for (size_t i = 0; i < w.size(); ++i) w[i] = ggml_fp32_to_fp16(std::sin(float(i) * .17f) * .04f);
         ggml_backend_tensor_set(weight, w.data(), 0, ggml_nbytes(weight));
+        std::vector<float> b(oc);
+        for (int i=0;i<oc;++i) b[i]=.017f*std::cos(float(i));
+        ggml_backend_tensor_set(bias,b.data(),0,ggml_nbytes(bias));
         if (htp) { set_htp_backend(htp); set_htp_vae_conv_enabled(true); }
     }
     std::string get_desc() override { return "vae-conv-test"; }
-    sd::Tensor<float> run(const sd::Tensor<float>& input, bool htp) {
+    sd::Tensor<float> run(const sd::Tensor<float>& input, bool htp, bool fused=false, bool upscale=false) {
         auto build = [&]() {
             auto ctx = get_context();
             auto* x = make_input(input);
+            if(upscale) x=ggml_upscale(compute_ctx,x,2,GGML_SCALE_MODE_NEAREST);
             auto* packed = ctx.htp_conv_weight ? ctx.htp_conv_weight(weight) : nullptr;
             auto* out = packed
                 ? ggml_htp_vae_conv_2d(compute_ctx, x, weight, packed,
-                                        stride, stride, pad, pad, dilation, dilation, 16 * 1024)
-                : ggml_ext_conv_2d(compute_ctx, x, weight, nullptr,
+                                        stride, stride, pad, pad, dilation, dilation, 16 * 1024, fused ? bias : nullptr, fused)
+                : ggml_ext_conv_2d(compute_ctx, x, weight, bias,
                                     stride, stride, pad, pad, dilation, dilation);
+            if (packed && !fused) out=ggml_add(compute_ctx,out,ggml_reshape_4d(compute_ctx,bias,1,1,bias->ne[0],1));
             auto* graph = ggml_new_graph(compute_ctx);
             ggml_build_forward_expand(graph, out);
             if (htp) GGML_ASSERT(!collect_planned_htp_target_ops(graph).empty());
@@ -47,17 +54,19 @@ static void self_test(ggml_backend_t cpu, ggml_backend_t htp) {
     // Unequal spatial dimensions and batch=2 expose axis/order mistakes;
     // non-multiple channels exercise K/N padding (including RGB output).
     const int cases[][8] = {
+        {65, 9, 3, 5, 3, 1, 1, 1}, {64, 64, 512, 32, 3, 1, 1, 1},
         {11, 9, 3, 5, 3, 1, 1, 1}, {9, 7, 16, 32, 1, 1, 0, 1},
         {13, 11, 32, 3, 3, 2, 1, 1}, {11, 9, 32, 64, 3, 1, 2, 2},
     };
-    for (const auto& c : cases) {
+    for (const auto& c : cases) for(bool upscale:{false,true}) {
+        if(c[2]>=512 && upscale) continue;
         sd::Tensor<float> input({c[0], c[1], c[2], 2});
         for (int64_t i = 0; i < input.numel(); ++i) input[i] = std::sin(float(i) * .071f);
         ConvRunner reference(cpu, nullptr, c[2], c[3], c[4], c[5], c[6], c[7]);
-        auto expected = reference.run(input, false);
+        auto expected = reference.run(input, false, false, upscale);
         ConvRunner accelerated(cpu, htp, c[2], c[3], c[4], c[5], c[6], c[7]);
         for (int repeat = 0; repeat < 2; ++repeat) {
-            auto actual = accelerated.run(input, true);
+            auto actual = accelerated.run(input, true, repeat==1, upscale);
             GGML_ASSERT(actual.shape() == expected.shape());
             double max_error = 0, squared = 0;
             for (int64_t i = 0; i < actual.numel(); ++i) {
@@ -130,10 +139,13 @@ int main(int argc, char** argv) {
         }
         sd_tiling_params_t tiling{};
         for (int repeat = 0; repeat < repeats; ++repeat) {
+            const bool alternate=std::getenv("SD_HTP_FUSION_AB")!=nullptr;
+            if (alternate) setenv("SD_HTP_VAE_FUSION",repeat%2 ? "1" : "0",1);
             const double begin = seconds();
             auto output = vae.decode(threads, latent, tiling);
             GGML_ASSERT(!output.empty());
             for (int64_t i = 0; i < output.numel(); ++i) GGML_ASSERT(std::isfinite(output[i]));
+            std::printf("fusion=%d ",sd_env_flag_enabled("SD_HTP_VAE_FUSION") ? 1 : 0);
             std::printf("decode repeat=%d seconds=%.6f packed_count=%zu packed_bytes=%zu offline_count=%zu params_bytes=%zu elements=%lld\n",
                         repeat, seconds() - begin, vae.get_htp_vae_packed_count(),
                         vae.get_htp_vae_packed_bytes(), vae.get_htp_vae_offline_count(), vae.get_params_buffer_size(), (long long) output.numel());
@@ -141,8 +153,9 @@ int main(int argc, char** argv) {
                 GGML_ASSERT(vae.get_htp_vae_packed_count() == 0 && vae.get_htp_vae_packed_bytes() == 0);
             }
             std::fflush(stdout);
-            if (repeat == repeats - 1) {
-                std::ofstream file(argv[5], std::ios::binary);
+            if (alternate || repeat == repeats - 1) {
+                const std::string path=std::string(argv[5])+(alternate ? "."+std::to_string(repeat) : "");
+                std::ofstream file(path, std::ios::binary);
                 GGML_ASSERT(file.write(reinterpret_cast<const char*>(output.data()), output.numel() * sizeof(float)));
             }
         }

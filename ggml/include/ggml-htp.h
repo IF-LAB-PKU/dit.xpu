@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-htp-fusion.h"
 #include "ggml-backend.h"
 #include "ggml-htp-lifetime.h"
 
