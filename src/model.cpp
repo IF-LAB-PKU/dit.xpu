@@ -405,7 +405,8 @@ bool ModelLoader::init_from_gguf_file(const std::string& file_path, const std::s
     for (auto& tensor_storage : tensor_storages) {
         // LOG_DEBUG("%s", tensor_storage.name.c_str());
 
-        if (!starts_with(tensor_storage.name, prefix)) {
+        const bool canonical_vae_name = prefix == "vae." && starts_with(tensor_storage.name, "first_stage_model.");
+        if (!canonical_vae_name && !starts_with(tensor_storage.name, prefix)) {
             tensor_storage.name = prefix + tensor_storage.name;
         }
         tensor_storage.file_index = file_index;
@@ -1069,6 +1070,12 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
 #endif
                     }
 
+                    if (tensor_storage.layout != TensorDataLayout::REFERENCE && dst_tensor->type != tensor_storage.type) {
+                        LOG_ERROR("packed tensor cannot be converted to another type: %s", tensor_storage.name.c_str());
+                        failed = true;
+                        break;
+                    }
+
                     // skip mmapped tensors
                     if (dst_tensor->buffer != nullptr && dst_tensor->buffer == fdata.mmbuffer.get()) {
                         continue;
@@ -1277,7 +1284,8 @@ bool ModelLoader::load_tensors(std::map<std::string, ggml_tensor*>& tensors,
             *dst_tensor = real;
             return true;
         }
-        if (tensor_storage.layout == TensorDataLayout::HTP_PERMUTED_W16A32) {
+        if (tensor_storage.layout == TensorDataLayout::HTP_PERMUTED_W16A32 ||
+            tensor_storage.layout == TensorDataLayout::HTP_CONV2D_W16A32) {
             // GGUF 元数据已声明该权重是离线 packed 布局；打上 HTP-only flag 后，
             // runner 会把它放进 RPCMEM 并禁止 CPU fallback 按 row-major 解释这块数据。
             real->flags |= SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32;
@@ -1355,7 +1363,8 @@ bool ModelLoader::load_tensor_subset(const std::map<std::string, ggml_tensor*>& 
             *dst_tensor = real;
             return true;
         }
-        if (tensor_storage.layout == TensorDataLayout::HTP_PERMUTED_W16A32) {
+        if (tensor_storage.layout == TensorDataLayout::HTP_PERMUTED_W16A32 ||
+            tensor_storage.layout == TensorDataLayout::HTP_CONV2D_W16A32) {
             real->flags |= SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32;
         }
         const bool deferred =

@@ -2,6 +2,7 @@
 #define __SD_MODEL_IO_GGUF_IO_H__
 
 #include <string>
+#include <array>
 #include <vector>
 
 #include "tensor_storage.h"
@@ -10,6 +11,9 @@ struct GGUFHTPMetadata {
     bool htp_packed_dit = false;
     std::string htp_layout;
     std::vector<std::string> htp_packed_tensors;
+    bool htp_packed_vae = false;
+    std::vector<std::string> htp_vae_conv_tensors;
+    std::vector<int64_t> htp_vae_conv_shapes;
 };
 
 struct GGUFWriteOptions {

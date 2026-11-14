@@ -395,9 +395,11 @@ protected:
                            const std::string& prefix,
                            int& decoder_ch) {
         auto conv_in_iter = tensor_storage_map.find(get_tensor_name(prefix, "decoder.conv_in.weight"));
-        if (conv_in_iter != tensor_storage_map.end() && conv_in_iter->second.n_dims >= 4 && conv_in_iter->second.ne[3] > 0) {
+        if (conv_in_iter != tensor_storage_map.end() &&
+            (conv_in_iter->second.n_dims >= 4 || conv_in_iter->second.layout == TensorDataLayout::HTP_CONV2D_W16A32)) {
             int last_ch_mult             = dd_config.ch_mult.back();
-            int64_t conv_in_out_channels = conv_in_iter->second.ne[3];
+            int64_t conv_in_out_channels = conv_in_iter->second.layout == TensorDataLayout::HTP_CONV2D_W16A32
+                ? conv_in_iter->second.htp_conv_shape[3] : conv_in_iter->second.ne[3];
             if (last_ch_mult > 0 && conv_in_out_channels % last_ch_mult == 0) {
                 decoder_ch = static_cast<int>(conv_in_out_channels / last_ch_mult);
                 LOG_INFO("vae decoder: ch = %d", decoder_ch);
@@ -559,7 +561,7 @@ struct AutoEncoderKL : public VAE {
                 continue;
             }
             if (ends_with(name, "attn_1.proj_out.weight")) {
-                if (tensor_storage.n_dims == 2) {
+                if (tensor_storage.n_dims == 2 && tensor_storage.layout != TensorDataLayout::HTP_CONV2D_W16A32) {
                     use_linear_projection = true;
                 }
                 break;

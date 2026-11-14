@@ -42,6 +42,7 @@ struct SDCliParams {
     bool canny_preprocess = false;
     bool convert_name     = false;
     bool htp_pack_dit     = false;
+    bool htp_pack_vae     = false;
     bool force_f16        = false;
 
     preview_t preview_method = PREVIEW_NONE;
@@ -103,6 +104,10 @@ struct SDCliParams {
              "--htp-pack-dit",
             "convert standalone DIT weights to HTP packed W16A32 GGUF layout; HTP-only matmul fallback is forbidden",
              true, &htp_pack_dit},
+            {"",
+             "--htp-pack-vae",
+             "convert standalone SD3 VAE convolutions to HTP-only W16A32 GGUF (preserves other tensors)",
+             true, &htp_pack_vae},
             {"",
              "--force-f16",
              "convert every BF16 tensor to F16 (convert mode only)",
@@ -611,7 +616,13 @@ int main(int argc, const char* argv[]) {
     LOG_DEBUG("%s", gen_params.to_string().c_str());
 
     if (cli_params.mode == CONVERT) {
-        bool success = convert(ctx_params.model_path.c_str(),
+        if (cli_params.htp_pack_vae && (cli_params.htp_pack_dit || !ctx_params.vae_path.empty() || cli_params.force_f16)) {
+            LOG_ERROR("--htp-pack-vae takes a standalone -m VAE and cannot be combined with --htp-pack-dit, --vae or --force-f16");
+            return 1;
+        }
+        bool success = cli_params.htp_pack_vae
+            ? convert_vae_htp(ctx_params.model_path.c_str(), cli_params.output_path.c_str())
+            : convert(ctx_params.model_path.c_str(),
                                ctx_params.vae_path.c_str(),
                                cli_params.output_path.c_str(),
                                ctx_params.wtype,

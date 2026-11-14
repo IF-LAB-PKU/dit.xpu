@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <fstream>
+#include <limits>
+#include <map>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -16,6 +18,10 @@
 static constexpr const char* SD_GGUF_HTP_PACKED_DIT_KEY     = "sd.cpp.htp.packed_dit";
 static constexpr const char* SD_GGUF_HTP_LAYOUT_KEY         = "sd.cpp.htp.layout";
 static constexpr const char* SD_GGUF_HTP_PACKED_TENSORS_KEY = "sd.cpp.htp.packed_tensors";
+
+static constexpr const char* SD_GGUF_HTP_PACKED_VAE_KEY = "sd.cpp.htp.packed_vae";
+static constexpr const char* SD_GGUF_HTP_VAE_TENSORS_KEY = "sd.cpp.htp.vae_conv_tensors";
+static constexpr const char* SD_GGUF_HTP_VAE_SHAPES_KEY = "sd.cpp.htp.vae_conv_shapes";
 
 static void set_error(std::string* error, const std::string& message) {
     if (error != nullptr) {
@@ -54,6 +60,24 @@ static void read_htp_metadata_from_gguf(const gguf_context* ctx, GGUFHTPMetadata
         metadata->htp_layout = layout != nullptr ? layout : "";
     }
 
+    const int64_t vae_key = gguf_find_key(ctx, SD_GGUF_HTP_PACKED_VAE_KEY);
+    if (vae_key >= 0 && gguf_get_kv_type(ctx, vae_key) == GGUF_TYPE_BOOL) {
+        metadata->htp_packed_vae = gguf_get_val_bool(ctx, vae_key);
+    }
+    const int64_t vae_names = gguf_find_key(ctx, SD_GGUF_HTP_VAE_TENSORS_KEY);
+    if (vae_names >= 0 && gguf_get_kv_type(ctx, vae_names) == GGUF_TYPE_ARRAY &&
+        gguf_get_arr_type(ctx, vae_names) == GGUF_TYPE_STRING) {
+        for (size_t i = 0; i < gguf_get_arr_n(ctx, vae_names); ++i) {
+            metadata->htp_vae_conv_tensors.emplace_back(gguf_get_arr_str(ctx, vae_names, i));
+        }
+    }
+    const int64_t vae_shapes = gguf_find_key(ctx, SD_GGUF_HTP_VAE_SHAPES_KEY);
+    if (vae_shapes >= 0 && gguf_get_kv_type(ctx, vae_shapes) == GGUF_TYPE_ARRAY &&
+        gguf_get_arr_type(ctx, vae_shapes) == GGUF_TYPE_INT64) {
+        const auto* shapes = static_cast<const int64_t*>(gguf_get_arr_data(ctx, vae_shapes));
+        metadata->htp_vae_conv_shapes.assign(shapes, shapes + gguf_get_arr_n(ctx, vae_shapes));
+    }
+
     const int64_t packed_tensors_key = gguf_find_key(ctx, SD_GGUF_HTP_PACKED_TENSORS_KEY);
     if (packed_tensors_key < 0) {
         return;
@@ -86,6 +110,54 @@ static void apply_htp_metadata_to_tensors(const GGUFHTPMetadata& metadata, std::
             tensor_storage.layout = TensorDataLayout::HTP_PERMUTED_W16A32;
         }
     }
+}
+
+static bool apply_vae_metadata(const GGUFHTPMetadata& metadata,
+                                std::vector<TensorStorage>& tensors, std::string* error) {
+    if (!metadata.htp_packed_vae) {
+        if (!metadata.htp_vae_conv_tensors.empty() || !metadata.htp_vae_conv_shapes.empty()) {
+            set_error(error, "VAE packed tensors require sd.cpp.htp.packed_vae=true");
+            return false;
+        }
+        return true;
+    }
+    const auto& names = metadata.htp_vae_conv_tensors;
+    const auto& shapes = metadata.htp_vae_conv_shapes;
+    if (metadata.htp_layout != "permuted_w16a32" || names.empty() || shapes.size() != names.size() * 4) {
+        set_error(error, "invalid HTP VAE layout/shape metadata");
+        return false;
+    }
+    std::map<std::string, TensorStorage*> by_name;
+    for (auto& tensor : tensors) by_name.emplace(tensor.name, &tensor);
+    std::unordered_set<std::string> seen;
+    for (size_t i = 0; i < names.size(); ++i) {
+        auto found = by_name.find(names[i]);
+        if (found == by_name.end() || !seen.insert(names[i]).second) {
+            set_error(error, "missing or duplicate packed VAE tensor: " + names[i]);
+            return false;
+        }
+        auto& tensor = *found->second;
+        int64_t k = 1;
+        for (int axis = 0; axis < 4; ++axis) {
+            const int64_t dim = shapes[4 * i + axis];
+            if (dim <= 0 || dim > std::numeric_limits<int32_t>::max() ||
+                (axis < 3 && k > (std::numeric_limits<int64_t>::max() - 31) / dim)) {
+                set_error(error, "invalid packed VAE convolution shape: " + names[i]);
+                return false;
+            }
+            tensor.htp_conv_shape[axis] = dim;
+            if (axis < 3) k *= dim;
+        }
+        const int64_t n = tensor.htp_conv_shape[3];
+        if (tensor.type != GGML_TYPE_F16 || tensor.n_dims != 2 ||
+            tensor.ne[0] != GGML_PAD(k, 32) || tensor.ne[1] != GGML_PAD(n, 32) ||
+            tensor.layout != TensorDataLayout::REFERENCE) {
+            set_error(error, "packed VAE tensor has incompatible type, size or layout: " + names[i]);
+            return false;
+        }
+        tensor.layout = TensorDataLayout::HTP_CONV2D_W16A32;
+    }
+    return true;
 }
 
 bool is_gguf_file(const std::string& file_path) {
@@ -147,6 +219,16 @@ bool read_gguf_file(const std::string& file_path,
 
     GGUFHTPMetadata metadata;
     read_htp_metadata_from_gguf(ctx_gguf_, &metadata);
+    const int64_t vae_key = gguf_find_key(ctx_gguf_, SD_GGUF_HTP_PACKED_VAE_KEY);
+    const int64_t vae_names = gguf_find_key(ctx_gguf_, SD_GGUF_HTP_VAE_TENSORS_KEY);
+    const int64_t vae_shapes = gguf_find_key(ctx_gguf_, SD_GGUF_HTP_VAE_SHAPES_KEY);
+    if ((vae_key >= 0 && gguf_get_kv_type(ctx_gguf_, vae_key) != GGUF_TYPE_BOOL) ||
+        ((vae_names >= 0 || vae_shapes >= 0) && !metadata.htp_packed_vae)) {
+        set_error(error, "invalid HTP VAE metadata flag");
+        gguf_free(ctx_gguf_);
+        ggml_free(ctx_meta_);
+        return false;
+    }
 
     int n_tensors = static_cast<int>(gguf_get_n_tensors(ctx_gguf_));
 
@@ -169,6 +251,11 @@ bool read_gguf_file(const std::string& file_path,
     }
 
     apply_htp_metadata_to_tensors(metadata, tensor_storages);
+    if (!apply_vae_metadata(metadata, tensor_storages, error)) {
+        gguf_free(ctx_gguf_);
+        ggml_free(ctx_meta_);
+        return false;
+    }
     if (htp_metadata != nullptr) {
         *htp_metadata = metadata;
     }
@@ -210,6 +297,17 @@ bool write_gguf_file(const std::string& file_path,
             names.push_back(name.c_str());
         }
         gguf_set_arr_str(gguf_ctx, SD_GGUF_HTP_PACKED_TENSORS_KEY, names.data(), names.size());
+    }
+
+    if (options != nullptr && options->htp.htp_packed_vae) {
+        const auto& metadata = options->htp;
+        gguf_set_val_bool(gguf_ctx, SD_GGUF_HTP_PACKED_VAE_KEY, true);
+        gguf_set_val_str(gguf_ctx, SD_GGUF_HTP_LAYOUT_KEY, metadata.htp_layout.c_str());
+        std::vector<const char*> names;
+        for (const auto& name : metadata.htp_vae_conv_tensors) names.push_back(name.c_str());
+        gguf_set_arr_str(gguf_ctx, SD_GGUF_HTP_VAE_TENSORS_KEY, names.data(), names.size());
+        gguf_set_arr_data(gguf_ctx, SD_GGUF_HTP_VAE_SHAPES_KEY, GGUF_TYPE_INT64,
+                          metadata.htp_vae_conv_shapes.data(), metadata.htp_vae_conv_shapes.size());
     }
 
     LOG_INFO("trying to save tensors to %s", file_path.c_str());

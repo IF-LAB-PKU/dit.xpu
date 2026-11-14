@@ -40,6 +40,7 @@
 #include "htp_tensor_flags.h"
 #include "htp_packed_staging.h"
 #include "htp_dense_mask.h"
+#include "htp_vae_conv.hpp"
 #include "ggml/src/ggml-htp/htp_param_placement.h"
 #include "ggml/src/ggml-htp/session_placement.h"
 #include "ggml/src/ggml-htp/session_ownership.h"
@@ -2135,7 +2136,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
                                                 bool direct     = false,
                                                 bool circular_x = false,
                                                 bool circular_y = false,
-                                                float scale     = 1.f) {
+                                                float scale     = 1.f,
+                                                ggml_tensor* htp_packed = nullptr) {
     if (scale != 1.f) {
         x = ggml_ext_scale(ctx, x, scale);
     }
@@ -2149,7 +2151,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
         p1 = 0;
     }
 
-    if (direct) {
+    if (htp_packed != nullptr) {
+        x = ggml_htp_vae_conv_2d(ctx, x, w, htp_packed, s0, s1, p0, p1, d0, d1);
+    } else if (direct) {
         x = ggml_conv_2d_direct(ctx, w, x, s0, s1, p0, p1, d0, d1);
     } else {
         x = ggml_conv_2d(ctx, w, x, s0, s1, p0, p1, d0, d1);
@@ -6134,6 +6138,7 @@ struct GGMLRunnerContext {
     std::function<ggml_tensor*(const std::string&, ggml_tensor*)> cache_tensor;
     std::function<void(const std::string&, ggml_tensor*)> bind_cache_tensor;
     std::function<ggml_tensor*(int64_t, int64_t, int64_t)> dense_mask_cache;
+    std::function<ggml_tensor*(ggml_tensor*)> htp_conv_weight;
 
     void capture_tensor(const std::string& name, ggml_tensor* tensor) {
         if (debug_tensors == nullptr || tensor == nullptr) {
@@ -6234,9 +6239,11 @@ protected:
 
     ggml_backend_t params_backend  = nullptr;
     ggml_backend_t runtime_backend = nullptr;
-    // 只有 diffusion 推理明确注入 HTP backend 后，runner 才会启用 RPCMEM 放置和 hybrid compute 判定。
+    // 显式注入 HTP backend 后，runner 才启用 RPCMEM 放置和 hybrid compute 判定。
     ggml_backend_t htp_backend     = nullptr;
     HtpDenseMaskCache htp_dense_mask_cache_;
+    HtpVaeConvWeights htp_vae_conv_weights_;
+    bool htp_vae_conv_enabled_ = false;
     std::unique_ptr<HtpPackedStagingPool> htp_packed_staging_pool_;
     HtpPackedStagingPool::TypedLoadFn htp_packed_staging_loader_;
     std::vector<HtpPackedStagingPool::Handle> htp_packed_staging_handles_;
@@ -6976,6 +6983,12 @@ protected:
             sd_htp_opencl_sparse_local_lifetime_prerequisites()
                 ? sd_collect_local_residual_owned_sparse_producers(gf)
                 : std::vector<const ggml_tensor*>{};
+        for (int i = 0; i < sd::ggml_graph_cut::leaf_count(gf); ++i) {
+            auto* leaf = sd::ggml_graph_cut::leaf_tensor(gf, i);
+            if ((leaf->flags & SD_GGML_TENSOR_FLAG_HTP_CONV_SHAPE_ONLY) != 0) {
+                compute_no_alloc_tensors_.push_back(leaf);
+            }
+        }
         if (!ggml_gallocr_set_no_alloc_tensors(
                 compute_allocr,
                 compute_no_alloc_tensors_.empty()
@@ -7237,7 +7250,7 @@ protected:
         // 只接受离线 packed 的直接参数。普通 row-major F16 权重不再在推理前在线重排。
         return root != nullptr &&
                root == tensor &&
-               (root->flags & SD_GGML_TENSOR_FLAG_HTP_MUL_MAT_WEIGHT) != 0 &&
+               (root->flags & (SD_GGML_TENSOR_FLAG_HTP_MUL_MAT_WEIGHT | SD_GGML_TENSOR_FLAG_HTP_VAE_CONV_WEIGHT)) != 0 &&
                (root->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) != 0 &&
                tensor->view_src == nullptr &&
                tensor->type == GGML_TYPE_F16 &&
@@ -7426,7 +7439,7 @@ protected:
         }
 #endif
         if (!htp_op_routing_enabled() || htp_param_placement_buffer_ != nullptr ||
-            sd_env_flag_enabled("SD_HTP_PACKED_STAGING")) {
+            (sd_env_flag_enabled("SD_HTP_PACKED_STAGING") && !htp_vae_conv_enabled_)) {
             return true;
         }
 
@@ -7764,6 +7777,12 @@ protected:
             for (int j = 0; j < GGML_MAX_SRC; ++j) {
                 ggml_tensor* src = node->src[j];
                 ggml_tensor* root = get_htp_tensor_backing_root(src);
+                if (root != nullptr && (root->flags & SD_GGML_TENSOR_FLAG_HTP_CONV_SHAPE_ONLY) != 0) {
+                    if (j == 0 && node->op == GGML_OP_IM2COL && src == root && root->op == GGML_OP_NONE) continue;
+                    LOG_ERROR("shape-only convolution metadata used by unsupported op %s", ggml_op_name(node->op));
+                    valid = false;
+                    continue;
+                }
                 if (root == nullptr || (root->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) == 0) {
                     continue;
                 }
@@ -9661,6 +9680,12 @@ public:
                     ggml_backend_get_default_buffer_type(htp_backend), queries, keys, stride);
             };
         }
+        if (htp_vae_conv_enabled_ && htp_op_routing_enabled() &&
+            sd_env_flag_enabled("SD_HTP_COMPUTE")) {
+            runner_ctx.htp_conv_weight = [this](ggml_tensor* weight) {
+                return htp_vae_conv_weights_.get(htp_backend, weight);
+            };
+        }
         runner_ctx.get_cache_tensor      = [this](const std::string& name) {
             return this->get_cache_tensor_by_name(name);
         };
@@ -9690,6 +9715,13 @@ public:
     }
 
     bool alloc_params_buffer() {
+        for (auto* tensor = ggml_get_first_tensor(params_ctx); tensor; tensor = ggml_get_next_tensor(params_ctx, tensor)) {
+            if ((tensor->flags & SD_GGML_TENSOR_FLAG_HTP_VAE_CONV_WEIGHT) != 0 &&
+                (!htp_vae_conv_enabled_ || !htp_op_routing_enabled() || !sd_env_flag_enabled("SD_HTP_COMPUTE"))) {
+                LOG_ERROR("offline HTP VAE weights require SD_HTP_VAE=1, SD_HTP_COMPUTE=1 and an HTP backend");
+                return false;
+            }
+        }
         params_buffer_tensors_.clear();
         size_t num_tensors = ggml_tensor_num(params_ctx);
         if (num_tensors > 0) {
@@ -9779,6 +9811,7 @@ public:
     }
 
     void free_params_buffer() {
+        htp_vae_conv_weights_.clear();
         htp_dense_mask_cache_.clear();
         free_htp_param_placement();
         non_deferred_params_allocation_.clear();
@@ -9807,6 +9840,7 @@ public:
                 size += ggml_backend_buffer_get_size(buffer);
             }
         }
+        size += htp_vae_conv_weights_.bytes();
         size += non_deferred_params_allocation_.buffer_size();
         return size;
     }
@@ -10005,9 +10039,28 @@ public:
 
     // 由上层在模型初始化完成后注入 HTP backend，避免默认路径无意打开 HTP 逻辑。
     void set_htp_backend(ggml_backend_t backend) {
-        if (htp_backend != backend) htp_dense_mask_cache_.clear();
+        if (htp_backend != backend) {
+            htp_dense_mask_cache_.clear();
+            htp_vae_conv_weights_.clear();
+        }
         htp_backend = backend;
     }
+
+    void set_htp_vae_conv_enabled(bool enabled) {
+        htp_vae_conv_enabled_ = enabled;
+        if (!enabled) htp_vae_conv_weights_.clear();
+    }
+
+    size_t get_htp_vae_packed_bytes() const { return htp_vae_conv_weights_.bytes(); }
+    size_t get_htp_vae_packed_count() const { return htp_vae_conv_weights_.size(); }
+    size_t get_htp_vae_offline_count() const {
+        size_t count = 0;
+        if (params_ctx) for (auto* t = ggml_get_first_tensor(params_ctx); t; t = ggml_get_next_tensor(params_ctx, t)) {
+            if ((t->flags & SD_GGML_TENSOR_FLAG_HTP_VAE_CONV_WEIGHT) != 0) ++count;
+        }
+        return count;
+    }
+
 
     void set_htp_packed_staging_loader(ModelLoader* loader) {
         if (loader == nullptr) {
@@ -10297,13 +10350,26 @@ protected:
     std::pair<int, int> padding;
     std::pair<int, int> dilation;
     bool bias;
+    bool offline_htp_weight = false;
     float scale = 1.f;
     std::string prefix;
 
     void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map, const std::string prefix = "") override {
         this->prefix         = prefix;
         enum ggml_type wtype = GGML_TYPE_F16;
-        params["weight"]     = ggml_new_tensor_4d(ctx, wtype, kernel_size.second, kernel_size.first, in_channels, out_channels);
+        const auto stored = tensor_storage_map.find(prefix + "weight");
+        offline_htp_weight = stored != tensor_storage_map.end() &&
+                             stored->second.layout == TensorDataLayout::HTP_CONV2D_W16A32;
+        if (offline_htp_weight) {
+            const auto& shape = stored->second.htp_conv_shape;
+            if (shape != std::array<int64_t, 4>{kernel_size.second, kernel_size.first, in_channels, out_channels}) {
+                throw std::runtime_error("offline VAE convolution shape does not match model: " + prefix);
+            }
+            params["weight"] = ggml_new_tensor_2d(ctx, wtype, stored->second.ne[0], stored->second.ne[1]);
+            params["weight"]->flags |= SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32 | SD_GGML_TENSOR_FLAG_HTP_VAE_CONV_WEIGHT;
+        } else {
+            params["weight"] = ggml_new_tensor_4d(ctx, wtype, kernel_size.second, kernel_size.first, in_channels, out_channels);
+        }
         if (bias) {
             enum ggml_type wtype = GGML_TYPE_F32;
             params["bias"]       = ggml_new_tensor_1d(ctx, wtype, out_channels);
@@ -10340,6 +10406,19 @@ public:
         if (bias) {
             b = params["bias"];
         }
+        ggml_tensor* htp_weight = nullptr;
+        if (offline_htp_weight) {
+            if (!ctx->htp_conv_weight || ctx->weight_adapter || x->type != GGML_TYPE_F32) {
+                GGML_ABORT("offline packed VAE convolution requires HTP routing, F32 activation and no weight adapter");
+            }
+            htp_weight = ctx->htp_conv_weight(w);
+            GGML_ASSERT(htp_weight == w);
+            // IM2COL consumes only kernel dimensions. No original-weight buffer
+            // exists and the graph allocator must not materialize one.
+            w = ggml_new_tensor_4d(ctx->ggml_ctx, GGML_TYPE_F16, kernel_size.second, kernel_size.first, in_channels, out_channels);
+            w->flags |= SD_GGML_TENSOR_FLAG_HTP_CONV_SHAPE_ONLY;
+            ggml_format_name(w, "htp_vae_shape_%s", prefix.c_str());
+        }
         if (ctx->weight_adapter) {
             WeightAdapter::ForwardParams forward_params;
             forward_params.op_type           = WeightAdapter::ForwardParams::op_type_t::OP_CONV2D;
@@ -10368,7 +10447,9 @@ public:
                                 ctx->conv2d_direct_enabled,
                                 ctx->circular_x_enabled,
                                 ctx->circular_y_enabled,
-                                scale);
+                                scale,
+                                htp_weight ? htp_weight :
+                                    (ctx->htp_conv_weight && x->type == GGML_TYPE_F32 ? ctx->htp_conv_weight(w) : nullptr));
     }
 };
 

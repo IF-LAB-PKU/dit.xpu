@@ -305,3 +305,16 @@ add_executable(${TEST_TARGET} test-model-families.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
 target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../src)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+# Explicit device experiment; requires a VAE model or a functioning HTP runtime.
+set(TEST_TARGET test-vae-decode)
+add_executable(${TEST_TARGET} test-vae-decode.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/.. ${CMAKE_CURRENT_LIST_DIR}/../src)
+target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
+
+set(TEST_TARGET test-vae-offline-pack)
+add_executable(${TEST_TARGET} test-vae-offline-pack.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/.. ${CMAKE_CURRENT_LIST_DIR}/../src)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)

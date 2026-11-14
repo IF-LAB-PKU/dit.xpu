@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <functional>
 #include <sstream>
 #include <string>
@@ -16,6 +17,7 @@
 enum class TensorDataLayout {
     REFERENCE,
     HTP_PERMUTED_W16A32,
+    HTP_CONV2D_W16A32,
 };
 
 struct TensorStorage {
@@ -23,6 +25,8 @@ struct TensorStorage {
     ggml_type type          = GGML_TYPE_F32;
     ggml_type expected_type = GGML_TYPE_COUNT;
     TensorDataLayout layout = TensorDataLayout::REFERENCE;
+    // Physical ne[] describes padded packed storage; this is [KW,KH,IC,OC].
+    std::array<int64_t, 4> htp_conv_shape{};
     bool is_f8_e4m3         = false;
     bool is_f8_e5m2         = false;
     bool is_f64             = false;

@@ -1156,6 +1156,25 @@ public:
             }
         }
 
+        if (!sd_env_flag_enabled("SD_HTP_VAE") && first_stage_model && first_stage_model->get_htp_vae_offline_count() != 0) {
+            LOG_ERROR("this VAE GGUF contains HTP-only convolution weights; enable SD_HTP_VAE=1");
+            ggml_free(ctx);
+            return false;
+        }
+        if (sd_env_flag_enabled("SD_HTP_VAE")) {
+            ggml_backend_t htp = backend_manager.cached_backend("htp");
+            if (!first_stage_model || !htp || !sd_env_flag_enabled("SD_HTP_COMPUTE") ||
+                !backend_manager.runtime_backend_is_cpu(SDBackendModule::VAE) ||
+                !backend_manager.params_backend_is_cpu(SDBackendModule::VAE)) {
+                LOG_ERROR("SD_HTP_VAE requires a VAE, preloaded HTP, SD_HTP_COMPUTE=1 and CPU VAE runtime/params");
+                ggml_free(ctx);
+                return false;
+            }
+            first_stage_model->set_htp_backend(htp);
+            first_stage_model->set_htp_vae_conv_enabled(true);
+            LOG_INFO("enabled experimental VAE CPU im2col + HTP FP16 GEMM (other VAE ops on CPU)");
+        }
+
         if (staged_params_loading) {
             LOG_INFO("staged parameter loading enabled");
             if (!ensure_weight_stage(WeightStage::CONDITIONER)) {

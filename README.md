@@ -171,6 +171,10 @@ adb pull /data/local/tmp/sdcpp/sdcpp-sparse-256.log results/
 
 The generated image and runtime log are saved in `results/` on the host.
 
+To try VAE convolution on HTP as well, add `SD_HTP_VAE=1`. See
+[HTP VAE experiments](docs/htp_vae.md) for the hybrid execution path, memory costs
+and isolated decoder benchmarks.
+
 <a id="issues"></a>
 
 ## 🐛 Issues

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 #include <regex>
@@ -43,11 +44,21 @@ static bool load_tensors_for_export(ModelLoader& model_loader,
                                     ggml_type type,
                                     const TensorTypeRules& tensor_type_rules,
                                     bool force_f16,
-                                    std::vector<TensorWriteInfo>& tensors) {
+                                    std::vector<TensorWriteInfo>& tensors,
+                                    bool htp_pack_vae = false) {
     std::mutex tensor_mutex;
     auto on_new_tensor_cb = [&](const TensorStorage& tensor_storage, ggml_tensor** dst_tensor) -> bool {
         const std::string& name = tensor_storage.name;
-        ggml_type tensor_type   = get_export_tensor_type(model_loader, tensor_storage, type, tensor_type_rules, force_f16);
+        ggml_type tensor_type   = htp_pack_vae ? tensor_storage.type
+            : get_export_tensor_type(model_loader, tensor_storage, type, tensor_type_rules, force_f16);
+        if (htp_pack_vae && starts_with(name, "first_stage_model.") &&
+            ends_with(name, ".weight") && tensor_storage.n_dims == 4) {
+            tensor_type = GGML_TYPE_F16;
+        }
+        if (htp_pack_vae && tensor_storage.layout != TensorDataLayout::REFERENCE) {
+            LOG_ERROR("re-exporting packed input is unsupported; use the original model: %s", name.c_str());
+            return false;
+        }
 
         std::lock_guard<std::mutex> lock(tensor_mutex);
         ggml_tensor* tensor = ggml_new_tensor(ggml_ctx, tensor_type, tensor_storage.n_dims, tensor_storage.ne);
@@ -161,17 +172,54 @@ static bool pack_htp_dit_weights_for_export(std::vector<TensorWriteInfo>& tensor
     return true;
 }
 
-bool convert(const char* input_path,
+static bool pack_htp_vae_weights_for_export(ggml_context* packed_ctx,
+                                             std::vector<TensorWriteInfo>& tensors,
+                                             std::vector<std::vector<ggml_fp16_t>>& storage,
+                                             GGUFHTPMetadata& metadata) {
+    metadata.htp_packed_vae = true;
+    metadata.htp_layout = SD_GGUF_HTP_LAYOUT_W16A32;
+    size_t bytes = 0;
+    for (auto& info : tensors) {
+        auto* source = info.tensor;
+        const std::string name = source->name;
+        if (!starts_with(name, "first_stage_model.") || !ends_with(name, ".weight") || info.n_dims != 4) continue;
+        if (source->type != GGML_TYPE_F16) return false;
+        const int64_t k = source->ne[0] * source->ne[1] * source->ne[2], n = source->ne[3];
+        const int64_t kp = GGML_PAD(k, 32), np = GGML_PAD(n, 32);
+        std::vector<ggml_fp16_t> padded(size_t(kp * np), 0);
+        const auto* data = static_cast<const ggml_fp16_t*>(source->data);
+        for (int64_t row = 0; row < n; ++row) std::copy_n(data + row * k, k, padded.data() + row * kp);
+        storage.emplace_back(size_t(kp * np));
+        pack_htp_f16_weight_w16a32(storage.back().data(), padded.data(), kp, np);
+        auto* packed = ggml_new_tensor_2d(packed_ctx, GGML_TYPE_F16, kp, np);
+        ggml_set_name(packed, name.c_str());
+        packed->data = storage.back().data();
+        metadata.htp_vae_conv_tensors.push_back(name);
+        metadata.htp_vae_conv_shapes.insert(metadata.htp_vae_conv_shapes.end(), source->ne, source->ne + 4);
+        info = TensorWriteInfo{};
+        info.tensor = packed;
+        info.n_dims = 2;
+        info.ne[0] = kp;
+        info.ne[1] = np;
+        bytes += ggml_nbytes(packed);
+    }
+    LOG_INFO("HTP packed VAE GGUF: %zu convolutions, %.2f MiB; non-convolution tensors preserve source precision",
+             metadata.htp_vae_conv_tensors.size(), bytes / 1024.f / 1024.f);
+    return !metadata.htp_vae_conv_tensors.empty();
+}
+
+static bool convert_impl(const char* input_path,
              const char* vae_path,
              const char* output_path,
              sd_type_t output_type,
              const char* tensor_type_rules,
              bool convert_name,
              bool htp_pack_dit,
-             bool force_f16) {
+             bool force_f16,
+             bool htp_pack_vae) {
     const bool output_is_safetensors = ends_with(output_path, ".safetensors");
-    if (htp_pack_dit && output_is_safetensors) {
-        LOG_ERROR("--htp-pack-dit only supports GGUF output");
+    if ((htp_pack_dit || htp_pack_vae) && output_is_safetensors) {
+        LOG_ERROR("HTP offline packing only supports GGUF output");
         return false;
     }
     if (htp_pack_dit) {
@@ -182,7 +230,10 @@ bool convert(const char* input_path,
 
     // HTP packing accepts standalone DiT files whose tensor names omit the runtime namespace.
     const std::string input_prefix = htp_pack_dit ? "model.diffusion_model." : "";
-    if (!model_loader.init_from_file(input_path, input_prefix)) {
+    const bool initialized = htp_pack_vae
+        ? model_loader.init_from_file_and_convert_name(input_path, "vae.", VERSION_SD3)
+        : model_loader.init_from_file(input_path, input_prefix);
+    if (!initialized) {
         LOG_ERROR("init model loader from file failed: '%s'", input_path);
         return false;
     }
@@ -193,7 +244,7 @@ bool convert(const char* input_path,
             return false;
         }
     }
-    if (convert_name) {
+    if (convert_name && !htp_pack_vae) {
         model_loader.convert_tensors_name();
     }
 
@@ -203,7 +254,7 @@ bool convert(const char* input_path,
     auto backend    = ggml_backend_cpu_init();
     size_t mem_size = 1 * 1024 * 1024;  // for padding
     mem_size += model_loader.get_tensor_storage_map().size() * ggml_tensor_overhead();
-    mem_size += model_loader.get_params_mem_size(backend, type);
+    mem_size += model_loader.get_params_mem_size(backend, htp_pack_vae ? GGML_TYPE_F32 : type);
     LOG_INFO("model tensors mem size: %.2fMB", mem_size / 1024.f / 1024.f);
     ggml_context* ggml_ctx = ggml_init({mem_size, nullptr, false});
 
@@ -214,11 +265,18 @@ bool convert(const char* input_path,
     }
 
     std::vector<TensorWriteInfo> tensors;
-    bool success = load_tensors_for_export(model_loader, ggml_ctx, type, type_rules, force_f16, tensors);
+    bool success = load_tensors_for_export(model_loader, ggml_ctx, type, type_rules, force_f16, tensors, htp_pack_vae);
     std::vector<std::string> packed_tensor_names;
     if (success && htp_pack_dit) {
         // --htp-pack-dit 只在导出 GGUF 时执行一次重排；推理阶段只消费这个 packed GGUF。
         success = pack_htp_dit_weights_for_export(tensors, packed_tensor_names);
+    }
+    ggml_context* packed_ctx = nullptr;
+    std::vector<std::vector<ggml_fp16_t>> packed_storage;
+    GGUFWriteOptions options;
+    if (success && htp_pack_vae) {
+        packed_ctx = ggml_init({(tensors.size() + 1) * ggml_tensor_overhead() + 1024, nullptr, true});
+        success = packed_ctx != nullptr && pack_htp_vae_weights_for_export(packed_ctx, tensors, packed_storage, options.htp);
     }
     ggml_backend_free(backend);
 
@@ -227,14 +285,13 @@ bool convert(const char* input_path,
         if (output_is_safetensors) {
             success = write_safetensors_file(output_path, tensors, &error);
         } else {
-            GGUFWriteOptions options;
             if (htp_pack_dit) {
                 // 把离线 packed 布局写入 GGUF 元数据，加载端用它恢复 HTP-only tensor flag。
                 options.htp.htp_packed_dit     = true;
                 options.htp.htp_layout         = SD_GGUF_HTP_LAYOUT_W16A32;
                 options.htp.htp_packed_tensors = packed_tensor_names;
             }
-            success = write_gguf_file(output_path, tensors, &error, htp_pack_dit ? &options : nullptr);
+            success = write_gguf_file(output_path, tensors, &error, (htp_pack_dit || htp_pack_vae) ? &options : nullptr);
         }
     }
 
@@ -242,6 +299,17 @@ bool convert(const char* input_path,
         LOG_ERROR("%s", error.c_str());
     }
 
+    ggml_free(packed_ctx);
     ggml_free(ggml_ctx);
     return success;
+}
+
+// Keep the existing conversion ABI intact.
+bool convert(const char* input_path, const char* vae_path, const char* output_path,
+             sd_type_t type, const char* rules, bool convert_name, bool pack_dit, bool force_f16) {
+    return convert_impl(input_path, vae_path, output_path, type, rules, convert_name, pack_dit, force_f16, false);
+}
+
+bool convert_vae_htp(const char* input_path, const char* output_path) {
+    return convert_impl(input_path, "", output_path, SD_TYPE_F16, "", true, false, false, true);
 }
