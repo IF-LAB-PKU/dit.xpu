@@ -16,7 +16,7 @@ A C/C++ inference runtime for DiT image generation on Qualcomm Snapdragon device
 | --- | --- |
 | SD3.5 Medium | [SD3 / SD3.5](docs/sd3.md) |
 | SD3.5 Large | [SD3 / SD3.5](docs/sd3.md) |
-| FLUX.2 Klein 4B | [FLUX.2](docs/flux2.md) |
+| FLUX.2 Klein 4B | [FLUX.2](docs/flux2.md) · [HTP offline models and runtime](docs/htp_flux2_klein.md) |
 | Z-Image Turbo | [Z-Image](docs/z_image.md) |
 | Z-Image Base | [Z-Image](docs/z_image.md) |
 
@@ -24,24 +24,26 @@ A C/C++ inference runtime for DiT image generation on Qualcomm Snapdragon device
 
 ## 🚀 Quick Start
 
-This example uses **SD3.5 Medium** to build in Docker and run **256×256 HTP sparse inference with 20 sampling steps** on an Android phone.
+This example uses **SD3.5 Medium** to build in Docker and run **256×256 HTP sparse inference with 20 sampling steps** on an Android phone. The DiT, VAE and all three text encoders use offline-packed weights; native HTP kernels handle text attention and VAE convolution as well.
 
 ### 1. 🛠️ Prerequisites
 
 - Install Docker, Git, and ADB on the host, and enable USB debugging on the phone.
 - Prepare the Linux version of [Hexagon SDK 6.7.0.0](https://www.qualcomm.com/developer/software/hexagon-sdk), including Tools 21.0.04, NDK r27d, and CMake 3.28.3.
-- Use a phone with HTP and OpenCL support and at least 20 GB of free storage. The build below targets DSP v75.
+- Use a phone with HTP and OpenCL support. Allow about 40 GB of free storage to keep both the original and converted model files. The build below targets DSP v75.
 
 Run the following commands in the same terminal on the host.
 
 ### 2. 📦 Clone the Repositories and Retrieve the OpenCL Library
 
+This configuration requires the matching HTP library commit `3315a61a1b8a0aaa7ea3e9fa5789efdd0f04b55d`, pinned below.
+
 ```bash
 mkdir sdcpp-work
 cd sdcpp-work
-git clone https://github.com/IF-LAB-PKU/dit.xpu.git sdcpp
+git clone https://github.com/destined555/sd.cpp-npu.git sdcpp
 git clone https://github.com/destined555/htp-ops-lib-sd.cpp.git htp-ops-lib
-git -C htp-ops-lib checkout --detach 9e122149185295b7ef4517b40465d0445bd52b9a
+git -C htp-ops-lib checkout --detach 3315a61a1b8a0aaa7ea3e9fa5789efdd0f04b55d
 git clone --depth 1 --branch v2024.10.24 \
   https://github.com/KhronosGroup/OpenCL-Headers.git OpenCL-Headers
 
@@ -102,7 +104,15 @@ Download the following five files from Hugging Face and save them in `models/sd3
 
 ### 6. 📱 Deploy to the Phone and Convert to HTP GGUF
 
-Convert the DiT weights to the HTP layout, producing `sd3.5_medium_htp_w16a32.gguf`.
+Convert the original files once into the following HTP packages. The VAE conversion includes attention projections as packed 1×1 convolutions; text conversion packs Linear weights while retaining embedding tables in row-major layout.
+
+| Component | Converted Filename |
+| --- | --- |
+| DiT | `sd3.5_medium_htp_w16a32.gguf` |
+| VAE | `sd3.5vae_htp_w16a32.gguf` |
+| CLIP-L | `clip_l_htp_w16a32.gguf` |
+| CLIP-G | `clip_g_htp_w16a32.gguf` |
+| T5-XXL | `t5xxl_htp_w16a32.gguf` |
 
 ```bash
 adb shell 'mkdir -p /data/local/tmp/sdcpp/model'
@@ -111,18 +121,33 @@ adb push models/sd3.5-medium /data/local/tmp/sdcpp/model/
 adb shell 'chmod +x /data/local/tmp/sdcpp/bin/sd-cli'
 
 adb shell '
+  set -e
   cd /data/local/tmp/sdcpp || exit 1
   export LD_LIBRARY_PATH="$PWD/bin"
   ./bin/sd-cli -M convert \
     -m model/sd3.5-medium/sd3.5_medium-F16.gguf \
     --type f16 --convert-name --htp-pack-dit \
     -o model/sd3.5-medium/sd3.5_medium_htp_w16a32.gguf
+  ./bin/sd-cli -M convert \
+    -m model/sd3.5-medium/sd3.5vae.safetensors \
+    --htp-pack-vae -o model/sd3.5-medium/sd3.5vae_htp_w16a32.gguf
+  ./bin/sd-cli -M convert \
+    -m model/sd3.5-medium/clip_l.safetensors \
+    --htp-pack-text clip_l -o model/sd3.5-medium/clip_l_htp_w16a32.gguf
+  ./bin/sd-cli -M convert \
+    -m model/sd3.5-medium/clip_g.safetensors \
+    --htp-pack-text clip_g -o model/sd3.5-medium/clip_g_htp_w16a32.gguf
+  ./bin/sd-cli -M convert \
+    -m model/sd3.5-medium/t5xxl_fp8_e4m3fn.safetensors \
+    --htp-pack-text t5xxl -o model/sd3.5-medium/t5xxl_htp_w16a32.gguf
 '
 ```
 
+T5's FP8 source is decoded to F16 for HTP GEMM, so its converted file is about 8.87 GiB. These packages are HTP-only; keep the original files for CPU inference. Re-export an older VAE package to include the attention projections. Deploy the matching host/DSP libraries built above; the old `9e12214` DSP revision lacks the native text/VAE kernels.
+
 ### 7. 🎨 Run Inference and Retrieve the Image
 
-Generate a 256×256 image with 20 sampling steps, the prompt `cat`, and seed 42. The text encoders and VAE run on the CPU; the DiT uses the HTP and OpenCL sparse path.
+Generate a 256×256 image with 20 sampling steps, the prompt `cat`, and seed 42. Text Linear/attention/norm and VAE convolution/attention/norm use HTP; the DiT retains the HTP/OpenCL sparse path. CPU remains the graph scheduler and handles unsupported operations. The CPU backend assignments below are required by the hybrid HTP runner.
 
 ```bash
 adb shell '
@@ -134,6 +159,16 @@ adb shell '
   export SD_HTP_OPS=1
   export SD_HTP_COMPUTE=1
   export SD_HTP_ATTENTION=1
+  export SD_HTP_MULTI_SESSION=1
+  export SD_HTP_MULTI_SESSION_COUNT=2
+  export SD_HTP_TEXT=1
+  export SD_HTP_TEXT_NATIVE=1
+  export SD_HTP_TEXT_NATIVE_AUX=1
+  export SD_HTP_TEXT_FUSION=1
+  export SD_HTP_VAE=1
+  export SD_HTP_VAE_NATIVE=1
+  export SD_HTP_VAE_NATIVE_CONV=1
+  export SD_HTP_VAE_FUSION=1
   export SD_HTP_BLOCK_SPARSE_ATTN=1
   export SD_HTP_BLOCK_SPARSE_KEEP_RATIO=0
   export SD_HTP_BLOCK_SPARSE_PATCH_HALO=1
@@ -147,14 +182,13 @@ adb shell '
   export SD_HTP_SPARSE_OPENCL_LIFETIME_MODE=reuse
   export SD_HTP_HALO_KV_LOAD=l2fetch
   export SD_HTP_PACKED_ATTENTION=1
-  export GGML_HTP_CPU_FALLBACK_THREADS=4
 
   ./bin/sd-cli -v -t 4 --backend cpu --params-backend cpu \
-    --clip_l model/sd3.5-medium/clip_l.safetensors \
-    --clip_g model/sd3.5-medium/clip_g.safetensors \
-    --t5xxl model/sd3.5-medium/t5xxl_fp8_e4m3fn.safetensors \
+    --clip_l model/sd3.5-medium/clip_l_htp_w16a32.gguf \
+    --clip_g model/sd3.5-medium/clip_g_htp_w16a32.gguf \
+    --t5xxl model/sd3.5-medium/t5xxl_htp_w16a32.gguf \
     --diffusion-model model/sd3.5-medium/sd3.5_medium_htp_w16a32.gguf \
-    --vae model/sd3.5-medium/sd3.5vae.safetensors \
+    --vae model/sd3.5-medium/sd3.5vae_htp_w16a32.gguf \
     --clip-on-cpu --diffusion-fa -p cat --steps 20 --cfg-scale 4.5 \
     --guidance 3.5 --sampling-method euler -W 256 -H 256 -s 42 \
     -o sdcpp-sparse-256.png > sdcpp-sparse-256.log 2>&1
@@ -171,13 +205,9 @@ adb pull /data/local/tmp/sdcpp/sdcpp-sparse-256.log results/
 
 The generated image and runtime log are saved in `results/` on the host.
 
-To try VAE convolution on HTP as well, add `SD_HTP_VAE=1`. See
-[HTP VAE experiments](docs/htp_vae.md) for the hybrid execution path, memory costs
-and isolated decoder benchmarks.
+Text weights use segment-scoped staging automatically, with a default 512 MiB pool and 256 MiB slots. This avoids mapping all of T5 at once. It does not enable global DiT staging. The sparse example keeps `SD_HTP_SPARSE_OPENCL=1`, which disables the current packed-weight prefetch path; it still uses synchronous text staging.
 
-For SD3 text encoders, use `--htp-pack-text clip_l|clip_g|t5xxl` during conversion
-and `SD_HTP_TEXT=1` during inference. See [HTP text encoders](docs/htp_text_encoders.md)
-for conversion commands, segment staging and device validation.
+See [native HTP text/VAE](docs/htp_native_models.md) for kernel coverage and validation, and [HTP text encoders](docs/htp_text_encoders.md) for weight formats and staging. Native mode is not guaranteed to be faster for every shape. For FLUX.2 Klein 4B, use the separate [HTP guide](docs/htp_flux2_klein.md), including Qwen3 conversion and dense DiT prefetch settings.
 
 <a id="issues"></a>
 
@@ -189,7 +219,7 @@ This issue affects phones with Snapdragon 8 Gen 3 or earlier SoCs. As discussed 
 
 **1. Multi Session**
 
-Distribute weight mappings across multiple FastRPC sessions. Add the following inside the `adb shell` block in Step 7, before running `sd-cli`. This example uses two sessions:
+Distribute weight mappings across multiple FastRPC sessions. Step 7 already enables two sessions:
 
 ```bash
 export SD_HTP_MULTI_SESSION=1
@@ -198,14 +228,17 @@ export SD_HTP_MULTI_SESSION_COUNT=2
 
 **2. Staging**
 
-Use graph segmentation to load packed weights on demand and reuse RPCMEM buffers. Add the following after the environment variables above:
+Text encoders already use segment-scoped staging when `SD_HTP_TEXT=1`, with a default 512 MiB pool and 256 MiB slots. No additional staging flags are needed for the text encoders in Step 7.
+
+If DiT weight mappings also fail, enable staging for DiT and start with a bounded pool:
 
 ```bash
 export SD_HTP_PACKED_STAGING=1
-export SD_HTP_PACKED_STAGING_BUDGET_MB=20480
+export SD_HTP_PACKED_STAGING_BUDGET_MB=512
+export SD_HTP_PACKED_STAGING_SLOT_MB=256
 ```
 
-Also add `--max-vram 10` to the `sd-cli` command to enable graph segmentation. `SD_HTP_PACKED_STAGING_BUDGET_MB` sets the total staging buffer pool budget in MiB.
+Also add `--max-vram 0.5` to the `sd-cli` command to limit graph weight segments to 0.5 GiB. `SD_HTP_PACKED_STAGING_BUDGET_MB` sets the staging pool budget in MiB; these settings also apply to text staging. Segments that exceed the pool budget must be split further or given a larger budget. For FLUX.2 Klein, follow its [model-specific settings](docs/htp_flux2_klein.md).
 
 For other problems, open a [GitHub issue](https://github.com/destined555/sd.cpp-npu/issues) with your device and SDK versions, repository commit, model filenames, full command, and logs.
 
