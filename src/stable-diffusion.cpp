@@ -1171,7 +1171,7 @@ public:
                 !backend_manager.runtime_backend_is_cpu(SDBackendModule::TE) ||
                 !backend_manager.params_backend_is_cpu(SDBackendModule::TE) ||
                 !cond_stage_model || !cond_stage_model->configure_htp_text_encoder(htp, retained_model_loader.get())) {
-                LOG_ERROR("SD_HTP_TEXT requires SD3 packed text encoders, preloaded HTP, SD_HTP_COMPUTE=1 and CPU conditioner runtime/params");
+                LOG_ERROR("SD_HTP_TEXT requires supported packed text encoders, preloaded HTP, SD_HTP_COMPUTE=1 and CPU conditioner runtime/params");
                 ggml_free(ctx);
                 return false;
             }

@@ -2,6 +2,7 @@
 #include "model_io/gguf_io.h"
 #include "model_io/safetensors_io.h"
 #include "stable-diffusion.h"
+#include "htp_text_encoder.h"
 #include <algorithm>
 #include <cstring>
 #include <chrono>
@@ -21,14 +22,14 @@ int main() {
     std::filesystem::create_directory(root);
     auto* ctx = ggml_init({1024 * 1024, nullptr, false});
     CHECK(ctx);
-    for (const std::string kind : {"clip_l", "clip_g", "t5xxl"}) {
-        const auto prefix = "text_encoders." + kind + ".transformer.";
-        const auto local = kind == "t5xxl" ? "encoder.block.0.layer.0.SelfAttention.q.weight" : "text_model.encoder.layers.0.mlp.fc1.weight";
+    for (const std::string kind : {"clip_l", "clip_g", "t5xxl", "qwen3"}) {
+        const auto prefix = sd_htp_text_prefix(kind);
+        const auto local = kind == "qwen3" ? "model.layers.0.self_attn.q_proj.weight" : kind == "t5xxl" ? "encoder.block.0.layer.0.SelfAttention.q.weight" : "text_model.encoder.layers.0.mlp.fc1.weight";
         auto* linear = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 32, 64);
         ggml_set_name(linear, local);
         for (int i = 0; i < 2048; ++i) static_cast<ggml_bf16_t*>(linear->data)[i] = ggml_fp32_to_bf16(std::sin(i * .01f));
         auto* table = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 32, 64);
-        const auto table_local = kind == "t5xxl" ? "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight" : "text_model.embeddings.token_embedding.weight";
+        const auto table_local = kind == "qwen3" ? "model.embed_tokens.weight" : kind == "t5xxl" ? "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight" : "text_model.embeddings.token_embedding.weight";
         ggml_set_name(table, table_local);
         for (int i = 0; i < 2048; ++i) static_cast<ggml_fp16_t*>(table->data)[i] = ggml_fp32_to_fp16(i * .01f);
         const auto input = (root / (kind + ".safetensors")).string();
@@ -42,7 +43,7 @@ int main() {
         CHECK(metadata.htp_packed_text && metadata.htp_text_encoder == kind && !metadata.htp_packed_dit);
         CHECK(metadata.htp_packed_tensors == std::vector<std::string>{prefix + local});
         ModelLoader loader;
-        CHECK(loader.init_from_file_and_convert_name(output, prefix, VERSION_SD3));
+        CHECK(loader.init_from_file_and_convert_name(output, prefix, kind == "qwen3" ? VERSION_FLUX2_KLEIN : VERSION_SD3));
         CHECK(loader.get_tensor_storage_map().at(prefix + local).layout == TensorDataLayout::HTP_PERMUTED_W16A32);
         CHECK(loader.get_tensor_storage_map().at(prefix + table_local).layout == TensorDataLayout::REFERENCE);
         auto* packed = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 32, 64);

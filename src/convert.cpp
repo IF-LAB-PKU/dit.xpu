@@ -268,7 +268,8 @@ static bool convert_impl(const char* input_path,
     // HTP packing accepts standalone DiT files whose tensor names omit the runtime namespace.
     const std::string input_prefix = htp_pack_dit ? "model.diffusion_model." : "";
     const bool initialized = !text_kind.empty()
-        ? model_loader.init_from_file_and_convert_name(input_path, sd_htp_text_prefix(text_kind), VERSION_SD3)
+        ? model_loader.init_from_file_and_convert_name(input_path, sd_htp_text_prefix(text_kind),
+                                                     text_kind == "qwen3" ? VERSION_FLUX2_KLEIN : VERSION_SD3)
         : htp_pack_vae
         ? model_loader.init_from_file_and_convert_name(input_path, "vae.", VERSION_SD3)
         : model_loader.init_from_file(input_path, input_prefix);
@@ -367,7 +368,7 @@ bool convert_vae_htp(const char* input_path, const char* output_path) {
 bool convert_text_encoder_htp(const char* input_path, const char* output_path, const char* kind) {
     const std::string encoder = kind ? kind : "";
     if (sd_htp_text_prefix(encoder).empty()) {
-        LOG_ERROR("HTP text encoder kind must be clip_l, clip_g or t5xxl");
+        LOG_ERROR("HTP text encoder kind must be clip_l, clip_g, t5xxl or qwen3");
         return false;
     }
     return convert_impl(input_path, "", output_path, SD_TYPE_F16, "", true, false, false, false, encoder);

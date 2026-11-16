@@ -7,6 +7,40 @@
 #include <algorithm>
 int main() {
  auto *htp=ggml_backend_init_by_name("HTP",nullptr);GGML_ASSERT(htp);ggml_backend_htp_set_hybrid_enabled(true);
+ // Qwen3 uses compact KV heads. Check its 4:1 GQA mapping, causal mask,
+ // padded query rows and token tails against an independent double reference.
+ for (int len : {1, 19, 32, 77}) {
+  const int dim=128,heads=32,kvheads=8;
+  auto *ctx=ggml_init({4*1024*1024,nullptr,true});
+  auto *qb=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,dim,heads,len);
+  auto *kb=ggml_new_tensor_3d(ctx,GGML_TYPE_F16,dim,kvheads,len);
+  auto *vb=ggml_dup_tensor(ctx,kb);
+  const int mask_stride=GGML_PAD(len,64);
+  auto *mask=ggml_new_tensor_2d(ctx,GGML_TYPE_F16,mask_stride,mask_stride);
+  auto *out=ggml_flash_attn_ext(ctx,ggml_permute(ctx,qb,0,2,1,3),ggml_permute(ctx,kb,0,2,1,3),
+                               ggml_permute(ctx,vb,0,2,1,3),mask,1.f/sqrtf(dim),0,0);
+  auto *g=ggml_new_graph_custom(ctx,32,false);ggml_build_forward_expand(g,out);
+  GGML_ASSERT(ggml_backend_supports_op(htp,out));auto *buf=ggml_backend_alloc_ctx_tensors(ctx,htp);GGML_ASSERT(buf);
+  std::vector<float> qs(ggml_nelements(qb)),ys(ggml_nelements(out));
+  std::vector<ggml_fp16_t> ks(ggml_nelements(kb)),vs(ks.size()),ms(ggml_nelements(mask));
+  for(size_t i=0;i<qs.size();++i)qs[i]=.4f*sinf(i*.139f);
+  for(size_t i=0;i<ks.size();++i){ks[i]=ggml_fp32_to_fp16(.3f*cosf(i*.117f));vs[i]=ggml_fp32_to_fp16(sinf(i*.019f));}
+  for(int row=0;row<mask_stride;++row)for(int col=0;col<mask_stride;++col)ms[row*mask_stride+col]=ggml_fp32_to_fp16(col>=len||col>row?-INFINITY:0);
+  ggml_backend_tensor_set(qb,qs.data(),0,ggml_nbytes(qb));ggml_backend_tensor_set(kb,ks.data(),0,ggml_nbytes(kb));
+  ggml_backend_tensor_set(vb,vs.data(),0,ggml_nbytes(vb));ggml_backend_tensor_set(mask,ms.data(),0,ggml_nbytes(mask));
+  GGML_ASSERT(ggml_backend_graph_compute(htp,g)==GGML_STATUS_SUCCESS);
+  GGML_ASSERT(ggml_backend_htp_get_last_attention_elapsed_us(htp)>0);
+  ggml_backend_tensor_get(out,ys.data(),0,ggml_nbytes(out));double maxerr=0;
+  for(int row=0;row<len;++row)for(int h=0;h<heads;++h){
+   int kh=h/(heads/kvheads);std::vector<double> scores(row+1);double maximum=-INFINITY,sum=0;
+   for(int col=0;col<=row;++col){double dot=0;for(int d=0;d<dim;++d)dot+=double(qs[(row*heads+h)*dim+d])*ggml_fp16_to_fp32(ks[(col*kvheads+kh)*dim+d]);scores[col]=dot/sqrt(double(dim));maximum=std::max(maximum,scores[col]);}
+   for(auto &s:scores){s=exp(s-maximum);sum+=s;}
+   for(int d=0;d<dim;++d){double ref=0;for(int col=0;col<=row;++col)ref+=scores[col]/sum*ggml_fp16_to_fp32(vs[(col*kvheads+kh)*dim+d]);
+    float actual=ys[(row*heads+h)*dim+d];GGML_ASSERT(std::isfinite(actual));maxerr=std::max(maxerr,std::abs(actual-ref));}
+  }
+  printf("qwen3_gqa len=%d heads=%d kv_heads=%d max_abs=%g\n",len,heads,kvheads,maxerr);fflush(stdout);GGML_ASSERT(maxerr<.012);
+  ggml_backend_buffer_free(buf);ggml_free(ctx);
+ }
  for(int dim:{64,512}) for(int mode=0;mode<4;++mode) for(int len:{1,31,77,128}) {
   int heads=dim==512?1:3,batch=2,keys=len+3,channels=heads*dim;
   auto *ctx=ggml_init({4*1024*1024,nullptr,true});

@@ -1,4 +1,4 @@
-# SD3 text encoders with offline HTP weights
+# Text encoders with offline HTP weights
 
 This page describes the base Linear-only path. [Native HTP models](htp_native_models.md) adds attention, normalization, residual/gating and expanded epilogues, with device correctness and performance results.
 
@@ -159,3 +159,33 @@ script and PNG are in the sibling workspace directory
 `text-htp-results-20261114/`.
 
 Optional native DSP epilogue fusion is described in [htp_fusion.md](htp_fusion.md).
+
+## FLUX.2 Klein 4B / Qwen3
+
+The standalone Qwen3 encoder can use the same offline Linear layout and
+segment staging. Convert it with an explicit encoder kind:
+
+```sh
+./bin/sd-cli -M convert -m qwen3-4b.gguf \
+  --htp-pack-text qwen3 -o qwen3_4b_htp_w16a32.gguf
+```
+
+Pass the result through `--llm`, with `SD_HTP_TEXT=1` and the CPU runtime and
+parameter backends shown above. Only the seven attention/MLP projection weights
+per transformer layer are packed; embeddings and normalization weights remain
+row-major. Quantized source projections are dequantized to F16, increasing file
+size; conversion cannot recover information discarded by source quantization.
+
+`SD_HTP_TEXT_NATIVE=1` also routes Qwen3 causal attention to existing DSP Flash
+Attention, preserving compact KV heads (32 query / 8 KV heads for 4B).
+`SD_HTP_TEXT_NATIVE_AUX=1` enables RMSNorm with affine weights, residual ADD,
+SiLU and gating MUL. Tokenization, embeddings, RoPE and layout/cast/mask
+preparation still use CPU. This path is enabled for FLUX.2 Klein only; other
+LLM-based conditioners retain their existing routing. The existing packed
+prefetch switch applies to Qwen3 graph segments as well.
+
+`test-text-encoder qwen3 MODEL cpu|htp REPEATS OUTPUT_PREFIX [PROMPT]` tests
+the production Klein tokenizer and hidden-state extraction, saving finite F32
+conditioning outputs. `SD_HTP_PREFETCH_AB=1` alternates synchronous/prefetched
+execution and checks identical outputs. `test-htp-native` additionally checks
+compact GQA and causal token tails against an independent double reference.

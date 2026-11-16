@@ -1,4 +1,4 @@
-// Device correctness checks and isolated SD3 VAE decoder timing.
+// Device correctness checks and isolated SD3 / Flux2 VAE decoder timing.
 #include "auto_encoder_kl.hpp"
 #include <chrono>
 
@@ -96,7 +96,7 @@ struct RawVae : AutoEncoderKL {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "Usage: %s --self-test | <vae.safetensors> <cpu|htp> <image-size> <repeats> <output.f32> [latent.f32] [threads]\n", argv[0]);
+        std::fprintf(stderr, "Usage: %s --self-test | <vae.safetensors> <cpu|htp> <image-size> <repeats> <output.f32> [latent.f32] [threads] [sd3|flux2]\n", argv[0]);
         return 2;
     }
     sd_set_log_callback(log_line, nullptr);
@@ -119,11 +119,14 @@ int main(int argc, char** argv) {
     } else {
         const int size = std::atoi(argv[3]), repeats = std::atoi(argv[4]);
         const int threads = argc > 7 ? std::atoi(argv[7]) : 4;
+        const std::string kind = argc > 8 ? argv[8] : "sd3";
+        GGML_ASSERT(kind == "sd3" || kind == "flux2");
+        const SDVersion version = kind == "flux2" ? VERSION_FLUX2_KLEIN : VERSION_SD3;
         GGML_ASSERT(size > 0 && size <= 2048 && size % 8 == 0 && repeats > 0 && threads > 0);
         const double load_start = seconds();
         ModelLoader loader;
-        GGML_ASSERT(loader.init_from_file_and_convert_name(argv[1], "vae.", VERSION_SD3));
-        RawVae vae(cpu, cpu, loader.get_tensor_storage_map(), "first_stage_model", true, VERSION_SD3);
+        GGML_ASSERT(loader.init_from_file_and_convert_name(argv[1], "vae.", version));
+        RawVae vae(cpu, cpu, loader.get_tensor_storage_map(), "first_stage_model", true, version);
         if (htp) { vae.set_htp_backend(htp); vae.set_htp_vae_conv_enabled(true); }
         GGML_ASSERT(vae.alloc_params_buffer());
         std::map<std::string, ggml_tensor*> tensors;
@@ -132,7 +135,7 @@ int main(int argc, char** argv) {
         vae.raw_output();
         if (htp) { vae.set_htp_backend(htp); vae.set_htp_vae_conv_enabled(true); }
         std::printf("load_seconds=%.6f mode=%s size=%d threads=%d\n", seconds() - load_start, argv[2], size, threads);
-        sd::Tensor<float> latent({size / 8, size / 8, 16, 1});
+        sd::Tensor<float> latent({size / vae.get_scale_factor(), size / vae.get_scale_factor(), vae.get_encoder_output_channels(3), 1});
         if (argc > 6 && std::string(argv[6]) != "-") {
             std::ifstream file(argv[6], std::ios::binary);
             GGML_ASSERT(file.read(reinterpret_cast<char*>(latent.data()), latent.numel() * sizeof(float)));

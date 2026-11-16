@@ -2,6 +2,10 @@
 
 This opt-in path runs CLIP-L/CLIP-G/T5 attention and SD3.5 Medium VAE convolution on the DSP/HMX backend. It extends the hybrid offline-packed path; it does not export a QNN graph. CPU remains the graph scheduler and weight-streaming host. Deploy matching sd.cpp and htp-ops-lib-dit libraries.
 
+FLUX.2 Klein 4B Qwen3 and Flux2 VAE use the same kernels; see
+[Klein HTP configuration](htp_flux2_klein.md) for conversion, staging budgets
+and dense DiT prefetch.
+
 ## Enable
 
 Add to the existing packed-model command (CPU runtime and parameter backend):

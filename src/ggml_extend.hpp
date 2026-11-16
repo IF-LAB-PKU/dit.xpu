@@ -9694,7 +9694,12 @@ protected:
         };
         int prefetch_token = 0;
         std::unique_ptr<int, decltype(prefetch_cleanup)> prefetch_guard(&prefetch_token, prefetch_cleanup);
-        if (get_desc() == "t5" && htp_packed_staging_enabled() &&
+        const bool prefetch_runner = get_desc() == "t5" ||
+            (htp_text_encoder_enabled_ && get_desc() == "qwen3") ||
+            (get_desc() == "flux" && sd_env_flag_enabled("SD_HTP_DIT_PREFETCH") &&
+             !sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_ATTN") &&
+             !sd_env_flag_enabled("SD_HTP_PACKED_FLUX2"));
+        if (prefetch_runner && htp_packed_staging_enabled() &&
             sd_env_flag_enabled("SD_HTP_PACKED_PREFETCH") && plan.segments.size() > 1 &&
             !sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL")) {
             auto profile = execution_profile_.timer(RunnerProfile::Build);
@@ -10283,6 +10288,7 @@ public:
         set_htp_backend(backend);
         set_htp_packed_staging_loader(loader);
         htp_text_encoder_enabled_ = true;
+        set_htp_attention_enabled(sd_env_flag_enabled("SD_HTP_TEXT_NATIVE"));
         const size_t staging_budget = size_t(std::max(1, sd_env_int_value("SD_HTP_PACKED_STAGING_BUDGET_MB", 512))) * 1024 * 1024;
         max_graph_vram_bytes = max_graph_vram_bytes == 0 ? staging_budget : std::min(max_graph_vram_bytes, staging_budget);
     }
@@ -10931,7 +10937,7 @@ static inline ggml_tensor *sd_htp_model_silu(GGMLRunnerContext *ctx,ggml_tensor 
   auto *y=ggml_htp_native_aux(ctx->ggml_ctx,x->src[0],x->src[1],x->src[2],2,ggml_htp_native_meta(x)->v[1],ggml_htp_native_meta(x)->scale);
   ((ggml_htp_native_metadata *)ggml_htp_native_meta(y))->v[2]=1;return y;
  }
- return ctx->htp_vae_native ? ggml_htp_native_aux(ctx->ggml_ctx,x,nullptr,nullptr,5,0,0) : ggml_silu_inplace(ctx->ggml_ctx,x);
+ return (ctx->htp_vae_native || ctx->htp_text_native_aux) ? ggml_htp_native_aux(ctx->ggml_ctx,x,nullptr,nullptr,5,0,0) : ggml_silu_inplace(ctx->ggml_ctx,x);
 }
 class LayerNorm : public UnaryBlock {
 protected:

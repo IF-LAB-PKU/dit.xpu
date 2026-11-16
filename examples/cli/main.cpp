@@ -63,7 +63,7 @@ struct SDCliParams {
         ArgOptions options;
 
         options.string_options = {
-            {"", "--htp-pack-text", "offline pack a standalone text encoder: clip_l, clip_g or t5xxl (convert mode)", &htp_pack_text},
+            {"", "--htp-pack-text", "offline pack a standalone text encoder: clip_l, clip_g, t5xxl or qwen3 (convert mode)", &htp_pack_text},
             {"-o",
              "--output",
              "path to write result image to. you can use printf-style %d format specifiers for image sequences (default: ./output.png) (eg. output_%03d.png). Single-file video outputs support .avi, .webm, and animated .webp",

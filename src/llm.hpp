@@ -121,6 +121,9 @@ namespace LLM {
             if (ctx->weight_adapter) {
                 w = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, w, prefix + "weight");
             }
+            if (ctx->htp_text_native_aux && !add_unit_offset) {
+                return ggml_htp_native_aux(ctx->ggml_ctx, x, w, nullptr, 1, 1, eps);
+            }
             x           = ggml_rms_norm(ctx->ggml_ctx, x, eps);
             auto scaled = ggml_mul(ctx->ggml_ctx, x, w);
             if (add_unit_offset) {
@@ -155,9 +158,10 @@ namespace LLM {
             if (activation == MLPActivation::GELU_TANH) {
                 h = ggml_ext_gelu(ctx->ggml_ctx, h, true);
             } else {
-                h = ggml_silu_inplace(ctx->ggml_ctx, h);
+                h = sd_htp_model_silu(ctx, h);
             }
-            h = ggml_mul_inplace(ctx->ggml_ctx, h, up_proj->forward(ctx, x));
+            auto up = up_proj->forward(ctx, x);
+            h = ctx->htp_text_native_aux ? sd_htp_model_mul(ctx, h, up) : ggml_mul_inplace(ctx->ggml_ctx, h, up);
             h = down_proj->forward(ctx, h);
             return h;
         }
@@ -700,6 +704,29 @@ namespace LLM {
                 k               = ggml_rope_multi(ctx->ggml_ctx, k, input_pos, nullptr, head_dim, sections, GGML_ROPE_TYPE_MROPE, 128000, 1000000.f, 1.f, 0.f, 1.f, 32.f, 1.f);
             }
 
+            if (ctx->htp_text_native && arch == LLMArch::QWEN3 && N == 1) {
+                // Reuse the DiT Flash Attention path: its DSP core handles GQA
+                // directly (32 query heads / 8 KV heads for Klein 4B). Keep KV
+                // heads compact instead of repeating them to query-head count.
+                q = ggml_permute(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, q), 0, 2, 1, 3);
+                k = ggml_permute(ctx->ggml_ctx, ggml_cast(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, k), GGML_TYPE_F16), 0, 2, 1, 3);
+                v = ggml_permute(ctx->ggml_ctx, ggml_cast(ctx->ggml_ctx, v, GGML_TYPE_F16), 0, 2, 1, 3);
+                GGML_ASSERT(attention_mask && attention_mask->ne[0] == n_token && attention_mask->ne[1] == n_token);
+                auto mask = attention_mask;
+                const int pad = GGML_PAD(n_token, 64) - n_token;
+                if (pad) {
+                    // The DSP reads a 64-aligned mask row. Exclude padded keys
+                    // explicitly; zero padding would change the softmax sum.
+                    mask = ggml_concat(ctx->ggml_ctx, mask, ggml_ext_full(ctx->ggml_ctx, -INFINITY, pad, n_token, 1, 1), 0);
+                    mask = ggml_pad(ctx->ggml_ctx, mask, 0, pad, 0, 0);
+                }
+                mask = ggml_cast(ctx->ggml_ctx, mask, GGML_TYPE_F16);
+                x = ggml_flash_attn_ext(ctx->ggml_ctx, q, k, v, mask, 1.f/sqrtf(head_dim), 0, 0);
+                ggml_flash_attn_ext_set_prec(x, GGML_PREC_F32);
+                x = ggml_reshape_3d(ctx->ggml_ctx, x, head_dim * num_heads, n_token, N);
+                return out_proj->forward(ctx, x);
+            }
+
             q = ggml_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, q, 0, 2, 1, 3));  // [N, num_heads, n_token, head_dim]
             q = ggml_reshape_3d(ctx->ggml_ctx, q, q->ne[0], q->ne[1], q->ne[2] * q->ne[3]);      // [N*num_heads, n_token, head_dim]
 
@@ -775,7 +802,7 @@ namespace LLM {
             if (post_attention_norm != nullptr) {
                 x = post_attention_norm->forward(ctx, x);
             }
-            x = ggml_add_inplace(ctx->ggml_ctx, x, residual);
+            x = ctx->htp_text_native_aux ? sd_htp_model_add(ctx, x, residual) : ggml_add_inplace(ctx->ggml_ctx, x, residual);
 
             residual = x;
             x        = post_attention_layernorm->forward(ctx, x);
@@ -783,7 +810,7 @@ namespace LLM {
             if (post_ffw_norm != nullptr) {
                 x = post_ffw_norm->forward(ctx, x);
             }
-            x = ggml_add_inplace(ctx->ggml_ctx, x, residual);
+            x = ctx->htp_text_native_aux ? sd_htp_model_add(ctx, x, residual) : ggml_add_inplace(ctx->ggml_ctx, x, residual);
 
             return x;
         }

@@ -1123,6 +1123,12 @@ struct LLMEmbedder : public Conditioner {
     std::shared_ptr<BPETokenizer> tokenizer;
     std::shared_ptr<LLM::LLMRunner> llm;
 
+    bool configure_htp_text_encoder(ggml_backend_t backend, ModelLoader* loader) override {
+        if (version != VERSION_FLUX2_KLEIN || !llm) return false;
+        llm->configure_htp_text_encoder(backend, loader);
+        return true;
+    }
+
     LLMEmbedder(ggml_backend_t backend,
                 ggml_backend_t params_backend,
                 const String2TensorStorage& tensor_storage_map = {},

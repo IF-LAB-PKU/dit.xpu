@@ -5,6 +5,7 @@
 #include "util.h"
 
 inline std::string sd_htp_text_prefix(const std::string& kind) {
+    if (kind == "qwen3") return "text_encoders.llm.";
     if (kind != "clip_l" && kind != "clip_g" && kind != "t5xxl") return {};
     return "text_encoders." + kind + ".transformer.";
 }
@@ -15,7 +16,14 @@ inline bool sd_htp_text_linear_name(const std::string& name, const std::string& 
     const auto prefix = sd_htp_text_prefix(kind);
     if (prefix.empty() || !starts_with(name, prefix)) return false;
     const auto local = name.substr(prefix.size());
-    if (kind == "t5xxl") {
+    if (kind == "qwen3") {
+        if (!starts_with(local, "model.layers.")) return false;
+        for (const auto* suffix : {".self_attn.q_proj.weight", ".self_attn.k_proj.weight",
+                                  ".self_attn.v_proj.weight", ".self_attn.o_proj.weight",
+                                  ".mlp.gate_proj.weight", ".mlp.up_proj.weight", ".mlp.down_proj.weight"}) {
+            if (ends_with(local, suffix)) return true;
+        }
+    } else if (kind == "t5xxl") {
         if (!starts_with(local, "encoder.block.")) return false;
         for (const auto* suffix : {".SelfAttention.q.weight", ".SelfAttention.k.weight",
                                    ".SelfAttention.v.weight", ".SelfAttention.o.weight",
