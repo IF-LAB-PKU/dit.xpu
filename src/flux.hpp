@@ -50,6 +50,7 @@ namespace Flux {
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
             ggml_tensor* w = params["scale"];
+            if(ctx->htp_dit_native) return ggml_htp_native_aux(ctx->ggml_ctx,x,w,nullptr,1,1,eps);
             x              = ggml_rms_norm(ctx->ggml_ctx, x, eps);
             x              = ggml_mul(ctx->ggml_ctx, x, w);
             return x;
@@ -392,8 +393,8 @@ namespace Flux {
         int image_tokens,
         int text_tokens,
         const char* residual_kind) {
-        q = Rope::apply_rope(ctx->ggml_ctx, q, pe);
-        k = Rope::apply_rope(ctx->ggml_ctx, k, pe);
+        q = Rope::apply_rope(ctx, q, pe);
+        k = Rope::apply_rope(ctx, k, pe);
         return flux2_residual_attention(ctx,
                                         q, k, v,
                                         v->ne[1],
@@ -442,7 +443,7 @@ namespace Flux {
 
             x = mlp_0->forward(ctx, x);
             if (use_mlp_silu_act) {
-                x = ggml_ext_silu_act(ctx->ggml_ctx, x);
+                x = ctx->htp_dit_native ? ggml_htp_dit_swiglu(ctx->ggml_ctx,x,1) : ggml_ext_silu_act(ctx->ggml_ctx,x);
             } else {
                 x = ggml_ext_gelu(ctx->ggml_ctx, x, true);
             }
@@ -536,6 +537,24 @@ namespace Flux {
         x = ggml_add(ctx, x, ggml_mul(ctx, x, scale));
         x = ggml_add(ctx, x, shift);
         return x;
+    }
+
+    static inline ggml_tensor* norm_modulate(GGMLRunnerContext* ctx, ggml_tensor* normalized,
+                                             ggml_tensor* shift, ggml_tensor* scale) {
+        if (ctx->htp_dit_native && normalized->op == GGML_OP_NORM && normalized->ne[3] == 1) {
+            float eps;
+            memcpy(&eps, normalized->op_params, sizeof(eps));
+            return ggml_htp_dit_norm_modulate(ctx->ggml_ctx, normalized->src[0], scale, shift, eps);
+        }
+        return modulate(ctx->ggml_ctx, normalized, shift, scale);
+    }
+
+    static inline ggml_tensor* gate_residual(GGMLRunnerContext* ctx, ggml_tensor* residual,
+                                            ggml_tensor* x, ggml_tensor* gate) {
+        if (ctx->htp_dit_native && x->ne[3] == 1 && ggml_are_same_shape(x, residual)) {
+            return ggml_htp_dit_gate_residual(ctx->ggml_ctx, x, gate, residual);
+        }
+        return ggml_add(ctx->ggml_ctx, residual, ggml_mul(ctx->ggml_ctx, x, gate));
     }
 
     struct DoubleStreamBlock : public GGMLBlock {
@@ -649,11 +668,11 @@ namespace Flux {
 
             // prepare image for attention
             auto img_modulated = img_norm1->forward(ctx, img);
-            img_modulated      = Flux::modulate(ctx->ggml_ctx, img_modulated, img_mod1.shift, img_mod1.scale);
+            img_modulated      = Flux::norm_modulate(ctx, img_modulated, img_mod1.shift, img_mod1.scale);
 
             // prepare txt for attention
             auto txt_modulated = txt_norm1->forward(ctx, txt);
-            txt_modulated      = Flux::modulate(ctx->ggml_ctx, txt_modulated, txt_mod1.shift, txt_mod1.scale);
+            txt_modulated      = Flux::norm_modulate(ctx, txt_modulated, txt_mod1.shift, txt_mod1.scale);
             ggml_tensor* attn = nullptr;
             ggml_tensor* img_attn_out = nullptr;
             ggml_tensor* txt_attn_out = nullptr;
@@ -694,17 +713,17 @@ namespace Flux {
             }
 
             // calculate the img bloks
-            img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_attn->post_attention(ctx, img_attn_out), img_mod1.gate));
+            img = gate_residual(ctx,img,img_attn->post_attention(ctx,img_attn_out),img_mod1.gate);
 
-            auto img_mlp_out = img_mlp->forward(ctx, Flux::modulate(ctx->ggml_ctx, img_norm2->forward(ctx, img), img_mod2.shift, img_mod2.scale));
+            auto img_mlp_out = img_mlp->forward(ctx, Flux::norm_modulate(ctx, img_norm2->forward(ctx, img), img_mod2.shift, img_mod2.scale));
 
-            img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_mlp_out, img_mod2.gate));
+            img = gate_residual(ctx,img,img_mlp_out,img_mod2.gate);
 
             // calculate the txt bloks
-            txt = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_attn->post_attention(ctx, txt_attn_out), txt_mod1.gate));
+            txt = gate_residual(ctx,txt,txt_attn->post_attention(ctx,txt_attn_out),txt_mod1.gate);
 
-            auto txt_mlp_out = txt_mlp->forward(ctx, Flux::modulate(ctx->ggml_ctx, txt_norm2->forward(ctx, txt), txt_mod2.shift, txt_mod2.scale));
-            txt              = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_mlp_out, txt_mod2.gate));
+            auto txt_mlp_out = txt_mlp->forward(ctx, Flux::norm_modulate(ctx, txt_norm2->forward(ctx, txt), txt_mod2.shift, txt_mod2.scale));
+            txt              = gate_residual(ctx,txt,txt_mlp_out,txt_mod2.gate);
 
             return {img, txt};
         }
@@ -787,7 +806,7 @@ namespace Flux {
                 }
             }
 
-            auto x_mod = Flux::modulate(ctx->ggml_ctx, pre_norm->forward(ctx, x), mod.shift, mod.scale);
+            auto x_mod = Flux::norm_modulate(ctx, pre_norm->forward(ctx, x), mod.shift, mod.scale);
             int64_t head_dim = hidden_size / num_heads;
             ggml_tensor* attn = nullptr;
             ggml_tensor* mlp = nullptr;
@@ -884,14 +903,21 @@ namespace Flux {
                                    qkv_mlp->ne[1], qkv_mlp->ne[2], qkv_mlp->nb[1], qkv_mlp->nb[2],
                                    hidden_size * 3 * qkv_mlp->nb[0]);
             }
-            if (use_yak_mlp) {
-                mlp = ggml_ext_silu_act(ctx->ggml_ctx, mlp, false);
-            } else if (use_mlp_silu_act) {
-                mlp = ggml_ext_silu_act(ctx->ggml_ctx, mlp);
+            const bool fused_swiglu_concat = ctx->htp_dit_native &&
+                sd_env_flag_enabled("SD_HTP_DIT_CONCAT") && (use_yak_mlp || use_mlp_silu_act);
+            ggml_tensor* attn_mlp = nullptr;
+            if (fused_swiglu_concat) {
+                attn_mlp = ggml_htp_dit_swiglu_concat(ctx->ggml_ctx, mlp, attn, use_yak_mlp ? 0 : 1);
             } else {
-                mlp = ggml_ext_gelu(ctx->ggml_ctx, mlp, true);
+                if (use_yak_mlp) {
+                    mlp = ctx->htp_dit_native ? ggml_htp_dit_swiglu(ctx->ggml_ctx,mlp,0) : ggml_ext_silu_act(ctx->ggml_ctx,mlp,false);
+                } else if (use_mlp_silu_act) {
+                    mlp = ctx->htp_dit_native ? ggml_htp_dit_swiglu(ctx->ggml_ctx,mlp,1) : ggml_ext_silu_act(ctx->ggml_ctx,mlp);
+                } else {
+                    mlp = ggml_ext_gelu(ctx->ggml_ctx, mlp, true);
+                }
+                attn_mlp = ggml_concat(ctx->ggml_ctx, attn, mlp, 0);  // [N, n_token, hidden_size + mlp_hidden_dim]
             }
-            auto attn_mlp = ggml_concat(ctx->ggml_ctx, attn, mlp, 0);  // [N, n_token, hidden_size + mlp_hidden_dim]
             if (packed.storage != nullptr && mask == nullptr &&
                 sd_env_flag_enabled("SD_HTP_PACKED_FLUX2_TRACE") && idx == 0) {
                 LOG_INFO("flux2_single_layout post_mlp=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] attn_mlp=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]",
@@ -902,7 +928,7 @@ namespace Flux {
             }
             auto output   = linear2->forward(ctx, attn_mlp);           // [N, n_token, hidden_size]
 
-            output = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, output, mod.gate));
+            output = gate_residual(ctx,x,output,mod.gate);
             return output;
         }
     };
@@ -955,7 +981,7 @@ namespace Flux {
                 scale      = m_vec[1];  // [N, hidden_size]
             }
 
-            x = Flux::modulate(ctx->ggml_ctx, norm_final->forward(ctx, x), shift, scale);
+            x = Flux::norm_modulate(ctx, norm_final->forward(ctx, x), shift, scale);
             x = linear->forward(ctx, x);
 
             return x;
@@ -1707,6 +1733,12 @@ namespace Flux {
 
         std::string get_desc() override {
             return "flux";
+        }
+
+        bool htp_dit_native_enabled() const override {
+            return version == VERSION_FLUX2_KLEIN && htp_op_routing_enabled() &&
+                sd_env_flag_enabled("SD_HTP_COMPUTE") && sd_env_flag_enabled("SD_HTP_DIT_NATIVE") &&
+                !block_sparse_attn_enabled && !sd_env_flag_enabled("SD_HTP_PACKED_FLUX2");
         }
 
         void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string prefix) {

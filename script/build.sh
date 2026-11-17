@@ -6,6 +6,13 @@ set -u
 cmake_bin="$CMAKE_ROOT_PATH/bin/cmake"
 ops=/work/htp-ops-lib
 sd_cpp=/work/sdcpp
+# Ship both routes: dense is the inference default; explicit sparse flags use OpenCL.
+opencl=${SD_HTP_BUILD_OPENCL:-ON}
+case "$opencl" in
+  ON) runtime_build="$sd_cpp/build-htp-opencl" ;;
+  OFF) runtime_build="$sd_cpp/build-htp-only" ;;
+  *) echo "SD_HTP_BUILD_OPENCL must be ON or OFF" >&2; exit 2 ;;
+esac
 host_build="$ops/android_ReleaseG_aarch64"
 dsp_build="$ops/hexagon_ReleaseG_toolv21_v75"
 
@@ -32,23 +39,32 @@ dsp_build="$ops/hexagon_ReleaseG_toolv21_v75"
   -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="$dsp_build/ship"
 "$cmake_bin" --build "$dsp_build" -j4
 
-"$cmake_bin" -S "$sd_cpp" -B "$sd_cpp/build-htp-opencl" -G Ninja \
+"$cmake_bin" -S "$sd_cpp" -B "$runtime_build" -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$ANDROID_ROOT_DIR/build/cmake/android.toolchain.cmake" \
   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 -DANDROID_STL=c++_shared \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
   -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_SHARED_GGML_LIB=ON \
   -DSD_BUILD_TESTS=OFF -DSD_BUILD_EXAMPLES=ON \
-  -DGGML_HTP=ON -DSD_OPENCL=ON -DGGML_NATIVE=OFF \
+  -DGGML_HTP=ON -DSD_OPENCL="$opencl" -DGGML_OPENCL="$opencl" -DGGML_NATIVE=OFF \
   -DSD_WEBP=OFF -DSD_WEBM=OFF -DSD_SERVER_BUILD_FRONTEND=OFF \
   -DOpenCL_INCLUDE_DIR=/work/OpenCL-Headers \
   -DOpenCL_LIBRARY=/work/libOpenCL.so
-"$cmake_bin" --build "$sd_cpp/build-htp-opencl" --target sd-cli -j4
+"$cmake_bin" --build "$runtime_build" --target sd-cli -j4
 
 mkdir -p /work/output/bin
-cp "$sd_cpp/build-htp-opencl/bin/sd-cli" /work/output/bin/
-for lib in stable-diffusion ggml ggml-base ggml-cpu ggml-htp ggml-opencl; do
-  cp "$sd_cpp/build-htp-opencl/bin/lib$lib.so" /work/output/bin/
+cp "$runtime_build/bin/sd-cli" /work/output/bin/
+for lib in stable-diffusion ggml ggml-base ggml-cpu ggml-htp; do
+  cp "$runtime_build/bin/lib$lib.so" /work/output/bin/
 done
+if [ "$opencl" = ON ]; then
+  cp "$runtime_build/bin/libggml-opencl.so" /work/output/bin/
+else
+  # Avoid shipping a stale auto-loaded OpenCL backend from an earlier build.
+  rm -f /work/output/bin/libggml-opencl.so
+fi
+mkdir -p /work/output/bin/htp
+cp "$sd_cpp"/script/htp/*.sh /work/output/bin/htp/
+chmod +x /work/output/bin/htp/run-*.sh
 cp "$host_build/ship/libhtp_ops.so" /work/output/bin/
 cp "$dsp_build/ship/libhtp_ops_skel.so" /work/output/bin/
 for lib in libc++.so.1 libc++abi.so.1; do

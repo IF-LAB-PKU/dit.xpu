@@ -107,10 +107,49 @@ static inline struct ggml_tensor *ggml_htp_native_aux(struct ggml_context *ctx,
  struct ggml_htp_native_metadata *p=ggml_htp_native_new_meta(ctx);p->v[0]=mode;p->v[1]=groups;p->scale=eps;
  x=ggml_htp_native_activation(ctx,x);
  if(w) w=w->type!=GGML_TYPE_F32?ggml_cast(ctx,w,GGML_TYPE_F32):mode<=2?ggml_cont(ctx,w):ggml_htp_native_activation(ctx,w);
- if(bias) bias=bias->type!=GGML_TYPE_F32?ggml_cast(ctx,bias,GGML_TYPE_F32):ggml_cont(ctx,bias);
+ if(bias) bias=bias->type!=GGML_TYPE_F32?ggml_cast(ctx,bias,GGML_TYPE_F32):mode>=9?ggml_htp_native_activation(ctx,bias):ggml_cont(ctx,bias);
  struct ggml_tensor *args[]={x,w,bias};
  struct ggml_tensor *out=ggml_custom_4d(ctx,GGML_TYPE_F32,x->ne[0],x->ne[1],x->ne[2],x->ne[3],args,bias?3:w?2:1,ggml_htp_f16_epilogue_no_cpu,1,p);
  ggml_htp_set_custom_tag(out,3);ggml_set_name(out,"htp_native_aux");return out;
+}
+
+// DiT tensors are [channels,tokens,batch]. Broadcast parameters remain
+// [channels,1,batch]. Preserve norm + norm*scale + shift arithmetic order.
+static inline struct ggml_tensor *ggml_htp_dit_norm_modulate(
+    struct ggml_context *ctx, struct ggml_tensor *x,
+    struct ggml_tensor *scale, struct ggml_tensor *shift, float eps) {
+    GGML_ASSERT(x->ne[3] == 1 && scale->ne[0] == x->ne[0] && shift->ne[0] == x->ne[0]);
+    scale = ggml_htp_native_activation(ctx, scale);
+    shift = ggml_htp_native_activation(ctx, shift);
+    scale = ggml_reshape_3d(ctx, scale, scale->ne[0], 1, ggml_nelements(scale)/scale->ne[0]);
+    shift = ggml_reshape_3d(ctx, shift, shift->ne[0], 1, ggml_nelements(shift)/shift->ne[0]);
+    return ggml_htp_native_aux(ctx, x, scale, shift, 9, 0, eps);
+}
+
+static inline struct ggml_tensor *ggml_htp_dit_gate_residual(
+    struct ggml_context *ctx, struct ggml_tensor *x,
+    struct ggml_tensor *gate, struct ggml_tensor *residual) {
+    GGML_ASSERT(x->ne[3] == 1 && ggml_are_same_shape(x, residual) && gate->ne[0] == x->ne[0]);
+    gate = ggml_htp_native_activation(ctx, gate);
+    gate = ggml_reshape_3d(ctx, gate, gate->ne[0], 1, ggml_nelements(gate)/gate->ne[0]);
+    return ggml_htp_native_aux(ctx, x, gate, residual, 10, 0, 0);
+}
+
+// Interleaved matrix RoPE: input [dim,heads,tokens,batch], matrix
+// [2,2,dim/2,tokens*batch], output [dim,tokens,heads*batch].
+static inline struct ggml_tensor *ggml_htp_dit_rope(
+    struct ggml_context *ctx, struct ggml_tensor *x, struct ggml_tensor *pe) {
+    struct ggml_htp_native_metadata *p = ggml_htp_native_new_meta(ctx);
+    p->v[0] = 11;
+    x = ggml_htp_native_activation(ctx, x);
+    pe = ggml_htp_native_activation(ctx, pe);
+    struct ggml_tensor *args[] = {x, pe};
+    struct ggml_tensor *out = ggml_custom_4d(ctx, GGML_TYPE_F32,
+        x->ne[0], x->ne[2], x->ne[1]*x->ne[3], 1,
+        args, 2, ggml_htp_f16_epilogue_no_cpu, 1, p);
+    ggml_htp_set_custom_tag(out, 3);
+    ggml_set_name(out, "htp_dit_rope");
+    return out;
 }
 
 // Transpose each row-major [rows,cols] matrix, preserving exact F32 values.
@@ -121,4 +160,52 @@ static inline struct ggml_tensor *ggml_htp_native_transpose(struct ggml_context 
  struct ggml_tensor *args[]={x};
  struct ggml_tensor *out=ggml_custom_4d(ctx,GGML_TYPE_F32,n0,n1,n2,n3,args,1,ggml_htp_f16_epilogue_no_cpu,1,p);
  ggml_htp_set_custom_tag(out,3);ggml_set_name(out,"htp_native_aux");return out;
+}
+
+// Fused SiLU(gate) * up. Input [2*width,tokens,batch], compact output;
+// no separate gate tensor or activation materialization.
+static inline struct ggml_tensor *ggml_htp_dit_swiglu(
+    struct ggml_context *ctx, struct ggml_tensor *x, int gate_first) {
+    GGML_ASSERT(x->ne[0]%2 == 0);
+    struct ggml_htp_native_metadata *p = ggml_htp_native_new_meta(ctx);
+    p->v[0] = 12;
+    p->v[2] = gate_first;
+    // Single-stream MLP is a row-strided slice of QKV+MLP. Consume it
+    // directly from the GEMM buffer instead of copying the full slice on CPU.
+    const bool row_slice = x->nb[0] == sizeof(float) && x->nb[1]%sizeof(float) == 0 &&
+        x->nb[1] >= x->ne[0]*sizeof(float) && x->nb[2] == x->nb[1]*x->ne[1] &&
+        x->nb[3] == x->nb[2]*x->ne[2];
+    if (!row_slice || (x->op == GGML_OP_NONE && x->buffer)) {
+        x = ggml_htp_native_activation(ctx, x);
+    }
+    struct ggml_tensor *args[] = {x};
+    struct ggml_tensor *out = ggml_custom_4d(ctx, GGML_TYPE_F32,
+        x->ne[0]/2, x->ne[1], x->ne[2], x->ne[3],
+        args, 1, ggml_htp_f16_epilogue_no_cpu, 1, p);
+    ggml_htp_set_custom_tag(out, 3);
+    ggml_set_name(out, "htp_dit_swiglu");
+    return out;
+}
+
+// Single-stream projection input: concatenate attention with SwiGLU directly
+// in DSP output. The raw MLP input may be a row-strided QKV+MLP slice.
+static inline struct ggml_tensor *ggml_htp_dit_swiglu_concat(
+    struct ggml_context *ctx, struct ggml_tensor *x, struct ggml_tensor *attention, int gate_first) {
+    GGML_ASSERT(x->ne[0]%2 == 0 && x->ne[1] == attention->ne[1] &&
+                x->ne[2] == attention->ne[2] && x->ne[3] == attention->ne[3]);
+    struct ggml_htp_native_metadata *p = ggml_htp_native_new_meta(ctx);
+    p->v[0] = 13;
+    p->v[2] = gate_first;
+    const bool row_slice = x->nb[0] == sizeof(float) && x->nb[1]%sizeof(float) == 0 &&
+        x->nb[1] >= x->ne[0]*sizeof(float) && x->nb[2] == x->nb[1]*x->ne[1] &&
+        x->nb[3] == x->nb[2]*x->ne[2];
+    if (!row_slice || (x->op == GGML_OP_NONE && x->buffer)) x = ggml_htp_native_activation(ctx, x);
+    attention = ggml_htp_native_activation(ctx, attention);
+    struct ggml_tensor *args[] = {x, attention};
+    struct ggml_tensor *out = ggml_custom_4d(ctx, GGML_TYPE_F32,
+        x->ne[0]/2 + attention->ne[0], x->ne[1], x->ne[2], x->ne[3],
+        args, 2, ggml_htp_f16_epilogue_no_cpu, 1, p);
+    ggml_htp_set_custom_tag(out, 3);
+    ggml_set_name(out, "htp_dit_swiglu_concat");
+    return out;
 }

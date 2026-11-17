@@ -195,6 +195,9 @@ bool RpcMemMapper::validate(const ggml_tensor * dst, const ggml_tensor * extra) 
             const bool persistent = persistent_bufs.count(base) != 0;
             const ViewKey key{base, fd, 0, buf->size};
             view_mapping.emplace(key, ViewRecord{fd, base, base, 0, buf->size, 0, persistent});
+            // release_buffer() decrements bytes only for accounted allocations.
+            // Staging uses the same lifetime accounting as range/plain maps.
+            accounted_bufs.insert(base);
             if (persistent) persistent_map_size += buf->size;
             else {
                 active_map_size += buf->size;

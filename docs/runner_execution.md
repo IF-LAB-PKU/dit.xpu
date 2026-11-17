@@ -82,9 +82,12 @@ final images under identical prompts, seeds and model files.
 ## T5 packed-weight prefetch
 
 `SD_HTP_PACKED_PREFETCH=1` enables one-segment lookahead for graph-cut T5
-with deferred, offline-packed F16 weights. Other runners and non-deferred
-weights retain synchronous staging. The sparse/OpenCL path is excluded.
-The switch is off by default because the extra bank increases memory usage.
+with deferred, offline-packed F16 weights. Qwen3 and DiT have their own
+runner eligibility switches; SD3.5 supports both dense and sparse/OpenCL
+attention. Packed QKV F32 bias/norm parameters travel in the same typed
+prefetch batch as their F16 projections. Other unsupported/non-deferred
+weights retain synchronous staging. The library switch is opt-in because the
+extra bank increases memory usage; recognized packed CLI models enable it.
 
 The main thread plans each segment's tensors and session owners, initializes
 loader metadata, and reserves a private next bank. One background task reads
@@ -92,7 +95,10 @@ copied names/types/sizes into raw reserved addresses while the current bank
 is consumed. It never changes tensor bindings or backend mappings. Before
 the next segment, the main thread joins the reader, checks the tensor set,
 binds the completed bank, then reuses the released previous bank. All exits
-drain the reader before freeing reservations. Reservation/launch failure
+drain the reader before freeing reservations. HTP GEMM/QKV finishes before
+segment return; deferred OpenCL attention/residual work owns activation/cache
+arenas, not weight banks. Bank reuse therefore retains the existing OpenCL
+activation lifetime protocol. Reservation/launch failure
 falls back to synchronous staging; an actual read failure fails the request.
 
 Each bank independently obeys `SD_HTP_PACKED_STAGING_BUDGET_MB` and

@@ -33,7 +33,15 @@ public:
         auto fc2 = std::dynamic_pointer_cast<Linear>(blocks["fc2"]);
 
         x = fc1->forward(ctx, x);
-        x = ggml_ext_gelu(ctx->ggml_ctx, x, true);
+        // Upgrade this SD3 MLP's packed projection without depending on text flags.
+        auto* linear = x->op == GGML_OP_RESHAPE ? x->src[0] : x;
+        if (ctx->htp_sd3_dit_native && ggml_htp_f16_epilogue_mode(linear) == 0) {
+            auto* activated = ggml_htp_f16_epilogue(ctx->ggml_ctx, linear->src[0],
+                linear->src[1], linear->src[2], 1, linear->ne[0]);
+            x = ggml_reshape_4d(ctx->ggml_ctx, activated, x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
+        } else {
+            x = ggml_ext_gelu(ctx->ggml_ctx, x, true);
+        }
         x = fc2->forward(ctx, x);
         return x;
     }
@@ -284,6 +292,25 @@ __STATIC_INLINE__ ggml_tensor* modulate(ggml_context* ctx,
     return x;
 }
 
+// Keep the bare norm visible so normalization and modulation share one DSP pass.
+static inline ggml_tensor* mmdit_norm_modulate(GGMLRunnerContext* ctx, ggml_tensor* normalized,
+                                               ggml_tensor* shift, ggml_tensor* scale) {
+    if (ctx->htp_dit_native && normalized->op == GGML_OP_NORM && normalized->ne[3] == 1) {
+        float eps;
+        memcpy(&eps, normalized->op_params, sizeof(eps));
+        return ggml_htp_dit_norm_modulate(ctx->ggml_ctx, normalized->src[0], scale, shift, eps);
+    }
+    return modulate(ctx->ggml_ctx, normalized, shift, scale);
+}
+
+static inline ggml_tensor* mmdit_gate_residual(GGMLRunnerContext* ctx, ggml_tensor* residual,
+                                               ggml_tensor* branch, ggml_tensor* gate) {
+    if (ctx->htp_dit_native && branch->ne[3] == 1 && ggml_are_same_shape(branch, residual)) {
+        return ggml_htp_dit_gate_residual(ctx->ggml_ctx, branch, gate, residual);
+    }
+    return ggml_add(ctx->ggml_ctx, residual, ggml_mul(ctx->ggml_ctx, branch, gate));
+}
+
 struct DismantledBlock : public GGMLBlock {
     // A DiT block with gated adaptive layer norm (adaLN) conditioning.
 public:
@@ -343,7 +370,7 @@ public:
         const int n_mods = self_attn ? 9 : (pre_only ? 2 : 6);
         auto m = adaLN_modulation_1->forward(ctx, ggml_silu(ctx->ggml_ctx, c));
         auto m_vec = ggml_ext_chunk(ctx->ggml_ctx, m, n_mods, 0);
-        auto attn_in = modulate(ctx->ggml_ctx, norm1->forward(ctx, x), m_vec[0], m_vec[1]);
+        auto attn_in = mmdit_norm_modulate(ctx, norm1->forward(ctx, x), m_vec[0], m_vec[1]);
         if (pre_only) {
             return {attn_in, {nullptr, nullptr, nullptr, nullptr, nullptr}};
         }
@@ -374,8 +401,8 @@ public:
 
         auto x_norm = norm1->forward(ctx, x);
 
-        auto attn_in = modulate(ctx->ggml_ctx, x_norm, shift_msa, scale_msa);
-        auto attn2_in = modulate(ctx->ggml_ctx, x_norm, shift_msa2, scale_msa2);
+        auto attn_in = mmdit_norm_modulate(ctx, x_norm, shift_msa, scale_msa);
+        auto attn2_in = mmdit_norm_modulate(ctx, x_norm, shift_msa2, scale_msa2);
         return {attn_in, attn2_in, {x, gate_msa, shift_mlp, scale_mlp, gate_mlp, gate_msa2}};
     }
 
@@ -414,13 +441,13 @@ public:
             auto scale_mlp = m_vec[4];  // [N, hidden_size]
             auto gate_mlp  = m_vec[5];  // [N, hidden_size]
 
-            auto attn_in = modulate(ctx->ggml_ctx, norm1->forward(ctx, x), shift_msa, scale_msa);
+            auto attn_in = mmdit_norm_modulate(ctx, norm1->forward(ctx, x), shift_msa, scale_msa);
 
             auto qkv = attn->pre_attention(ctx, attn_in);
 
             return {qkv, {x, gate_msa, shift_mlp, scale_mlp, gate_mlp}};
         } else {
-            auto attn_in = modulate(ctx->ggml_ctx, norm1->forward(ctx, x), shift_msa, scale_msa);
+            auto attn_in = mmdit_norm_modulate(ctx, norm1->forward(ctx, x), shift_msa, scale_msa);
             auto qkv     = attn->pre_attention(ctx, attn_in);
 
             return {qkv, {nullptr, nullptr, nullptr, nullptr, nullptr}};
@@ -457,10 +484,10 @@ public:
         attn_out  = attn->post_attention(ctx, attn_out);
         attn2_out = attn2->post_attention(ctx, attn2_out);
 
-        x            = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, attn_out, gate_msa));
-        x            = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, attn2_out, gate_msa2));
-        auto mlp_out = mlp->forward(ctx, modulate(ctx->ggml_ctx, norm2->forward(ctx, x), shift_mlp, scale_mlp));
-        x            = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, mlp_out, gate_mlp));
+        x            = mmdit_gate_residual(ctx, x, attn_out, gate_msa);
+        x            = mmdit_gate_residual(ctx, x, attn2_out, gate_msa2);
+        auto mlp_out = mlp->forward(ctx, mmdit_norm_modulate(ctx, norm2->forward(ctx, x), shift_mlp, scale_mlp));
+        x            = mmdit_gate_residual(ctx, x, mlp_out, gate_mlp);
 
         return x;
     }
@@ -490,9 +517,9 @@ public:
 
         attn_out = attn->post_attention(ctx, attn_out);
 
-        x            = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, attn_out, gate_msa));
-        auto mlp_out = mlp->forward(ctx, modulate(ctx->ggml_ctx, norm2->forward(ctx, x), shift_mlp, scale_mlp));
-        x            = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, mlp_out, gate_mlp));
+        x            = mmdit_gate_residual(ctx, x, attn_out, gate_msa);
+        auto mlp_out = mlp->forward(ctx, mmdit_norm_modulate(ctx, norm2->forward(ctx, x), shift_mlp, scale_mlp));
+        x            = mmdit_gate_residual(ctx, x, mlp_out, gate_mlp);
 
         return x;
     }
@@ -874,7 +901,7 @@ public:
         auto shift = m_vec[0];  // [N, hidden_size]
         auto scale = m_vec[1];  // [N, hidden_size]
 
-        x = modulate(ctx->ggml_ctx, norm_final->forward(ctx, x), shift, scale);
+        x = mmdit_norm_modulate(ctx, norm_final->forward(ctx, x), shift, scale);
         x = linear->forward(ctx, x);
 
         return x;
@@ -1163,6 +1190,11 @@ struct MMDiTRunner : public GGMLRunner {
         return "mmdit";
     }
 
+    bool htp_dit_native_enabled() const override {
+        return htp_op_routing_enabled() && sd_env_flag_enabled("SD_HTP_COMPUTE") &&
+            sd_env_flag_enabled("SD_HTP_SD3_DIT_NATIVE") && !block_sparse_attn_enabled;
+    }
+
     void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string prefix) {
         mmdit.get_param_tensors(tensors, prefix);
     }
@@ -1186,6 +1218,7 @@ struct MMDiTRunner : public GGMLRunner {
         ggml_tensor* y         = make_optional_input(y_tensor);
 
         auto runner_ctx = get_context();
+        runner_ctx.htp_sd3_dit_native = runner_ctx.htp_dit_native;
         sd_install_local_residual_graph_expansion(
             gf, block_sparse_residual_mode, &runner_ctx);
         if (block_sparse_residual_mode == SD_HTP_BLOCK_SPARSE_RESIDUAL_ANCHOR &&

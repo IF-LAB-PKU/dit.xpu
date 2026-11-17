@@ -6159,6 +6159,8 @@ struct GGMLRunnerContext {
     bool htp_text_native = false;
     bool htp_text_native_aux = false;
     bool htp_vae_native = false;
+    bool htp_dit_native = false;
+    bool htp_sd3_dit_native = false;
     bool conv2d_direct_enabled                                       = false;
     bool circular_x_enabled                                          = false;
     bool circular_y_enabled                                          = false;
@@ -7154,6 +7156,8 @@ protected:
     }
 
     // 当前只允许 CPU runtime 走 HTP hybrid，因为未支持算子需要直接回退到 CPU。
+    virtual bool htp_dit_native_enabled() const { return false; }
+
     bool htp_op_routing_enabled() const {
         return htp_backend != nullptr && ggml_backend_is_cpu(runtime_backend);
     }
@@ -8095,7 +8099,8 @@ protected:
         // directly. Cached leaves cannot be relocated by the graph allocator.
         const bool native_cache=htp_op_routing_enabled() &&
             ((htp_text_encoder_enabled_ && sd_env_flag_enabled("SD_HTP_TEXT_NATIVE")) ||
-             (htp_vae_conv_enabled_ && sd_env_flag_enabled("SD_HTP_VAE_NATIVE")));
+             (htp_vae_conv_enabled_ && sd_env_flag_enabled("SD_HTP_VAE_NATIVE")) ||
+             htp_dit_native_enabled());
         segment.buffer = ggml_backend_alloc_ctx_tensors(segment.ctx, native_cache ? htp_backend : runtime_backend);
         if (segment.buffer == nullptr) {
             LOG_ERROR("%s alloc cache backend buffer failed, num_tensors=%zu",
@@ -9696,12 +9701,12 @@ protected:
         std::unique_ptr<int, decltype(prefetch_cleanup)> prefetch_guard(&prefetch_token, prefetch_cleanup);
         const bool prefetch_runner = get_desc() == "t5" ||
             (htp_text_encoder_enabled_ && get_desc() == "qwen3") ||
+            (get_desc() == "mmdit" && sd_env_flag_enabled("SD_HTP_SD3_DIT_PREFETCH")) ||
             (get_desc() == "flux" && sd_env_flag_enabled("SD_HTP_DIT_PREFETCH") &&
              !sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_ATTN") &&
              !sd_env_flag_enabled("SD_HTP_PACKED_FLUX2"));
         if (prefetch_runner && htp_packed_staging_enabled() &&
-            sd_env_flag_enabled("SD_HTP_PACKED_PREFETCH") && plan.segments.size() > 1 &&
-            !sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL")) {
+            sd_env_flag_enabled("SD_HTP_PACKED_PREFETCH") && plan.segments.size() > 1) {
             auto profile = execution_profile_.timer(RunnerProfile::Build);
             bool eligible = true;
             prefetch_plan.resize(plan.segments.size());
@@ -9711,9 +9716,15 @@ protected:
                 const auto weights = collect_htp_packable_f16_weights(view);
                 const auto owners = plan_htp_staging_owners(view, weights);
                 for (auto* weight : weights) {
-                    if (weight->type != GGML_TYPE_F16 ||
-                        !(weight->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) ||
-                        !(weight->flags & SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM)) {
+                    const bool deferred_projection = weight->type == GGML_TYPE_F16 &&
+                        (weight->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) &&
+                        (weight->flags & SD_GGML_TENSOR_FLAG_HTP_DEFERRED_PACKED_PARAM);
+                    // Packed QKV also stages small F32 bias/norm parameters.
+                    // The typed loader can read them into the private bank;
+                    // bindings change only on the main thread after join.
+                    const bool qkv_aux = weight->type == GGML_TYPE_F32 &&
+                        should_place_param_in_htp_rpcmem(weight);
+                    if (!deferred_projection && !qkv_aux) {
                         eligible = false;
                         break;
                     }
@@ -9752,6 +9763,9 @@ protected:
                     return true;
                 };
                 htp_start_prefetch_ = [&] {
+                    // HTP GEMM/QKV dispatch completes before segment return.
+                    // Deferred OpenCL work owns Q/K/V activation/cache arenas,
+                    // never projection weights, so the released bank is reusable.
                     const size_t next = current_segment + 1;
                     if (next >= prefetch_plan.size() || prefetch_plan[next].empty()) return;
                     GGML_ASSERT(!prefetch.pending());
@@ -9874,6 +9888,7 @@ public:
         runner_ctx.htp_text_native_aux = runner_ctx.htp_text_native &&
             (!std::getenv("SD_HTP_TEXT_NATIVE_AUX") || sd_env_flag_enabled("SD_HTP_TEXT_NATIVE_AUX"));
         runner_ctx.htp_vae_native = htp_vae_conv_enabled_ && htp_op_routing_enabled() && sd_env_flag_enabled("SD_HTP_VAE_NATIVE");
+        runner_ctx.htp_dit_native = htp_dit_native_enabled();
         runner_ctx.flash_attn_enabled    = flash_attn_enabled;
         runner_ctx.block_sparse_attn_enabled = block_sparse_attn_enabled;
         runner_ctx.htp_attention_enabled  = htp_attention_enabled;
@@ -10541,6 +10556,14 @@ public:
             forward_params.linear.scale          = scale;
             return ctx->weight_adapter->forward(ctx->ggml_ctx, ctx->backend, x, w, b, prefix, forward_params);
         }
+        if (ctx->htp_sd3_dit_native && scale == 1.f && x->type == GGML_TYPE_F32 &&
+            (w->flags & SD_GGML_TENSOR_FLAG_HTP_PACKED_W16A32) != 0) {
+            const int64_t n1 = x->ne[1], n2 = x->ne[2], n3 = x->ne[3];
+            if (!ggml_is_contiguous(x)) x = ggml_cont(ctx->ggml_ctx, x);
+            x = ggml_reshape_2d(ctx->ggml_ctx, x, x->ne[0], n1*n2*n3);
+            x = ggml_htp_f16_epilogue(ctx->ggml_ctx, w, x, b, 0, w->ne[1]);
+            return ggml_reshape_4d(ctx->ggml_ctx, x, x->ne[0], n1, n2, n3);
+        }
         return ggml_ext_linear(ctx->ggml_ctx, x, w, b, force_prec_f32, scale);
     }
 };
@@ -10985,7 +11008,8 @@ public:
                 }
             }
         }
-        if(ctx->htp_text_native_aux) return ggml_htp_native_aux(ctx->ggml_ctx,x,w,b,0,1,eps);
+        if (ctx->htp_text_native_aux || (ctx->htp_sd3_dit_native && elementwise_affine))
+            return ggml_htp_native_aux(ctx->ggml_ctx,x,w,b,0,1,eps);
         return ggml_ext_layer_norm(ctx->ggml_ctx, x, w, b, eps);
     }
 };
@@ -11063,6 +11087,7 @@ public:
         if (ctx->weight_adapter) {
             w = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, w, prefix + "weight");
         }
+        if (ctx->htp_sd3_dit_native) return ggml_htp_native_aux(ctx->ggml_ctx,x,w,nullptr,1,1,eps);
         x = ggml_rms_norm(ctx->ggml_ctx, x, eps);
         x = ggml_mul_inplace(ctx->ggml_ctx, x, w);
         return x;

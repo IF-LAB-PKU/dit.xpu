@@ -787,7 +787,7 @@ int ggml_backend_htp_context::set_active_session(int session_index) {
     if (target == nullptr || current == nullptr || target->native_session == nullptr) {
         return -1;
     }
-    if (session_index == active_session_index) {
+    if (session_index == active_session_index && target->lease_active) {
         return 0;
     }
 
@@ -803,7 +803,6 @@ int ggml_backend_htp_context::set_active_session(int session_index) {
 
     using release_fn_type = int(htp_ops_session *);
     using acquire_fn_type = int(htp_ops_session *);
-    using init_fn_type = void();
     using set_active_fn_type = int(htp_ops_session *);
     using set_default_fn_type = int();
 
@@ -823,21 +822,16 @@ int ggml_backend_htp_context::set_active_session(int session_index) {
         current->lease_active = false;
     }
 
-    if (target->reserved) {
-        auto acquire = reinterpret_cast<acquire_fn_type *>(reserved_session_acquire_fn);
-        if (acquire == nullptr || acquire(target->native_session) != 0) {
-            std::fprintf(stderr, "[ggml-htp] session[%d] acquire failed\n", session_index);
-            return -1;
-        }
-        target->lease_active = true;
-    } else {
-        auto init_default = reinterpret_cast<init_fn_type *>(dlsym(ops_dl_handle, "init_htp_backend"));
-        if (init_default == nullptr) {
-            return -1;
-        }
-        init_default();
-        target->lease_active = true;
+    // Both default and reserved sessions use the checked lease API. The old
+    // default-session void initializer hid resource failures and incorrectly
+    // marked the session active, so the following op failed with EBADSTATE.
+    auto acquire = reinterpret_cast<acquire_fn_type *>(reserved_session_acquire_fn);
+    const int acquire_err = acquire == nullptr ? -1 : acquire(target->native_session);
+    if (acquire_err != 0) {
+        std::fprintf(stderr, "[ggml-htp] session[%d] acquire failed rc=0x%x\n", session_index, acquire_err);
+        return -1;
     }
+    target->lease_active = true;
 
     auto set_active = reinterpret_cast<set_active_fn_type *>(
         dlsym(ops_dl_handle, "htp_ops_set_active_session"));

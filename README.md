@@ -24,26 +24,25 @@ A C/C++ inference runtime for DiT image generation on Qualcomm Snapdragon device
 
 ## 🚀 Quick Start
 
-This example uses **SD3.5 Medium** to build in Docker and run **256×256 HTP sparse inference with 20 sampling steps** on an Android phone. The DiT, VAE and all three text encoders use offline-packed weights; native HTP kernels handle text attention and VAE convolution as well.
+This example uses **SD3.5 Medium** to build in Docker and run **256×256 HTP/OpenCL sparse inference with 20 sampling steps** on an Android phone. The DiT, VAE and all three text encoders use offline-packed weights; native HTP kernels handle text attention and VAE convolution as well.
 
 ### 1. 🛠️ Prerequisites
 
 - Install Docker, Git, and ADB on the host, and enable USB debugging on the phone.
 - Prepare the Linux version of [Hexagon SDK 6.7.0.0](https://www.qualcomm.com/developer/software/hexagon-sdk), including Tools 21.0.04, NDK r27d, and CMake 3.28.3.
-- Use a phone with HTP and OpenCL support. Allow about 40 GB of free storage to keep both the original and converted model files. The build below targets DSP v75.
+- Use a phone with HTP and OpenCL support (OpenCL is used by the sparse route below). Allow about 40 GB of free storage to keep both the original and converted model files. The build below targets DSP v75.
 
 Run the following commands in the same terminal on the host.
 
 ### 2. 📦 Clone the Repositories and Retrieve the OpenCL Library
 
-This configuration requires the matching HTP library commit `3315a61a1b8a0aaa7ea3e9fa5789efdd0f04b55d`, pinned below.
+Clone the current `main` branches of both repositories and build the matching HTP host/DSP libraries together with sd.cpp. Native DiT/concat kernels require HTP commit `e2663f6` or later; the earlier `3315a61` revision lacks these kernels.
 
 ```bash
 mkdir sdcpp-work
 cd sdcpp-work
 git clone https://github.com/destined555/sd.cpp-npu.git sdcpp
 git clone https://github.com/destined555/htp-ops-lib-sd.cpp.git htp-ops-lib
-git -C htp-ops-lib checkout --detach 3315a61a1b8a0aaa7ea3e9fa5789efdd0f04b55d
 git clone --depth 1 --branch v2024.10.24 \
   https://github.com/KhronosGroup/OpenCL-Headers.git OpenCL-Headers
 
@@ -83,7 +82,7 @@ docker exec sdcpp-build bash -c '
 
 ### 4. 🔨 Build and Collect Runtime Files
 
-Use [script/build.sh](script/build.sh) to build the Android host library, DSP v75 library, and `sd-cli` with CPU / HTP / OpenCL enabled. Runtime files are collected in `output/bin/`.
+Use [script/build.sh](script/build.sh) to build the Android host library, DSP v75 library, and `sd-cli` with CPU / HTP / OpenCL support. Dense is the default inference route; OpenCL is used when sparse flags are explicitly enabled. Runtime files and optional convenience launchers are collected in `output/bin/`. `SD_HTP_BUILD_OPENCL=OFF` builds a smaller CPU/HTP-only package, which cannot run the OpenCL sparse route.
 
 ```bash
 docker exec sdcpp-build bash /work/sdcpp/script/build.sh
@@ -146,31 +145,17 @@ adb shell '
 T5's FP8 source is decoded to F16 for HTP GEMM, so its converted file is about 8.87 GiB. These packages are HTP-only; keep the original files for CPU inference. Re-export an older VAE package to include the attention projections. Deploy the matching host/DSP libraries built above; the old `9e12214` DSP revision lacks the native text/VAE kernels.
 
 ### 7. 🎨 Run Inference and Retrieve the Image
+Generate a 256×256 image with 20 sampling steps, the prompt cat, and seed 42. Text Linear/attention/norm and VAE convolution/attention/norm use HTP; the DiT retains the HTP/OpenCL sparse path. CPU remains the graph scheduler and handles unsupported operations. The CPU backend assignments below are required by the hybrid HTP runner.
 
-Generate a 256×256 image with 20 sampling steps, the prompt `cat`, and seed 42. Text Linear/attention/norm and VAE convolution/attention/norm use HTP; the DiT retains the HTP/OpenCL sparse path. CPU remains the graph scheduler and handles unsupported operations. The CPU backend assignments below are required by the hybrid HTP runner.
 
 ```bash
 adb shell '
   cd /data/local/tmp/sdcpp || exit 1
-  export LD_LIBRARY_PATH="$PWD/bin"
-  export DSP_LIBRARY_PATH="$PWD/bin;/vendor/lib/rfsa/adsp;/vendor/dsp/cdsp"
+  export LD_LIBRARY_PATH="$PWD/bin:/vendor/lib64:/system/lib64"
+  export DSP_LIBRARY_PATH="$PWD/bin;/vendor/lib/rfsa/adsp;/vendor/dsp/cdsp;/vendor/dsp;/dsp"
   export ADSP_LIBRARY_PATH="$DSP_LIBRARY_PATH"
-  export SD_PRELOAD_BACKENDS=htp
-  export SD_HTP_OPS=1
-  export SD_HTP_COMPUTE=1
-  export SD_HTP_ATTENTION=1
-  export SD_HTP_MULTI_SESSION=1
-  export SD_HTP_MULTI_SESSION_COUNT=2
-  export SD_HTP_TEXT=1
-  export SD_HTP_TEXT_NATIVE=1
-  export SD_HTP_TEXT_NATIVE_AUX=1
-  export SD_HTP_TEXT_FUSION=1
-  export SD_HTP_VAE=1
-  export SD_HTP_VAE_NATIVE=1
-  export SD_HTP_VAE_NATIVE_CONV=1
-  export SD_HTP_VAE_FUSION=1
+
   export SD_HTP_BLOCK_SPARSE_ATTN=1
-  export SD_HTP_BLOCK_SPARSE_KEEP_RATIO=0
   export SD_HTP_BLOCK_SPARSE_PATCH_HALO=1
   export SD_HTP_BLOCK_SPARSE_WARMUP_RATIO=0.2
   export SD_HTP_BLOCK_SPARSE_DENSE_TAIL_RATIO=0
@@ -179,9 +164,6 @@ adb shell '
   export SD_HTP_BLOCK_SPARSE_RESIDUAL_EXACT_RHO=1
   export SD_HTP_SPARSE_OPENCL=1
   export SD_HTP_SPARSE_OPENCL_RESIDUAL=1
-  export SD_HTP_SPARSE_OPENCL_LIFETIME_MODE=reuse
-  export SD_HTP_HALO_KV_LOAD=l2fetch
-  export SD_HTP_PACKED_ATTENTION=1
 
   ./bin/sd-cli -v -t 4 --backend cpu --params-backend cpu \
     --clip_l model/sd3.5-medium/clip_l_htp_w16a32.gguf \
@@ -203,42 +185,17 @@ adb pull /data/local/tmp/sdcpp/sdcpp-sparse-256.png results/
 adb pull /data/local/tmp/sdcpp/sdcpp-sparse-256.log results/
 ```
 
-The generated image and runtime log are saved in `results/` on the host.
-
-Text weights use segment-scoped staging automatically, with a default 512 MiB pool and 256 MiB slots. This avoids mapping all of T5 at once. It does not enable global DiT staging. The sparse example keeps `SD_HTP_SPARSE_OPENCL=1`, which disables the current packed-weight prefetch path; it still uses synchronous text staging.
-
-See [native HTP text/VAE](docs/htp_native_models.md) for kernel coverage and validation, and [HTP text encoders](docs/htp_text_encoders.md) for weight formats and staging. Native mode is not guaranteed to be faster for every shape. For FLUX.2 Klein 4B, use the separate [HTP guide](docs/htp_flux2_klein.md), including Qwen3 conversion and dense DiT prefetch settings.
-
 <a id="issues"></a>
 
 ## 🐛 Issues
 
-### FastRPC Mapping Limits on Snapdragon 8 Gen 3 and Earlier: Multi Session + Staging
+### FastRPC Mapping Limits: Staging and Optional Multi Session
 
-This issue affects phones with Snapdragon 8 Gen 3 or earlier SoCs. As discussed in [qualcomm/fastrpc#137](https://github.com/qualcomm/fastrpc/issues/137), DSP virtual address space is limited, and mappings may not be released immediately after unmapping. This can cause subsequent weight mappings to fail. On affected devices, use the following workarounds.
+Snapdragon 8 Gen 3 and earlier devices have limited DSP virtual address space; see [qualcomm/fastrpc#137](https://github.com/qualcomm/fastrpc/issues/137). Current packed dense CLI defaults use bounded staging, immediate unmap and the staging byte-accounting fix, so single-session execution is the default for the tested SD3.5 Medium/Klein4B configurations.
 
-**1. Multi Session**
+Keep each graph-cut segment within its staging bank budget. Klein needs a 1 GiB bank because its existing double-stream block contains about 684 MiB of packed weights. `--max-vram 0.5` controls graph-cut planning; it cannot split every individual block and is distinct from the pool allocation budget.
 
-Distribute weight mappings across multiple FastRPC sessions. Step 7 already enables two sessions:
-
-```bash
-export SD_HTP_MULTI_SESSION=1
-export SD_HTP_MULTI_SESSION_COUNT=2
-```
-
-**2. Staging**
-
-Text encoders already use segment-scoped staging when `SD_HTP_TEXT=1`, with a default 512 MiB pool and 256 MiB slots. No additional staging flags are needed for the text encoders in Step 7.
-
-If DiT weight mappings also fail, enable staging for DiT and start with a bounded pool:
-
-```bash
-export SD_HTP_PACKED_STAGING=1
-export SD_HTP_PACKED_STAGING_BUDGET_MB=512
-export SD_HTP_PACKED_STAGING_SLOT_MB=256
-```
-
-Also add `--max-vram 0.5` to the `sd-cli` command to limit graph weight segments to 0.5 GiB. `SD_HTP_PACKED_STAGING_BUDGET_MB` sets the staging pool budget in MiB; these settings also apply to text staging. Segments that exceed the pool budget must be split further or given a larger budget. For FLUX.2 Klein, follow its [model-specific settings](docs/htp_flux2_klein.md).
+Multi session remains an optional experiment, explicitly enabled with `SD_HTP_MULTI_SESSION=1` and `SD_HTP_MULTI_SESSION_COUNT=2`. It is not required by the current dense defaults and does not imply parallel execution. Two-session switching has shown VTCM acquire errors (`0x80000402`) on the current phone; a later single-session initialization also returned this code after repeated runs and required a reboot. That resource issue is separate from the fixed host mapping accounting, and single session is not a guarantee against it. Larger resolutions and other models require separate validation. Sparse/OpenCL execution remains an explicit alternative rather than the default.
 
 For other problems, open a [GitHub issue](https://github.com/destined555/sd.cpp-npu/issues) with your device and SDK versions, repository commit, model filenames, full command, and logs.
 

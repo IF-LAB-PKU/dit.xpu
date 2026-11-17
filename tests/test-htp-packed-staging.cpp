@@ -159,6 +159,33 @@ static void test_prefetch() {
         CHECK(static_cast<unsigned char*>(b->data)[127] == 55);
     }
     CHECK(a->data == nullptr && b->data == nullptr && allocations == 0);
+    {
+        // Packed QKV lookahead includes F32 auxiliaries with existing storage.
+        // Loading must preserve their bindings until main-thread commit, and
+        // releasing the bank must restore the original allocation.
+        auto* bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
+        float original[32] = {};
+        bias->data = original;
+        HtpWeightPrefetch pipeline;
+        auto mixed = weights;
+        mixed[1] = {bias, "qkv.bias", 128, GGML_TYPE_F32, 1};
+        CHECK(pipeline.start(bank(), mixed, [](const std::string& name, void* p, size_t n, ggml_type type) {
+            if (name == "qkv.bias") {
+                CHECK(type == GGML_TYPE_F32 && n == 32 * sizeof(float));
+                std::fill_n(static_cast<float*>(p), 32, 1.25f);
+            } else {
+                CHECK(type == GGML_TYPE_F16);
+                std::memset(p, 66, n);
+            }
+            return true;
+        }));
+        auto ready = pipeline.take();
+        CHECK(ready && bias->data == original && original[0] == 0.f);
+        CHECK(ready->bind());
+        CHECK(bias->data != original && static_cast<float*>(bias->data)[31] == 1.25f);
+        ready.reset();
+        CHECK(bias->data == original && original[0] == 0.f && allocations == 0);
+    }
     ggml_free(ctx);
     std::puts("prefetch lifecycle checks passed");
 }

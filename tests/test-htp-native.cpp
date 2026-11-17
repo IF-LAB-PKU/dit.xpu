@@ -71,7 +71,7 @@ int main() {
   printf("attention dim=%d mode=%d len=%d max_abs=%g rmse=%g\n",dim,mode,len,maxerr,sqrt(squared/ys.size()));fflush(stdout);GGML_ASSERT(maxerr<.012);
   ggml_backend_buffer_free(buf);ggml_free(ctx);
  }
- for(int width:{13,768}) for(int mode=0;mode<8;++mode) for(int fused=0;fused<(mode==2?2:1);++fused) {
+ for(int width:{13,64,768}) for(int mode=0;mode<8;++mode) for(int fused=0;fused<(mode==2?2:1);++fused) {
   int channels=12,height=7,batch=2,count=width*height*channels*batch,normwidth=mode==2?channels:width;
   auto *ctx=ggml_init({4*1024*1024,nullptr,true});auto *x=ggml_new_tensor_4d(ctx,GGML_TYPE_F32,width,height,channels,batch);
   auto *w=ggml_new_tensor_1d(ctx,GGML_TYPE_F32,mode<=2?normwidth:count);auto *b=ggml_new_tensor_1d(ctx,GGML_TYPE_F32,normwidth);

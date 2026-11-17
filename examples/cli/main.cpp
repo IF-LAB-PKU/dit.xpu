@@ -19,6 +19,7 @@
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
 #include "image_metadata.h"
+#include "htp_defaults.hpp"
 
 namespace fs = std::filesystem;
 
@@ -770,6 +771,16 @@ int main(int argc, const char* argv[]) {
                                                                   true,
                                                                   cli_params.taesd_preview,
                                                                   staged_params_loading);
+
+    bool max_vram_explicit = false;
+    for (int i = 1; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--max-vram") || !std::strncmp(argv[i], "--max-vram=", 11))
+            max_vram_explicit = true;
+    }
+    if (const char* profile = sd_cli_htp::apply(sd_ctx_params, max_vram_explicit)) {
+        LOG_INFO("HTP CLI defaults: %s (explicit environment/CLI values preserved, max_vram=%.3f)",
+                 profile, sd_ctx_params.max_vram);
+    }
 
     SDImageVec results;
     int num_results             = 0;

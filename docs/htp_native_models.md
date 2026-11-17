@@ -15,15 +15,20 @@ export SD_PRELOAD_BACKENDS=htp SD_HTP_COMPUTE=1
 export SD_HTP_TEXT=1 SD_HTP_VAE=1
 export SD_HTP_TEXT_NATIVE=1 SD_HTP_VAE_NATIVE=1
 export SD_HTP_TEXT_FUSION=1 SD_HTP_VAE_FUSION=1
-# Current SD3.5 Medium device configuration:
-export SD_HTP_MULTI_SESSION=1 SD_HTP_MULTI_SESSION_COUNT=2
+# Current SD3.5 Medium/Klein defaults use one session:
+export SD_HTP_MULTI_SESSION=0 SD_HTP_DEFER_UNMAP=0
 ```
 
 `SD_HTP_TEXT_NATIVE` enables attention, LayerNorm/RMSNorm, residual additions and T5 gating multiplication, plus packed Linear bias/MLP epilogues. To measure attention and Linear epilogues with CPU normalization/residual/gating, set `SD_HTP_TEXT_NATIVE_AUX=0`. The auxiliary switch defaults to enabled when text native mode is enabled. Embeddings, tokenization, CLIP position addition, T5 bias lookup/scaling and parameter-copy nodes remain on CPU. Reshape/view nodes only describe layouts.
 
 `SD_HTP_VAE_NATIVE` enables native convolution, attention, GroupNorm+SiLU, residual addition and attention-layout transpose. `SD_HTP_VAE_NATIVE_CONV` can override convolution independently. Setting it alone retains CPU normalization/attention. Two-times nearest upsampling followed by a native convolution is absorbed into its input sampler. Bias is fused into the convolution output store.
 
-All native switches default to off. Unsupported packed operations fail explicitly rather than executing tiled weights as ordinary CPU weights. Weight adapters and unsupported convolution variants retain their existing implementation. This implementation targets standard Conv2d, not grouped/depthwise/transposed convolutions. It has been tested on SD3.5 Medium decode; broader models and VAE encoding are not yet validated.
+For the current packed SD3.5 Medium/Klein4B models with CPU backends, staged
+image generation through `sd-cli` automatically enables native text/VAE and
+the measured dense settings before backend initialization. Explicit sparse
+exports retain the previous sparse route. Other models and the C API remain
+opt-in; `SD_HTP_MODEL_DEFAULTS=0` disables CLI defaults. See the
+[direct CLI example](../README.md#7--run-inference-and-retrieve-the-image). Unsupported packed operations fail explicitly rather than executing tiled weights as ordinary CPU weights. Weight adapters and unsupported convolution variants retain their existing implementation. This implementation targets standard Conv2d, not grouped/depthwise/transposed convolutions. It has been tested on SD3.5 Medium decode; broader models and VAE encoding are not yet validated.
 
 ## Hybrid execution resources
 

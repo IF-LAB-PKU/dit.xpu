@@ -1133,8 +1133,31 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                 const auto *p=ggml_htp_native_meta(dst); if(!p || dst->type!=GGML_TYPE_F32 || !ggml_is_contiguous(dst)) return false;
                 if(ggml_htp_native_kind(dst)==3) {
                     auto *x=dst->src[0],*w=dst->src[1],*b=dst->src[2];int mode=p->v[0];
-                    if(!x || x->type!=GGML_TYPE_F32 || !ggml_is_contiguous(x) || ggml_nelements(x)>INT32_MAX || mode<0 || mode>8) return false;
+                    if(!x || x->type!=GGML_TYPE_F32 || (!ggml_is_contiguous(x) && mode!=12 && mode!=13) || ggml_nelements(x)>INT32_MAX || mode<0 || mode>13) return false;
                     for(auto *t:{w,b}) if(t && (t->type!=GGML_TYPE_F32 || !ggml_is_contiguous(t))) return false;
+                    if(mode>=9) {
+                        if(!dlsym(ops_dl_handle,"htp_ops_dit_aux_version")) return false;
+                        if(mode==13) return dlsym(ops_dl_handle,"htp_ops_dit_concat_version") && w && !b &&
+                            x->ne[0]%2==0 && x->nb[0]==sizeof(float) && x->nb[1]%sizeof(float)==0 &&
+                            x->nb[1]/sizeof(float)<=INT32_MAX && x->nb[1]>=x->ne[0]*sizeof(float) &&
+                            x->nb[2]==x->nb[1]*x->ne[1] && x->nb[3]==x->nb[2]*x->ne[2] &&
+                            (p->v[2]==0 || p->v[2]==1) && ggml_nelements(dst)<=INT32_MAX &&
+                            ggml_nelements(w)<=INT32_MAX && dst->ne[0]==x->ne[0]/2+w->ne[0] &&
+                            dst->ne[1]==x->ne[1] && dst->ne[2]==x->ne[2] && dst->ne[3]==x->ne[3] &&
+                            w->ne[1]==x->ne[1] && w->ne[2]==x->ne[2] && w->ne[3]==x->ne[3];
+                        if(mode==12) return !w && !b && x->ne[0]%2==0 && x->nb[0]==sizeof(float) &&
+                            x->nb[1]%sizeof(float)==0 && x->nb[1]/sizeof(float)<=INT32_MAX &&
+                            x->nb[1]>=x->ne[0]*sizeof(float) && x->nb[2]==x->nb[1]*x->ne[1] &&
+                            x->nb[3]==x->nb[2]*x->ne[2] && (p->v[2]==0 || p->v[2]==1) && dst->ne[0]==x->ne[0]/2 &&
+                            dst->ne[1]==x->ne[1] && dst->ne[2]==x->ne[2] && dst->ne[3]==x->ne[3];
+                        if(mode==11) return w && !b && x->ne[0]%2==0 && w->ne[0]==2 && w->ne[1]==2 &&
+                            w->ne[2]==x->ne[0]/2 && (w->ne[3]==x->ne[2] || w->ne[3]==x->ne[2]*x->ne[3]) &&
+                            dst->ne[0]==x->ne[0] && dst->ne[1]==x->ne[2] && dst->ne[2]==x->ne[1]*x->ne[3] && dst->ne[3]==1;
+                        const bool compact=w && x->ne[3]==1 && w->ne[0]==x->ne[0] && w->ne[1]==1 &&
+                            (w->ne[2]==1 || w->ne[2]==x->ne[2]) && w->ne[3]==1;
+                        return compact && b && ggml_are_same_shape(dst,x) && (mode==9 ?
+                            (ggml_are_same_shape(w,b) && std::isfinite(p->scale) && p->scale>=0) : ggml_are_same_shape(x,b));
+                    }
                     if(mode==8) return !w && !b && p->v[3]>0 && p->v[4]>0 && p->v[5]>0 && ggml_nelements(x)==(int64_t)p->v[3]*p->v[4]*p->v[5];
                     if(mode<=2) {int64_t n=mode==2?x->ne[2]:x->ne[0];
                         return (!w || ggml_nelements(w)==n) && (!b || ggml_nelements(b)==n) && (mode!=2 || (p->v[1]>0 && n%p->v[1]==0));}
@@ -1375,6 +1398,13 @@ bool htp_ops_support_op_runtime(const struct ggml_tensor * dst) {
             }
             return true;
         }
+    }
+
+    if (ggml_htp_native_kind(dst)==3 && (ggml_htp_native_meta(dst)->v[0]==12 || ggml_htp_native_meta(dst)->v[0]==13)) {
+        // Static validation checks the row stride; runtime validation checks
+        // that the complete sliced source is backed by mapped RPCMEM.
+        return tensor_ready_for_htp_dispatch_view_backed(dst->src[0]) &&
+            (!dst->src[1] || tensor_ready_for_htp_dispatch(dst->src[1]));
     }
 
     if (dst->op == GGML_OP_MUL_MAT || ggml_htp_f16_epilogue_mode(dst)>=0 || ggml_htp_native_kind(dst)==1) {
@@ -2717,6 +2747,10 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                         p.mode=meta->v[0];p.groups=meta->v[1];p.activation=meta->v[2];p.eps=meta->scale;
                         p.count=ggml_nelements(x);p.width=x->ne[0];p.channels=x->ne[2];p.spatial=x->ne[0]*x->ne[1];p.batch=x->ne[3];p.other_count=w?ggml_nelements(w):0;
                         if(p.mode==8) {p.width=meta->v[3];p.spatial=meta->v[4];p.batch=meta->v[5];}
+                        if(p.mode==9 || p.mode==10) {p.spatial=x->ne[1];p.batch=x->ne[2];p.channels=x->ne[0];}
+                        if(p.mode==11) {p.channels=x->ne[1];p.spatial=x->ne[2];p.batch=x->ne[3];p.groups=w->ne[3]/x->ne[2];}
+                        if(p.mode==12) {p.count=ggml_nelements(dst);p.width=dst->ne[0];p.spatial=x->ne[1];p.batch=x->ne[2]*x->ne[3];p.channels=x->nb[1]/sizeof(float);}
+                        if(p.mode==13) {p.count=ggml_nelements(dst);p.width=x->ne[0]/2;p.groups=w->ne[0];p.spatial=x->ne[1];p.batch=x->ne[2]*x->ne[3];p.channels=x->nb[1]/sizeof(float);}
                         memcpy(param_buf,&p,sizeof(p));op_index=HTP_OPS_MODEL_AUX_F32;args_size=sizeof(p);dispatch_m=p.count;dispatch_k=p.mode;dispatch_n=1;
                     } else if(ggml_htp_native_kind(dst)==1) {
                         auto *a=dst->src[1]; NativeConvParams p{};

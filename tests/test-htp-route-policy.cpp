@@ -612,7 +612,7 @@ void test_opencl_staging_slot_parser() {
 }
 
 void test_opencl_lifetime_route_contract() {
-    set_opencl_lifetime_route_env(nullptr);
+    set_opencl_lifetime_route_env("deferred");
     require(sd_htp_opencl_background_residual_job_enabled(),
             "legacy deferred mode must keep the background residual job");
     require(sd_htp_opencl_whole_arena_deferred_ownership(),
@@ -714,8 +714,10 @@ void test_opencl_lifetime_effective_defaults() {
 
     set_opencl_lifetime_route_env(nullptr);
     require(ggml_htp_opencl_lifetime_mode_effective() ==
-                GGML_HTP_OPENCL_LIFETIME_DEFERRED,
-            "unset OpenCL sparse route must preserve deferred default");
+                GGML_HTP_OPENCL_LIFETIME_REUSE,
+            "unset OpenCL sparse route must default to reuse");
+    require(sd_htp_opencl_sparse_local_lifetime_prerequisites(),
+            "unset OpenCL sparse route must enable local cache lifetime");
 
     for (const char* mode : {"deferred", "reuse", "strict"}) {
         set_local_cache_route_env(true, false, true, mode);

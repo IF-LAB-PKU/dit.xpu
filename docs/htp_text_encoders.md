@@ -57,9 +57,10 @@ export SD_HTP_TEXT=1
   <your diffusion model, VAE and generation arguments>
 ```
 
-Existing DiT/VAE HTP switches are independent. Full SD3.5 Medium generation on
-the current Snapdragon 8 Gen 3 device also uses `SD_HTP_MULTI_SESSION=1` and
-`SD_HTP_MULTI_SESSION_COUNT=2`, as documented in [HTP VAE](htp_vae.md).
+Existing DiT/VAE HTP switches are independent. The current SD3.5 Medium and
+Klein launchers use `SD_HTP_MULTI_SESSION=0`, immediate unmap and bounded
+weight staging. The staging mapping-accounting fix is required; earlier
+dual-session measurements in [HTP VAE](htp_vae.md) are historical configurations.
 
 ## Weight memory and graph segments
 

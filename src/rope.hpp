@@ -780,6 +780,15 @@ namespace Rope {
         return x_out;
     }
 
+    static inline ggml_tensor* apply_rope(GGMLRunnerContext* ctx,ggml_tensor* x,ggml_tensor* pe,
+                                          bool interleaved=true) {
+        if(ctx->htp_dit_native && interleaved && x->type==GGML_TYPE_F32 && pe->type==GGML_TYPE_F32 &&
+           x->ne[0]%2==0 && pe->ne[0]==2 && pe->ne[1]==2 && pe->ne[2]==x->ne[0]/2 &&
+           (pe->ne[3]==x->ne[2] || pe->ne[3]==x->ne[2]*x->ne[3]))
+            return ggml_htp_dit_rope(ctx->ggml_ctx,x,pe);
+        return apply_rope(ctx->ggml_ctx,x,pe,interleaved);
+    }
+
     __STATIC_INLINE__ ggml_tensor* attention(GGMLRunnerContext* ctx,
                                              ggml_tensor* q,
                                              ggml_tensor* k,
@@ -791,8 +800,8 @@ namespace Rope {
         // q,k,v: [N, L, n_head, d_head]
         // pe: [L, d_head/2, 2, 2]
         // return: [N, L, n_head*d_head]
-        q = apply_rope(ctx->ggml_ctx, q, pe, rope_interleaved);  // [N*n_head, L, d_head]
-        k = apply_rope(ctx->ggml_ctx, k, pe, rope_interleaved);  // [N*n_head, L, d_head]
+        q = apply_rope(ctx, q, pe, rope_interleaved);  // [N*n_head, L, d_head]
+        k = apply_rope(ctx, k, pe, rope_interleaved);  // [N*n_head, L, d_head]
 
         auto x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, v->ne[1], mask, true, ctx->flash_attn_enabled, kv_scale);  // [N, L, n_head*d_head]
         return x;
@@ -817,8 +826,8 @@ namespace Rope {
         // q,k,v: [N, L, n_head, d_head]
         // pe: [L, d_head/2, 2, 2]
         // return: [N, L, n_head*d_head]
-        q = apply_rope(ctx->ggml_ctx, q, pe, rope_interleaved);  // [N*n_head, L, d_head]
-        k = apply_rope(ctx->ggml_ctx, k, pe, rope_interleaved);  // [N*n_kv_head, L, d_head]
+        q = apply_rope(ctx, q, pe, rope_interleaved);  // [N*n_head, L, d_head]
+        k = apply_rope(ctx, k, pe, rope_interleaved);  // [N*n_kv_head, L, d_head]
 
         auto x = ggml_ext_attention_ext(ctx->ggml_ctx,
                                         ctx->backend,

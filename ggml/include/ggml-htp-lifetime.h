@@ -82,7 +82,8 @@ static inline ggml_htp_opencl_lifetime_mode
 ggml_htp_opencl_lifetime_mode_default_for_route(
         ggml_htp_opencl_lifetime_route route) {
     return route == GGML_HTP_OPENCL_LIFETIME_ROUTE_FUSED ||
-               route == GGML_HTP_OPENCL_LIFETIME_ROUTE_HTP_CPU
+               route == GGML_HTP_OPENCL_LIFETIME_ROUTE_HTP_CPU ||
+               route == GGML_HTP_OPENCL_LIFETIME_ROUTE_OPENCL_SPARSE
         ? GGML_HTP_OPENCL_LIFETIME_REUSE
         : GGML_HTP_OPENCL_LIFETIME_DEFERRED;
 }
