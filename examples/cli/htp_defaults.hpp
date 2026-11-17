@@ -10,7 +10,7 @@
 // CLI defaults are resolved before any backend/session is initialized. Inspect
 // model metadata, never filenames: ordinary/partially packed models stay opt-in.
 namespace sd_cli_htp {
-enum class Model { none, sd35_medium, klein4b };
+enum class Model { none, sd35_medium, sd35_large, klein4b, z_image };
 
 inline bool enabled(const char* name) {
     const char* value = std::getenv(name);
@@ -28,7 +28,7 @@ inline void default_env(const char* name, const char* value) {
 
 inline Model identify(SDVersion version, const String2TensorStorage& tensors) {
     bool dit = false, clip_l = false, clip_g = false, t5 = false, llm = false, vae = false;
-    bool medium = false, klein = false;
+    bool medium = false, large = false, klein = false, z_image = false;
     for (const auto& item : tensors) {
         const auto& name = item.first;
         const auto& tensor = item.second;
@@ -41,14 +41,22 @@ inline Model identify(SDVersion version, const String2TensorStorage& tensors) {
         }
         if (tensor.layout == TensorDataLayout::HTP_CONV2D_W16A32 &&
             name.find("first_stage_model.") == 0) vae = true;
-        if (name == "model.diffusion_model.joint_blocks.0.x_block.attn.qkv.weight")
+        if (name == "model.diffusion_model.joint_blocks.0.x_block.attn.qkv.weight") {
             medium = tensor.ne[0] == 1536;
+            large = tensor.ne[0] == 2432;
+        }
         if (name == "model.diffusion_model.img_in.weight")
             klein = tensor.ne[1] == 3072;
+        if (name == "model.diffusion_model.x_embedder.weight")
+            z_image = tensor.ne[0] == 64 && tensor.ne[1] == 3840;
     }
     if (!dit || !vae) return Model::none;
     if (version == VERSION_SD3 && medium && clip_l && clip_g && t5) return Model::sd35_medium;
+    if (version == VERSION_SD3 && large && clip_l && clip_g && t5) return Model::sd35_large;
     if (version == VERSION_FLUX2_KLEIN && klein && llm) return Model::klein4b;
+    // Base and Turbo share this architecture and resource policy. Do not infer
+    // their sampler, step count or CFG from a filename or identical shapes.
+    if (version == VERSION_Z_IMAGE && z_image && llm) return Model::z_image;
     return Model::none;
 }
 
@@ -67,16 +75,18 @@ inline void configure(Model model, sd_ctx_params_t& params, bool max_vram_explic
     // Attention flags never select a different weight/session/text/VAE policy.
     default_env("SD_HTP_DEFER_UNMAP", "0");
     default_env("SD_HTP_PACKED_STAGING", "1");
-    default_env("SD_HTP_PACKED_STAGING_BUDGET_MB", model == Model::klein4b ? "1024" : "512");
+    default_env("SD_HTP_PACKED_STAGING_BUDGET_MB", model == Model::sd35_medium ? "512" : "1024");
     default_env("SD_HTP_PACKED_STAGING_SLOT_MB", "512");
     default_env("SD_HTP_PACKED_PREFETCH", "1");
-    if (model == Model::sd35_medium) {
+    if (model == Model::sd35_medium || model == Model::sd35_large) {
         default_env("SD_HTP_SD3_DIT_PREFETCH", "1");
         default_env("SD_HTP_SD3_DIT_NATIVE", "0");
-    } else {
+    } else if (model == Model::klein4b) {
         default_env("SD_HTP_DIT_PREFETCH", "1");
         default_env("SD_HTP_DIT_NATIVE", "1");
         default_env("SD_HTP_DIT_CONCAT", "1");
+    } else if (model == Model::z_image) {
+        default_env("SD_HTP_Z_IMAGE_DIT_PREFETCH", "1");
     }
     if (!max_vram_explicit && params.max_vram == 0.f) params.max_vram = .5f;
 }
@@ -104,6 +114,8 @@ inline const char* apply(sd_ctx_params_t& params, bool max_vram_explicit) {
     const bool sparse = enabled("SD_HTP_BLOCK_SPARSE_ATTN") || enabled("SD_HTP_SPARSE_OPENCL");
     configure(model, params, max_vram_explicit);
     if (model == Model::sd35_medium) return sparse ? "sd35-medium-sparse-attention" : "sd35-medium-dense";
+    if (model == Model::sd35_large) return sparse ? "sd35-large-sparse-attention" : "sd35-large-dense";
+    if (model == Model::z_image) return sparse ? "z-image-sparse-attention" : "z-image-dense";
     return sparse ? "klein4b-sparse-attention" : "klein4b-dense";
 #else
     (void)params; (void)max_vram_explicit;

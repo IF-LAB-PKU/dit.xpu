@@ -84,7 +84,9 @@ final images under identical prompts, seeds and model files.
 `SD_HTP_PACKED_PREFETCH=1` enables one-segment lookahead for graph-cut T5
 with deferred, offline-packed F16 weights. Qwen3 and DiT have their own
 runner eligibility switches; SD3.5 supports both dense and sparse/OpenCL
-attention. Packed QKV F32 bias/norm parameters travel in the same typed
+attention. Dense Z-Image Base/Turbo use `SD_HTP_Z_IMAGE_DIT_PREFETCH=1`;
+sparse/OpenCL/packed-Z requests retain synchronous DiT staging. Packed QKV F32
+bias/norm parameters travel in the same typed
 prefetch batch as their F16 projections. Other unsupported/non-deferred
 weights retain synchronous staging. The library switch is opt-in because the
 extra bank increases memory usage; recognized packed CLI models enable it.

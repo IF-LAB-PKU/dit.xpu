@@ -1,5 +1,8 @@
 # How to Use
 
+For offline-packed Android HTP execution of Base/Turbo, see
+[Z-Image HTP usage](htp_extended_models.md).
+
 You can run Z-Image with stable-diffusion.cpp on GPUs with 4GB of VRAM — or even less.
 
 ## Download weights

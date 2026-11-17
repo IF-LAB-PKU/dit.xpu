@@ -13,9 +13,10 @@ static void save(const std::string& path, const sd::Tensor<float>& tensor) {
     GGML_ASSERT(file.write(reinterpret_cast<const char*>(tensor.data()), tensor.numel() * sizeof(float)));
 }
 static int benchmark_qwen3(int argc, char** argv, ggml_backend_t cpu, ggml_backend_t htp) {
+    const auto version = std::string(argv[1]) == "qwen3-z-image" ? VERSION_Z_IMAGE : VERSION_FLUX2_KLEIN;
     ModelLoader loader;
-    GGML_ASSERT(loader.init_from_file_and_convert_name(argv[2], "text_encoders.llm.", VERSION_FLUX2_KLEIN));
-    LLMEmbedder encoder(cpu, cpu, loader.get_tensor_storage_map(), VERSION_FLUX2_KLEIN);
+    GGML_ASSERT(loader.init_from_file_and_convert_name(argv[2], "text_encoders.llm.", version));
+    LLMEmbedder encoder(cpu, cpu, loader.get_tensor_storage_map(), version);
     if (htp) GGML_ASSERT(encoder.configure_htp_text_encoder(htp, &loader));
     encoder.alloc_params_buffer();
     std::map<std::string, ggml_tensor*> params;
@@ -37,18 +38,18 @@ static int benchmark_qwen3(int argc, char** argv, ggml_backend_t cpu, ggml_backe
             else GGML_ASSERT(reference.size() == size_t(out.numel()) &&
                              std::memcmp(reference.data(), out.data(), reference.size() * sizeof(float)) == 0);
         }
-        std::printf("encoder=qwen3 mode=%s repeat=%d prefetch=%d seconds=%.6f cross_elements=%lld\n",
-                    argv[3], r, sd_env_flag_enabled("SD_HTP_PACKED_PREFETCH"), elapsed, (long long)out.numel());
+        std::printf("encoder=%s mode=%s repeat=%d prefetch=%d seconds=%.6f cross_elements=%lld\n",
+                    argv[1], argv[3], r, sd_env_flag_enabled("SD_HTP_PACKED_PREFETCH"), elapsed, (long long)out.numel());
     }
     return 0;
 }
 int main(int argc, char** argv) {
     if (argc < 6) {
-        std::fprintf(stderr, "usage: %s clip_l|clip_g|t5xxl|qwen3 MODEL cpu|htp REPEATS OUTPUT_PREFIX [PROMPT]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s clip_l|clip_g|t5xxl|qwen3|qwen3-z-image MODEL cpu|htp REPEATS OUTPUT_PREFIX [PROMPT]\n", argv[0]);
         return 2;
     }
     const std::string kind = argv[1];
-    if (kind != "clip_l" && kind != "clip_g" && kind != "t5xxl" && kind != "qwen3") return 2;
+    if (kind != "clip_l" && kind != "clip_g" && kind != "t5xxl" && kind != "qwen3" && kind != "qwen3-z-image") return 2;
     const bool use_htp = std::string(argv[3]) == "htp";
     if (!use_htp && std::string(argv[3]) != "cpu") return 2;
     const int repeats = std::atoi(argv[4]);
@@ -58,7 +59,7 @@ int main(int argc, char** argv) {
     auto* htp = use_htp ? ggml_backend_init_by_name("HTP", nullptr) : nullptr;
     GGML_ASSERT(cpu && (!use_htp || htp));
     if (use_htp) setenv("SD_HTP_COMPUTE", "1", 1);
-    if (kind == "qwen3") {
+    if (kind == "qwen3" || kind == "qwen3-z-image") {
         const int result = benchmark_qwen3(argc, argv, cpu, htp);
         ggml_backend_free(htp);
         ggml_backend_free(cpu);

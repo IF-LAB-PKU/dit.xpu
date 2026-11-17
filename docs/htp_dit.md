@@ -185,14 +185,19 @@ stability/quality smoke without a baseline, not another speedup comparison.
 
 ## Direct CLI defaults and optional launchers
 
-For packed SD3.5 Medium/Klein4B, CPU runtime/params and staged image generation,
+For packed SD3.5 Medium/Large, Klein4B and Z-Image Base/Turbo, CPU runtime/params
+and staged image generation,
 `sd-cli` now resolves these defaults from tensor layout/shape metadata before
-backend initialization. Dense SD3 uses one session, immediate unmap,
+backend initialization. Dense SD3.5 Medium uses one session, immediate unmap,
 512 MiB/bank, DiT prefetch and native DiT off. Dense Klein uses one session,
 1024 MiB/bank and DiT prefetch/native/concat on. Default graph-cut budget is
 0.5 GiB unless `--max-vram` was explicit (including zero). User environment
 values always win. `SD_HTP_MODEL_DEFAULTS=0` disables CLI auto-configuration;
 other models/backends and the C API keep their previous opt-in behavior.
+Large uses 1024 MiB/bank with MMDiT prefetch and native DiT off. Z-Image uses
+1024 MiB/bank with its new dense-only `SD_HTP_Z_IMAGE_DIT_PREFETCH=1`; its
+Qwen3 text encoder and VAE use the native HTP path. See
+[model conversion and launchers](htp_extended_models.md).
 
 The SD3.5 sparse flags in the [README](../README.md#7--run-inference-and-retrieve-the-image)
 change only DiT attention, its packed QKV and residual reconstruction. Sparse

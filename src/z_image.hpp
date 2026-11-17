@@ -896,7 +896,10 @@ namespace ZImage {
                 img_slice_start = total_txt_tokens;
                 img_slice_len   = total_img_tokens;
             }
-            sd::ggml_graph_cut::mark_graph_cut(txt_img, "z_image.prelude", "txt_img");
+            // This join follows both refiner stacks. Reusing the embedding
+            // group would pull their weights into the prelude's segment,
+            // exceeding the bounded staging bank before joint attention starts.
+            sd::ggml_graph_cut::mark_graph_cut(txt_img, "z_image.joint_input", "txt_img");
 
             // Joint layers: sparse uses image-first with protected text suffix
             int block_sparse_protected_start = sparse_eligible ? static_cast<int>(total_img_tokens) : 0;

@@ -8097,10 +8097,14 @@ protected:
         const size_t num_tensors = ggml_tensor_num(segment.ctx);
         // Native norm/residual/attention may consume a cut's cached output
         // directly. Cached leaves cannot be relocated by the graph allocator.
+        // Z-Image's packed AdaLN projections consume the cached timestep
+        // directly through reshape views. Unlike an allocated intermediate,
+        // a cached CPU leaf cannot be relocated to RPCMEM by graph placement.
         const bool native_cache=htp_op_routing_enabled() &&
             ((htp_text_encoder_enabled_ && sd_env_flag_enabled("SD_HTP_TEXT_NATIVE")) ||
              (htp_vae_conv_enabled_ && sd_env_flag_enabled("SD_HTP_VAE_NATIVE")) ||
-             htp_dit_native_enabled());
+             htp_dit_native_enabled() ||
+             (get_desc() == "z_image" && sd_env_flag_enabled("SD_HTP_COMPUTE")));
         segment.buffer = ggml_backend_alloc_ctx_tensors(segment.ctx, native_cache ? htp_backend : runtime_backend);
         if (segment.buffer == nullptr) {
             LOG_ERROR("%s alloc cache backend buffer failed, num_tensors=%zu",
@@ -9702,6 +9706,10 @@ protected:
         const bool prefetch_runner = get_desc() == "t5" ||
             (htp_text_encoder_enabled_ && get_desc() == "qwen3") ||
             (get_desc() == "mmdit" && sd_env_flag_enabled("SD_HTP_SD3_DIT_PREFETCH")) ||
+            (get_desc() == "z_image" && sd_env_flag_enabled("SD_HTP_Z_IMAGE_DIT_PREFETCH") &&
+             !sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_ATTN") &&
+             !sd_env_flag_enabled("SD_HTP_SPARSE_OPENCL") &&
+             !sd_env_flag_enabled("SD_HTP_PACKED_Z_IMAGE")) ||
             (get_desc() == "flux" && sd_env_flag_enabled("SD_HTP_DIT_PREFETCH") &&
              !sd_env_flag_enabled("SD_HTP_BLOCK_SPARSE_ATTN") &&
              !sd_env_flag_enabled("SD_HTP_PACKED_FLUX2"));

@@ -11,6 +11,9 @@
 ## Run
 
 ### SD3.5 Large
+
+For offline-packed Android HTP execution, see [Large HTP usage](htp_extended_models.md).
+
 For example:
 
 ```

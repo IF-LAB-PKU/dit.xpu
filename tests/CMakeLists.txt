@@ -25,7 +25,27 @@ target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/.. $
 target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
+set(TEST_TARGET test-z-image-graph-cuts)
+add_executable(${TEST_TARGET} test-z-image-graph-cuts.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/.. ${CMAKE_CURRENT_LIST_DIR}/../src)
+target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+if(GGML_HTP)
+    set(TEST_TARGET test-htp-packed-fallback)
+    add_executable(${TEST_TARGET} test-htp-packed-fallback.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion)
+    target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
+endif()
+
 # Explicit real-model/device benchmark, not part of ordinary CTest runs.
+set(TEST_TARGET test-z-image-forward)
+add_executable(${TEST_TARGET} test-z-image-forward.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/.. ${CMAKE_CURRENT_LIST_DIR}/../src)
+target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
+
 set(TEST_TARGET test-text-encoder)
 add_executable(${TEST_TARGET} test-text-encoder.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE stable-diffusion Threads::Threads)

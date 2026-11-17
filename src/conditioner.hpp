@@ -1124,7 +1124,7 @@ struct LLMEmbedder : public Conditioner {
     std::shared_ptr<LLM::LLMRunner> llm;
 
     bool configure_htp_text_encoder(ggml_backend_t backend, ModelLoader* loader) override {
-        if (version != VERSION_FLUX2_KLEIN || !llm) return false;
+        if ((version != VERSION_FLUX2_KLEIN && !sd_version_is_z_image(version)) || !llm) return false;
         llm->configure_htp_text_encoder(backend, loader);
         return true;
     }

@@ -12,6 +12,7 @@ static void clear() {
         "SD_HTP_PACKED_STAGING", "SD_HTP_PACKED_STAGING_BUDGET_MB", "SD_HTP_PACKED_STAGING_SLOT_MB",
         "SD_HTP_PACKED_PREFETCH", "SD_HTP_SD3_DIT_PREFETCH", "SD_HTP_SD3_DIT_NATIVE",
         "SD_HTP_DIT_PREFETCH", "SD_HTP_DIT_NATIVE", "SD_HTP_DIT_CONCAT",
+        "SD_HTP_Z_IMAGE_DIT_PREFETCH",
         "SD_HTP_BLOCK_SPARSE_ATTN", "SD_HTP_SPARSE_OPENCL", "SD_HTP_PACKED_ATTENTION",
         "SD_HTP_HALO_KV_LOAD"}) unsetenv(key);
 }
@@ -30,7 +31,9 @@ int main() {
         tensors[std::string("text_encoders.")+encoder+".projection.weight"].layout = TensorDataLayout::HTP_PERMUTED_W16A32;
     assert(identify(VERSION_SD3, tensors) == Model::sd35_medium);
     tensors[qkv].ne[0] = 2432;
-    assert(identify(VERSION_SD3, tensors) == Model::none); // Large is not Medium.
+    assert(identify(VERSION_SD3, tensors) == Model::sd35_large);
+    tensors[qkv].ne[0] = 2048;
+    assert(identify(VERSION_SD3, tensors) == Model::none);
     tensors[qkv].ne[0] = 1536;
     tensors["text_encoders.t5xxl.projection.weight"].layout = TensorDataLayout::REFERENCE;
     assert(identify(VERSION_SD3, tensors) == Model::none); // Mixed raw/packed is opt-in.
@@ -39,6 +42,14 @@ int main() {
     assert(identify(VERSION_FLUX2_KLEIN, tensors) == Model::klein4b);
     tensors["model.diffusion_model.img_in.weight"].ne[1] = 4096;
     assert(identify(VERSION_FLUX2_KLEIN, tensors) == Model::none);
+    tensors["model.diffusion_model.x_embedder.weight"].ne[0] = 64;
+    tensors["model.diffusion_model.x_embedder.weight"].ne[1] = 3840;
+    assert(identify(VERSION_Z_IMAGE, tensors) == Model::z_image);
+    tensors["text_encoders.llm.projection.weight"].layout = TensorDataLayout::REFERENCE;
+    assert(identify(VERSION_Z_IMAGE, tensors) == Model::none);
+    tensors["text_encoders.llm.projection.weight"].layout = TensorDataLayout::HTP_PERMUTED_W16A32;
+    tensors["first_stage_model.decoder.conv_in.weight"].layout = TensorDataLayout::REFERENCE;
+    assert(identify(VERSION_Z_IMAGE, tensors) == Model::none);
 
     clear();
     sd_ctx_params_t params{};
@@ -76,6 +87,24 @@ int main() {
     assert(params.max_vram == 0.f); // Explicit --max-vram 0 is respected.
     value("SD_HTP_DIT_CONCAT", "0"); value("SD_HTP_PACKED_STAGING_BUDGET_MB", "1536");
     value("SD_HTP_DIT_NATIVE", "1"); value("SD_HTP_DIT_PREFETCH", "1");
+    clear();
+    params.max_vram = 0.f;
+    configure(Model::sd35_large, params, false);
+    value("SD_HTP_PACKED_STAGING_BUDGET_MB", "1024");
+    value("SD_HTP_SD3_DIT_PREFETCH", "1"); value("SD_HTP_SD3_DIT_NATIVE", "0");
+    assert(!std::getenv("SD_HTP_DIT_NATIVE"));
+    clear();
+    params.max_vram = 0.f;
+    configure(Model::z_image, params, false);
+    value("SD_HTP_PACKED_STAGING_BUDGET_MB", "1024");
+    value("SD_HTP_Z_IMAGE_DIT_PREFETCH", "1");
+    value("SD_HTP_TEXT_NATIVE", "1"); value("SD_HTP_VAE_NATIVE_CONV", "1");
+    assert(!std::getenv("SD_HTP_DIT_NATIVE") && !std::getenv("SD_HTP_SD3_DIT_NATIVE"));
+    assert(params.max_vram == .5f);
+    clear();
+    setenv("SD_HTP_Z_IMAGE_DIT_PREFETCH", "0", 1);
+    configure(Model::z_image, params, false);
+    value("SD_HTP_Z_IMAGE_DIT_PREFETCH", "0");
     clear();
     puts("HTP CLI model selection, dense/sparse defaults and explicit overrides PASSED");
 }

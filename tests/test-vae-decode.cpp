@@ -96,7 +96,7 @@ struct RawVae : AutoEncoderKL {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "Usage: %s --self-test | <vae.safetensors> <cpu|htp> <image-size> <repeats> <output.f32> [latent.f32] [threads] [sd3|flux2]\n", argv[0]);
+        std::fprintf(stderr, "Usage: %s --self-test | <vae.safetensors> <cpu|htp> <image-size> <repeats> <output.f32> [latent.f32] [threads] [sd3|flux2|z-image]\n", argv[0]);
         return 2;
     }
     sd_set_log_callback(log_line, nullptr);
@@ -120,8 +120,9 @@ int main(int argc, char** argv) {
         const int size = std::atoi(argv[3]), repeats = std::atoi(argv[4]);
         const int threads = argc > 7 ? std::atoi(argv[7]) : 4;
         const std::string kind = argc > 8 ? argv[8] : "sd3";
-        GGML_ASSERT(kind == "sd3" || kind == "flux2");
-        const SDVersion version = kind == "flux2" ? VERSION_FLUX2_KLEIN : VERSION_SD3;
+        GGML_ASSERT(kind == "sd3" || kind == "flux2" || kind == "z-image");
+        const SDVersion version = kind == "flux2" ? VERSION_FLUX2_KLEIN :
+                                  kind == "z-image" ? VERSION_Z_IMAGE : VERSION_SD3;
         GGML_ASSERT(size > 0 && size <= 2048 && size % 8 == 0 && repeats > 0 && threads > 0);
         const double load_start = seconds();
         ModelLoader loader;
@@ -135,7 +136,10 @@ int main(int argc, char** argv) {
         vae.raw_output();
         if (htp) { vae.set_htp_backend(htp); vae.set_htp_vae_conv_enabled(true); }
         std::printf("load_seconds=%.6f mode=%s size=%d threads=%d\n", seconds() - load_start, argv[2], size, threads);
-        sd::Tensor<float> latent({size / vae.get_scale_factor(), size / vae.get_scale_factor(), vae.get_encoder_output_channels(3), 1});
+        // SD3/Flux1/Z-Image encoders return mean and log-variance. The
+        // decoder consumes only the sampled channels, not both moments.
+        const int channels = vae.get_encoder_output_channels(3) / (kind == "flux2" ? 1 : 2);
+        sd::Tensor<float> latent({size / vae.get_scale_factor(), size / vae.get_scale_factor(), channels, 1});
         if (argc > 6 && std::string(argv[6]) != "-") {
             std::ifstream file(argv[6], std::ios::binary);
             GGML_ASSERT(file.read(reinterpret_cast<char*>(latent.data()), latent.numel() * sizeof(float)));

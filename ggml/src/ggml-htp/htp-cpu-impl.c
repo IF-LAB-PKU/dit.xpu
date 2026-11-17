@@ -1893,6 +1893,15 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                     if (err != 0) {
                         ggml_htp_mark_op_failed(params, tensor, err);
                     }
+                } else if (tensor->src[0] != NULL &&
+                           ggml_backend_htp_get_packed_f16_weight(tensor->src[0]) == tensor->src[0]) {
+                    // Offline W16A32 has no row-major copy. A placement
+                    // rejection must fail, never feed packed bytes to CPU GEMM.
+                    if (params->ith == 0) {
+                        fprintf(stderr, "ggml-htp: offline packed weight '%s' requires HTP placement; CPU fallback rejected\n",
+                                tensor->src[0]->name);
+                    }
+                    ggml_htp_mark_op_failed(params, tensor, -EINVAL);
                 } else {
                     ggml_compute_forward_mul_mat(params, tensor);
                 }
